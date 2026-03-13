@@ -1,0 +1,24 @@
+[package]
+name = "yaya"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.60", features = ["derive", "env"] }
+crossbeam-channel = "0.5.15"
+ctrlc = "3.5.1"
+hex = "0.4.3"
+memmap2 = "0.9.10"
+md-5 = "0.10.6"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+signal-hook = "0.3.18"
+thiserror = "2.0.18"
+yara-x = { version = "1.14.0", default-features = false, features = ["linkme"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

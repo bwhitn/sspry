@@ -1,0 +1,37 @@
+/target
+/coverage
+/candidate_db/
+*.sock
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local env files
+.env
+.env.*
+
+# tgsdb runtime artifacts (default paths)
+/bins.bin
+/bins.bin.meta
+/bins.bin.insert_state.json
+/index.bin
+/index.bin.*
+/delete.bin
+/delete.bin.*
+/removed_hashes.bin
+/removed_hashes.bin.*
+
+# tgsdb sidecar/state files
+*.meta
+*.shards.json
+*.loctbl
+*.locrec
+*.insert_state.json
+.tgsdb.insert.inflight.*.json
+
+# tgsdb lock files
+.tgsdb.write.lock
+.tgsdb.core.lock
+.tgsdb.bin.*.lock

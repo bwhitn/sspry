@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="260" viewBox="0 0 980 260">
+  <rect width="980" height="260" fill="#fbfaf5"/>
+  <text x="32" y="38" font-family="Helvetica, Arial, sans-serif" font-size="26" font-weight="700" fill="#1f2937">Query Flow</text>
+  <g font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#111827" text-anchor="middle">
+    <rect x="30" y="90" width="130" height="70" rx="10" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+    <text x="95" y="130">Rule Parse</text>
+    <rect x="190" y="90" width="150" height="70" rx="10" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+    <text x="265" y="120">Anchor Selection</text>
+    <text x="265" y="142">DF + branch ordering</text>
+    <rect x="370" y="90" width="150" height="70" rx="10" fill="#fde68a" stroke="#a16207" stroke-width="2"/>
+    <text x="445" y="120">Shard Fanout</text>
+    <text x="445" y="142">dynamic workers</text>
+    <rect x="550" y="90" width="150" height="70" rx="10" fill="#fecaca" stroke="#b91c1c" stroke-width="2"/>
+    <text x="625" y="120">Tier1 Exact</text>
+    <text x="625" y="142">Tier2 Bloom Fallback</text>
+    <rect x="730" y="90" width="100" height="70" rx="10" fill="#e9d5ff" stroke="#7e22ce" stroke-width="2"/>
+    <text x="780" y="130">Score</text>
+    <rect x="860" y="90" width="90" height="70" rx="10" fill="#fbcfe8" stroke="#be185d" stroke-width="2"/>
+    <text x="905" y="120">Verify</text>
+    <text x="905" y="142">optional</text>
+  </g>
+  <g stroke="#334155" stroke-width="3" fill="#334155">
+    <line x1="160" y1="125" x2="190" y2="125"/>
+    <polygon points="190,125 178,119 178,131"/>
+    <line x1="340" y1="125" x2="370" y2="125"/>
+    <polygon points="370,125 358,119 358,131"/>
+    <line x1="520" y1="125" x2="550" y2="125"/>
+    <polygon points="550,125 538,119 538,131"/>
+    <line x1="700" y1="125" x2="730" y2="125"/>
+    <polygon points="730,125 718,119 718,131"/>
+    <line x1="830" y1="125" x2="860" y2="125"/>
+    <polygon points="860,125 848,119 848,131"/>
+  </g>
+</svg>

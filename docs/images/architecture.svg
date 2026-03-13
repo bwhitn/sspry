@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420">
+  <rect width="920" height="420" fill="#fbfaf5"/>
+  <text x="40" y="42" font-family="Helvetica, Arial, sans-serif" font-size="26" font-weight="700" fill="#1f2937">yaya Architecture</text>
+  <rect x="40" y="90" width="220" height="110" rx="12" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+  <text x="68" y="128" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#1e3a8a">Clients</text>
+  <text x="68" y="160" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">index / delete / search / info</text>
+  <rect x="345" y="70" width="240" height="150" rx="12" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
+  <text x="388" y="112" font-family="Helvetica, Arial, sans-serif" font-size="24" font-weight="700" fill="#7f1d1d">TCP RPC Server</text>
+  <text x="378" y="148" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">addr, shards, id-source, set-fp,</text>
+  <text x="378" y="172" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">gram-sizes, store-path, workers</text>
+  <rect x="650" y="55" width="220" height="80" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="686" y="98" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Search Store</text>
+  <rect x="650" y="155" width="220" height="80" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="692" y="198" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Shard Metadata</text>
+  <rect x="650" y="255" width="220" height="110" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+  <text x="688" y="295" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Binary Sidecars</text>
+  <text x="682" y="323" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">blooms, grams, ids, tombstones,</text>
+  <text x="720" y="346" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">df state</text>
+  <rect x="345" y="270" width="240" height="95" rx="12" fill="#fde68a" stroke="#a16207" stroke-width="2"/>
+  <text x="399" y="309" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#78350f">Local Verify</text>
+  <text x="385" y="337" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#78350f">optional yara-x over stored paths</text>
+  <path d="M260 145 H345" stroke="#334155" stroke-width="3" fill="none"/>
+  <polygon points="345,145 333,139 333,151" fill="#334155"/>
+  <path d="M585 145 H650" stroke="#334155" stroke-width="3" fill="none"/>
+  <polygon points="650,145 638,139 638,151" fill="#334155"/>
+  <path d="M585 315 H650" stroke="#334155" stroke-width="3" fill="none"/>
+  <polygon points="650,315 638,309 638,321" fill="#334155"/>
+  <path d="M465 220 V270" stroke="#334155" stroke-width="3" fill="none"/>
+  <polygon points="465,270 459,258 471,258" fill="#334155"/>
+</svg>
