@@ -89,6 +89,7 @@ pub struct ServerConfig {
     pub candidate_config: CandidateConfig,
     pub candidate_shards: usize,
     pub search_workers: usize,
+    pub memory_budget_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -827,6 +828,10 @@ impl ServerState {
         stats.insert(
             "search_workers".to_owned(),
             json!(self.config.search_workers),
+        );
+        stats.insert(
+            "memory_budget_bytes".to_owned(),
+            json!(self.config.memory_budget_bytes),
         );
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
         stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
@@ -2183,6 +2188,7 @@ mod tests {
                     },
                     candidate_shards: 1,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -2200,6 +2206,7 @@ mod tests {
                     },
                     candidate_shards,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -2228,6 +2235,7 @@ mod tests {
                     },
                     candidate_shards,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
             );
         });
@@ -2283,6 +2291,7 @@ mod tests {
                     },
                     candidate_shards,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
             );
         });
@@ -2325,6 +2334,7 @@ mod tests {
                     },
                     candidate_shards: 1,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
                 server_shutdown,
             )
@@ -3289,6 +3299,7 @@ rule q {
                 },
                 candidate_shards: 1,
                 search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             },
             Arc::new(AtomicBool::new(true)),
         )
@@ -3593,6 +3604,7 @@ rule q {
                 },
                 candidate_shards: 2,
                 search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             })
             .expect_err("single-shard mismatch")
             .to_string()
@@ -3616,6 +3628,7 @@ rule q {
                 },
                 candidate_shards: 1,
                 search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             })
             .expect_err("sharded mismatch")
             .to_string()
@@ -3630,6 +3643,7 @@ rule q {
             },
             candidate_shards: 2,
             search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
         })
         .expect("create sharded stores");
         assert_eq!(stores.len(), 2);
@@ -3641,6 +3655,7 @@ rule q {
                 },
                 candidate_shards: 1,
                 search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             })
             .expect_err("manifest mismatch")
             .to_string()
@@ -3747,6 +3762,7 @@ rule q {
                 },
                 candidate_shards: 2,
                 search_workers: 2,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             },
             Arc::new(AtomicBool::new(false)),
         )
@@ -3846,6 +3862,7 @@ rule q {
             },
             candidate_shards: 2,
             search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
         })
         .expect("ensure stores");
         assert_eq!(stores.len(), 2);
@@ -3867,6 +3884,7 @@ rule q {
                     },
                     candidate_shards: 1,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -3957,6 +3975,7 @@ rule q {
                     },
                     candidate_shards: 4,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -4038,6 +4057,7 @@ rule q {
                     },
                     candidate_shards: 1,
                     search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 },
                 Arc::new(AtomicBool::new(false)),
             )

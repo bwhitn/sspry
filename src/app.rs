@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::bounded;
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
@@ -43,6 +43,10 @@ pub const DEFAULT_RPC_TIMEOUT: f64 = 30.0;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SEARCH_RESULT_CHUNK_SIZE: usize = 1024;
 pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
+const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 
 struct ServeSignalFlags {
     shutdown: Arc<AtomicBool>,
@@ -198,6 +202,41 @@ fn current_process_memory_kb() -> (usize, usize) {
         }
     }
     (current_rss_kb, peak_rss_kb)
+}
+
+fn available_memory_bytes() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u64>().ok())?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn effective_memory_budget_bytes(configured_budget_bytes: u64) -> u64 {
+    if configured_budget_bytes == 0 {
+        return 0;
+    }
+    match available_memory_bytes() {
+        Some(available) if available > 0 => configured_budget_bytes.min(available.saturating_mul(3) / 4),
+        _ => configured_budget_bytes,
+    }
+}
+
+fn index_queue_capacity(memory_budget_bytes: u64, workers: usize) -> usize {
+    let workers = workers.max(1);
+    let worker_floor = workers.saturating_mul(2).max(4);
+    if memory_budget_bytes == 0 {
+        return worker_floor.min(MAX_INDEX_QUEUE_CAPACITY);
+    }
+    let budget_capacity = usize::try_from(memory_budget_bytes / ESTIMATED_INDEX_QUEUE_ITEM_BYTES)
+        .unwrap_or(usize::MAX);
+    budget_capacity.clamp(worker_floor, MAX_INDEX_QUEUE_CAPACITY)
 }
 
 fn server_memory_kb(connection: &ClientConnectionArgs) -> Result<Option<(u64, u64)>> {
@@ -416,24 +455,100 @@ fn resolve_delete_identity(
     Ok(hex::encode(chosen.expect("chosen identity")))
 }
 
-fn collect_files_recursive(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn sorted_directory_children(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut children = fs::read_dir(path)?
+        .map(|entry| entry.map(|value| value.path()).map_err(TgsError::from))
+        .collect::<Result<Vec<_>>>()?;
+    children.sort();
+    Ok(children)
+}
+
+fn visit_files_recursive(path: &Path, visit: &mut impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
     if path.is_file() {
-        out.push(path.to_path_buf());
+        visit(path.to_path_buf())?;
         return Ok(());
     }
     if !path.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        if child.is_dir() {
-            collect_files_recursive(&child, out)?;
-        } else if child.is_file() {
-            out.push(child);
-        }
+    for child in sorted_directory_children(path)? {
+        visit_files_recursive(&child, visit)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn collect_files_recursive(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    visit_files_recursive(path, &mut |child| {
+        out.push(child);
+        Ok(())
+    })
+}
+
+fn count_files_recursive(path: &Path) -> Result<usize> {
+    if path.is_file() {
+        return Ok(1);
+    }
+    if !path.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0usize;
+    for child in sorted_directory_children(path)? {
+        total = total.saturating_add(count_files_recursive(&child)?);
+    }
+    Ok(total)
+}
+
+fn normalize_input_paths(paths: &[String]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root_path in paths {
+        let path = PathBuf::from(root_path);
+        if path.exists() {
+            roots.push(path);
+        } else {
+            println!("Skipping missing path: {}", path.display());
+        }
+    }
+    roots.sort();
+    roots
+}
+
+fn count_input_files(paths: &[PathBuf]) -> Result<usize> {
+    let mut total = 0usize;
+    for path in paths {
+        total = total.saturating_add(count_files_recursive(path)?);
+    }
+    Ok(total)
+}
+
+fn stream_input_files(paths: &[PathBuf], mut visit: impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
+    for path in paths {
+        visit_files_recursive(path, &mut visit)?;
+    }
+    Ok(())
+}
+
+fn maybe_report_index_progress(
+    enabled: bool,
+    processed: usize,
+    total: usize,
+    last_reported: &mut usize,
+    last_report_at: &mut Instant,
+    force: bool,
+) {
+    if !enabled || total == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let processed_delta = processed.saturating_sub(*last_reported);
+    let time_ready = now.duration_since(*last_report_at) >= Duration::from_secs(5);
+    if !force && processed_delta < 250 && !time_ready {
+        return;
+    }
+    let percent = (processed as f64 / total as f64) * 100.0;
+    eprintln!("progress.index: {percent:.1}% ({processed}/{total})");
+    *last_reported = processed;
+    *last_report_at = now;
 }
 
 fn rpc_client(connection: &ClientConnectionArgs) -> TgsdbClient {
@@ -480,6 +595,7 @@ struct ServerScanPolicy {
     store_path: bool,
     filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
+    memory_budget_bytes: u64,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
@@ -503,6 +619,10 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
             .unwrap_or(false),
         filter_target_fp: json_f64_opt(&stats, "filter_target_fp"),
         gram_sizes,
+        memory_budget_bytes: stats
+            .get("memory_budget_bytes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(DEFAULT_MEMORY_BUDGET_BYTES),
     })
 }
 
@@ -629,6 +749,74 @@ fn push_remote_batch_row(
     if pending.len() >= batch_size {
         flush_remote_batch(client, pending, processed)?;
     }
+    Ok(())
+}
+
+fn flush_local_pending_rows(
+    stores: &mut [CandidateStore],
+    pending: &mut Vec<IndexBatchRow>,
+    processed: &mut usize,
+    submit_time: &mut Duration,
+    show_progress: bool,
+    total_files: usize,
+    last_progress_reported: &mut usize,
+    last_progress_at: &mut Instant,
+) -> Result<()> {
+    for row in pending.drain(..) {
+        let started_submit = Instant::now();
+        let shard_idx = candidate_shard_index(&row.sha256, stores.len());
+        let _ = stores[shard_idx].insert_document(
+            row.sha256,
+            row.file_size,
+            row.gram_count_estimate,
+            Some(row.bloom_hashes),
+            row.tier2_gram_count_estimate,
+            Some(row.tier2_bloom_hashes),
+            row.filter_bytes,
+            &row.bloom_filter,
+            row.tier2_filter_bytes,
+            &row.tier2_bloom_filter,
+            &row.grams,
+            row.grams_complete,
+            row.effective_diversity,
+            row.external_id,
+            true,
+        )?;
+        *submit_time += started_submit.elapsed();
+        *processed += 1;
+        maybe_report_index_progress(
+            show_progress,
+            *processed,
+            total_files,
+            last_progress_reported,
+            last_progress_at,
+            false,
+        );
+    }
+    Ok(())
+}
+
+fn flush_remote_pending_rows(
+    client: &TgsdbClient,
+    pending: &mut Vec<CandidateDocumentWire>,
+    processed: &mut usize,
+    submit_time: &mut Duration,
+    show_progress: bool,
+    total_files: usize,
+    last_progress_reported: &mut usize,
+    last_progress_at: &mut Instant,
+) -> Result<()> {
+    let started_submit = Instant::now();
+    flush_remote_batch(client, pending, processed)?;
+    *submit_time += started_submit.elapsed();
+    maybe_report_index_progress(
+        show_progress,
+        *processed,
+        total_files,
+        last_progress_reported,
+        last_progress_at,
+        false,
+    );
     Ok(())
 }
 
@@ -1169,6 +1357,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 candidate_config: store_config_from_serve_args(args),
                 candidate_shards: args.shards.max(1),
                 search_workers: args.search_workers.max(1),
+                memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
             },
             signals.shutdown.clone(),
             Some(signals.status_dump.clone()),
@@ -1356,24 +1545,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let mut scan_time = Duration::ZERO;
         let mut submit_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
-        let mut files = Vec::<PathBuf>::new();
-        for root_path in &args.paths {
-            let path = PathBuf::from(root_path);
-            if path.is_file() {
-                files.push(path);
-                continue;
-            }
-            if path.is_dir() {
-                collect_files_recursive(&path, &mut files)?;
-                continue;
-            }
-            println!("Skipping missing path: {}", path.display());
-        }
-        files.sort();
-        if files.is_empty() {
+        let input_roots = normalize_input_paths(&args.paths);
+        let total_files = count_input_files(&input_roots)?;
+        if total_files == 0 {
             return Err(TgsError::from("No input files found."));
         }
-
+        let show_progress = args.verbose && input_roots.iter().any(|path| path.is_dir());
+        let mut last_progress_reported = 0usize;
+        let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
         let batch_size = args.batch_size.max(1);
         if let Some(root) = &args.root {
@@ -1394,42 +1573,32 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 store_path: args.external_id_from_path,
                 id_source,
             };
+            let configured_budget_bytes = DEFAULT_MEMORY_BUDGET_BYTES;
+            let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
+            let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
             let mut pending = Vec::<IndexBatchRow>::new();
             if args.workers <= 1 {
-                for file_path in &files {
+                stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
-                    pending.push(scan_index_batch_row(file_path, policy)?);
+                    pending.push(scan_index_batch_row(&file_path, policy)?);
                     scan_time += started_scan.elapsed();
-                    if pending.len() < batch_size {
-                        continue;
-                    }
-                    for row in pending.drain(..) {
-                        let started_submit = Instant::now();
-                        let shard_idx = candidate_shard_index(&row.sha256, stores.len());
-                        let _ = stores[shard_idx].insert_document(
-                            row.sha256,
-                            row.file_size,
-                            row.gram_count_estimate,
-                            Some(row.bloom_hashes),
-                            row.tier2_gram_count_estimate,
-                            Some(row.tier2_bloom_hashes),
-                            row.filter_bytes,
-                            &row.bloom_filter,
-                            row.tier2_filter_bytes,
-                            &row.tier2_bloom_filter,
-                            &row.grams,
-                            row.grams_complete,
-                            row.effective_diversity,
-                            row.external_id,
-                            true,
+                    if pending.len() >= batch_size {
+                        flush_local_pending_rows(
+                            &mut stores,
+                            &mut pending,
+                            &mut processed,
+                            &mut submit_time,
+                            show_progress,
+                            total_files,
+                            &mut last_progress_reported,
+                            &mut last_progress_at,
                         )?;
-                        submit_time += started_submit.elapsed();
-                        processed += 1;
                     }
-                }
+                    Ok(())
+                })?;
             } else {
-                let (job_tx, job_rx) = unbounded::<PathBuf>();
-                let (result_tx, result_rx) = unbounded::<Result<IndexBatchRow>>();
+                let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                let (result_tx, result_rx) = bounded::<Result<IndexBatchRow>>(queue_capacity);
                 let worker_count = args.workers.max(1);
                 thread::scope(|scope| {
                     for _ in 0..worker_count {
@@ -1442,72 +1611,63 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             }
                         });
                     }
+                    let producer_tx = job_tx.clone();
+                    let producer_result_tx = result_tx.clone();
+                    let producer_roots = input_roots.clone();
+                    scope.spawn(move || {
+                        let produce = stream_input_files(&producer_roots, |file_path| {
+                            producer_tx.send(file_path).map_err(|_| {
+                                TgsError::from("candidate ingest file producer terminated unexpectedly")
+                            })?;
+                            Ok(())
+                        });
+                        if let Err(err) = produce {
+                            let _ = producer_result_tx.send(Err(err));
+                        }
+                        drop(producer_tx);
+                    });
+
+                    drop(job_tx);
                     drop(result_tx);
 
-                    for file_path in &files {
-                        let _ = job_tx.send(file_path.clone());
-                    }
-                    drop(job_tx);
-
-                    for _ in 0..files.len() {
+                    for _ in 0..total_files {
                         let started_scan = Instant::now();
                         pending.push(result_rx.recv().map_err(|_| {
                             TgsError::from("candidate ingest workers terminated unexpectedly")
                         })??);
                         scan_time += started_scan.elapsed();
-                        if pending.len() < batch_size {
-                            continue;
-                        }
-                        for row in pending.drain(..) {
-                            let started_submit = Instant::now();
-                            let shard_idx = candidate_shard_index(&row.sha256, stores.len());
-                            let _ = stores[shard_idx].insert_document(
-                                row.sha256,
-                                row.file_size,
-                                row.gram_count_estimate,
-                                Some(row.bloom_hashes),
-                                row.tier2_gram_count_estimate,
-                                Some(row.tier2_bloom_hashes),
-                                row.filter_bytes,
-                                &row.bloom_filter,
-                                row.tier2_filter_bytes,
-                                &row.tier2_bloom_filter,
-                                &row.grams,
-                                row.grams_complete,
-                                row.effective_diversity,
-                                row.external_id,
-                                true,
+                        if pending.len() >= batch_size {
+                            flush_local_pending_rows(
+                                &mut stores,
+                                &mut pending,
+                                &mut processed,
+                                &mut submit_time,
+                                show_progress,
+                                total_files,
+                                &mut last_progress_reported,
+                                &mut last_progress_at,
                             )?;
-                            submit_time += started_submit.elapsed();
-                            processed += 1;
                         }
                     }
                     Ok::<(), TgsError>(())
                 })?;
             }
 
-            for row in pending.drain(..) {
-                let started_submit = Instant::now();
-                let shard_idx = candidate_shard_index(&row.sha256, stores.len());
-                let _ = stores[shard_idx].insert_document(
-                    row.sha256,
-                    row.file_size,
-                    row.gram_count_estimate,
-                    Some(row.bloom_hashes),
-                    row.tier2_gram_count_estimate,
-                    Some(row.tier2_bloom_hashes),
-                    row.filter_bytes,
-                    &row.bloom_filter,
-                    row.tier2_filter_bytes,
-                    &row.tier2_bloom_filter,
-                    &row.grams,
-                    row.grams_complete,
-                    row.effective_diversity,
-                    row.external_id,
-                    true,
-                )?;
-                submit_time += started_submit.elapsed();
-                processed += 1;
+            flush_local_pending_rows(
+                &mut stores,
+                &mut pending,
+                &mut processed,
+                &mut submit_time,
+                show_progress,
+                total_files,
+                &mut last_progress_reported,
+                &mut last_progress_at,
+            )?;
+
+            if args.verbose {
+                eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
+                eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
+                eprintln!("verbose.index.queue_capacity: {queue_capacity}");
             }
         } else {
             let server_policy = server_scan_policy(&args.connection)?;
@@ -1522,13 +1682,15 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 id_source: server_policy.id_source,
             };
             let client = rpc_client(&args.connection);
+            let configured_budget_bytes = server_policy.memory_budget_bytes;
+            let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
+            let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
             let mut pending = Vec::<CandidateDocumentWire>::new();
             if args.workers <= 1 {
-                for file_path in &files {
+                stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
-                    let row = batch_row_to_wire(scan_index_batch_row(file_path, policy)?);
+                    let row = batch_row_to_wire(scan_index_batch_row(&file_path, policy)?);
                     scan_time += started_scan.elapsed();
-                    let started_submit = Instant::now();
                     push_remote_batch_row(
                         &client,
                         &mut pending,
@@ -1536,11 +1698,19 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         batch_size,
                         &mut processed,
                     )?;
-                    submit_time += started_submit.elapsed();
-                }
+                    maybe_report_index_progress(
+                        show_progress,
+                        processed,
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        false,
+                    );
+                    Ok(())
+                })?;
             } else {
-                let (job_tx, job_rx) = unbounded::<PathBuf>();
-                let (result_tx, result_rx) = unbounded::<Result<IndexBatchRow>>();
+                let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                let (result_tx, result_rx) = bounded::<Result<IndexBatchRow>>(queue_capacity);
                 let worker_count = args.workers.max(1);
                 thread::scope(|scope| {
                     for _ in 0..worker_count {
@@ -1553,20 +1723,31 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             }
                         });
                     }
+                    let producer_tx = job_tx.clone();
+                    let producer_result_tx = result_tx.clone();
+                    let producer_roots = input_roots.clone();
+                    scope.spawn(move || {
+                        let produce = stream_input_files(&producer_roots, |file_path| {
+                            producer_tx.send(file_path).map_err(|_| {
+                                TgsError::from("candidate ingest file producer terminated unexpectedly")
+                            })?;
+                            Ok(())
+                        });
+                        if let Err(err) = produce {
+                            let _ = producer_result_tx.send(Err(err));
+                        }
+                        drop(producer_tx);
+                    });
+
+                    drop(job_tx);
                     drop(result_tx);
 
-                    for file_path in &files {
-                        let _ = job_tx.send(file_path.clone());
-                    }
-                    drop(job_tx);
-
-                    for _ in 0..files.len() {
+                    for _ in 0..total_files {
                         let started_scan = Instant::now();
                         let row = batch_row_to_wire(result_rx.recv().map_err(|_| {
                             TgsError::from("candidate ingest workers terminated unexpectedly")
                         })??);
                         scan_time += started_scan.elapsed();
-                        let started_submit = Instant::now();
                         push_remote_batch_row(
                             &client,
                             &mut pending,
@@ -1574,21 +1755,47 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             batch_size,
                             &mut processed,
                         )?;
-                        submit_time += started_submit.elapsed();
+                        maybe_report_index_progress(
+                            show_progress,
+                            processed,
+                            total_files,
+                            &mut last_progress_reported,
+                            &mut last_progress_at,
+                            false,
+                        );
                     }
                     Ok::<(), TgsError>(())
                 })?;
             }
 
-            let started_submit = Instant::now();
-            flush_remote_batch(&client, &mut pending, &mut processed)?;
-            submit_time += started_submit.elapsed();
+            flush_remote_pending_rows(
+                &client,
+                &mut pending,
+                &mut processed,
+                &mut submit_time,
+                show_progress,
+                total_files,
+                &mut last_progress_reported,
+                &mut last_progress_at,
+            )?;
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
+                eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
+                eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
+                eprintln!("verbose.index.queue_capacity: {queue_capacity}");
             }
         }
 
-        println!("submitted_documents: {}", files.len());
+        maybe_report_index_progress(
+            show_progress,
+            processed,
+            total_files,
+            &mut last_progress_reported,
+            &mut last_progress_at,
+            true,
+        );
+
+        println!("submitted_documents: {total_files}");
         println!("processed_documents: {processed}");
         if args.verbose {
             let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
@@ -1599,7 +1806,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
             eprintln!("verbose.index.batch_size: {}", batch_size);
             eprintln!("verbose.index.workers: {}", args.workers.max(1));
-            eprintln!("verbose.index.submitted_documents: {}", files.len());
+            eprintln!("verbose.index.submitted_documents: {total_files}");
             eprintln!("verbose.index.processed_documents: {processed}");
             let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
             eprintln!("verbose.index.client_current_rss_kb: {client_current_rss_kb}");
@@ -2304,6 +2511,12 @@ struct ServeArgs {
         help = "Server-side shard query workers. Default is max(1, cpus/4)."
     )]
     search_workers: usize,
+    #[arg(
+        long = "memory-budget-gb",
+        default_value_t = DEFAULT_MEMORY_BUDGET_GB,
+        help = "Configured indexing memory budget in GiB. Client-side indexing backpressure will use the lower of this value and available memory."
+    )]
+    memory_budget_gb: u64,
     #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate storage root directory.")]
     root: String,
     #[arg(
@@ -2545,6 +2758,7 @@ mod tests {
             },
             candidate_shards: shard_count,
             search_workers: default_search_workers_for(4),
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         })
     }
 
@@ -2580,6 +2794,7 @@ mod tests {
             addr: DEFAULT_RPC_ADDR.to_owned(),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             search_workers: default_search_workers_for(4),
+            memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             shards: 256,
             filter_target_fp: 0.35,
@@ -3504,6 +3719,7 @@ rule remote_q {
             },
             candidate_shards: 1,
             search_workers: default_search_workers_for(4),
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         });
 
         assert_eq!(
