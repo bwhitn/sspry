@@ -33,8 +33,178 @@ const DEFAULT_DF_MAX: usize = 0;
 const DEFAULT_TIER1_GRAM_BUDGET: usize = 4096;
 const DEFAULT_TIER1_GRAM_HASH_SEED: u64 = 1337;
 const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 128;
+const MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
+
+#[derive(Debug, Default)]
+struct DfCountsState {
+    gram_bytes: usize,
+    snapshot: Option<Mmap>,
+    snapshot_rows: usize,
+    delta: HashMap<u64, i64>,
+}
+
+impl DfCountsState {
+    fn load(root: &Path, gram_bytes: usize) -> Result<Self> {
+        let snapshot_path = df_counts_path(root);
+        let snapshot = if snapshot_path.exists() {
+            let file = fs::File::open(&snapshot_path)?;
+            let len = file.metadata()?.len() as usize;
+            let row_bytes = gram_bytes + 4;
+            if len % row_bytes != 0 {
+                return Err(TgsError::from(format!(
+                    "Invalid df_counts snapshot at {}",
+                    snapshot_path.display()
+                )));
+            }
+            if len == 0 {
+                None
+            } else {
+                Some(unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
+                    TgsError::from(format!(
+                        "Failed to mmap {}: {err}",
+                        snapshot_path.display()
+                    ))
+                })?)
+            }
+        } else {
+            None
+        };
+
+        let mut state = Self {
+            gram_bytes,
+            snapshot_rows: snapshot
+                .as_ref()
+                .map(|mmap| mmap.len() / (gram_bytes + 4))
+                .unwrap_or(0),
+            snapshot,
+            delta: HashMap::new(),
+        };
+        state.load_delta(root)?;
+        Ok(state)
+    }
+
+    fn load_delta(&mut self, root: &Path) -> Result<()> {
+        let delta_path = df_counts_delta_path(root);
+        if !delta_path.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read(&delta_path)?;
+        let row_bytes = self.gram_bytes + 4;
+        if bytes.len() % row_bytes != 0 {
+            return Err(TgsError::from(format!(
+                "Invalid df_counts delta at {}",
+                delta_path.display()
+            )));
+        }
+        for chunk in bytes.chunks_exact(row_bytes) {
+            let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
+            let change = i32::from_le_bytes(
+                chunk[self.gram_bytes..self.gram_bytes + 4]
+                    .try_into()
+                    .expect("df delta value"),
+            );
+            *self.delta.entry(gram).or_insert(0) += i64::from(change);
+        }
+        self.delta.retain(|_, value| *value != 0);
+        Ok(())
+    }
+
+    fn snapshot_count(&self, gram: u64) -> usize {
+        let Some(snapshot) = &self.snapshot else {
+            return 0;
+        };
+        let row_bytes = self.gram_bytes + 4;
+        let mut left = 0usize;
+        let mut right = self.snapshot_rows;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let start = mid * row_bytes;
+            let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
+            if candidate == gram {
+                return u32::from_le_bytes(
+                    snapshot[start + self.gram_bytes..start + row_bytes]
+                        .try_into()
+                        .expect("df count"),
+                ) as usize;
+            }
+            if candidate < gram {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        0
+    }
+
+    fn get(&self, gram: u64) -> usize {
+        let base = self.snapshot_count(gram) as i64;
+        let delta = self.delta.get(&gram).copied().unwrap_or(0);
+        (base + delta).max(0) as usize
+    }
+
+    fn get_many(&self, grams: &[u64]) -> HashMap<u64, usize> {
+        let mut out = HashMap::with_capacity(grams.len());
+        for gram in grams {
+            let count = self.get(*gram);
+            if count > 0 {
+                out.insert(*gram, count);
+            }
+        }
+        out
+    }
+
+    fn materialize(&self) -> HashMap<u64, usize> {
+        let mut counts = HashMap::<u64, usize>::with_capacity(self.snapshot_rows + self.delta.len());
+        if let Some(snapshot) = &self.snapshot {
+            let row_bytes = self.gram_bytes + 4;
+            for chunk in snapshot.chunks_exact(row_bytes) {
+                let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
+                let count = u32::from_le_bytes(
+                    chunk[self.gram_bytes..row_bytes]
+                        .try_into()
+                        .expect("df count"),
+                ) as usize;
+                if count > 0 {
+                    counts.insert(gram, count);
+                }
+            }
+        }
+        for (gram, delta) in &self.delta {
+            let next = counts.get(gram).copied().unwrap_or(0) as i64 + *delta;
+            if next > 0 {
+                counts.insert(*gram, next as usize);
+            } else {
+                counts.remove(gram);
+            }
+        }
+        counts
+    }
+
+    fn apply_deltas(&mut self, deltas: &[(u64, i32)]) {
+        for (gram, delta) in deltas {
+            let next = self.delta.get(gram).copied().unwrap_or(0) + i64::from(*delta);
+            if next == 0 {
+                self.delta.remove(gram);
+            } else {
+                self.delta.insert(*gram, next);
+            }
+        }
+    }
+
+    fn refresh_snapshot(&mut self, root: &Path) -> Result<()> {
+        let fresh = Self::load(root, self.gram_bytes)?;
+        self.snapshot = fresh.snapshot;
+        self.snapshot_rows = fresh.snapshot_rows;
+        self.delta = fresh.delta;
+        Ok(())
+    }
+
+    fn unique_count_hint(&self) -> usize {
+        self.snapshot_rows + self.delta.len()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CandidateConfig {
@@ -426,6 +596,7 @@ impl StoreSidecars {
 struct Tier2SuperblockIndex {
     docs_per_block: usize,
     keys_per_block: Vec<Vec<(usize, usize)>>,
+    summary_bytes_by_key: BTreeMap<(usize, usize), usize>,
     masks_by_key: BTreeMap<(usize, usize), Vec<Vec<u8>>>,
 }
 
@@ -434,6 +605,7 @@ impl Default for Tier2SuperblockIndex {
         Self {
             docs_per_block: DEFAULT_TIER2_SUPERBLOCK_DOCS,
             keys_per_block: Vec::new(),
+            summary_bytes_by_key: BTreeMap::new(),
             masks_by_key: BTreeMap::new(),
         }
     }
@@ -521,6 +693,19 @@ fn normalized_log_df(projected_df: usize, doc_count: usize) -> f64 {
     (numerator / denominator).clamp(0.0, 1.0)
 }
 
+fn tier2_superblock_summary_bytes(filter_bytes: usize) -> usize {
+    filter_bytes.max(1).min(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
+}
+
+fn fold_bloom_masks(required_masks: &[(usize, u8)], summary_bytes: usize) -> Vec<(usize, u8)> {
+    let mut folded = BTreeMap::<usize, u8>::new();
+    let summary_bytes = summary_bytes.max(1);
+    for (byte_idx, mask) in required_masks {
+        *folded.entry(*byte_idx % summary_bytes).or_insert(0) |= *mask;
+    }
+    folded.into_iter().collect()
+}
+
 fn median_value(values: &mut [f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -585,7 +770,7 @@ pub struct CandidateStore {
     tier2_doc_rows: Vec<Tier2DocMetaRow>,
     sidecars: StoreSidecars,
     sha_to_pos: HashMap<String, usize>,
-    df_counts: HashMap<u64, usize>,
+    df_counts: DfCountsState,
     mutation_counter: u64,
     compaction_generation: u64,
     retired_generation_roots: Vec<String>,
@@ -741,7 +926,7 @@ impl CandidateStore {
             tier2_doc_rows: Vec::new(),
             sidecars: StoreSidecars::new(&config.root),
             sha_to_pos: HashMap::new(),
-            df_counts: HashMap::new(),
+            df_counts: DfCountsState::default(),
             mutation_counter: 0,
             compaction_generation: 1,
             retired_generation_roots: Vec::new(),
@@ -750,8 +935,10 @@ impl CandidateStore {
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
         };
+        store.df_counts = DfCountsState::load(&config.root, store.meta.exact_gram_bytes())?;
         store.persist_meta()?;
         store.persist_df_counts_snapshot()?;
+        store.df_counts.refresh_snapshot(&config.root)?;
         write_shard_compaction_manifest(&config.root, &ShardCompactionManifest::default())?;
         Ok(store)
     }
@@ -778,7 +965,7 @@ impl CandidateStore {
             tier2_doc_rows,
             sidecars: StoreSidecars::map_existing(root.as_path())?,
             sha_to_pos: HashMap::new(),
-            df_counts: HashMap::new(),
+            df_counts: DfCountsState::default(),
             mutation_counter: 0,
             compaction_generation: compaction_manifest.current_generation,
             retired_generation_roots: compaction_manifest.retired_roots,
@@ -810,19 +997,13 @@ impl CandidateStore {
         record_counter("candidate.df_counts_docs_total", self.docs.len() as u64);
         record_counter(
             "candidate.df_counts_unique_grams_total",
-            self.df_counts.len() as u64,
+            self.df_counts.unique_count_hint() as u64,
         );
-        self.df_counts.clone()
+        self.df_counts.materialize()
     }
 
     pub fn df_counts_for(&self, grams: &[u64]) -> HashMap<u64, usize> {
-        let mut out = HashMap::with_capacity(grams.len());
-        for gram in grams {
-            if let Some(count) = self.df_counts.get(gram) {
-                out.insert(*gram, *count);
-            }
-        }
-        out
+        self.df_counts.get_many(grams)
     }
 
     fn mark_write_activity(&mut self) {
@@ -1035,7 +1216,7 @@ impl CandidateStore {
         let active_docs = self.docs.iter().filter(|doc| !doc.deleted).count().max(1);
         let mut entries = Vec::with_capacity(grams.len());
         for gram in grams {
-            let projected_df = self.df_counts.get(gram).copied().unwrap_or(0) + 1;
+            let projected_df = self.df_counts.get(*gram) + 1;
             entries.push(Tier1DfEntry {
                 gram: *gram,
                 projected_df,
@@ -1245,6 +1426,10 @@ impl CandidateStore {
 
         let status;
         let doc_id;
+        let df_deltas = dedup_received
+            .iter()
+            .map(|gram| (*gram, 1))
+            .collect::<Vec<_>>();
         if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
             if !self.docs[existing_pos].deleted {
                 let existing = &self.docs[existing_pos];
@@ -1258,9 +1443,7 @@ impl CandidateStore {
                     grams_complete: existing.grams_complete,
                 });
             }
-            for gram in &dedup_received {
-                *self.df_counts.entry(*gram).or_insert(0) += 1;
-            }
+            self.df_counts.apply_deltas(&df_deltas);
             let snapshot = {
                 let existing = &mut self.docs[existing_pos];
                 existing.file_size = file_size;
@@ -1321,9 +1504,7 @@ impl CandidateStore {
                 grams_complete: complete,
                 deleted: false,
             };
-            for gram in &dedup_received {
-                *self.df_counts.entry(*gram).or_insert(0) += 1;
-            }
+            self.df_counts.apply_deltas(&df_deltas);
             {
                 let _scope = scope("candidate.insert_document.persist");
                 let row = self.build_doc_row(
@@ -1358,10 +1539,7 @@ impl CandidateStore {
         append_df_count_deltas(
             &self.root,
             self.meta.exact_gram_bytes(),
-            &dedup_received
-                .iter()
-                .map(|gram| (*gram, 1))
-                .collect::<Vec<_>>(),
+            &df_deltas,
         )?;
         self.maybe_compact_df_counts()?;
 
@@ -1465,14 +1643,11 @@ impl CandidateStore {
                 });
             }
             let grams_received = self.doc_grams_received(pos)?;
-            for gram in &grams_received {
-                if let Some(count) = self.df_counts.get_mut(gram) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.df_counts.remove(gram);
-                    }
-                }
-            }
+            let df_deltas = grams_received
+                .iter()
+                .map(|gram| (*gram, -1))
+                .collect::<Vec<_>>();
+            self.df_counts.apply_deltas(&df_deltas);
             let snapshot = {
                 let doc = &mut self.docs[pos];
                 doc.deleted = true;
@@ -1491,10 +1666,7 @@ impl CandidateStore {
             append_df_count_deltas(
                 &self.root,
                 self.meta.exact_gram_bytes(),
-                &grams_received
-                    .iter()
-                    .map(|gram| (*gram, -1))
-                    .collect::<Vec<_>>(),
+                &df_deltas,
             )?;
             self.maybe_compact_df_counts()?;
             self.mark_write_activity();
@@ -1820,12 +1992,12 @@ impl CandidateStore {
     fn persist_df_counts_snapshot(&self) -> Result<()> {
         persist_df_counts_snapshot_to_root(
             &self.root,
-            &self.df_counts,
+            &self.df_counts.materialize(),
             self.meta.exact_gram_bytes(),
         )
     }
 
-    fn maybe_compact_df_counts(&self) -> Result<()> {
+    fn maybe_compact_df_counts(&mut self) -> Result<()> {
         let path = df_counts_delta_path(&self.root);
         let len = match fs::metadata(&path) {
             Ok(metadata) => metadata.len(),
@@ -1833,6 +2005,7 @@ impl CandidateStore {
         };
         if len >= DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES {
             self.persist_df_counts_snapshot()?;
+            self.df_counts.refresh_snapshot(&self.root)?;
         }
         Ok(())
     }
@@ -1949,13 +2122,17 @@ impl CandidateStore {
                 .resize_with(needed_blocks, Vec::new);
         }
         let filter_key = (filter_bytes, bloom_hashes);
+        let summary_bytes = tier2_superblock_summary_bytes(filter_bytes);
+        self.tier2_superblocks
+            .summary_bytes_by_key
+            .insert(filter_key, summary_bytes);
         let blocks = self
             .tier2_superblocks
             .masks_by_key
             .entry(filter_key)
             .or_insert_with(Vec::new);
         while blocks.len() < needed_blocks {
-            blocks.push(vec![0u8; filter_bytes]);
+            blocks.push(vec![0u8; summary_bytes]);
         }
         let keys = &mut self.tier2_superblocks.keys_per_block[block_idx];
         if !keys.contains(&filter_key) {
@@ -1986,8 +2163,10 @@ impl CandidateStore {
             .get_mut(&(filter_bytes, bloom_hashes))
         {
             if let Some(block) = blocks.get_mut(block_idx) {
-                for (dst, src) in block.iter_mut().zip(bloom_bytes.iter().copied()) {
-                    *dst |= src;
+                let summary_bytes = block.len().max(1);
+                for (source_idx, src) in bloom_bytes.iter().copied().enumerate() {
+                    let folded_idx = source_idx % summary_bytes;
+                    block[folded_idx] |= src;
                 }
             }
         }
@@ -2025,7 +2204,7 @@ impl CandidateStore {
 
     fn rebuild_indexes(&mut self) -> Result<()> {
         self.sha_to_pos.clear();
-        self.df_counts = load_persisted_df_counts(&self.root, self.meta.exact_gram_bytes())?;
+        self.df_counts = DfCountsState::load(&self.root, self.meta.exact_gram_bytes())?;
         for (index, doc) in self.docs.iter_mut().enumerate() {
             if doc.bloom_hashes == 0 {
                 doc.bloom_hashes = DEFAULT_BLOOM_HASHES;
@@ -2471,64 +2650,6 @@ fn persist_df_counts_snapshot_for_docs(
     persist_df_counts_snapshot_to_root(root, &counts, gram_bytes)
 }
 
-fn load_persisted_df_counts(root: &Path, gram_bytes: usize) -> Result<HashMap<u64, usize>> {
-    let mut counts = HashMap::<u64, usize>::new();
-    let snapshot_row_bytes = gram_bytes + 4;
-    let delta_row_bytes = gram_bytes + 4;
-    let snapshot = df_counts_path(root);
-    if snapshot.exists() {
-        let bytes = fs::read(&snapshot)?;
-        if bytes.len() % snapshot_row_bytes != 0 {
-            return Err(TgsError::from(format!(
-                "Invalid df_counts snapshot at {}",
-                snapshot.display()
-            )));
-        }
-        for chunk in bytes.chunks_exact(snapshot_row_bytes) {
-            let gram = decode_packed_exact_gram(&chunk[..gram_bytes]);
-            let count = u32::from_le_bytes(
-                chunk[gram_bytes..gram_bytes + 4]
-                    .try_into()
-                    .expect("df count"),
-            );
-            if count > 0 {
-                counts.insert(gram, count as usize);
-            }
-        }
-    }
-
-    let delta = df_counts_delta_path(root);
-    if delta.exists() {
-        let bytes = fs::read(&delta)?;
-        if bytes.len() % delta_row_bytes != 0 {
-            return Err(TgsError::from(format!(
-                "Invalid df_counts delta at {}",
-                delta.display()
-            )));
-        }
-        for chunk in bytes.chunks_exact(delta_row_bytes) {
-            let gram = decode_packed_exact_gram(&chunk[..gram_bytes]);
-            let change = i32::from_le_bytes(
-                chunk[gram_bytes..gram_bytes + 4]
-                    .try_into()
-                    .expect("df delta value"),
-            );
-            if change >= 0 {
-                *counts.entry(gram).or_insert(0) += change as usize;
-            } else {
-                let amount = change.unsigned_abs() as usize;
-                if let Some(value) = counts.get_mut(&gram) {
-                    *value = value.saturating_sub(amount);
-                    if *value == 0 {
-                        counts.remove(&gram);
-                    }
-                }
-            }
-        }
-    }
-    Ok(counts)
-}
-
 fn persist_df_counts_snapshot_to_root(
     root: &Path,
     counts: &HashMap<u64, usize>,
@@ -2929,6 +3050,7 @@ fn normalize_sha256_hex(value: &str) -> Result<String> {
 #[derive(Clone, Debug, Default)]
 struct PreparedPatternMasks {
     tier1: Vec<BTreeMap<(usize, usize), Vec<(usize, u8)>>>,
+    tier1_superblocks: Vec<BTreeMap<(usize, usize), Vec<(usize, u8)>>>,
     tier2: Vec<BTreeMap<(usize, usize), Vec<(usize, u8)>>>,
 }
 
@@ -2988,20 +3110,25 @@ fn build_pattern_mask_cache(
     let mut tier2_gram_cache = HashMap::<(u64, usize, usize), Vec<(usize, u8)>>::new();
     for pattern in patterns {
         let mut tier1_masks = Vec::with_capacity(pattern.alternatives.len());
+        let mut tier1_superblock_masks = Vec::with_capacity(pattern.alternatives.len());
         for alternative in &pattern.alternatives {
             let mut by_key = BTreeMap::<(usize, usize), Vec<(usize, u8)>>::new();
+            let mut superblock_by_key = BTreeMap::<(usize, usize), Vec<(usize, u8)>>::new();
             for (filter_bytes, bloom_hashes) in tier1_filter_keys {
-                by_key.insert(
+                let required = merge_cached_bloom_masks(
+                    alternative,
+                    *filter_bytes,
+                    *bloom_hashes,
+                    &mut tier1_gram_cache,
+                )?;
+                superblock_by_key.insert(
                     (*filter_bytes, *bloom_hashes),
-                    merge_cached_bloom_masks(
-                        alternative,
-                        *filter_bytes,
-                        *bloom_hashes,
-                        &mut tier1_gram_cache,
-                    )?,
+                    fold_bloom_masks(&required, tier2_superblock_summary_bytes(*filter_bytes)),
                 );
+                by_key.insert((*filter_bytes, *bloom_hashes), required);
             }
             tier1_masks.push(by_key);
+            tier1_superblock_masks.push(superblock_by_key);
         }
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
@@ -3025,6 +3152,7 @@ fn build_pattern_mask_cache(
             pattern.pattern_id.clone(),
             PreparedPatternMasks {
                 tier1: tier1_masks,
+                tier1_superblocks: tier1_superblock_masks,
                 tier2: tier2_masks,
             },
         );
@@ -3064,7 +3192,7 @@ fn block_matches_pattern(
     let Some(keys) = superblocks.keys_per_block.get(block_idx) else {
         return false;
     };
-    pattern_masks.tier1.iter().any(|by_key| {
+    pattern_masks.tier1_superblocks.iter().any(|by_key| {
         if by_key.is_empty() {
             return true;
         }
@@ -5066,5 +5194,83 @@ rule q {
 
         let _third = store.query_candidates(&plan, 0, 64).expect("third query");
         assert_eq!(store.prepared_query_cache.len(), 1);
+    }
+
+    #[test]
+    fn folded_superblock_masks_preserve_required_bits() {
+        let required = vec![(0usize, 0b0000_0011), (4096usize, 0b0000_0100), (8193usize, 0b1000_0000)];
+        let folded = fold_bloom_masks(&required, 4096);
+        let folded_map = folded.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(folded_map.get(&0).copied(), Some(0b0000_0111));
+        assert_eq!(folded_map.get(&1).copied(), Some(0b1000_0000));
+    }
+
+    #[test]
+    fn tier2_superblocks_use_bounded_summary_bytes() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let sha256 = [0x11; 32];
+        let file_size = 64 * 1024 * 1024u64;
+        let gram_count_estimate = 1_000_000usize;
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(gram_count_estimate))
+            .expect("large primary filter bytes");
+        assert!(filter_bytes > MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
+        let bloom_hashes =
+            store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
+        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("primary bloom");
+        primary_bloom
+            .add(pack_exact_gram(&[1, 2, 3]))
+            .expect("add primary gram");
+        let tier2_filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(2))
+            .expect("secondary filter bytes");
+        let tier2_bloom_hashes =
+            store.resolve_bloom_hashes_for_document(tier2_filter_bytes, Some(2), None);
+        let mut secondary_bloom =
+            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("secondary bloom");
+        secondary_bloom
+            .add(pack_exact_gram(&[1, 2, 3, 4]))
+            .expect("add secondary gram");
+        store
+            .insert_document(
+                sha256,
+                file_size,
+                Some(gram_count_estimate),
+                Some(bloom_hashes),
+                Some(2),
+                Some(tier2_bloom_hashes),
+                filter_bytes,
+                &primary_bloom.into_bytes(),
+                tier2_filter_bytes,
+                &secondary_bloom.into_bytes(),
+                &[pack_exact_gram(&[1, 2, 3, 4])],
+                false,
+                None,
+                None,
+                true,
+            )
+            .expect("insert");
+
+        let key = (filter_bytes, bloom_hashes);
+        assert_eq!(
+            store.tier2_superblocks.summary_bytes_by_key.get(&key).copied(),
+            Some(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
+        );
+        let blocks = store
+            .tier2_superblocks
+            .masks_by_key
+            .get(&key)
+            .expect("superblock masks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
     }
 }
