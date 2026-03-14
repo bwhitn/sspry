@@ -2959,7 +2959,11 @@ fn cmd_search_candidates(args: &SearchCommandArgs) -> i32 {
 
 fn cmd_info(args: &InfoCommandArgs) -> i32 {
     match (|| -> Result<i32> {
-        let stats = rpc_client(&args.connection).candidate_stats()?;
+        let stats = if args.light {
+            rpc_client(&args.connection).candidate_status()?
+        } else {
+            rpc_client(&args.connection).candidate_stats()?
+        };
         println!("{}", serde_json::to_string_pretty(&stats)?);
         Ok(0)
     })() {
@@ -3076,6 +3080,12 @@ struct SearchCommandArgs {
 struct InfoCommandArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
+    #[arg(
+        long = "light",
+        action = ArgAction::SetTrue,
+        help = "Return lightweight server status without walking shard stats."
+    )]
+    light: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -4334,6 +4344,7 @@ rule remote_q {
         assert_eq!(
             cmd_info(&InfoCommandArgs {
                 connection: connection.clone(),
+                light: false,
             }),
             0
         );

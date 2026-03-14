@@ -52,6 +52,7 @@ const ACTION_PUBLISH: u8 = 9;
 const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
 const ACTION_INDEX_SESSION_END: u8 = 11;
 const ACTION_INDEX_SESSION_PROGRESS: u8 = 12;
+const ACTION_CANDIDATE_STATUS: u8 = 13;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const DF_CACHE_CAPACITY: usize = 128;
@@ -553,6 +554,10 @@ impl TgsdbClient {
 
     pub fn candidate_stats(&self) -> Result<Map<String, Value>> {
         self.request_json_value(ACTION_CANDIDATE_STATS, &json!({}))
+    }
+
+    pub fn candidate_status(&self) -> Result<Map<String, Value>> {
+        self.request_json_value(ACTION_CANDIDATE_STATUS, &json!({}))
     }
 
     pub fn candidate_df(&self, grams: &[u64]) -> Result<HashMap<u64, usize>> {
@@ -2202,6 +2207,197 @@ impl ServerState {
         Ok(stats)
     }
 
+    fn status_json(&self) -> Result<Map<String, Value>> {
+        let mut stats = Map::new();
+        stats.insert("draining".to_owned(), json!(self.is_shutting_down()));
+        stats.insert(
+            "active_connections".to_owned(),
+            json!(self.active_connections.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "active_mutations".to_owned(),
+            json!(self.active_mutations.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "mutations_paused".to_owned(),
+            json!(self.mutations_paused.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "publish_in_progress".to_owned(),
+            json!(self.publish_in_progress.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "active_index_sessions".to_owned(),
+            json!(self.active_index_sessions.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "work_dirty".to_owned(),
+            json!(self.work_dirty.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "last_work_mutation_unix_ms".to_owned(),
+            json!(self.last_work_mutation_unix_ms.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "auto_publish_idle_ms".to_owned(),
+            json!(self.config.auto_publish_idle_ms),
+        );
+        stats.insert(
+            "search_workers".to_owned(),
+            json!(self.config.search_workers),
+        );
+        stats.insert(
+            "memory_budget_bytes".to_owned(),
+            json!(self.config.memory_budget_bytes),
+        );
+        stats.insert(
+            "tier2_superblock_budget_divisor".to_owned(),
+            json!(self.config.tier2_superblock_budget_divisor),
+        );
+        let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
+        stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
+        stats.insert("peak_rss_kb".to_owned(), json!(peak_rss_kb));
+        stats.insert(
+            "startup_cleanup_removed_roots".to_owned(),
+            json!(self.startup_cleanup_removed_roots),
+        );
+
+        let index_total_documents = self.index_session_total_documents.load(Ordering::Acquire);
+        let index_processed_documents = self
+            .index_session_processed_documents
+            .load(Ordering::Acquire);
+        let index_submitted_documents = self
+            .index_session_submitted_documents
+            .load(Ordering::Acquire);
+        let index_remaining_documents =
+            index_total_documents.saturating_sub(index_processed_documents);
+        let index_progress_percent = if index_total_documents == 0 {
+            0.0
+        } else {
+            (index_processed_documents as f64 / index_total_documents as f64) * 100.0
+        };
+        stats.insert(
+            "index_session".to_owned(),
+            json!({
+                "active": self.active_index_sessions.load(Ordering::Acquire) > 0,
+                "total_documents": index_total_documents,
+                "submitted_documents": index_submitted_documents,
+                "processed_documents": index_processed_documents,
+                "remaining_documents": index_remaining_documents,
+                "progress_percent": index_progress_percent,
+                "started_unix_ms": self.index_session_started_unix_ms.load(Ordering::Acquire),
+                "last_update_unix_ms": self.index_session_last_update_unix_ms.load(Ordering::Acquire),
+            }),
+        );
+
+        stats.insert(
+            "startup".to_owned(),
+            json!({
+                "total_ms": self.startup_profile.total_ms,
+                "startup_cleanup_removed_roots": self.startup_cleanup_removed_roots,
+                "current": {
+                    "total_ms": self.startup_profile.current.total_ms,
+                    "opened_existing_shards": self.startup_profile.current.opened_existing_shards,
+                    "initialized_new_shards": self.startup_profile.current.initialized_new_shards,
+                    "doc_count": self.startup_profile.current.doc_count,
+                },
+                "work": {
+                    "total_ms": self.startup_profile.work.total_ms,
+                    "opened_existing_shards": self.startup_profile.work.opened_existing_shards,
+                    "initialized_new_shards": self.startup_profile.work.initialized_new_shards,
+                    "doc_count": self.startup_profile.work.doc_count,
+                }
+            }),
+        );
+
+        if let Some((published_root, work_root)) = self.workspace_roots()? {
+            let retired_root = workspace_retired_root(&self.config.candidate_config.root);
+            let (retired_published_root_count, retired_published_disk_usage_bytes) =
+                workspace_retired_stats(&retired_root);
+            let now_unix_ms = current_unix_ms();
+            let readiness = self.publish_readiness(now_unix_ms);
+            stats.insert("workspace_mode".to_owned(), json!(true));
+            stats.insert(
+                "published_root".to_owned(),
+                Value::String(published_root.display().to_string()),
+            );
+            stats.insert(
+                "work_root".to_owned(),
+                Value::String(work_root.display().to_string()),
+            );
+            stats.insert(
+                "publish".to_owned(),
+                json!({
+                    "pending": self.work_dirty.load(Ordering::Acquire),
+                    "eligible": readiness.eligible,
+                    "blocked_reason": readiness.blocked_reason,
+                    "idle_elapsed_ms": readiness.idle_elapsed_ms,
+                    "idle_remaining_ms": readiness.idle_remaining_ms,
+                    "retired_published_root_count": retired_published_root_count,
+                    "retired_published_disk_usage_bytes": retired_published_disk_usage_bytes,
+                    "retired_published_roots_to_keep": DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP as u64,
+                    "last_publish_started_unix_ms": self.last_publish_started_unix_ms.load(Ordering::Acquire),
+                    "last_publish_completed_unix_ms": self.last_publish_completed_unix_ms.load(Ordering::Acquire),
+                    "last_publish_duration_ms": self.last_publish_duration_ms.load(Ordering::Acquire),
+                    "last_publish_swap_ms": self.last_publish_swap_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_ms": self.last_publish_promote_work_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_export_ms": self.last_publish_promote_work_export_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_ms": self.last_publish_promote_work_import_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_classify_ms": self.last_publish_promote_work_import_classify_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_apply_df_counts_ms": self.last_publish_promote_work_import_apply_df_counts_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_build_payloads_ms": self.last_publish_promote_work_import_build_payloads_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_append_sidecars_ms": self.last_publish_promote_work_import_append_sidecars_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_install_docs_ms": self.last_publish_promote_work_import_install_docs_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_tier2_update_ms": self.last_publish_promote_work_import_tier2_update_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_persist_meta_ms": self.last_publish_promote_work_import_persist_meta_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_append_df_delta_ms": self.last_publish_promote_work_import_append_df_delta_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_compact_df_counts_ms": self.last_publish_promote_work_import_compact_df_counts_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_import_rebalance_tier2_ms": self.last_publish_promote_work_import_rebalance_tier2_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_remove_work_root_ms": self.last_publish_promote_work_remove_work_root_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_other_ms": self.last_publish_promote_work_other_ms.load(Ordering::Acquire),
+                    "last_publish_promote_work_imported_docs": self.last_publish_promote_work_imported_docs.load(Ordering::Acquire),
+                    "last_publish_promote_work_imported_shards": self.last_publish_promote_work_imported_shards.load(Ordering::Acquire),
+                    "last_publish_persist_df_counts_ms": self.last_publish_persist_df_counts_ms.load(Ordering::Acquire),
+                    "last_publish_df_snapshot_persist_failures": self.last_publish_df_snapshot_persist_failures.load(Ordering::Acquire),
+                    "last_publish_init_work_ms": self.last_publish_init_work_ms.load(Ordering::Acquire),
+                    "last_publish_persist_tier2_superblocks_ms": self.last_publish_persist_tier2_superblocks_ms.load(Ordering::Acquire),
+                    "last_publish_tier2_snapshot_persist_failures": self.last_publish_tier2_snapshot_persist_failures.load(Ordering::Acquire),
+                    "last_publish_persisted_snapshot_shards": self.last_publish_persisted_snapshot_shards.load(Ordering::Acquire),
+                    "last_publish_reused_work_stores": self.last_publish_reused_work_stores.load(Ordering::Acquire),
+                    "publish_runs_total": self.publish_runs_total.load(Ordering::Acquire),
+                    "observed_at_unix_ms": now_unix_ms,
+                }),
+            );
+            stats.insert(
+                "published_df_snapshot_seal".to_owned(),
+                json!({
+                    "pending_shards": self.pending_published_df_snapshot_shard_count().unwrap_or(0),
+                    "in_progress": self.published_df_snapshot_seal_in_progress.load(Ordering::Acquire),
+                    "runs_total": self.published_df_snapshot_seal_runs_total.load(Ordering::Acquire),
+                    "last_duration_ms": self.last_published_df_snapshot_seal_duration_ms.load(Ordering::Acquire),
+                    "last_persisted_shards": self.last_published_df_snapshot_seal_persisted_shards.load(Ordering::Acquire),
+                    "last_failures": self.last_published_df_snapshot_seal_failures.load(Ordering::Acquire),
+                    "last_completed_unix_ms": self.last_published_df_snapshot_seal_completed_unix_ms.load(Ordering::Acquire),
+                }),
+            );
+            stats.insert(
+                "published_tier2_snapshot_seal".to_owned(),
+                json!({
+                    "pending_shards": self.pending_published_tier2_snapshot_shard_count().unwrap_or(0),
+                    "in_progress": self.published_tier2_snapshot_seal_in_progress.load(Ordering::Acquire),
+                    "runs_total": self.published_tier2_snapshot_seal_runs_total.load(Ordering::Acquire),
+                    "last_duration_ms": self.last_published_tier2_snapshot_seal_duration_ms.load(Ordering::Acquire),
+                    "last_persisted_shards": self.last_published_tier2_snapshot_seal_persisted_shards.load(Ordering::Acquire),
+                    "last_failures": self.last_published_tier2_snapshot_seal_failures.load(Ordering::Acquire),
+                    "last_completed_unix_ms": self.last_published_tier2_snapshot_seal_completed_unix_ms.load(Ordering::Acquire),
+                }),
+            );
+        } else {
+            stats.insert("workspace_mode".to_owned(), json!(false));
+        }
+        Ok(stats)
+    }
+
     fn candidate_shard_count(&self) -> usize {
         self.config.candidate_shards.max(1)
     }
@@ -2622,6 +2818,7 @@ impl ServerState {
                     &plan,
                 )?)
             }
+            ACTION_CANDIDATE_STATUS => json_bytes(&Value::Object(self.status_json()?)),
             ACTION_CANDIDATE_STATS => json_bytes(&Value::Object(self.current_stats_json()?)),
             ACTION_CANDIDATE_DF => {
                 let request: CandidateDfRequest = json_from_bytes(payload)?;
@@ -4293,6 +4490,25 @@ mod tests {
         assert!(
             err.to_string().contains("busy during stats"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn status_json_does_not_require_shard_locks() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        let work = state.work_store_set().expect("work stores");
+        let _guard = work.stores[0].lock().expect("lock store");
+        let status = state.status_json().expect("light status");
+        assert_eq!(
+            status.get("workspace_mode").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            status
+                .get("index_session")
+                .and_then(Value::as_object)
+                .is_some()
         );
     }
 
