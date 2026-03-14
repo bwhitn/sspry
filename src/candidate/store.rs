@@ -2375,6 +2375,7 @@ impl CandidateStore {
             Vec::new()
         };
         let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
+        let mut aggregate_df_delta_payload = Vec::<u8>::new();
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
         let mut meta_dirty = false;
@@ -2395,11 +2396,12 @@ impl CandidateStore {
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
-            let df_deltas = document
-                .grams_received_bytes
-                .chunks_exact(gram_bytes)
-                .map(|chunk| (decode_packed_exact_gram(chunk), 1))
-                .collect::<Vec<_>>();
+            extend_unit_df_deltas_and_payload_from_packed(
+                &mut aggregate_df_deltas,
+                &mut aggregate_df_delta_payload,
+                &document.grams_received_bytes,
+                gram_bytes,
+            )?;
 
             if !assume_new {
                 if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
@@ -2419,7 +2421,6 @@ impl CandidateStore {
                         continue;
                     }
 
-                    aggregate_df_deltas.extend(df_deltas.iter().copied());
                     let snapshot = {
                         let existing = &mut self.docs[existing_pos];
                         existing.file_size = document.file_size;
@@ -2472,7 +2473,6 @@ impl CandidateStore {
 
             let doc_id = self.meta.next_doc_id;
             self.meta.next_doc_id += 1;
-            aggregate_df_deltas.extend(df_deltas.iter().copied());
             pending_inserts.push(PendingImportedInsert {
                 doc_id,
                 sha256_hex,
@@ -2694,10 +2694,9 @@ impl CandidateStore {
                     .unwrap_or(u64::MAX);
             }
             let append_df_delta_started = Instant::now();
-            append_df_count_deltas_with_writer(
+            append_df_count_delta_payload_with_writer(
                 &mut self.append_writers.df_counts_delta,
-                self.meta.exact_gram_bytes(),
-                &aggregate_df_deltas,
+                &aggregate_df_delta_payload,
             )?;
             import_profile.append_df_delta_ms = append_df_delta_started
                 .elapsed()
@@ -4167,6 +4166,37 @@ fn append_df_count_deltas_with_writer(
         payload.extend_from_slice(&delta.to_le_bytes());
     }
     writer.append(&payload)?;
+    Ok(())
+}
+
+fn append_df_count_delta_payload_with_writer(
+    writer: &mut AppendFile,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+    writer.append(payload)?;
+    Ok(())
+}
+
+fn extend_unit_df_deltas_and_payload_from_packed(
+    deltas: &mut Vec<(u64, i32)>,
+    payload: &mut Vec<u8>,
+    packed_grams: &[u8],
+    gram_bytes: usize,
+) -> Result<()> {
+    if gram_bytes == 0 || packed_grams.len() % gram_bytes != 0 {
+        return Err(TgsError::from("Invalid packed exact gram payload."));
+    }
+    let count = packed_grams.len() / gram_bytes;
+    deltas.reserve(count);
+    payload.reserve(count * (gram_bytes + 4));
+    for chunk in packed_grams.chunks_exact(gram_bytes) {
+        deltas.push((decode_packed_exact_gram(chunk), 1));
+        payload.extend_from_slice(chunk);
+        payload.extend_from_slice(&1i32.to_le_bytes());
+    }
     Ok(())
 }
 
