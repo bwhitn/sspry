@@ -1320,8 +1320,8 @@ impl ServerState {
                 return Ok((0, 0));
             };
             match store_lock.try_lock() {
-                Ok(store) => {
-                    store.persist_df_counts_snapshot()?;
+                Ok(mut store) => {
+                    store.seal_df_counts_snapshot_from_disk()?;
                     Ok((1, 0))
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -1352,6 +1352,9 @@ impl ServerState {
         self.last_published_df_snapshot_seal_failures
             .store(failures, Ordering::SeqCst);
         if persisted_shards > 0 || failures > 0 {
+            if persisted_shards > 0 {
+                self.invalidate_df_cache();
+            }
             self.published_df_snapshot_seal_runs_total
                 .fetch_add(1, Ordering::SeqCst);
             self.last_published_df_snapshot_seal_completed_unix_ms
@@ -2116,6 +2119,12 @@ impl ServerState {
             cache.clear();
         }
         if let Ok(mut cache) = self.query_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn invalidate_df_cache(&self) {
+        if let Ok(mut cache) = self.df_cache.lock() {
             cache.clear();
         }
     }
@@ -4676,6 +4685,68 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(0)
         );
+    }
+
+    #[test]
+    fn published_df_seal_refreshes_counts_and_invalidates_df_cache() {
+        fn wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
+            fs::write(path, bytes).expect("write sample");
+            let features = crate::candidate::scan_file_features(
+                path, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+            )
+            .expect("features");
+            CandidateDocumentWire {
+                sha256: hex::encode(features.sha256),
+                file_size: features.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features.unique_grams,
+                grams_complete: !features.unique_grams_truncated,
+                effective_diversity: None,
+                external_id: None,
+            }
+        }
+
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+
+        state
+            .handle_candidate_insert(&wire_from_bytes(
+                &tmp.path().join("df-publish-one.bin"),
+                b"xxABCDyy",
+            ))
+            .expect("insert first");
+        state.handle_publish().expect("publish first");
+        state
+            .run_published_df_snapshot_seal_cycle()
+            .expect("seal first publish");
+        let df_after_first = state.handle_candidate_df(&[gram]).expect("df after first");
+        assert_eq!(df_after_first.df.get(&gram.to_string()).copied(), Some(1));
+
+        state
+            .handle_candidate_insert(&wire_from_bytes(
+                &tmp.path().join("df-publish-two.bin"),
+                b"zzABCDww",
+            ))
+            .expect("insert second");
+        state.handle_publish().expect("publish second");
+        let stale_df = state
+            .handle_candidate_df(&[gram])
+            .expect("stale df before seal");
+        assert_eq!(stale_df.df.get(&gram.to_string()).copied(), Some(1));
+
+        state
+            .run_published_df_snapshot_seal_cycle()
+            .expect("seal second publish");
+        let df_after_second = state.handle_candidate_df(&[gram]).expect("df after second");
+        assert_eq!(df_after_second.df.get(&gram.to_string()).copied(), Some(2));
     }
 
     #[cfg(unix)]

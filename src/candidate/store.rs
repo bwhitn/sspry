@@ -230,25 +230,6 @@ impl DfCountsState {
         }
     }
 
-    fn apply_unit_deltas(&mut self, grams: &[u64]) {
-        self.delta.reserve(grams.len());
-        for gram in grams {
-            match self.delta.entry(*gram) {
-                FastEntry::Occupied(mut entry) => {
-                    let next = *entry.get() + 1;
-                    if next == 0 {
-                        entry.remove();
-                    } else {
-                        *entry.get_mut() = next;
-                    }
-                }
-                FastEntry::Vacant(entry) => {
-                    entry.insert(1);
-                }
-            }
-        }
-    }
-
     fn refresh_snapshot(&mut self, root: &Path) -> Result<()> {
         let fresh = Self::load(root, self.gram_bytes)?;
         self.snapshot = fresh.snapshot;
@@ -2425,7 +2406,6 @@ impl CandidateStore {
         } else {
             Vec::new()
         };
-        let mut aggregate_df_grams = Vec::<u64>::new();
         let mut aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
@@ -2447,8 +2427,7 @@ impl CandidateStore {
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
-            extend_unit_df_grams_and_payload_from_packed(
-                &mut aggregate_df_grams,
+            extend_unit_df_payload_from_packed(
                 &mut aggregate_df_unit_delta_payload,
                 &document.grams_received_bytes,
                 gram_bytes,
@@ -2533,14 +2512,6 @@ impl CandidateStore {
             meta_dirty = true;
         }
         import_profile.classify_ms = classify_started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-
-        let apply_df_counts_started = Instant::now();
-        self.df_counts.apply_unit_deltas(&aggregate_df_grams);
-        import_profile.apply_df_counts_ms = apply_df_counts_started
             .elapsed()
             .as_millis()
             .try_into()
@@ -2750,13 +2721,6 @@ impl CandidateStore {
                 &aggregate_df_unit_delta_payload,
             )?;
             import_profile.append_df_delta_ms = append_df_delta_started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
-            let compact_df_counts_started = Instant::now();
-            self.maybe_compact_df_counts()?;
-            import_profile.compact_df_counts_ms = compact_df_counts_started
                 .elapsed()
                 .as_millis()
                 .try_into()
@@ -3138,6 +3102,16 @@ impl CandidateStore {
             &self.df_counts.materialize(),
             self.meta.exact_gram_bytes(),
         )
+    }
+
+    pub(crate) fn seal_df_counts_snapshot_from_disk(&mut self) -> Result<()> {
+        self.df_counts.refresh_snapshot(&self.root)?;
+        self.persist_df_counts_snapshot()?;
+        self.df_counts.refresh_snapshot(&self.root)?;
+        self.append_writers.df_counts_delta = AppendFile::new(df_counts_delta_path(&self.root))?;
+        self.append_writers.df_counts_unit_delta =
+            AppendFile::new(df_counts_unit_delta_path(&self.root))?;
+        Ok(())
     }
 
     fn maybe_compact_df_counts(&mut self) -> Result<()> {
@@ -4236,8 +4210,7 @@ fn append_df_count_unit_payload_with_writer(writer: &mut AppendFile, payload: &[
     Ok(())
 }
 
-fn extend_unit_df_grams_and_payload_from_packed(
-    grams: &mut Vec<u64>,
+fn extend_unit_df_payload_from_packed(
     payload: &mut Vec<u8>,
     packed_grams: &[u8],
     gram_bytes: usize,
@@ -4245,13 +4218,8 @@ fn extend_unit_df_grams_and_payload_from_packed(
     if gram_bytes == 0 || packed_grams.len() % gram_bytes != 0 {
         return Err(TgsError::from("Invalid packed exact gram payload."));
     }
-    let count = packed_grams.len() / gram_bytes;
-    grams.reserve(count);
     payload.reserve(packed_grams.len());
     payload.extend_from_slice(packed_grams);
-    for chunk in packed_grams.chunks_exact(gram_bytes) {
-        grams.push(decode_packed_exact_gram(chunk));
-    }
     Ok(())
 }
 
