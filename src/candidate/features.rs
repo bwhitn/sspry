@@ -757,6 +757,8 @@ pub fn scan_file_features_with_gram_sizes(
     let mut current_window_index = 0usize;
     let mut stream_buffer = Vec::<u8>::new();
     let mut buffer_start = 0usize;
+    let mut window_data = Vec::<u8>::with_capacity(ENTROPY_WINDOW_BYTES + trailing_bytes);
+    let mut current_seen = HashSet::<u64>::new();
 
     if collect_unique_grams && target_budget > 0 {
         loop {
@@ -769,16 +771,16 @@ pub fn scan_file_features_with_gram_sizes(
             digest.update(chunk);
             stream_buffer.extend_from_slice(chunk);
             while stream_buffer.len().saturating_sub(buffer_start) >= ENTROPY_WINDOW_BYTES {
-                let current =
-                    stream_buffer[buffer_start..buffer_start + ENTROPY_WINDOW_BYTES].to_vec();
+                let current = &stream_buffer[buffer_start..buffer_start + ENTROPY_WINDOW_BYTES];
                 buffer_start += ENTROPY_WINDOW_BYTES;
-                let mut data = trailing.clone();
-                data.extend_from_slice(&current);
+                window_data.clear();
+                window_data.extend_from_slice(&trailing);
+                window_data.extend_from_slice(current);
                 let mut current_unique = Vec::<u64>::new();
-                let mut current_seen = HashSet::<u64>::new();
-                if data.len() >= gram_sizes.tier1 {
-                    for idx in 0..=(data.len() - gram_sizes.tier1) {
-                        let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier1]);
+                current_seen.clear();
+                if window_data.len() >= gram_sizes.tier1 {
+                    for idx in 0..=(window_data.len() - gram_sizes.tier1) {
+                        let gram = pack_exact_gram(&window_data[idx..idx + gram_sizes.tier1]);
                         bloom.add(gram)?;
                         gram_windows = gram_windows.saturating_add(1);
                         if idx < trailing.len() {
@@ -791,10 +793,10 @@ pub fn scan_file_features_with_gram_sizes(
                     }
                 }
                 if let Some(tier2_bloom_ref) = tier2_bloom.as_mut() {
-                    if data.len() >= gram_sizes.tier2 {
-                        for idx in 0..=(data.len() - gram_sizes.tier2) {
+                    if window_data.len() >= gram_sizes.tier2 {
+                        for idx in 0..=(window_data.len() - gram_sizes.tier2) {
                             tier2_bloom_ref
-                                .add(pack_exact_gram(&data[idx..idx + gram_sizes.tier2]))?;
+                                .add(pack_exact_gram(&window_data[idx..idx + gram_sizes.tier2]))?;
                         }
                     }
                 }
@@ -814,15 +816,16 @@ pub fn scan_file_features_with_gram_sizes(
                 }
                 pending_window = Some(EntropyWindow {
                     window_index: current_window_index,
-                    entropy: entropy_for_window(&current),
+                    entropy: entropy_for_window(current),
                     unique_grams: current_unique,
                 });
                 current_window_index = current_window_index.saturating_add(1);
-                trailing = if current.len() >= trailing_bytes {
-                    current[current.len() - trailing_bytes..].to_vec()
+                trailing.clear();
+                trailing.extend_from_slice(if current.len() >= trailing_bytes {
+                    &current[current.len() - trailing_bytes..]
                 } else {
-                    current.clone()
-                };
+                    current
+                });
             }
             if buffer_start > 0 {
                 stream_buffer.drain(..buffer_start);
@@ -831,14 +834,15 @@ pub fn scan_file_features_with_gram_sizes(
         }
 
         if !stream_buffer.is_empty() {
-            let current = stream_buffer.clone();
-            let mut data = trailing.clone();
-            data.extend_from_slice(&current);
+            let current = stream_buffer.as_slice();
+            window_data.clear();
+            window_data.extend_from_slice(&trailing);
+            window_data.extend_from_slice(current);
             let mut current_unique = Vec::<u64>::new();
-            let mut current_seen = HashSet::<u64>::new();
-            if data.len() >= gram_sizes.tier1 {
-                for idx in 0..=(data.len() - gram_sizes.tier1) {
-                    let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier1]);
+            current_seen.clear();
+            if window_data.len() >= gram_sizes.tier1 {
+                for idx in 0..=(window_data.len() - gram_sizes.tier1) {
+                    let gram = pack_exact_gram(&window_data[idx..idx + gram_sizes.tier1]);
                     bloom.add(gram)?;
                     gram_windows = gram_windows.saturating_add(1);
                     if idx < trailing.len() {
@@ -851,9 +855,10 @@ pub fn scan_file_features_with_gram_sizes(
                 }
             }
             if let Some(tier2_bloom_ref) = tier2_bloom.as_mut() {
-                if data.len() >= gram_sizes.tier2 {
-                    for idx in 0..=(data.len() - gram_sizes.tier2) {
-                        tier2_bloom_ref.add(pack_exact_gram(&data[idx..idx + gram_sizes.tier2]))?;
+                if window_data.len() >= gram_sizes.tier2 {
+                    for idx in 0..=(window_data.len() - gram_sizes.tier2) {
+                        tier2_bloom_ref
+                            .add(pack_exact_gram(&window_data[idx..idx + gram_sizes.tier2]))?;
                     }
                 }
             }
