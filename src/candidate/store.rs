@@ -2296,15 +2296,23 @@ impl CandidateStore {
         &mut self,
         documents: &[ImportedCandidateDocument],
     ) -> Result<Vec<CandidateInsertResult>> {
+        struct PendingImportedInsert<'a> {
+            doc_id: u64,
+            sha256_hex: String,
+            document: &'a ImportedCandidateDocument,
+        }
+
         let mut total_scope = scope("candidate.import_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
         let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
+        let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
         let mut meta_dirty = false;
         let mut received_grams_total = 0u64;
         let mut indexed_grams_total = 0u64;
         let mut max_received_grams = 0u64;
         let mut max_indexed_grams = 0u64;
+        let gram_bytes = self.meta.exact_gram_bytes();
 
         for document in documents {
             total_scope.add_bytes(document.file_size);
@@ -2336,7 +2344,6 @@ impl CandidateStore {
                     continue;
                 }
 
-                self.df_counts.apply_deltas(&df_deltas);
                 aggregate_df_deltas.extend(df_deltas.iter().copied());
                 let snapshot = {
                     let existing = &mut self.docs[existing_pos];
@@ -2387,55 +2394,175 @@ impl CandidateStore {
 
             let doc_id = self.meta.next_doc_id;
             self.meta.next_doc_id += 1;
-            let doc = CandidateDoc {
-                doc_id,
-                sha256: sha256_hex.clone(),
-                file_size: document.file_size,
-                filter_bytes: document.filter_bytes,
-                bloom_hashes: document.bloom_hashes,
-                tier2_filter_bytes: document.tier2_filter_bytes,
-                tier2_bloom_hashes: document.tier2_bloom_hashes,
-                grams_complete: document.grams_complete,
-                deleted: false,
-            };
-            self.df_counts.apply_deltas(&df_deltas);
             aggregate_df_deltas.extend(df_deltas.iter().copied());
-            let row = self.build_doc_row(
-                doc.file_size,
-                doc.filter_bytes,
-                doc.bloom_hashes,
-                doc.grams_complete,
-                doc.deleted,
-                document.external_id.as_deref(),
-                &document.bloom_filter,
-                &document.grams_received,
-                &document.grams_indexed,
-            )?;
-            let tier2_row = self.build_doc_row5(
-                doc.tier2_filter_bytes,
-                doc.tier2_bloom_hashes,
-                &document.tier2_bloom_filter,
-            )?;
-            self.append_new_doc(&document.sha256, row, tier2_row)?;
-            self.doc_rows.push(row);
-            self.tier2_doc_rows.push(tier2_row);
-            self.docs.push(doc.clone());
-            self.sha_to_pos
-                .insert(sha256_hex.clone(), self.docs.len() - 1);
-            self.update_tier2_superblocks_for_doc_bytes_inner(
-                self.docs.len() - 1,
-                &document.bloom_filter,
-            )?;
+            pending_inserts.push(PendingImportedInsert {
+                doc_id,
+                sha256_hex,
+                document,
+            });
             modified = true;
             meta_dirty = true;
-            results.push(CandidateInsertResult {
-                status: "inserted".to_owned(),
-                doc_id,
-                sha256: sha256_hex,
-                grams_received: document.grams_received.len(),
-                grams_indexed: document.grams_indexed.len(),
-                grams_complete: document.grams_complete,
-            });
+        }
+
+        self.df_counts.apply_deltas(&aggregate_df_deltas);
+
+        if !pending_inserts.is_empty() {
+            let bloom_base = self.append_writers.blooms.offset;
+            let grams_received_base = self.append_writers.grams_received.offset;
+            let grams_indexed_base = self.append_writers.grams_indexed.offset;
+            let external_ids_base = self.append_writers.external_ids.offset;
+            let tier2_blooms_base = self.append_writers.tier2_blooms.offset;
+            let mut blooms_payload = Vec::<u8>::new();
+            let mut grams_received_payload = Vec::<u8>::new();
+            let mut grams_indexed_payload = Vec::<u8>::new();
+            let mut external_ids_payload = Vec::<u8>::new();
+            let mut tier2_blooms_payload = Vec::<u8>::new();
+            let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_inserts.len() * 32);
+            let mut doc_meta_payload =
+                Vec::<u8>::with_capacity(pending_inserts.len() * DOC_META_ROW_BYTES);
+            let mut tier2_doc_meta_payload =
+                Vec::<u8>::with_capacity(pending_inserts.len() * TIER2_DOC_META_ROW_BYTES);
+            let mut prepared = Vec::<(
+                CandidateDoc,
+                DocMetaRow,
+                Tier2DocMetaRow,
+                String,
+                Vec<u8>,
+                usize,
+                usize,
+                bool,
+            )>::with_capacity(pending_inserts.len());
+
+            for pending in pending_inserts {
+                let document = pending.document;
+                let bloom_offset = bloom_base + blooms_payload.len() as u64;
+                blooms_payload.extend_from_slice(&document.bloom_filter);
+
+                let grams_received_offset =
+                    grams_received_base + grams_received_payload.len() as u64;
+                for value in &document.grams_received {
+                    let encoded = value.to_le_bytes();
+                    grams_received_payload.extend_from_slice(&encoded[..gram_bytes]);
+                }
+
+                let grams_indexed_offset = grams_indexed_base + grams_indexed_payload.len() as u64;
+                for value in &document.grams_indexed {
+                    let encoded = value.to_le_bytes();
+                    grams_indexed_payload.extend_from_slice(&encoded[..gram_bytes]);
+                }
+
+                let (external_id_offset, external_id_len) =
+                    if let Some(external_id) = document.external_id.as_deref() {
+                        let bytes = external_id.as_bytes();
+                        let offset = external_ids_base + external_ids_payload.len() as u64;
+                        external_ids_payload.extend_from_slice(bytes);
+                        (offset, bytes.len() as u32)
+                    } else {
+                        (0, 0)
+                    };
+
+                let tier2_row = if document.tier2_bloom_filter.is_empty() {
+                    Tier2DocMetaRow::default()
+                } else {
+                    let bloom_offset = tier2_blooms_base + tier2_blooms_payload.len() as u64;
+                    tier2_blooms_payload.extend_from_slice(&document.tier2_bloom_filter);
+                    Tier2DocMetaRow {
+                        filter_bytes: document.tier2_filter_bytes as u32,
+                        bloom_hashes: document.tier2_bloom_hashes.min(u8::MAX as usize) as u8,
+                        bloom_offset,
+                        bloom_len: document.tier2_bloom_filter.len() as u32,
+                    }
+                };
+
+                let row = DocMetaRow {
+                    file_size: document.file_size,
+                    filter_bytes: document.filter_bytes as u32,
+                    flags: u8::from(document.grams_complete) * DOC_FLAG_GRAMS_COMPLETE,
+                    bloom_hashes: document.bloom_hashes.min(u8::MAX as usize) as u8,
+                    bloom_offset,
+                    bloom_len: document.bloom_filter.len() as u32,
+                    grams_received_offset,
+                    grams_received_count: document.grams_received.len() as u32,
+                    grams_indexed_offset,
+                    grams_indexed_count: document.grams_indexed.len() as u32,
+                    external_id_offset,
+                    external_id_len,
+                };
+
+                let doc = CandidateDoc {
+                    doc_id: pending.doc_id,
+                    sha256: pending.sha256_hex.clone(),
+                    file_size: document.file_size,
+                    filter_bytes: document.filter_bytes,
+                    bloom_hashes: document.bloom_hashes,
+                    tier2_filter_bytes: document.tier2_filter_bytes,
+                    tier2_bloom_hashes: document.tier2_bloom_hashes,
+                    grams_complete: document.grams_complete,
+                    deleted: false,
+                };
+
+                sha_by_docid_payload.extend_from_slice(&document.sha256);
+                doc_meta_payload.extend_from_slice(&row.encode());
+                tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
+                prepared.push((
+                    doc,
+                    row,
+                    tier2_row,
+                    pending.sha256_hex,
+                    document.bloom_filter.clone(),
+                    document.grams_received.len(),
+                    document.grams_indexed.len(),
+                    document.grams_complete,
+                ));
+            }
+
+            self.append_writers.blooms.append(&blooms_payload)?;
+            self.append_writers
+                .grams_received
+                .append(&grams_received_payload)?;
+            self.append_writers
+                .grams_indexed
+                .append(&grams_indexed_payload)?;
+            self.append_writers
+                .external_ids
+                .append(&external_ids_payload)?;
+            self.append_writers
+                .tier2_blooms
+                .append(&tier2_blooms_payload)?;
+            self.append_writers
+                .sha_by_docid
+                .append(&sha_by_docid_payload)?;
+            self.append_writers.doc_meta.append(&doc_meta_payload)?;
+            self.append_writers
+                .tier2_doc_meta
+                .append(&tier2_doc_meta_payload)?;
+
+            for (
+                doc,
+                row,
+                tier2_row,
+                sha256_hex,
+                bloom_filter,
+                grams_received_len,
+                grams_indexed_len,
+                grams_complete,
+            ) in prepared
+            {
+                self.doc_rows.push(row);
+                self.tier2_doc_rows.push(tier2_row);
+                let pos = self.docs.len();
+                self.docs.push(doc.clone());
+                self.sha_to_pos.insert(sha256_hex.clone(), pos);
+                self.update_tier2_superblocks_for_doc_bytes_inner(pos, &bloom_filter)?;
+                results.push(CandidateInsertResult {
+                    status: "inserted".to_owned(),
+                    doc_id: doc.doc_id,
+                    sha256: sha256_hex,
+                    grams_received: grams_received_len,
+                    grams_indexed: grams_indexed_len,
+                    grams_complete,
+                });
+            }
         }
 
         if modified {
