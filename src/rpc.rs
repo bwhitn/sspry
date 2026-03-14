@@ -59,6 +59,7 @@ const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
 const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
+const DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP: usize = 1;
 
 fn lock_candidate_store_with_timeout<'a>(
     store_lock: &'a Mutex<CandidateStore>,
@@ -1416,6 +1417,9 @@ impl ServerState {
             let work = self.work_store_set()?;
             let (work_stats, work_deleted_storage_bytes) =
                 self.candidate_stats_json_for_store_set(&work, "work stats")?;
+            let retired_root = workspace_retired_root(&self.config.candidate_config.root);
+            let (retired_published_root_count, retired_published_disk_usage_bytes) =
+                workspace_retired_stats(&retired_root);
             stats.insert("workspace_mode".to_owned(), json!(true));
             stats.insert(
                 "published_root".to_owned(),
@@ -1506,6 +1510,18 @@ impl ServerState {
                     work_disk_usage_bytes,
                     published_disk_usage_bytes
                 )),
+            );
+            publish.insert(
+                "retired_published_root_count".to_owned(),
+                json!(retired_published_root_count),
+            );
+            publish.insert(
+                "retired_published_disk_usage_bytes".to_owned(),
+                json!(retired_published_disk_usage_bytes),
+            );
+            publish.insert(
+                "retired_published_roots_to_keep".to_owned(),
+                json!(DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP as u64),
             );
             publish.insert(
                 "last_publish_started_unix_ms".to_owned(),
@@ -2450,23 +2466,17 @@ impl ServerState {
             let current_root = workspace_current_root(&workspace_root);
             let work_root = workspace_work_root(&workspace_root);
             let retired_parent = workspace_retired_root(&workspace_root);
-            let swap_started = Instant::now();
-            if current_root.exists() {
-                fs::create_dir_all(&retired_parent)?;
-                let retired_root = retired_parent.join(format!("published_{}", current_unix_ms()));
-                fs::rename(&current_root, &retired_root)?;
-            }
-            fs::rename(&work_root, &current_root)?;
-            self.last_publish_swap_ms.store(
-                swap_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                Ordering::SeqCst,
-            );
+            let published_store_set = match &*store_mode {
+                StoreMode::Workspace { published, .. } => published.clone(),
+                StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+            };
+            let published_is_empty = published_store_set.stores.iter().all(|store_lock| {
+                store_lock
+                    .lock()
+                    .map(|store| store.stats().doc_count == 0)
+                    .unwrap_or(false)
+            });
 
-            let publish_shard_count = self.candidate_shard_count();
             let prior_work = match &mut *store_mode {
                 StoreMode::Workspace { work, .. } => {
                     std::mem::replace(work, Arc::new(StoreSet::new(work_root.clone(), Vec::new())))
@@ -2474,50 +2484,109 @@ impl ServerState {
                 StoreMode::Direct { .. } => unreachable!("workspace already checked"),
             };
 
-            let promote_started = Instant::now();
-            let (published_store_set, removed_current, reused_work_stores) =
-                match Arc::try_unwrap(prior_work) {
-                    Ok(work_store_set) => {
-                        let mut stores = work_store_set.into_stores()?;
-                        for (shard_idx, store) in stores.iter_mut().enumerate() {
-                            store.retarget_root(candidate_shard_root(
-                                &current_root,
-                                publish_shard_count,
-                                shard_idx,
-                            ));
-                        }
-                        (
-                            Arc::new(StoreSet::new(current_root.clone(), stores)),
-                            0usize,
-                            true,
-                        )
-                    }
-                    Err(work_store_set) => {
-                        let _ = match &mut *store_mode {
-                            StoreMode::Workspace { work, .. } => {
-                                std::mem::replace(work, work_store_set)
+            let publish_shard_count = self.candidate_shard_count();
+            let mut removed_current = 0usize;
+            let reuse_work_stores;
+            let published_store_set = if published_is_empty {
+                let swap_started = Instant::now();
+                if current_root.exists() {
+                    fs::create_dir_all(&retired_parent)?;
+                    let retired_root = next_workspace_retired_root_path(&retired_parent);
+                    fs::rename(&current_root, &retired_root)?;
+                }
+                fs::rename(&work_root, &current_root)?;
+                self.last_publish_swap_ms.store(
+                    swap_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+                let promote_started = Instant::now();
+                let (published_store_set, removed_existing_current, reused_work_stores) =
+                    match Arc::try_unwrap(prior_work) {
+                        Ok(work_store_set) => {
+                            let mut stores = work_store_set.into_stores()?;
+                            for (shard_idx, store) in stores.iter_mut().enumerate() {
+                                store.retarget_root(candidate_shard_root(
+                                    &current_root,
+                                    publish_shard_count,
+                                    shard_idx,
+                                ));
                             }
-                            StoreMode::Direct { .. } => unreachable!("workspace already checked"),
-                        };
-                        let (published_stores, removed_current) =
-                            ensure_candidate_stores_at_root(&self.config, &current_root)?;
-                        (
-                            Arc::new(StoreSet::new(current_root.clone(), published_stores)),
-                            removed_current,
-                            false,
-                        )
+                            (
+                                Arc::new(StoreSet::new(current_root.clone(), stores)),
+                                0usize,
+                                true,
+                            )
+                        }
+                        Err(work_store_set) => {
+                            let _ = match &mut *store_mode {
+                                StoreMode::Workspace { work, .. } => {
+                                    std::mem::replace(work, work_store_set)
+                                }
+                                StoreMode::Direct { .. } => {
+                                    unreachable!("workspace already checked")
+                                }
+                            };
+                            let (published_stores, removed_existing_current) =
+                                ensure_candidate_stores_at_root(&self.config, &current_root)?;
+                            (
+                                Arc::new(StoreSet::new(current_root.clone(), published_stores)),
+                                removed_existing_current,
+                                false,
+                            )
+                        }
+                    };
+                removed_current = removed_existing_current;
+                self.last_publish_promote_work_ms.store(
+                    promote_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+                reuse_work_stores = reused_work_stores;
+                published_store_set
+            } else {
+                self.last_publish_swap_ms.store(0, Ordering::SeqCst);
+                let promote_started = Instant::now();
+                let work_store_set = Arc::try_unwrap(prior_work).map_err(|_| {
+                    TgsError::from("work stores are still busy during publish; retry later")
+                })?;
+                let work_stores = work_store_set.into_stores()?;
+                for (shard_idx, work_store) in work_stores.into_iter().enumerate() {
+                    let imported = work_store.export_live_documents()?;
+                    if imported.is_empty() {
+                        continue;
                     }
-                };
-            self.last_publish_promote_work_ms.store(
-                promote_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                Ordering::SeqCst,
-            );
+                    let mut published_store = published_store_set.stores[shard_idx]
+                        .lock()
+                        .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                    let _ = published_store.import_documents_batch(&imported)?;
+                }
+                if work_root.exists() {
+                    fs::remove_dir_all(&work_root)?;
+                }
+                self.last_publish_promote_work_ms.store(
+                    promote_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+                reuse_work_stores = false;
+                published_store_set
+            };
+            let removed_retired_roots = prune_workspace_retired_roots(
+                &retired_parent,
+                DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP,
+            )?;
             self.last_publish_reused_work_stores
-                .store(reused_work_stores, Ordering::SeqCst);
+                .store(reuse_work_stores, Ordering::SeqCst);
 
             let init_work_started = Instant::now();
             let (work_stores, removed_work) =
@@ -2558,9 +2627,10 @@ impl ServerState {
             self.invalidate_search_caches();
             Ok(CandidatePublishResponse {
                 message: format!(
-                    "published work root to {} (startup cleanup removed {})",
+                    "published work root to {} (startup cleanup removed {}, retired cleanup removed {})",
                     current_root.display(),
-                    removed_current.saturating_add(removed_work)
+                    removed_current.saturating_add(removed_work),
+                    removed_retired_roots,
                 ),
             })
         })();
@@ -2975,6 +3045,66 @@ fn workspace_retired_root(root: &Path) -> PathBuf {
     root.join("retired")
 }
 
+fn workspace_retired_roots(root: &Path) -> Vec<PathBuf> {
+    let mut retired = Vec::new();
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return retired,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with("published_") {
+            retired.push(path);
+        }
+    }
+    retired.sort_unstable();
+    retired
+}
+
+fn workspace_retired_stats(root: &Path) -> (u64, u64) {
+    let retired = workspace_retired_roots(root);
+    let bytes = retired.iter().map(|path| disk_usage_under(path)).sum();
+    (retired.len() as u64, bytes)
+}
+
+fn next_workspace_retired_root_path(root: &Path) -> PathBuf {
+    let base = current_unix_ms();
+    for offset in 0..1024u64 {
+        let candidate = root.join(format!("published_{}", base.saturating_add(offset)));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    root.join(format!("published_{}_{}", base, std::process::id()))
+}
+
+fn prune_workspace_retired_roots(root: &Path, keep: usize) -> Result<usize> {
+    let retired = workspace_retired_roots(root);
+    let prune_count = retired.len().saturating_sub(keep);
+    let mut removed = 0usize;
+    for path in retired.into_iter().take(prune_count) {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                removed = removed.saturating_add(1);
+            }
+            Err(err) => {
+                return Err(TgsError::from(format!(
+                    "Failed to remove retired workspace root {}: {err}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn ensure_candidate_stores_at_root(
     config: &ServerConfig,
     root: &Path,
@@ -3046,6 +3176,9 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize)> 
 
     let current_root = workspace_current_root(root);
     let work_root = workspace_work_root(root);
+    let retired_root = workspace_retired_root(root);
+    let removed_retired =
+        prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
     let (published, removed_current) = ensure_candidate_stores_at_root(config, &current_root)?;
     let (work, removed_work) = ensure_candidate_stores_at_root(config, &work_root)?;
     Ok((
@@ -3054,7 +3187,9 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize)> 
             published: Arc::new(StoreSet::new(current_root, published)),
             work: Arc::new(StoreSet::new(work_root, work)),
         },
-        removed_current.saturating_add(removed_work),
+        removed_current
+            .saturating_add(removed_work)
+            .saturating_add(removed_retired),
     ))
 }
 
@@ -3413,6 +3548,57 @@ mod tests {
     }
 
     #[test]
+    fn publish_prunes_workspace_retired_roots_to_keep_last_one() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let workspace_root = tmp.path().join("candidate_workspace_1");
+        let retired_root = workspace_retired_root(&workspace_root);
+
+        state.mark_work_mutation();
+        state.last_work_mutation_unix_ms.store(
+            current_unix_ms().saturating_sub(DEFAULT_AUTO_PUBLISH_IDLE_MS + 1),
+            Ordering::SeqCst,
+        );
+        state.handle_publish().expect("first publish");
+
+        let first_retired = retired_root.join("published_0000000000001");
+        fs::create_dir_all(&first_retired).expect("create first retained root");
+        let second_retired = retired_root.join("published_9999999999999");
+        fs::create_dir_all(&second_retired).expect("create second retained root");
+
+        state.mark_work_mutation();
+        state.last_work_mutation_unix_ms.store(
+            current_unix_ms().saturating_sub(DEFAULT_AUTO_PUBLISH_IDLE_MS + 1),
+            Ordering::SeqCst,
+        );
+        state.handle_publish().expect("second publish");
+
+        let retained = workspace_retired_roots(&retired_root);
+        assert_eq!(retained.len(), DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP);
+        assert_eq!(retained[0], second_retired);
+        assert!(!first_retired.exists());
+    }
+
+    #[test]
+    fn workspace_startup_prunes_old_retired_roots() {
+        let tmp = tempdir().expect("tmp");
+        let workspace_root = tmp.path().join("candidate_workspace_1");
+        let retired_root = workspace_retired_root(&workspace_root);
+        fs::create_dir_all(&retired_root).expect("create retired parent");
+        let older = retired_root.join("published_0000000000001");
+        let newer = retired_root.join("published_0000000000002");
+        fs::create_dir_all(&older).expect("create older retired root");
+        fs::create_dir_all(&newer).expect("create newer retired root");
+
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let retained = workspace_retired_roots(&retired_root);
+        assert_eq!(retained.len(), DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP);
+        assert_eq!(retained[0], newer);
+        assert!(!older.exists());
+        assert!(state.startup_cleanup_removed_roots >= 1);
+    }
+
+    #[test]
     fn workspace_mode_keeps_queries_on_published_root_until_publish() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -3584,6 +3770,83 @@ mod tests {
             .expect("query");
         assert_eq!(result.total_candidates, 1);
         assert!(!state.work_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn workspace_publish_merges_incremental_work_into_published_root() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+
+        let sample_a = tmp.path().join("inc-a.bin");
+        fs::write(&sample_a, b"xxABCDyy").expect("sample a");
+        let features_a = crate::candidate::scan_file_features(
+            &sample_a, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features a");
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(features_a.sha256),
+                file_size: features_a.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features_a.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features_a.unique_grams,
+                grams_complete: !features_a.unique_grams_truncated,
+                effective_diversity: None,
+                external_id: Some("inc-a".to_owned()),
+            })
+            .expect("insert a");
+        state.handle_publish().expect("publish a");
+
+        let sample_b = tmp.path().join("inc-b.bin");
+        fs::write(&sample_b, b"xxWXYZyy").expect("sample b");
+        let features_b = crate::candidate::scan_file_features(
+            &sample_b, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features b");
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(features_b.sha256),
+                file_size: features_b.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features_b.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features_b.unique_grams,
+                grams_complete: !features_b.unique_grams_truncated,
+                effective_diversity: None,
+                external_id: Some("inc-b".to_owned()),
+            })
+            .expect("insert b");
+        state.handle_publish().expect("publish b");
+
+        let stats = state.current_stats_json().expect("stats");
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            stats
+                .get("publish")
+                .and_then(Value::as_object)
+                .and_then(|publish| publish.get("retired_published_root_count"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats
+                .get("work")
+                .and_then(Value::as_object)
+                .and_then(|work| work.get("doc_count"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
     }
 
     #[cfg(unix)]

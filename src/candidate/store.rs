@@ -251,6 +251,22 @@ pub struct CandidateDeleteResult {
 }
 
 #[derive(Clone, Debug)]
+pub struct ImportedCandidateDocument {
+    pub sha256: [u8; 32],
+    pub file_size: u64,
+    pub filter_bytes: usize,
+    pub bloom_hashes: usize,
+    pub tier2_filter_bytes: usize,
+    pub tier2_bloom_hashes: usize,
+    pub bloom_filter: Vec<u8>,
+    pub tier2_bloom_filter: Vec<u8>,
+    pub grams_received: Vec<u64>,
+    pub grams_indexed: Vec<u64>,
+    pub grams_complete: bool,
+    pub external_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CandidateQueryResult {
     pub sha256: Vec<String>,
     pub scores: Vec<u32>,
@@ -2170,6 +2186,217 @@ impl CandidateStore {
         })
     }
 
+    pub fn export_live_documents(&self) -> Result<Vec<ImportedCandidateDocument>> {
+        let mut out = Vec::with_capacity(self.docs.len());
+        for pos in 0..self.docs.len() {
+            let doc = &self.docs[pos];
+            if doc.deleted {
+                continue;
+            }
+            let mut sha256 = [0u8; 32];
+            hex::decode_to_slice(&doc.sha256, &mut sha256)?;
+            out.push(ImportedCandidateDocument {
+                sha256,
+                file_size: doc.file_size,
+                filter_bytes: doc.filter_bytes,
+                bloom_hashes: doc.bloom_hashes,
+                tier2_filter_bytes: doc.tier2_filter_bytes,
+                tier2_bloom_hashes: doc.tier2_bloom_hashes,
+                bloom_filter: self.doc_bloom_bytes(pos)?.into_owned(),
+                tier2_bloom_filter: self.doc_tier2_bloom_bytes(pos)?.into_owned(),
+                grams_received: self.doc_grams_received(pos)?,
+                grams_indexed: decode_exact_gram_vec(
+                    self.doc_indexed_bytes(pos)?.as_ref(),
+                    self.meta.exact_gram_bytes(),
+                )?,
+                grams_complete: doc.grams_complete,
+                external_id: self.doc_external_id(pos)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn import_documents_batch(
+        &mut self,
+        documents: &[ImportedCandidateDocument],
+    ) -> Result<Vec<CandidateInsertResult>> {
+        let mut total_scope = scope("candidate.import_documents_batch");
+        let mut results = Vec::with_capacity(documents.len());
+        let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
+        let mut modified = false;
+        let mut meta_dirty = false;
+        let mut received_grams_total = 0u64;
+        let mut indexed_grams_total = 0u64;
+        let mut max_received_grams = 0u64;
+        let mut max_indexed_grams = 0u64;
+
+        for document in documents {
+            total_scope.add_bytes(document.file_size);
+            let sha256_hex = hex::encode(document.sha256);
+            let received_len = document.grams_received.len() as u64;
+            let indexed_len = document.grams_indexed.len() as u64;
+            received_grams_total = received_grams_total.saturating_add(received_len);
+            indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
+            max_received_grams = max_received_grams.max(received_len);
+            max_indexed_grams = max_indexed_grams.max(indexed_len);
+            let df_deltas = document
+                .grams_received
+                .iter()
+                .map(|gram| (*gram, 1))
+                .collect::<Vec<_>>();
+
+            if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
+                if !self.docs[existing_pos].deleted {
+                    let existing = &self.docs[existing_pos];
+                    let existing_row = self.doc_rows[existing_pos];
+                    results.push(CandidateInsertResult {
+                        status: "already_exists".to_owned(),
+                        doc_id: existing.doc_id,
+                        sha256: existing.sha256.clone(),
+                        grams_received: existing_row.grams_received_count as usize,
+                        grams_indexed: existing_row.grams_indexed_count as usize,
+                        grams_complete: existing.grams_complete,
+                    });
+                    continue;
+                }
+
+                self.df_counts.apply_deltas(&df_deltas);
+                aggregate_df_deltas.extend(df_deltas.iter().copied());
+                let snapshot = {
+                    let existing = &mut self.docs[existing_pos];
+                    existing.file_size = document.file_size;
+                    existing.filter_bytes = document.filter_bytes;
+                    existing.bloom_hashes = document.bloom_hashes;
+                    existing.tier2_filter_bytes = document.tier2_filter_bytes;
+                    existing.tier2_bloom_hashes = document.tier2_bloom_hashes;
+                    existing.grams_complete = document.grams_complete;
+                    existing.deleted = false;
+                    existing.clone()
+                };
+                let row = self.build_doc_row(
+                    snapshot.file_size,
+                    snapshot.filter_bytes,
+                    snapshot.bloom_hashes,
+                    snapshot.grams_complete,
+                    snapshot.deleted,
+                    document.external_id.as_deref(),
+                    &document.bloom_filter,
+                    &document.grams_received,
+                    &document.grams_indexed,
+                )?;
+                let tier2_row = self.build_doc_row5(
+                    snapshot.tier2_filter_bytes,
+                    snapshot.tier2_bloom_hashes,
+                    &document.tier2_bloom_filter,
+                )?;
+                self.doc_rows[existing_pos] = row;
+                self.tier2_doc_rows[existing_pos] = tier2_row;
+                self.write_doc_row(snapshot.doc_id, row)?;
+                self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                self.update_tier2_superblocks_for_doc_bytes_inner(
+                    existing_pos,
+                    &document.bloom_filter,
+                )?;
+                modified = true;
+                results.push(CandidateInsertResult {
+                    status: "restored".to_owned(),
+                    doc_id: snapshot.doc_id,
+                    sha256: sha256_hex,
+                    grams_received: document.grams_received.len(),
+                    grams_indexed: document.grams_indexed.len(),
+                    grams_complete: document.grams_complete,
+                });
+                continue;
+            }
+
+            let doc_id = self.meta.next_doc_id;
+            self.meta.next_doc_id += 1;
+            let doc = CandidateDoc {
+                doc_id,
+                sha256: sha256_hex.clone(),
+                file_size: document.file_size,
+                filter_bytes: document.filter_bytes,
+                bloom_hashes: document.bloom_hashes,
+                tier2_filter_bytes: document.tier2_filter_bytes,
+                tier2_bloom_hashes: document.tier2_bloom_hashes,
+                grams_complete: document.grams_complete,
+                deleted: false,
+            };
+            self.df_counts.apply_deltas(&df_deltas);
+            aggregate_df_deltas.extend(df_deltas.iter().copied());
+            let row = self.build_doc_row(
+                doc.file_size,
+                doc.filter_bytes,
+                doc.bloom_hashes,
+                doc.grams_complete,
+                doc.deleted,
+                document.external_id.as_deref(),
+                &document.bloom_filter,
+                &document.grams_received,
+                &document.grams_indexed,
+            )?;
+            let tier2_row = self.build_doc_row5(
+                doc.tier2_filter_bytes,
+                doc.tier2_bloom_hashes,
+                &document.tier2_bloom_filter,
+            )?;
+            self.append_new_doc(&document.sha256, row, tier2_row)?;
+            self.doc_rows.push(row);
+            self.tier2_doc_rows.push(tier2_row);
+            self.docs.push(doc.clone());
+            self.sha_to_pos
+                .insert(sha256_hex.clone(), self.docs.len() - 1);
+            self.update_tier2_superblocks_for_doc_bytes_inner(
+                self.docs.len() - 1,
+                &document.bloom_filter,
+            )?;
+            modified = true;
+            meta_dirty = true;
+            results.push(CandidateInsertResult {
+                status: "inserted".to_owned(),
+                doc_id,
+                sha256: sha256_hex,
+                grams_received: document.grams_received.len(),
+                grams_indexed: document.grams_indexed.len(),
+                grams_complete: document.grams_complete,
+            });
+        }
+
+        if modified {
+            if meta_dirty {
+                self.persist_meta()?;
+            }
+            append_df_count_deltas_with_writer(
+                &mut self.append_writers.df_counts_delta,
+                self.meta.exact_gram_bytes(),
+                &aggregate_df_deltas,
+            )?;
+            self.maybe_compact_df_counts()?;
+            self.maybe_rebalance_tier2_superblocks()?;
+            self.sidecars.invalidate_all();
+            self.mark_write_activity();
+            total_scope.add_items(received_grams_total);
+            record_counter(
+                "candidate.insert_document_received_grams_total",
+                received_grams_total,
+            );
+            record_counter(
+                "candidate.insert_document_indexed_grams_total",
+                indexed_grams_total,
+            );
+            record_max(
+                "candidate.insert_document_max_received_grams",
+                max_received_grams,
+            );
+            record_max(
+                "candidate.insert_document_max_indexed_grams",
+                max_indexed_grams,
+            );
+        }
+
+        Ok(results)
+    }
+
     pub fn query_candidates(
         &mut self,
         plan: &CompiledQueryPlan,
@@ -3536,6 +3763,17 @@ fn read_exact_gram_vec_from_path(
 ) -> Result<Vec<u64>> {
     let bytes = read_blob_from_path(path, offset, count as usize * gram_bytes, label, doc_id)?;
     let mut out = Vec::with_capacity(count as usize);
+    for chunk in bytes.chunks_exact(gram_bytes) {
+        out.push(decode_packed_exact_gram(chunk));
+    }
+    Ok(out)
+}
+
+fn decode_exact_gram_vec(bytes: &[u8], gram_bytes: usize) -> Result<Vec<u64>> {
+    if gram_bytes == 0 || bytes.len() % gram_bytes != 0 {
+        return Err(TgsError::from("Invalid packed exact gram payload."));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / gram_bytes);
     for chunk in bytes.chunks_exact(gram_bytes) {
         out.push(decode_packed_exact_gram(chunk));
     }
