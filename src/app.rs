@@ -912,15 +912,34 @@ fn flush_remote_batch(
     Ok(())
 }
 
-fn push_remote_batch_row(
-    client: &mut PersistentTgsdbClient,
-    pending: &mut RemotePendingBatch,
+fn prepare_remote_batch_row(
+    pending: &RemotePendingBatch,
     row: CandidateDocumentWire,
-    batch_size: usize,
-    processed: &mut usize,
     empty_payload_size: usize,
-) -> Result<()> {
+) -> Result<(Vec<u8>, bool)> {
     let row_bytes = serialize_candidate_document_wire(&row)?;
+    let row_payload_size = row_bytes.len();
+    let single_payload_size = empty_payload_size.saturating_add(row_payload_size);
+    if single_payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
+        return Err(TgsError::from(format!(
+            "single document insert request exceeds payload limit ({} bytes)",
+            single_payload_size
+        )));
+    }
+    let flush_before = !pending.rows.is_empty()
+        && pending
+            .payload_size
+            .saturating_add(1)
+            .saturating_add(row_payload_size)
+            > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES;
+    Ok((row_bytes, flush_before))
+}
+
+fn push_serialized_remote_batch_row(
+    pending: &mut RemotePendingBatch,
+    row_bytes: Vec<u8>,
+    batch_size: usize,
+) -> Result<bool> {
     let row_payload_size = row_bytes.len();
     let separator_bytes = usize::from(!pending.rows.is_empty());
     let payload_size = pending
@@ -928,24 +947,61 @@ fn push_remote_batch_row(
         .saturating_add(separator_bytes)
         .saturating_add(row_payload_size);
     if payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
-        flush_remote_batch(client, pending, processed, empty_payload_size)?;
-        let single_payload_size = empty_payload_size.saturating_add(row_payload_size);
-        if single_payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
-            return Err(TgsError::from(format!(
-                "single document insert request exceeds payload limit ({} bytes)",
-                single_payload_size
-            )));
-        }
-        pending.rows.push(row_bytes);
-        pending.payload_size = single_payload_size;
-    } else {
-        pending.rows.push(row_bytes);
-        pending.payload_size = payload_size;
+        return Err(TgsError::from(
+            "remote batch row exceeded payload limit before flush",
+        ));
     }
-    if pending.rows.len() >= batch_size {
-        flush_remote_batch(client, pending, processed, empty_payload_size)?;
+    pending.rows.push(row_bytes);
+    pending.payload_size = payload_size;
+    Ok(pending.rows.len() >= batch_size)
+}
+
+fn push_remote_batch_row(
+    client: &mut PersistentTgsdbClient,
+    pending: &mut RemotePendingBatch,
+    row: CandidateDocumentWire,
+    batch_size: usize,
+    processed: &mut usize,
+    submit_time: &mut Duration,
+    show_progress: bool,
+    total_files: usize,
+    last_progress_reported: &mut usize,
+    last_progress_at: &mut Instant,
+    empty_payload_size: usize,
+) -> Result<Duration> {
+    let started_buffer = Instant::now();
+    let (row_bytes, flush_before) = prepare_remote_batch_row(pending, row, empty_payload_size)?;
+    let mut buffer_time = started_buffer.elapsed();
+    if flush_before {
+        flush_remote_pending_rows(
+            client,
+            pending,
+            processed,
+            submit_time,
+            show_progress,
+            total_files,
+            last_progress_reported,
+            last_progress_at,
+            empty_payload_size,
+        )?;
     }
-    Ok(())
+    let started_buffer = Instant::now();
+    let flush_after = push_serialized_remote_batch_row(pending, row_bytes, batch_size)?;
+    buffer_time += started_buffer.elapsed();
+    if flush_after {
+        flush_remote_pending_rows(
+            client,
+            pending,
+            processed,
+            submit_time,
+            show_progress,
+            total_files,
+            last_progress_reported,
+            last_progress_at,
+            empty_payload_size,
+        )?;
+    }
+    Ok(buffer_time)
 }
 
 fn flush_local_pending_rows(
@@ -1939,24 +1995,19 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         let started_encode = Instant::now();
                         let row = batch_row_to_wire(scanned);
                         encode_time += started_encode.elapsed();
-                        let started_buffer = Instant::now();
-                        push_remote_batch_row(
+                        client_buffer_time += push_remote_batch_row(
                             &mut client,
                             &mut pending,
                             row,
                             batch_size,
                             &mut processed,
-                            empty_payload_size,
-                        )?;
-                        client_buffer_time += started_buffer.elapsed();
-                        maybe_report_index_progress(
+                            &mut submit_time,
                             show_progress,
-                            processed,
                             total_files,
                             &mut last_progress_reported,
                             &mut last_progress_at,
-                            false,
-                        );
+                            empty_payload_size,
+                        )?;
                         Ok(())
                     })?;
                 } else {
@@ -2013,24 +2064,19 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             let started_encode = Instant::now();
                             let row = batch_row_to_wire(scanned.row);
                             encode_time += started_encode.elapsed();
-                            let started_buffer = Instant::now();
-                            push_remote_batch_row(
+                            client_buffer_time += push_remote_batch_row(
                                 &mut client,
                                 &mut pending,
                                 row,
                                 batch_size,
                                 &mut processed,
-                                empty_payload_size,
-                            )?;
-                            client_buffer_time += started_buffer.elapsed();
-                            maybe_report_index_progress(
+                                &mut submit_time,
                                 show_progress,
-                                processed,
                                 total_files,
                                 &mut last_progress_reported,
                                 &mut last_progress_at,
-                                false,
-                            );
+                                empty_payload_size,
+                            )?;
                         }
                         Ok::<(), TgsError>(())
                     })?;

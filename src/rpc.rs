@@ -908,10 +908,10 @@ pub fn serve_with_shutdown(
     )
 }
 
-fn candidate_stats_json_from_parts(
-    root: &Path,
+fn candidate_stats_json_from_parts_with_disk_usage(
     stats_rows: &[crate::candidate::CandidateStats],
     filter_bucket_rows: &[BTreeMap<String, usize>],
+    disk_usage_bytes: u64,
 ) -> Map<String, Value> {
     let stats = stats_rows
         .first()
@@ -997,7 +997,7 @@ fn candidate_stats_json_from_parts(
         "tier2_superblock_memory_budget_bytes".to_owned(),
         json!(tier2_superblock_memory_budget_bytes),
     );
-    out.insert("disk_usage_bytes".to_owned(), json!(disk_usage_under(root)));
+    out.insert("disk_usage_bytes".to_owned(), json!(disk_usage_bytes));
     out.insert(
         "doc_count".to_owned(),
         json!(active_doc_count + deleted_doc_count),
@@ -1067,6 +1067,25 @@ fn candidate_stats_json_from_parts(
     );
     out.insert("version".to_owned(), json!(1));
     out
+}
+
+fn candidate_stats_json_from_parts(
+    root: &Path,
+    stats_rows: &[crate::candidate::CandidateStats],
+    filter_bucket_rows: &[BTreeMap<String, usize>],
+) -> Map<String, Value> {
+    candidate_stats_json_from_parts_with_disk_usage(
+        stats_rows,
+        filter_bucket_rows,
+        disk_usage_under(root),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CandidateStatsBuildProfile {
+    collect_store_stats_ms: u64,
+    disk_usage_ms: u64,
+    build_json_ms: u64,
 }
 
 pub fn candidate_stats_json(root: &Path, store: &CandidateStore) -> Map<String, Value> {
@@ -1683,11 +1702,12 @@ impl ServerState {
         Ok(())
     }
 
-    fn candidate_stats_json_for_store_set(
+    fn candidate_stats_json_for_store_set_profiled(
         &self,
         store_set: &StoreSet,
         operation: &str,
-    ) -> Result<(Map<String, Value>, u64)> {
+    ) -> Result<(Map<String, Value>, u64, CandidateStatsBuildProfile)> {
+        let started_collect = Instant::now();
         let mut stats_rows = Vec::with_capacity(store_set.stores.len());
         let mut filter_bucket_rows = Vec::with_capacity(store_set.stores.len());
         let mut deleted_storage_bytes = 0u64;
@@ -1698,20 +1718,51 @@ impl ServerState {
             deleted_storage_bytes =
                 deleted_storage_bytes.saturating_add(store.deleted_storage_bytes());
         }
+        let collect_store_stats_ms = started_collect
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let started_disk_usage = Instant::now();
+        let disk_usage_bytes = disk_usage_under(&store_set.root);
+        let disk_usage_ms = started_disk_usage
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let started_build_json = Instant::now();
+        let stats = candidate_stats_json_from_parts_with_disk_usage(
+            &stats_rows,
+            &filter_bucket_rows,
+            disk_usage_bytes,
+        );
+        let build_json_ms = started_build_json
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         Ok((
-            candidate_stats_json_from_parts(&store_set.root, &stats_rows, &filter_bucket_rows),
+            stats,
             deleted_storage_bytes,
+            CandidateStatsBuildProfile {
+                collect_store_stats_ms,
+                disk_usage_ms,
+                build_json_ms,
+            },
         ))
     }
 
     fn current_stats_json(&self) -> Result<Map<String, Value>> {
+        let started_total = Instant::now();
         let _op = self
             .operation_gate
             .read()
             .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
         let published = self.published_store_set()?;
-        let (mut stats, deleted_storage_bytes) =
-            self.candidate_stats_json_for_store_set(&published, "stats")?;
+        let (mut stats, deleted_storage_bytes, published_stats_profile) =
+            self.candidate_stats_json_for_store_set_profiled(&published, "stats")?;
+        let mut work_stats_profile = CandidateStatsBuildProfile::default();
+        let mut retired_stats_ms = 0u64;
         stats.insert("draining".to_owned(), json!(self.is_shutting_down()));
         stats.insert(
             "active_connections".to_owned(),
@@ -1887,11 +1938,18 @@ impl ServerState {
         );
         if let Some((published_root, work_root)) = self.workspace_roots()? {
             let work = self.work_store_set()?;
-            let (work_stats, work_deleted_storage_bytes) =
-                self.candidate_stats_json_for_store_set(&work, "work stats")?;
+            let (work_stats, work_deleted_storage_bytes, work_profile) =
+                self.candidate_stats_json_for_store_set_profiled(&work, "work stats")?;
+            work_stats_profile = work_profile;
             let retired_root = workspace_retired_root(&self.config.candidate_config.root);
+            let started_retired = Instant::now();
             let (retired_published_root_count, retired_published_disk_usage_bytes) =
                 workspace_retired_stats(&retired_root);
+            retired_stats_ms = started_retired
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
             stats.insert("workspace_mode".to_owned(), json!(true));
             stats.insert(
                 "published_root".to_owned(),
@@ -2204,6 +2262,23 @@ impl ServerState {
         } else {
             stats.insert("workspace_mode".to_owned(), json!(false));
         }
+        stats.insert(
+            "stats_profile".to_owned(),
+            json!({
+                "total_ms": started_total.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                "published": {
+                    "collect_store_stats_ms": published_stats_profile.collect_store_stats_ms,
+                    "disk_usage_ms": published_stats_profile.disk_usage_ms,
+                    "build_json_ms": published_stats_profile.build_json_ms,
+                },
+                "work": {
+                    "collect_store_stats_ms": work_stats_profile.collect_store_stats_ms,
+                    "disk_usage_ms": work_stats_profile.disk_usage_ms,
+                    "build_json_ms": work_stats_profile.build_json_ms,
+                },
+                "retired_stats_ms": retired_stats_ms,
+            }),
+        );
         Ok(stats)
     }
 
