@@ -260,6 +260,13 @@ type ParsedCandidateInsertDocument = (
 struct StoreSet {
     root: PathBuf,
     stores: Vec<Mutex<CandidateStore>>,
+    stats_cache: Mutex<Option<CachedStoreSetStats>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedStoreSetStats {
+    stats: Map<String, Value>,
+    deleted_storage_bytes: u64,
 }
 
 impl StoreSet {
@@ -267,6 +274,7 @@ impl StoreSet {
         Self {
             root,
             stores: stores.into_iter().map(Mutex::new).collect(),
+            stats_cache: Mutex::new(None),
         }
     }
 
@@ -279,6 +287,41 @@ impl StoreSet {
                     .map_err(|_| TgsError::from("Candidate store lock poisoned."))
             })
             .collect()
+    }
+
+    fn cached_stats(&self) -> Result<Option<(Map<String, Value>, u64)>> {
+        let cache = self
+            .stats_cache
+            .lock()
+            .map_err(|_| TgsError::from("Store set stats cache lock poisoned."))?;
+        Ok(cache
+            .as_ref()
+            .map(|entry| (entry.stats.clone(), entry.deleted_storage_bytes)))
+    }
+
+    fn set_cached_stats(
+        &self,
+        stats: Map<String, Value>,
+        deleted_storage_bytes: u64,
+    ) -> Result<()> {
+        let mut cache = self
+            .stats_cache
+            .lock()
+            .map_err(|_| TgsError::from("Store set stats cache lock poisoned."))?;
+        *cache = Some(CachedStoreSetStats {
+            stats,
+            deleted_storage_bytes,
+        });
+        Ok(())
+    }
+
+    fn invalidate_stats_cache(&self) -> Result<()> {
+        let mut cache = self
+            .stats_cache
+            .lock()
+            .map_err(|_| TgsError::from("Store set stats cache lock poisoned."))?;
+        *cache = None;
+        Ok(())
     }
 }
 
@@ -1380,6 +1423,17 @@ impl ServerState {
         self.work_dirty.store(true, Ordering::SeqCst);
         self.last_work_mutation_unix_ms
             .store(current_unix_ms(), Ordering::SeqCst);
+        let _ = self.invalidate_work_stats_cache();
+    }
+
+    fn invalidate_work_stats_cache(&self) -> Result<()> {
+        let work = self.work_store_set()?;
+        work.invalidate_stats_cache()
+    }
+
+    fn invalidate_published_stats_cache(&self) -> Result<()> {
+        let published = self.published_store_set()?;
+        published.invalidate_stats_cache()
     }
 
     fn enqueue_published_df_snapshot_shards<I>(&self, shard_indexes: I) -> Result<()>
@@ -1707,6 +1761,13 @@ impl ServerState {
         store_set: &StoreSet,
         operation: &str,
     ) -> Result<(Map<String, Value>, u64, CandidateStatsBuildProfile)> {
+        if let Some((stats, deleted_storage_bytes)) = store_set.cached_stats()? {
+            return Ok((
+                stats,
+                deleted_storage_bytes,
+                CandidateStatsBuildProfile::default(),
+            ));
+        }
         let started_collect = Instant::now();
         let mut stats_rows = Vec::with_capacity(store_set.stores.len());
         let mut filter_bucket_rows = Vec::with_capacity(store_set.stores.len());
@@ -1741,6 +1802,7 @@ impl ServerState {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
+        store_set.set_cached_stats(stats.clone(), deleted_storage_bytes)?;
         Ok((
             stats,
             deleted_storage_bytes,
@@ -2530,7 +2592,11 @@ impl ServerState {
         let mut store = work.stores[shard_idx]
             .lock()
             .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
-        store.garbage_collect_retired_generations()
+        let removed = store.garbage_collect_retired_generations()?;
+        if removed > 0 {
+            let _ = self.invalidate_work_stats_cache();
+        }
+        Ok(removed)
     }
 
     fn find_compaction_candidate(&self) -> Result<Option<(usize, CandidateCompactionSnapshot)>> {
@@ -2610,6 +2676,7 @@ impl ServerState {
 
         match apply_result {
             Ok(Some(result)) => {
+                let _ = self.invalidate_work_stats_cache();
                 let mut runtime = self
                     .compaction_runtime
                     .lock()
@@ -3206,6 +3273,10 @@ impl ServerState {
             }
             _ => published_result,
         };
+        if result.status == "deleted" {
+            let _ = self.invalidate_published_stats_cache();
+            let _ = self.invalidate_work_stats_cache();
+        }
         self.invalidate_search_caches();
         Ok(CandidateDeleteResponse {
             status: result.status,
@@ -4769,6 +4840,23 @@ mod tests {
                 .get("remaining_documents")
                 .and_then(Value::as_u64),
             Some(8)
+        );
+    }
+
+    #[test]
+    fn current_stats_json_uses_cached_store_set_snapshot() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.mark_work_mutation();
+        let _ = state.current_stats_json().expect("prime stats cache");
+        let published = state.published_store_set().expect("published");
+        let work = state.work_store_set().expect("work");
+        let _published_guard = published.stores[0].lock().expect("lock published");
+        let _work_guard = work.stores[0].lock().expect("lock work");
+        let stats = state.current_stats_json().expect("cached stats");
+        assert_eq!(
+            stats.get("workspace_mode").and_then(Value::as_bool),
+            Some(true)
         );
     }
 
