@@ -125,6 +125,145 @@ fn default_ingest_workers() -> usize {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestStorageClass {
+    Unknown,
+    SolidState,
+    Rotational,
+}
+
+impl IngestStorageClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::SolidState => "solid-state",
+            Self::Rotational => "rotational",
+        }
+    }
+}
+
+#[cfg(unix)]
+fn dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0x0fff) | ((dev >> 32) & !0x0fff);
+    let minor = (dev & 0x00ff) | ((dev >> 12) & !0x00ff);
+    (major, minor)
+}
+
+#[cfg(unix)]
+fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn detect_storage_class_for_path(path: &Path) -> IngestStorageClass {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(existing_path) = nearest_existing_path(path) else {
+        return IngestStorageClass::Unknown;
+    };
+    let Ok(metadata) = fs::metadata(existing_path) else {
+        return IngestStorageClass::Unknown;
+    };
+    let (major, minor) = dev_major_minor(metadata.dev());
+    let sys_block = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
+    let canonical = fs::canonicalize(&sys_block).unwrap_or(sys_block);
+    for ancestor in canonical.ancestors() {
+        let rotational_path = ancestor.join("queue").join("rotational");
+        if let Ok(raw) = fs::read_to_string(&rotational_path) {
+            return match raw.trim() {
+                "0" => IngestStorageClass::SolidState,
+                "1" => IngestStorageClass::Rotational,
+                _ => IngestStorageClass::Unknown,
+            };
+        }
+    }
+    IngestStorageClass::Unknown
+}
+
+#[cfg(not(unix))]
+fn detect_storage_class_for_path(_path: &Path) -> IngestStorageClass {
+    IngestStorageClass::Unknown
+}
+
+fn detect_storage_class_for_paths(paths: &[PathBuf]) -> IngestStorageClass {
+    let mut saw_solid_state = false;
+    for path in paths {
+        match detect_storage_class_for_path(path) {
+            IngestStorageClass::Rotational => return IngestStorageClass::Rotational,
+            IngestStorageClass::SolidState => saw_solid_state = true,
+            IngestStorageClass::Unknown => {}
+        }
+    }
+    if saw_solid_state {
+        IngestStorageClass::SolidState
+    } else {
+        IngestStorageClass::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedIngestWorkers {
+    workers: usize,
+    auto: bool,
+    input_storage: IngestStorageClass,
+    output_storage: IngestStorageClass,
+}
+
+fn auto_ingest_workers_for(
+    cpus: usize,
+    total_files: usize,
+    input_storage: IngestStorageClass,
+    output_storage: IngestStorageClass,
+) -> usize {
+    let cpu_default = default_ingest_workers_for(cpus);
+    let workload_cap = total_files.max(1).min(cpu_default);
+    let storage_cap = if matches!(input_storage, IngestStorageClass::Rotational)
+        || matches!(output_storage, IngestStorageClass::Rotational)
+    {
+        4
+    } else {
+        cpu_default
+    };
+    workload_cap.min(storage_cap).max(1)
+}
+
+fn resolve_ingest_workers(
+    requested_workers: usize,
+    total_files: usize,
+    input_roots: &[PathBuf],
+    output_root: Option<&Path>,
+) -> ResolvedIngestWorkers {
+    let input_storage = detect_storage_class_for_paths(input_roots);
+    let output_storage = output_root
+        .map(detect_storage_class_for_path)
+        .unwrap_or(IngestStorageClass::Unknown);
+    if requested_workers > 0 {
+        return ResolvedIngestWorkers {
+            workers: requested_workers.max(1),
+            auto: false,
+            input_storage,
+            output_storage,
+        };
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    ResolvedIngestWorkers {
+        workers: auto_ingest_workers_for(cpus, total_files, input_storage, output_storage),
+        auto: true,
+        input_storage,
+        output_storage,
+    }
+}
+
 fn default_search_workers_for(cpus: usize) -> usize {
     (cpus.max(1) / 4).max(1)
 }
@@ -1634,6 +1773,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
         let batch_size = args.batch_size.max(1);
+        let resolved_workers = resolve_ingest_workers(
+            args.workers,
+            total_files,
+            &input_roots,
+            args.root.as_deref().map(Path::new),
+        );
+        let workers = resolved_workers.workers;
         if let Some(root) = &args.root {
             let mut stores = open_stores(Path::new(root))?;
             let config = stores
@@ -1654,9 +1800,9 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             };
             let configured_budget_bytes = DEFAULT_MEMORY_BUDGET_BYTES;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
-            let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
+            let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
             let mut pending = Vec::<IndexBatchRow>::new();
-            if args.workers <= 1 {
+            if workers <= 1 {
                 stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
                     pending.push(scan_index_batch_row(&file_path, policy)?);
@@ -1679,7 +1825,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
                 let (result_tx, result_rx) =
                     bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
-                let worker_count = args.workers.max(1);
+                let worker_count = workers;
                 thread::scope(|scope| {
                     for _ in 0..worker_count {
                         let job_rx = job_rx.clone();
@@ -1758,6 +1904,15 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
                 eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
                 eprintln!("verbose.index.queue_capacity: {queue_capacity}");
+                eprintln!("verbose.index.worker_auto: {}", resolved_workers.auto);
+                eprintln!(
+                    "verbose.index.input_storage_class: {}",
+                    resolved_workers.input_storage.as_str()
+                );
+                eprintln!(
+                    "verbose.index.output_storage_class: {}",
+                    resolved_workers.output_storage.as_str()
+                );
             }
         } else {
             let server_policy = server_scan_policy(&args.connection)?;
@@ -1779,13 +1934,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             progress_rpc_time += started_progress_rpc.elapsed();
             let configured_budget_bytes = server_policy.memory_budget_bytes;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
-            let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
+            let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
             let empty_payload_size = empty_remote_batch_payload_size()?;
             let mut pending = RemotePendingBatch {
                 rows: Vec::new(),
                 payload_size: empty_payload_size,
             };
-            if args.workers <= 1 {
+            if workers <= 1 {
                 stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
                     let scanned = scan_index_batch_row(&file_path, policy)?;
@@ -1817,7 +1972,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
                 let (result_tx, result_rx) =
                     bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
-                let worker_count = args.workers.max(1);
+                let worker_count = workers;
                 thread::scope(|scope| {
                     for _ in 0..worker_count {
                         let job_rx = job_rx.clone();
@@ -1905,6 +2060,15 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
                 eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
                 eprintln!("verbose.index.queue_capacity: {queue_capacity}");
+                eprintln!("verbose.index.worker_auto: {}", resolved_workers.auto);
+                eprintln!(
+                    "verbose.index.input_storage_class: {}",
+                    resolved_workers.input_storage.as_str()
+                );
+                eprintln!(
+                    "verbose.index.output_storage_class: {}",
+                    resolved_workers.output_storage.as_str()
+                );
             }
         }
 
@@ -1936,7 +2100,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
             eprintln!("verbose.index.progress_rpc_ms: {progress_rpc_ms:.3}");
             eprintln!("verbose.index.batch_size: {}", batch_size);
-            eprintln!("verbose.index.workers: {}", args.workers.max(1));
+            eprintln!("verbose.index.workers: {workers}");
             eprintln!("verbose.index.submitted_documents: {total_files}");
             eprintln!("verbose.index.processed_documents: {processed}");
             let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
@@ -2518,7 +2682,7 @@ fn cmd_ingest(args: &IndexArgs) -> i32 {
         paths: args.paths.clone(),
         root: None,
         batch_size: args.batch_size,
-        workers: args.workers,
+        workers: args.workers.unwrap_or(0),
         chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
         max_unique_grams: None,
         no_grams: false,
@@ -2864,10 +3028,9 @@ struct IndexArgs {
     batch_size: usize,
     #[arg(
         long = "workers",
-        default_value_t = default_ingest_workers(),
-        help = "Process workers for recursive file scan/feature extraction before batched inserts."
+        help = "Process workers for recursive file scan/feature extraction before batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
     )]
-    workers: usize,
+    workers: Option<usize>,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
 }
@@ -3520,6 +3683,55 @@ mod tests {
     }
 
     #[test]
+    fn auto_ingest_workers_caps_rotational_and_small_workloads() {
+        assert_eq!(
+            auto_ingest_workers_for(
+                16,
+                500,
+                IngestStorageClass::SolidState,
+                IngestStorageClass::Unknown
+            ),
+            12
+        );
+        assert_eq!(
+            auto_ingest_workers_for(
+                16,
+                500,
+                IngestStorageClass::Rotational,
+                IngestStorageClass::Unknown
+            ),
+            4
+        );
+        assert_eq!(
+            auto_ingest_workers_for(
+                16,
+                3,
+                IngestStorageClass::SolidState,
+                IngestStorageClass::Unknown
+            ),
+            3
+        );
+        assert_eq!(
+            auto_ingest_workers_for(
+                16,
+                2,
+                IngestStorageClass::Rotational,
+                IngestStorageClass::Unknown
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn resolve_ingest_workers_respects_explicit_override() {
+        let resolved = resolve_ingest_workers(7, 500, &[], None);
+        assert_eq!(resolved.workers, 7);
+        assert!(!resolved.auto);
+        assert_eq!(resolved.input_storage, IngestStorageClass::Unknown);
+        assert_eq!(resolved.output_storage, IngestStorageClass::Unknown);
+    }
+
+    #[test]
     fn default_search_workers_is_quarter_cpu_floor() {
         assert_eq!(default_search_workers_for(1), 1);
         assert_eq!(default_search_workers_for(2), 1);
@@ -4058,7 +4270,7 @@ rule remote_q {
                     sample_c.display().to_string()
                 ],
                 batch_size: 1,
-                workers: 2,
+                workers: Some(2),
                 verbose: false,
             }),
             0
@@ -4272,7 +4484,7 @@ rule remote_q {
                 connection: connection.clone(),
                 paths: vec![sample.display().to_string()],
                 batch_size: 1,
-                workers: 1,
+                workers: Some(1),
                 verbose: false,
             }),
             0
