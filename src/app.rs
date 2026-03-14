@@ -2394,6 +2394,53 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     {
                         eprintln!("verbose.index.server_index_progress_percent: {value:.3}");
                     }
+                    if let Some(server_insert_batch_profile) = index_session
+                        .get("server_insert_batch_profile")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        for (key, label) in [
+                            ("batches", "verbose.index.server_index_insert_batch_count"),
+                            (
+                                "documents",
+                                "verbose.index.server_index_insert_batch_documents",
+                            ),
+                            (
+                                "shards_touched_total",
+                                "verbose.index.server_index_insert_batch_shards_touched_total",
+                            ),
+                            (
+                                "total_us",
+                                "verbose.index.server_index_insert_batch_total_us",
+                            ),
+                            (
+                                "parse_us",
+                                "verbose.index.server_index_insert_batch_parse_us",
+                            ),
+                            (
+                                "group_us",
+                                "verbose.index.server_index_insert_batch_group_us",
+                            ),
+                            (
+                                "build_us",
+                                "verbose.index.server_index_insert_batch_build_us",
+                            ),
+                            (
+                                "store_us",
+                                "verbose.index.server_index_insert_batch_store_us",
+                            ),
+                            (
+                                "finalize_us",
+                                "verbose.index.server_index_insert_batch_finalize_us",
+                            ),
+                        ] {
+                            if let Some(value) = server_insert_batch_profile
+                                .get(key)
+                                .and_then(serde_json::Value::as_u64)
+                            {
+                                eprintln!("{label}: {value}");
+                            }
+                        }
+                    }
                 }
                 if let Some(seal) = stats
                     .get("published_df_snapshot_seal")

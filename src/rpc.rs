@@ -354,6 +354,15 @@ struct ServerState {
     index_session_processed_documents: AtomicU64,
     index_session_started_unix_ms: AtomicU64,
     index_session_last_update_unix_ms: AtomicU64,
+    index_session_server_insert_batch_count: AtomicU64,
+    index_session_server_insert_batch_documents: AtomicU64,
+    index_session_server_insert_batch_shards_touched: AtomicU64,
+    index_session_server_insert_batch_total_us: AtomicU64,
+    index_session_server_insert_batch_parse_us: AtomicU64,
+    index_session_server_insert_batch_group_us: AtomicU64,
+    index_session_server_insert_batch_build_us: AtomicU64,
+    index_session_server_insert_batch_store_us: AtomicU64,
+    index_session_server_insert_batch_finalize_us: AtomicU64,
     last_publish_started_unix_ms: AtomicU64,
     last_publish_completed_unix_ms: AtomicU64,
     last_publish_duration_ms: AtomicU64,
@@ -1306,6 +1315,15 @@ impl ServerState {
             index_session_processed_documents: AtomicU64::new(0),
             index_session_started_unix_ms: AtomicU64::new(0),
             index_session_last_update_unix_ms: AtomicU64::new(0),
+            index_session_server_insert_batch_count: AtomicU64::new(0),
+            index_session_server_insert_batch_documents: AtomicU64::new(0),
+            index_session_server_insert_batch_shards_touched: AtomicU64::new(0),
+            index_session_server_insert_batch_total_us: AtomicU64::new(0),
+            index_session_server_insert_batch_parse_us: AtomicU64::new(0),
+            index_session_server_insert_batch_group_us: AtomicU64::new(0),
+            index_session_server_insert_batch_build_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_us: AtomicU64::new(0),
+            index_session_server_insert_batch_finalize_us: AtomicU64::new(0),
             last_publish_started_unix_ms: AtomicU64::new(0),
             last_publish_completed_unix_ms: AtomicU64::new(0),
             last_publish_duration_ms: AtomicU64::new(0),
@@ -1637,6 +1655,24 @@ impl ServerState {
                     .store(now, Ordering::SeqCst);
                 self.index_session_last_update_unix_ms
                     .store(now, Ordering::SeqCst);
+                self.index_session_server_insert_batch_count
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_shards_touched
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_total_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_parse_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_group_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_build_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_finalize_us
+                    .store(0, Ordering::SeqCst);
                 Ok(CandidateIndexSessionResponse {
                     message: "index session started".to_owned(),
                 })
@@ -1682,6 +1718,53 @@ impl ServerState {
             .fetch_add(inserted_count, Ordering::SeqCst);
         self.index_session_last_update_unix_ms
             .store(current_unix_ms(), Ordering::SeqCst);
+    }
+
+    fn record_index_session_insert_batch_profile(
+        &self,
+        documents: usize,
+        shards_touched: usize,
+        total: Duration,
+        parse: Duration,
+        group: Duration,
+        build: Duration,
+        store: Duration,
+        finalize: Duration,
+    ) {
+        if documents == 0 || self.active_index_sessions.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.index_session_server_insert_batch_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.index_session_server_insert_batch_documents
+            .fetch_add(documents as u64, Ordering::SeqCst);
+        self.index_session_server_insert_batch_shards_touched
+            .fetch_add(shards_touched as u64, Ordering::SeqCst);
+        self.index_session_server_insert_batch_total_us.fetch_add(
+            total.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
+        self.index_session_server_insert_batch_parse_us.fetch_add(
+            parse.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
+        self.index_session_server_insert_batch_group_us.fetch_add(
+            group.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
+        self.index_session_server_insert_batch_build_us.fetch_add(
+            build.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
+        self.index_session_server_insert_batch_store_us.fetch_add(
+            store.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
+        self.index_session_server_insert_batch_finalize_us
+            .fetch_add(
+                finalize.as_micros().min(u128::from(u64::MAX)) as u64,
+                Ordering::SeqCst,
+            );
     }
 
     fn handle_end_index_session(&self) -> Result<CandidateIndexSessionResponse> {
@@ -1891,6 +1974,17 @@ impl ServerState {
         } else {
             (index_processed_documents as f64 / index_total_documents as f64) * 100.0
         };
+        let index_server_insert_batch_profile = json!({
+            "batches": self.index_session_server_insert_batch_count.load(Ordering::Acquire),
+            "documents": self.index_session_server_insert_batch_documents.load(Ordering::Acquire),
+            "shards_touched_total": self.index_session_server_insert_batch_shards_touched.load(Ordering::Acquire),
+            "total_us": self.index_session_server_insert_batch_total_us.load(Ordering::Acquire),
+            "parse_us": self.index_session_server_insert_batch_parse_us.load(Ordering::Acquire),
+            "group_us": self.index_session_server_insert_batch_group_us.load(Ordering::Acquire),
+            "build_us": self.index_session_server_insert_batch_build_us.load(Ordering::Acquire),
+            "store_us": self.index_session_server_insert_batch_store_us.load(Ordering::Acquire),
+            "finalize_us": self.index_session_server_insert_batch_finalize_us.load(Ordering::Acquire),
+        });
         let mut index_session = Map::new();
         index_session.insert(
             "active".to_owned(),
@@ -1920,6 +2014,10 @@ impl ServerState {
                 self.index_session_last_update_unix_ms
                     .load(Ordering::Acquire)
             ),
+        );
+        index_session.insert(
+            "server_insert_batch_profile".to_owned(),
+            index_server_insert_batch_profile,
         );
         stats.insert("index_session".to_owned(), Value::Object(index_session));
         if let Ok(runtime) = self.compaction_runtime.lock() {
@@ -2413,6 +2511,17 @@ impl ServerState {
         } else {
             (index_processed_documents as f64 / index_total_documents as f64) * 100.0
         };
+        let index_server_insert_batch_profile = json!({
+            "batches": self.index_session_server_insert_batch_count.load(Ordering::Acquire),
+            "documents": self.index_session_server_insert_batch_documents.load(Ordering::Acquire),
+            "shards_touched_total": self.index_session_server_insert_batch_shards_touched.load(Ordering::Acquire),
+            "total_us": self.index_session_server_insert_batch_total_us.load(Ordering::Acquire),
+            "parse_us": self.index_session_server_insert_batch_parse_us.load(Ordering::Acquire),
+            "group_us": self.index_session_server_insert_batch_group_us.load(Ordering::Acquire),
+            "build_us": self.index_session_server_insert_batch_build_us.load(Ordering::Acquire),
+            "store_us": self.index_session_server_insert_batch_store_us.load(Ordering::Acquire),
+            "finalize_us": self.index_session_server_insert_batch_finalize_us.load(Ordering::Acquire),
+        });
         stats.insert(
             "index_session".to_owned(),
             json!({
@@ -2424,6 +2533,7 @@ impl ServerState {
                 "progress_percent": index_progress_percent,
                 "started_unix_ms": self.index_session_started_unix_ms.load(Ordering::Acquire),
                 "last_update_unix_ms": self.index_session_last_update_unix_ms.load(Ordering::Acquire),
+                "server_insert_batch_profile": index_server_insert_batch_profile,
             }),
         );
 
@@ -3136,6 +3246,8 @@ impl ServerState {
             .operation_gate
             .read()
             .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+        let started_total = Instant::now();
+        let started_parse = Instant::now();
         let mut parsed_documents = Vec::with_capacity(documents.len());
         for (idx, document) in documents.iter().enumerate() {
             parsed_documents.push(self.parse_candidate_insert_document(
@@ -3143,11 +3255,18 @@ impl ServerState {
                 &format!("request.payload.documents[{idx}]"),
             )?);
         }
+        let parse_elapsed = started_parse.elapsed();
+        let mut group_elapsed = Duration::ZERO;
+        let mut build_elapsed = Duration::ZERO;
+        let mut store_elapsed = Duration::ZERO;
+        let shards_touched;
 
         let mut results = vec![None; parsed_documents.len()];
         let work = self.work_store_set()?;
         if self.candidate_shard_count() == 1 {
+            shards_touched = usize::from(!parsed_documents.is_empty());
             let mut store = lock_candidate_store_with_timeout(&work.stores[0], 0, "insert batch")?;
+            let started_build = Instant::now();
             let batch = parsed_documents
                 .iter()
                 .map(|row| {
@@ -3170,6 +3289,8 @@ impl ServerState {
                     )
                 })
                 .collect::<Vec<_>>();
+            build_elapsed += started_build.elapsed();
+            let started_store = Instant::now();
             for (idx, result) in store
                 .insert_documents_batch(&batch)?
                 .into_iter()
@@ -3177,18 +3298,23 @@ impl ServerState {
             {
                 results[idx] = Some(Self::candidate_insert_response(result));
             }
+            store_elapsed += started_store.elapsed();
         } else {
+            let started_group = Instant::now();
             let mut grouped = HashMap::<usize, Vec<(usize, ParsedCandidateInsertDocument)>>::new();
             for (idx, row) in parsed_documents.into_iter().enumerate() {
                 let shard_idx = self.candidate_store_index_for_sha256(&row.0);
                 grouped.entry(shard_idx).or_default().push((idx, row));
             }
+            group_elapsed = started_group.elapsed();
+            shards_touched = grouped.len();
             for (shard_idx, rows) in grouped {
                 let mut store = lock_candidate_store_with_timeout(
                     &work.stores[shard_idx],
                     shard_idx,
                     "insert batch",
                 )?;
+                let started_build = Instant::now();
                 let batch = rows
                     .iter()
                     .map(|(_, row)| {
@@ -3211,14 +3337,18 @@ impl ServerState {
                         )
                     })
                     .collect::<Vec<_>>();
+                build_elapsed += started_build.elapsed();
+                let started_store = Instant::now();
                 for ((original_idx, _), result) in rows
                     .into_iter()
                     .zip(store.insert_documents_batch(&batch)?.into_iter())
                 {
                     results[original_idx] = Some(Self::candidate_insert_response(result));
                 }
+                store_elapsed += started_store.elapsed();
             }
         }
+        let started_finalize = Instant::now();
         let results = results.into_iter().flatten().collect::<Vec<_>>();
         if !results.is_empty() {
             self.mark_work_mutation();
@@ -3227,6 +3357,17 @@ impl ServerState {
             self.invalidate_search_caches();
         }
         self.record_index_session_insert_progress(results.len());
+        let finalize_elapsed = started_finalize.elapsed();
+        self.record_index_session_insert_batch_profile(
+            documents.len(),
+            shards_touched,
+            started_total.elapsed(),
+            parse_elapsed,
+            group_elapsed,
+            build_elapsed,
+            store_elapsed,
+            finalize_elapsed,
+        );
         Ok(CandidateInsertBatchResponse {
             inserted_count: results.len(),
             results,
@@ -4840,6 +4981,28 @@ mod tests {
                 .get("remaining_documents")
                 .and_then(Value::as_u64),
             Some(8)
+        );
+        let server_insert_batch_profile = index_session
+            .get("server_insert_batch_profile")
+            .and_then(Value::as_object)
+            .expect("server insert batch profile");
+        assert_eq!(
+            server_insert_batch_profile
+                .get("batches")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            server_insert_batch_profile
+                .get("documents")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            server_insert_batch_profile
+                .get("shards_touched_total")
+                .and_then(Value::as_u64),
+            Some(1)
         );
     }
 
