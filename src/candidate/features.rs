@@ -165,6 +165,84 @@ fn estimate_unique_grams_hll(
     Ok(hll_estimate(&registers, precision))
 }
 
+pub fn estimate_unique_grams_pair_hll(
+    path: impl AsRef<Path>,
+    first_gram_size: usize,
+    second_gram_size: usize,
+    chunk_size: usize,
+    precision: u8,
+) -> Result<(usize, usize)> {
+    if chunk_size == 0 {
+        return Err(TgsError::from("chunk_size must be > 0"));
+    }
+    if !(4..=18).contains(&precision) {
+        return Err(TgsError::from("precision must be in range 4..18"));
+    }
+    if first_gram_size == 0 || second_gram_size == 0 {
+        return Err(TgsError::from("gram_size must be > 0"));
+    }
+    if first_gram_size == second_gram_size {
+        let estimate = estimate_unique_grams_hll(path, first_gram_size, chunk_size, precision)?;
+        return Ok((estimate, estimate));
+    }
+
+    let mut first_registers = vec![0u8; 1usize << precision];
+    let mut second_registers = vec![0u8; 1usize << precision];
+    let max_gram_size = first_gram_size.max(second_gram_size);
+    let trailing_len = max_gram_size - 1;
+    let mut trailing = Vec::<u8>::new();
+    let mut saw_first = false;
+    let mut saw_second = false;
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; chunk_size];
+    loop {
+        let read_len = file.read(&mut buf)?;
+        if read_len == 0 {
+            break;
+        }
+        let mut data = trailing;
+        data.extend_from_slice(&buf[..read_len]);
+        if data.len() >= first_gram_size {
+            saw_first = true;
+            for idx in 0..=(data.len() - first_gram_size) {
+                hll_add(
+                    &mut first_registers,
+                    precision,
+                    pack_exact_gram(&data[idx..idx + first_gram_size]),
+                );
+            }
+        }
+        if data.len() >= second_gram_size {
+            saw_second = true;
+            for idx in 0..=(data.len() - second_gram_size) {
+                hll_add(
+                    &mut second_registers,
+                    precision,
+                    pack_exact_gram(&data[idx..idx + second_gram_size]),
+                );
+            }
+        }
+        trailing = if data.len() >= max_gram_size {
+            data[data.len() - trailing_len..].to_vec()
+        } else {
+            data
+        };
+    }
+
+    Ok((
+        if saw_first {
+            hll_estimate(&first_registers, precision)
+        } else {
+            0
+        },
+        if saw_second {
+            hll_estimate(&second_registers, precision)
+        } else {
+            0
+        },
+    ))
+}
+
 pub fn estimate_unique_grams_for_size_hll(
     path: impl AsRef<Path>,
     gram_size: usize,
@@ -1087,11 +1165,12 @@ mod tests {
     use super::{
         EntropyWindow, HLL_DEFAULT_PRECISION, bucket_selected_counter_name,
         bucket_window_counter_name, entropy_bucket, entropy_for_window,
-        estimate_unique_grams_for_size_hll, estimate_unique_grams4_hll, estimate_unique_grams5_hll,
-        estimate_unique_tier2_grams_hll, flush_entropy_window, iter_grams4_from_bytes,
-        iter_grams5_from_bytes, iter_tier2_grams_from_bytes, push_ready_window, push_unique,
-        resolve_collection_budget, scale_tier1_gram_budget, scan_file_features,
-        scan_file_features_with_tier2_gram_size, select_tier1_grams, split_evenly, split_weighted,
+        estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
+        estimate_unique_grams4_hll, estimate_unique_grams5_hll, estimate_unique_tier2_grams_hll,
+        flush_entropy_window, iter_grams4_from_bytes, iter_grams5_from_bytes,
+        iter_tier2_grams_from_bytes, push_ready_window, push_unique, resolve_collection_budget,
+        scale_tier1_gram_budget, scan_file_features, scan_file_features_with_tier2_gram_size,
+        select_tier1_grams, split_evenly, split_weighted,
     };
     use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, GramSizes};
 
@@ -1402,6 +1481,25 @@ mod tests {
             estimate_unique_tier2_grams_hll(&path, 3, 4, 5).expect("estimate secondary");
         assert!(estimate5 > 0);
         assert!(estimate_secondary > 0);
+    }
+
+    #[test]
+    fn paired_hll_estimate_matches_individual_estimates() {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("paired-hll.bin");
+        let payload = b"ABCDEFGHABCDEFGH12345678IJKLMNOP";
+        fs::write(&path, payload).expect("write");
+
+        let exact4 = estimate_unique_grams4_hll(&path, 8, 10).expect("exact4");
+        let exact5 = estimate_unique_grams5_hll(&path, 8, 10).expect("exact5");
+        let (paired4, paired5) = estimate_unique_grams_pair_hll(&path, 4, 5, 8, 10).expect("pair");
+        assert_eq!(paired4, exact4);
+        assert_eq!(paired5, exact5);
+
+        let (same_left, same_right) =
+            estimate_unique_grams_pair_hll(&path, 4, 4, 8, 10).expect("same");
+        assert_eq!(same_left, exact4);
+        assert_eq!(same_right, exact4);
     }
 
     #[test]

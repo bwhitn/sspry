@@ -11,10 +11,11 @@ pub use bloom::{BloomFilter, bloom_positions};
 pub use cache::BoundedCache;
 pub use features::{
     DocumentFeatures, HLL_DEFAULT_PRECISION, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams4_hll, estimate_unique_grams5_hll, estimate_unique_tier2_grams_hll,
-    iter_grams_from_bytes_exact_u64, iter_grams4_from_bytes, iter_grams5_from_bytes,
-    iter_tier2_grams_from_bytes, scan_file_features, scan_file_features_with_gram_sizes,
-    scan_file_features_with_tier2_gram_size, select_tier1_grams,
+    estimate_unique_grams_pair_hll, estimate_unique_grams4_hll, estimate_unique_grams5_hll,
+    estimate_unique_tier2_grams_hll, iter_grams_from_bytes_exact_u64, iter_grams4_from_bytes,
+    iter_grams5_from_bytes, iter_tier2_grams_from_bytes, scan_file_features,
+    scan_file_features_with_gram_sizes, scan_file_features_with_tier2_gram_size,
+    select_tier1_grams,
 };
 pub use grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, exact_gram_to_le_bytes,

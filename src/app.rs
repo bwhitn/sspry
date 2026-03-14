@@ -25,8 +25,8 @@ use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, GramSizes, HLL_DEFAULT_PRECISION,
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
-    encode_grams_delta_u64, estimate_unique_grams_for_size_hll, read_candidate_shard_count,
-    scan_file_features_with_gram_sizes,
+    encode_grams_delta_u64, estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
+    read_candidate_shard_count, scan_file_features_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -1071,27 +1071,34 @@ struct ScanPolicy {
 }
 
 fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBatchRow> {
-    let resolved_path = resolved_file_path(file_path)?;
-    let file_size = file_path.metadata()?.len();
-    let gram_count_estimate = if policy.filter_target_fp.is_some() {
-        Some(estimate_unique_grams_for_size_hll(
-            file_path,
-            policy.gram_sizes.tier1,
-            policy.chunk_size,
-            HLL_DEFAULT_PRECISION,
-        )?)
+    let resolved_path = if policy.store_path {
+        Some(resolved_file_path(file_path)?)
     } else {
         None
     };
-    let tier2_gram_count_estimate = if policy.filter_target_fp.is_some() {
-        Some(estimate_unique_grams_for_size_hll(
-            file_path,
-            policy.gram_sizes.tier2,
-            policy.chunk_size,
-            HLL_DEFAULT_PRECISION,
-        )?)
+    let scan_path = resolved_path.as_deref().unwrap_or(file_path);
+    let file_size = scan_path.metadata()?.len();
+    let (gram_count_estimate, tier2_gram_count_estimate) = if policy.filter_target_fp.is_some() {
+        if policy.gram_sizes.tier1 == policy.gram_sizes.tier2 {
+            let estimate = estimate_unique_grams_for_size_hll(
+                scan_path,
+                policy.gram_sizes.tier1,
+                policy.chunk_size,
+                HLL_DEFAULT_PRECISION,
+            )?;
+            (Some(estimate), Some(estimate))
+        } else {
+            let (tier1_estimate, tier2_estimate) = estimate_unique_grams_pair_hll(
+                scan_path,
+                policy.gram_sizes.tier1,
+                policy.gram_sizes.tier2,
+                policy.chunk_size,
+                HLL_DEFAULT_PRECISION,
+            )?;
+            (Some(tier1_estimate), Some(tier2_estimate))
+        }
     } else {
-        None
+        (None, None)
     };
     let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         value
@@ -1128,7 +1135,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     );
     let started = Instant::now();
     let features = scan_file_features_with_gram_sizes(
-        file_path,
+        scan_path,
         policy.gram_sizes,
         filter_bytes,
         bloom_hashes,
@@ -1144,7 +1151,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     )?;
     perf::record_sample(
         "candidate.scan_file_features.file",
-        resolved_path.display().to_string(),
+        scan_path.display().to_string(),
         started.elapsed().as_nanos(),
         file_size,
         features.unique_grams.len() as u64,
@@ -1153,7 +1160,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         sha256: if policy.id_source == CandidateIdSource::Sha256 {
             features.sha256
         } else {
-            identity_from_file(file_path, policy.chunk_size, policy.id_source)?
+            identity_from_file(scan_path, policy.chunk_size, policy.id_source)?
         },
         file_size: features.file_size,
         filter_bytes,
@@ -1167,11 +1174,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         grams: features.unique_grams,
         grams_complete: !features.unique_grams_truncated,
         effective_diversity: features.effective_diversity,
-        external_id: if policy.store_path {
-            Some(resolved_path.display().to_string())
-        } else {
-            None
-        },
+        external_id: resolved_path.map(|path| path.display().to_string()),
     })
 }
 
