@@ -17,7 +17,7 @@ use crate::candidate::features::scale_tier1_gram_budget;
 use crate::candidate::filter_policy::{
     choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
-use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
+use crate::candidate::grams::{GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, TgsError};
@@ -62,10 +62,7 @@ impl DfCountsState {
                 None
             } else {
                 Some(unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-                    TgsError::from(format!(
-                        "Failed to mmap {}: {err}",
-                        snapshot_path.display()
-                    ))
+                    TgsError::from(format!("Failed to mmap {}: {err}", snapshot_path.display()))
                 })?)
             }
         } else {
@@ -156,7 +153,8 @@ impl DfCountsState {
     }
 
     fn materialize(&self) -> HashMap<u64, usize> {
-        let mut counts = HashMap::<u64, usize>::with_capacity(self.snapshot_rows + self.delta.len());
+        let mut counts =
+            HashMap::<u64, usize>::with_capacity(self.snapshot_rows + self.delta.len());
         if let Some(snapshot) = &self.snapshot {
             let row_bytes = self.gram_bytes + 4;
             for chunk in snapshot.chunks_exact(row_bytes) {
@@ -287,6 +285,11 @@ pub struct CandidateStats {
     pub tier2_match_ratio: f64,
     pub tier2_superblock_count: usize,
     pub tier2_superblock_docs: usize,
+    pub tier2_superblock_summary_bytes: u64,
+    pub tier2_superblock_memory_budget_bytes: u64,
+    pub df_counts_delta_bytes: u64,
+    pub df_counts_delta_entries: usize,
+    pub df_counts_delta_compact_threshold_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -339,7 +342,11 @@ impl Default for StoreMeta {
 
 impl StoreMeta {
     fn exact_gram_bytes(&self) -> usize {
-        if self.tier1_gram_size <= 4 { 4 } else { 8 }
+        if self.tier1_gram_size <= 4 {
+            4
+        } else {
+            8
+        }
     }
 }
 
@@ -381,6 +388,11 @@ struct LegacyCandidateDoc {
 const DOC_META_ROW_BYTES: usize = 64;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const DF_COUNTS_DELTA_MEMORY_BUDGET_DIVISOR: u64 = 16;
+const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
+const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_GRAMS_COMPLETE: u8 = 0x01;
 const DOC_FLAG_DELETED: u8 = 0x02;
 
@@ -596,8 +608,10 @@ impl StoreSidecars {
 struct Tier2SuperblockIndex {
     docs_per_block: usize,
     keys_per_block: Vec<Vec<(usize, usize)>>,
-    summary_bytes_by_key: BTreeMap<(usize, usize), usize>,
-    masks_by_key: BTreeMap<(usize, usize), Vec<Vec<u8>>>,
+    bucket_for_key: BTreeMap<(usize, usize), (usize, usize)>,
+    summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
+    masks_by_bucket: BTreeMap<(usize, usize), Vec<Vec<u8>>>,
+    summary_memory_bytes: u64,
 }
 
 impl Default for Tier2SuperblockIndex {
@@ -605,8 +619,10 @@ impl Default for Tier2SuperblockIndex {
         Self {
             docs_per_block: DEFAULT_TIER2_SUPERBLOCK_DOCS,
             keys_per_block: Vec::new(),
-            summary_bytes_by_key: BTreeMap::new(),
-            masks_by_key: BTreeMap::new(),
+            bucket_for_key: BTreeMap::new(),
+            summary_bytes_by_bucket: BTreeMap::new(),
+            masks_by_bucket: BTreeMap::new(),
+            summary_memory_bytes: 0,
         }
     }
 }
@@ -697,6 +713,48 @@ fn tier2_superblock_summary_bytes(filter_bytes: usize) -> usize {
     filter_bytes.max(1).min(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
 }
 
+const TIER2_SUPERBLOCK_FILTER_BUCKETS: &[usize] = &[
+    1 << 10,
+    2 << 10,
+    4 << 10,
+    8 << 10,
+    12 << 10,
+    16 << 10,
+    24 << 10,
+    32 << 10,
+    48 << 10,
+    64 << 10,
+    96 << 10,
+    128 << 10,
+    192 << 10,
+    256 << 10,
+    384 << 10,
+    512 << 10,
+    768 << 10,
+    1 << 20,
+];
+
+fn tier2_superblock_filter_bucket(filter_bytes: usize) -> usize {
+    let filter_bytes = filter_bytes.max(1);
+    for bucket in TIER2_SUPERBLOCK_FILTER_BUCKETS {
+        if filter_bytes <= *bucket {
+            return *bucket;
+        }
+    }
+    let mut bucket = *TIER2_SUPERBLOCK_FILTER_BUCKETS.last().unwrap_or(&(1 << 20));
+    while bucket < filter_bytes {
+        bucket = bucket.saturating_mul(2);
+        if bucket == usize::MAX {
+            break;
+        }
+    }
+    bucket.max(filter_bytes.next_power_of_two())
+}
+
+fn tier2_superblock_bucket_key(filter_bytes: usize, bloom_hashes: usize) -> (usize, usize) {
+    (tier2_superblock_filter_bucket(filter_bytes), bloom_hashes)
+}
+
 fn fold_bloom_masks(required_masks: &[(usize, u8)], summary_bytes: usize) -> Vec<(usize, u8)> {
     let mut folded = BTreeMap::<usize, u8>::new();
     let summary_bytes = summary_bytes.max(1);
@@ -778,6 +836,11 @@ pub struct CandidateStore {
     tier2_superblocks: Tier2SuperblockIndex,
     tier2_telemetry: Tier2Telemetry,
     prepared_query_cache: BoundedCache<String, Arc<PreparedQueryArtifacts>>,
+    memory_budget_bytes: u64,
+    total_shards: usize,
+    tier2_superblock_memory_budget_divisor: u64,
+    tier2_superblock_memory_budget_bytes: u64,
+    df_counts_delta_compact_threshold_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -840,6 +903,45 @@ fn paginate_query_hits(
     let next_cursor = if end < total { Some(end) } else { None };
 
     (page, page_scores, total, start, end, next_cursor)
+}
+
+fn df_counts_delta_compact_threshold_bytes(memory_budget_bytes: u64, total_shards: usize) -> u64 {
+    if memory_budget_bytes == 0 || total_shards == 0 {
+        return DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES;
+    }
+    let aggregate_budget = memory_budget_bytes / DF_COUNTS_DELTA_MEMORY_BUDGET_DIVISOR;
+    let per_shard_budget = aggregate_budget / total_shards as u64;
+    per_shard_budget.clamp(
+        MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+        MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+    )
+}
+
+fn tier2_superblock_memory_budget_bytes(
+    memory_budget_bytes: u64,
+    total_shards: usize,
+    budget_divisor: u64,
+) -> u64 {
+    if memory_budget_bytes == 0 || total_shards == 0 {
+        return 0;
+    }
+    let aggregate_budget = memory_budget_bytes / budget_divisor.max(1);
+    let per_shard_budget = aggregate_budget / total_shards as u64;
+    per_shard_budget.max(MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES)
+}
+
+fn scaled_docs_per_block_for_budget(
+    current_docs_per_block: usize,
+    summary_memory_bytes: u64,
+    budget_bytes: u64,
+) -> usize {
+    let current_docs_per_block = current_docs_per_block.max(1);
+    if budget_bytes == 0 || summary_memory_bytes <= budget_bytes {
+        return current_docs_per_block;
+    }
+    let required_scale = summary_memory_bytes.div_ceil(budget_bytes);
+    let scale = required_scale.next_power_of_two();
+    current_docs_per_block.saturating_mul(usize::try_from(scale).unwrap_or(usize::MAX))
 }
 
 impl CandidateStore {
@@ -934,6 +1036,11 @@ impl CandidateStore {
             tier2_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
+            memory_budget_bytes: 0,
+            total_shards: 1,
+            tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
+            tier2_superblock_memory_budget_bytes: 0,
+            df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
         };
         store.df_counts = DfCountsState::load(&config.root, store.meta.exact_gram_bytes())?;
         store.persist_meta()?;
@@ -973,9 +1080,34 @@ impl CandidateStore {
             tier2_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
+            memory_budget_bytes: 0,
+            total_shards: 1,
+            tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
+            tier2_superblock_memory_budget_bytes: 0,
+            df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
         };
         store.rebuild_indexes()?;
         Ok(store)
+    }
+
+    pub fn apply_runtime_limits(
+        &mut self,
+        memory_budget_bytes: u64,
+        total_shards: usize,
+        tier2_superblock_memory_budget_divisor: u64,
+    ) -> Result<()> {
+        self.memory_budget_bytes = memory_budget_bytes;
+        self.total_shards = total_shards.max(1);
+        self.tier2_superblock_memory_budget_divisor = tier2_superblock_memory_budget_divisor.max(1);
+        self.tier2_superblock_memory_budget_bytes = tier2_superblock_memory_budget_bytes(
+            memory_budget_bytes,
+            self.total_shards,
+            self.tier2_superblock_memory_budget_divisor,
+        );
+        self.df_counts_delta_compact_threshold_bytes =
+            df_counts_delta_compact_threshold_bytes(memory_budget_bytes, self.total_shards);
+        self.maybe_compact_df_counts()?;
+        self.maybe_rebalance_tier2_superblocks()
     }
 
     pub fn config(&self) -> CandidateConfig {
@@ -1126,7 +1258,7 @@ impl CandidateStore {
             return Err(err);
         }
 
-        let reopened = match CandidateStore::open(&root) {
+        let mut reopened = match CandidateStore::open(&root) {
             Ok(store) => store,
             Err(err) => {
                 let _ = fs::remove_dir_all(&root);
@@ -1134,6 +1266,15 @@ impl CandidateStore {
                 return Err(err);
             }
         };
+        if let Err(err) = reopened.apply_runtime_limits(
+            self.memory_budget_bytes,
+            self.total_shards,
+            self.tier2_superblock_memory_budget_divisor,
+        ) {
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::rename(&retired_root, &root);
+            return Err(err);
+        }
         *self = reopened;
 
         Ok(Some(CandidateCompactionResult {
@@ -1536,11 +1677,7 @@ impl CandidateStore {
             status = "inserted".to_owned();
         }
 
-        append_df_count_deltas(
-            &self.root,
-            self.meta.exact_gram_bytes(),
-            &df_deltas,
-        )?;
+        append_df_count_deltas(&self.root, self.meta.exact_gram_bytes(), &df_deltas)?;
         self.maybe_compact_df_counts()?;
 
         self.mark_write_activity();
@@ -1663,11 +1800,7 @@ impl CandidateStore {
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
             self.rebuild_tier2_superblocks()?;
-            append_df_count_deltas(
-                &self.root,
-                self.meta.exact_gram_bytes(),
-                &df_deltas,
-            )?;
+            append_df_count_deltas(&self.root, self.meta.exact_gram_bytes(), &df_deltas)?;
             self.maybe_compact_df_counts()?;
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
@@ -1863,6 +1996,11 @@ impl CandidateStore {
             tier2_match_ratio,
             tier2_superblock_count: self.tier2_superblocks.keys_per_block.len(),
             tier2_superblock_docs: self.tier2_superblocks.docs_per_block,
+            tier2_superblock_summary_bytes: self.tier2_superblocks.summary_memory_bytes,
+            tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
+            df_counts_delta_bytes: current_df_counts_delta_bytes(&self.root),
+            df_counts_delta_entries: self.df_counts.delta.len(),
+            df_counts_delta_compact_threshold_bytes: self.df_counts_delta_compact_threshold_bytes,
         }
     }
 
@@ -1886,7 +2024,7 @@ impl CandidateStore {
 
     pub(crate) fn tier2_filter_keys(&self) -> Vec<(usize, usize)> {
         self.tier2_superblocks
-            .masks_by_key
+            .bucket_for_key
             .keys()
             .copied()
             .collect::<Vec<_>>()
@@ -2003,7 +2141,7 @@ impl CandidateStore {
             Ok(metadata) => metadata.len(),
             Err(_) => 0,
         };
-        if len >= DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES {
+        if len >= self.df_counts_delta_compact_threshold_bytes {
             self.persist_df_counts_snapshot()?;
             self.df_counts.refresh_snapshot(&self.root)?;
         }
@@ -2122,17 +2260,25 @@ impl CandidateStore {
                 .resize_with(needed_blocks, Vec::new);
         }
         let filter_key = (filter_bytes, bloom_hashes);
-        let summary_bytes = tier2_superblock_summary_bytes(filter_bytes);
+        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+        let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0);
         self.tier2_superblocks
-            .summary_bytes_by_key
-            .insert(filter_key, summary_bytes);
+            .bucket_for_key
+            .insert(filter_key, bucket_key);
+        self.tier2_superblocks
+            .summary_bytes_by_bucket
+            .insert(bucket_key, summary_bytes);
         let blocks = self
             .tier2_superblocks
-            .masks_by_key
-            .entry(filter_key)
+            .masks_by_bucket
+            .entry(bucket_key)
             .or_insert_with(Vec::new);
         while blocks.len() < needed_blocks {
             blocks.push(vec![0u8; summary_bytes]);
+            self.tier2_superblocks.summary_memory_bytes = self
+                .tier2_superblocks
+                .summary_memory_bytes
+                .saturating_add(summary_bytes as u64);
         }
         let keys = &mut self.tier2_superblocks.keys_per_block[block_idx];
         if !keys.contains(&filter_key) {
@@ -2141,7 +2287,7 @@ impl CandidateStore {
         }
     }
 
-    fn update_tier2_superblocks_for_doc(&mut self, pos: usize) -> Result<()> {
+    fn update_tier2_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
         if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
@@ -2157,11 +2303,8 @@ impl CandidateStore {
             "bloom",
             doc_id,
         )?;
-        if let Some(blocks) = self
-            .tier2_superblocks
-            .masks_by_key
-            .get_mut(&(filter_bytes, bloom_hashes))
-        {
+        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+        if let Some(blocks) = self.tier2_superblocks.masks_by_bucket.get_mut(&bucket_key) {
             if let Some(block) = blocks.get_mut(block_idx) {
                 let summary_bytes = block.len().max(1);
                 for (source_idx, src) in bloom_bytes.iter().copied().enumerate() {
@@ -2173,12 +2316,44 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn rebuild_tier2_superblocks(&mut self) -> Result<()> {
-        self.tier2_superblocks = Tier2SuperblockIndex::default();
+    fn update_tier2_superblocks_for_doc(&mut self, pos: usize) -> Result<()> {
+        self.update_tier2_superblocks_for_doc_inner(pos)?;
+        self.maybe_rebalance_tier2_superblocks()
+    }
+
+    fn rebuild_tier2_superblocks_with_docs_per_block(
+        &mut self,
+        docs_per_block: usize,
+    ) -> Result<()> {
+        self.tier2_superblocks = Tier2SuperblockIndex {
+            docs_per_block: docs_per_block.max(1),
+            ..Tier2SuperblockIndex::default()
+        };
         for pos in 0..self.docs.len() {
-            self.update_tier2_superblocks_for_doc(pos)?;
+            self.update_tier2_superblocks_for_doc_inner(pos)?;
         }
         Ok(())
+    }
+
+    fn maybe_rebalance_tier2_superblocks(&mut self) -> Result<()> {
+        let budget_bytes = self.tier2_superblock_memory_budget_bytes;
+        let current_bytes = self.tier2_superblocks.summary_memory_bytes;
+        if budget_bytes == 0 || current_bytes <= budget_bytes {
+            return Ok(());
+        }
+        let target_docs_per_block = scaled_docs_per_block_for_budget(
+            self.tier2_superblocks.docs_per_block,
+            current_bytes,
+            budget_bytes,
+        );
+        if target_docs_per_block <= self.tier2_superblocks.docs_per_block {
+            return Ok(());
+        }
+        self.rebuild_tier2_superblocks_with_docs_per_block(target_docs_per_block)
+    }
+
+    fn rebuild_tier2_superblocks(&mut self) -> Result<()> {
+        self.rebuild_tier2_superblocks_with_docs_per_block(self.tier2_superblocks.docs_per_block)
     }
 
     fn record_query_metrics(
@@ -2676,6 +2851,12 @@ fn persist_df_counts_snapshot_to_root(
     Ok(())
 }
 
+fn current_df_counts_delta_bytes(root: &Path) -> u64 {
+    fs::metadata(df_counts_delta_path(root))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
 fn append_df_count_deltas(root: &Path, gram_bytes: usize, deltas: &[(u64, i32)]) -> Result<()> {
     if deltas.is_empty() {
         return Ok(());
@@ -3121,9 +3302,10 @@ fn build_pattern_mask_cache(
                     *bloom_hashes,
                     &mut tier1_gram_cache,
                 )?;
+                let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
                 superblock_by_key.insert(
                     (*filter_bytes, *bloom_hashes),
-                    fold_bloom_masks(&required, tier2_superblock_summary_bytes(*filter_bytes)),
+                    fold_bloom_masks(&required, tier2_superblock_summary_bytes(summary_bucket.0)),
                 );
                 by_key.insert((*filter_bytes, *bloom_hashes), required);
             }
@@ -3200,7 +3382,10 @@ fn block_matches_pattern(
             let Some(required) = by_key.get(filter_key) else {
                 return false;
             };
-            let Some(blocks) = superblocks.masks_by_key.get(filter_key) else {
+            let Some(bucket_key) = superblocks.bucket_for_key.get(filter_key) else {
+                return false;
+            };
+            let Some(blocks) = superblocks.masks_by_bucket.get(bucket_key) else {
                 return false;
             };
             let Some(block) = blocks.get(block_idx) else {
@@ -3499,8 +3684,8 @@ mod tests {
 
     use crate::candidate::BloomFilter;
     use crate::candidate::{
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, pack_exact_gram,
-        query_plan::compile_query_plan,
+        pack_exact_gram, query_plan::compile_query_plan, DEFAULT_TIER1_GRAM_SIZE,
+        DEFAULT_TIER2_GRAM_SIZE,
     };
 
     use super::*;
@@ -3848,13 +4033,11 @@ rule q {
 
         let manifest = ShardCompactionManifest {
             current_generation: 7,
-            retired_roots: vec![
-                retired_root
-                    .file_name()
-                    .expect("retired file name")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
+            retired_roots: vec![retired_root
+                .file_name()
+                .expect("retired file name")
+                .to_string_lossy()
+                .into_owned()],
         };
         fs::create_dir_all(&retired_root).expect("create retired root");
         write_shard_compaction_manifest(&root, &manifest).expect("write manifest");
@@ -3966,12 +4149,10 @@ rule q {
         )
         .expect("insert third");
 
-        assert!(
-            store
-                .apply_compaction_snapshot(&snapshot, &compacted_root)
-                .expect("apply compaction")
-                .is_none()
-        );
+        assert!(store
+            .apply_compaction_snapshot(&snapshot, &compacted_root)
+            .expect("apply compaction")
+            .is_none());
         assert_eq!(store.stats().doc_count, 2);
         assert_eq!(store.stats().deleted_doc_count, 1);
         let _ = fs::remove_dir_all(compacted_root);
@@ -3997,12 +4178,10 @@ rule q {
         bloom.add(0x4443_4241).expect("add gram");
         let bloom_bytes = bloom.into_bytes();
 
-        assert!(
-            store
-                .prepare_compaction_snapshot(false)
-                .expect("snapshot without deletes")
-                .is_none()
-        );
+        assert!(store
+            .prepare_compaction_snapshot(false)
+            .expect("snapshot without deletes")
+            .is_none());
 
         insert_primary(
             &mut store,
@@ -4022,18 +4201,14 @@ rule q {
             .delete_document(&hex::encode([0x11; 32]))
             .expect("delete");
 
-        assert!(
-            store
-                .prepare_compaction_snapshot(false)
-                .expect("cooldown snapshot")
-                .is_none()
-        );
-        assert!(
-            store
-                .prepare_compaction_snapshot(true)
-                .expect("forced snapshot")
-                .is_some()
-        );
+        assert!(store
+            .prepare_compaction_snapshot(false)
+            .expect("cooldown snapshot")
+            .is_none());
+        assert!(store
+            .prepare_compaction_snapshot(true)
+            .expect("forced snapshot")
+            .is_some());
     }
 
     #[test]
@@ -4215,80 +4390,66 @@ rule q {
             true,
         )
         .expect("init");
-        assert!(
-            CandidateStore::init(
-                CandidateConfig {
-                    root: root.clone(),
-                    ..CandidateConfig::default()
-                },
-                false
-            )
-            .expect_err("existing store")
-            .to_string()
-            .contains("already exists")
-        );
+        assert!(CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            false
+        )
+        .expect_err("existing store")
+        .to_string()
+        .contains("already exists"));
 
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                df_min: 0,
-                ..CandidateConfig::default()
-            })
-            .expect_err("positive config")
-            .to_string()
-            .contains("must be positive")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                df_min: 2,
-                df_max: 1,
-                ..CandidateConfig::default()
-            })
-            .expect_err("df order")
-            .to_string()
-            .contains("df_max")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                id_source: "filepath".to_owned(),
-                ..CandidateConfig::default()
-            })
-            .expect_err("id source")
-            .to_string()
-            .contains("id_source")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                filter_target_fp: Some(1.0),
-                ..CandidateConfig::default()
-            })
-            .expect_err("target fp")
-            .to_string()
-            .contains("filter_target_fp")
-        );
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            df_min: 0,
+            ..CandidateConfig::default()
+        })
+        .expect_err("positive config")
+        .to_string()
+        .contains("must be positive"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            df_min: 2,
+            df_max: 1,
+            ..CandidateConfig::default()
+        })
+        .expect_err("df order")
+        .to_string()
+        .contains("df_max"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            id_source: "filepath".to_owned(),
+            ..CandidateConfig::default()
+        })
+        .expect_err("id source")
+        .to_string()
+        .contains("id_source"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            filter_target_fp: Some(1.0),
+            ..CandidateConfig::default()
+        })
+        .expect_err("target fp")
+        .to_string()
+        .contains("filter_target_fp"));
         assert_eq!(
             normalize_sha256_hex(&format!("  {}  ", "AB".repeat(32))).expect("normalize"),
             "ab".repeat(32)
         );
-        assert!(
-            normalize_sha256_hex("not-a-sha")
-                .expect_err("invalid sha")
-                .to_string()
-                .contains("64 hexadecimal")
-        );
+        assert!(normalize_sha256_hex("not-a-sha")
+            .expect_err("invalid sha")
+            .to_string()
+            .contains("64 hexadecimal"));
 
         let open_root = tmp.path().join("open_checks");
         fs::create_dir_all(&open_root).expect("open root");
         fs::write(meta_path(&open_root), b"{").expect("bad meta");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("invalid meta")
-                .to_string()
-                .contains("Invalid candidate metadata")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("invalid meta")
+            .to_string()
+            .contains("Invalid candidate metadata"));
 
         let bad_version = StoreMeta {
             version: STORE_VERSION + 1,
@@ -4299,12 +4460,10 @@ rule q {
             serde_json::to_vec_pretty(&bad_version).expect("version json"),
         )
         .expect("write version");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("unsupported version")
-                .to_string()
-                .contains("Unsupported candidate store version")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("unsupported version")
+            .to_string()
+            .contains("Unsupported candidate store version"));
 
         fs::write(
             meta_path(&open_root),
@@ -4315,12 +4474,10 @@ rule q {
         assert_eq!(opened.stats().doc_count, 0);
 
         fs::write(docs_path(&open_root), b"{").expect("bad docs");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("invalid docs")
-                .to_string()
-                .contains("Invalid candidate document state")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("invalid docs")
+            .to_string()
+            .contains("Invalid candidate document state"));
     }
 
     #[test]
@@ -4416,12 +4573,10 @@ rule q {
 
         let invalid_log = tmp.path().join("invalid_log.jsonl");
         fs::write(&invalid_log, b"{\n").expect("write invalid log");
-        assert!(
-            load_candidate_docs_log(&invalid_log)
-                .expect_err("invalid log")
-                .to_string()
-                .contains("Invalid candidate document log")
-        );
+        assert!(load_candidate_docs_log(&invalid_log)
+            .expect_err("invalid log")
+            .to_string()
+            .contains("Invalid candidate document log"));
     }
 
     #[test]
@@ -4442,22 +4597,18 @@ rule q {
         let invalid_len_root = tmp.path().join("invalid_len_root");
         persist_docs_as_binary(&invalid_len_root, &docs, 4).expect("persist invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
-        assert!(
-            load_candidate_binary_store(&invalid_len_root)
-                .expect_err("invalid binary len")
-                .to_string()
-                .contains("Invalid candidate binary document state")
-        );
+        assert!(load_candidate_binary_store(&invalid_len_root)
+            .expect_err("invalid binary len")
+            .to_string()
+            .contains("Invalid candidate binary document state"));
 
         let mismatch_root = tmp.path().join("mismatch_root");
         persist_docs_as_binary(&mismatch_root, &docs, 4).expect("persist mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
-        assert!(
-            load_candidate_binary_store(&mismatch_root)
-                .expect_err("mismatch state")
-                .to_string()
-                .contains("Mismatched candidate binary document state")
-        );
+        assert!(load_candidate_binary_store(&mismatch_root)
+            .expect_err("mismatch state")
+            .to_string()
+            .contains("Mismatched candidate binary document state"));
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
         persist_docs_as_binary(&invalid_bloom_root, &docs, 4).expect("persist invalid bloom root");
@@ -4471,12 +4622,10 @@ rule q {
             serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
-        assert!(
-            CandidateStore::open(&invalid_bloom_root)
-                .expect_err("invalid bloom offset")
-                .to_string()
-                .contains("Invalid bloom payload stored")
-        );
+        assert!(CandidateStore::open(&invalid_bloom_root)
+            .expect_err("invalid bloom offset")
+            .to_string()
+            .contains("Invalid bloom payload stored"));
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
         persist_docs_as_binary(&invalid_utf8_root, &docs, 4).expect("persist invalid utf8 root");
@@ -4486,14 +4635,12 @@ rule q {
             serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad utf8 meta"),
         )
         .expect("write bad utf8 meta");
-        assert!(
-            CandidateStore::open(&invalid_utf8_root)
-                .expect("open utf8 root")
-                .doc_external_id(0)
-                .expect_err("invalid external id utf8")
-                .to_string()
-                .contains("Invalid external_id payload stored")
-        );
+        assert!(CandidateStore::open(&invalid_utf8_root)
+            .expect("open utf8 root")
+            .doc_external_id(0)
+            .expect_err("invalid external id utf8")
+            .to_string()
+            .contains("Invalid external_id payload stored"));
     }
 
     #[test]
@@ -4525,12 +4672,10 @@ rule q {
         assert_eq!(decoded.grams_indexed_count, row.grams_indexed_count);
         assert_eq!(decoded.external_id_offset, row.external_id_offset);
         assert_eq!(decoded.external_id_len, row.external_id_len);
-        assert!(
-            DocMetaRow::decode(&encoded[..encoded.len() - 1])
-                .expect_err("short row")
-                .to_string()
-                .contains("Invalid candidate doc meta row size")
-        );
+        assert!(DocMetaRow::decode(&encoded[..encoded.len() - 1])
+            .expect_err("short row")
+            .to_string()
+            .contains("Invalid candidate doc meta row size"));
 
         let tmp = tempdir().expect("tmp");
         let blob_path = tmp.path().join("blob.bin");
@@ -4546,12 +4691,10 @@ rule q {
         write_at(blob_path.clone(), 1, b"Z").expect("write at");
         bytes = fs::read(&blob_path).expect("re-read blob file");
         assert_eq!(&bytes, b"aZcde");
-        assert!(
-            read_blob(&bytes, 99, 1, "blob", 1)
-                .expect_err("invalid blob range")
-                .to_string()
-                .contains("Invalid blob payload stored")
-        );
+        assert!(read_blob(&bytes, 99, 1, "blob", 1)
+            .expect_err("invalid blob range")
+            .to_string()
+            .contains("Invalid blob payload stored"));
 
         let u32_path = tmp.path().join("u32.bin");
         let offset = append_u32_slice(u32_path.clone(), &[7, 8, 9]).expect("append u32");
@@ -4560,12 +4703,10 @@ rule q {
             read_u32_vec(&u32_bytes, offset, 3, "grams", 9).expect("read u32 vec"),
             vec![7, 8, 9]
         );
-        assert!(
-            read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
-                .expect_err("invalid u32 range")
-                .to_string()
-                .contains("Invalid grams payload stored")
-        );
+        assert!(read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
+            .expect_err("invalid u32 range")
+            .to_string()
+            .contains("Invalid grams payload stored"));
     }
 
     #[test]
@@ -4582,52 +4723,48 @@ rule q {
         )
         .expect("init");
 
-        assert!(
-            store
-                .insert_document(
-                    [0x10; 32],
-                    8,
-                    None,
-                    None,
-                    None,
-                    None,
-                    0,
-                    &[],
-                    0,
-                    &[],
-                    &[],
-                    true,
-                    None,
-                    None,
-                    true,
-                )
-                .expect_err("zero filter bytes")
-                .to_string()
-                .contains("filter_bytes must be > 0")
-        );
-        assert!(
-            store
-                .insert_document(
-                    [0x10; 32],
-                    8,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1024,
-                    &vec![0u8; 32],
-                    0,
-                    &[],
-                    &[],
-                    true,
-                    None,
-                    None,
-                    true,
-                )
-                .expect_err("length mismatch")
-                .to_string()
-                .contains("bloom_filter length")
-        );
+        assert!(store
+            .insert_document(
+                [0x10; 32],
+                8,
+                None,
+                None,
+                None,
+                None,
+                0,
+                &[],
+                0,
+                &[],
+                &[],
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect_err("zero filter bytes")
+            .to_string()
+            .contains("filter_bytes must be > 0"));
+        assert!(store
+            .insert_document(
+                [0x10; 32],
+                8,
+                None,
+                None,
+                None,
+                None,
+                1024,
+                &vec![0u8; 32],
+                0,
+                &[],
+                &[],
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect_err("length mismatch")
+            .to_string()
+            .contains("bloom_filter length"));
 
         let inserted = insert_primary(
             &mut store,
@@ -5059,48 +5196,44 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1+tier2");
         assert!(outcome.score > 0);
 
-        assert!(
-            evaluate_node(
-                &QueryNode {
-                    kind: "n_of".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &doc,
-                &indexed,
-                &bloom_bytes,
-                tier2_bloom_bytes,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                &mut QueryEvalCache::default(),
-            )
-            .expect_err("missing threshold")
-            .to_string()
-            .contains("requires threshold")
-        );
-        assert!(
-            evaluate_node(
-                &QueryNode {
-                    kind: "bogus".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &doc,
-                &indexed,
-                &bloom_bytes,
-                tier2_bloom_bytes,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                &mut QueryEvalCache::default(),
-            )
-            .expect_err("unsupported kind")
-            .to_string()
-            .contains("Unsupported ast node kind")
-        );
+        assert!(evaluate_node(
+            &QueryNode {
+                kind: "n_of".to_owned(),
+                pattern_id: None,
+                threshold: None,
+                children: Vec::new(),
+            },
+            &doc,
+            &indexed,
+            &bloom_bytes,
+            tier2_bloom_bytes,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            &mut QueryEvalCache::default(),
+        )
+        .expect_err("missing threshold")
+        .to_string()
+        .contains("requires threshold"));
+        assert!(evaluate_node(
+            &QueryNode {
+                kind: "bogus".to_owned(),
+                pattern_id: None,
+                threshold: None,
+                children: Vec::new(),
+            },
+            &doc,
+            &indexed,
+            &bloom_bytes,
+            tier2_bloom_bytes,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            &mut QueryEvalCache::default(),
+        )
+        .expect_err("unsupported kind")
+        .to_string()
+        .contains("Unsupported ast node kind"));
     }
 
     #[test]
@@ -5198,7 +5331,11 @@ rule q {
 
     #[test]
     fn folded_superblock_masks_preserve_required_bits() {
-        let required = vec![(0usize, 0b0000_0011), (4096usize, 0b0000_0100), (8193usize, 0b1000_0000)];
+        let required = vec![
+            (0usize, 0b0000_0011),
+            (4096usize, 0b0000_0100),
+            (8193usize, 0b1000_0000),
+        ];
         let folded = fold_bloom_masks(&required, 4096);
         let folded_map = folded.into_iter().collect::<BTreeMap<_, _>>();
         assert_eq!(folded_map.get(&0).copied(), Some(0b0000_0111));
@@ -5226,7 +5363,8 @@ rule q {
         assert!(filter_bytes > MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
-        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("primary bloom");
+        let mut primary_bloom =
+            BloomFilter::new(filter_bytes, bloom_hashes).expect("primary bloom");
         primary_bloom
             .add(pack_exact_gram(&[1, 2, 3]))
             .expect("add primary gram");
@@ -5261,16 +5399,106 @@ rule q {
             .expect("insert");
 
         let key = (filter_bytes, bloom_hashes);
+        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
         assert_eq!(
-            store.tier2_superblocks.summary_bytes_by_key.get(&key).copied(),
+            store.tier2_superblocks.bucket_for_key.get(&key).copied(),
+            Some(bucket_key)
+        );
+        assert_eq!(
+            store
+                .tier2_superblocks
+                .summary_bytes_by_bucket
+                .get(&bucket_key)
+                .copied(),
             Some(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
         );
         let blocks = store
             .tier2_superblocks
-            .masks_by_key
-            .get(&key)
+            .masks_by_bucket
+            .get(&bucket_key)
             .expect("superblock masks");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].len(), MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
+    }
+
+    #[test]
+    fn df_counts_delta_compaction_threshold_respects_memory_budget_and_shards() {
+        assert_eq!(
+            df_counts_delta_compact_threshold_bytes(16 * 1024 * 1024 * 1024, 256),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            df_counts_delta_compact_threshold_bytes(0, 0),
+            DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            df_counts_delta_compact_threshold_bytes(1024 * 1024 * 1024, 256),
+            MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            df_counts_delta_compact_threshold_bytes(512 * 1024 * 1024 * 1024, 1),
+            MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES
+        );
+    }
+
+    #[test]
+    fn tier2_superblock_memory_budget_respects_memory_budget_and_divisor() {
+        assert_eq!(
+            tier2_superblock_memory_budget_bytes(16 * 1024 * 1024 * 1024, 256, 4),
+            16 * 1024 * 1024
+        );
+        assert_eq!(tier2_superblock_memory_budget_bytes(0, 256, 4), 0);
+        assert_eq!(
+            tier2_superblock_memory_budget_bytes(512 * 1024 * 1024, 256, 4),
+            MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn scaled_docs_per_block_grows_only_when_needed() {
+        assert_eq!(
+            scaled_docs_per_block_for_budget(128, 8 * 1024 * 1024, 0),
+            128
+        );
+        assert_eq!(
+            scaled_docs_per_block_for_budget(128, 8 * 1024 * 1024, 8 * 1024 * 1024),
+            128
+        );
+        assert_eq!(
+            scaled_docs_per_block_for_budget(128, 32 * 1024 * 1024, 16 * 1024 * 1024),
+            256
+        );
+        assert_eq!(
+            scaled_docs_per_block_for_budget(128, 80 * 1024 * 1024, 16 * 1024 * 1024),
+            1024
+        );
+    }
+
+    #[test]
+    fn apply_runtime_limits_updates_df_counts_threshold_and_stats() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        store
+            .apply_runtime_limits(16 * 1024 * 1024 * 1024, 256, 4)
+            .expect("apply runtime limits");
+
+        let stats = store.stats();
+        assert_eq!(stats.df_counts_delta_entries, 0);
+        assert_eq!(stats.df_counts_delta_bytes, 0);
+        assert_eq!(
+            stats.df_counts_delta_compact_threshold_bytes,
+            4 * 1024 * 1024
+        );
+        assert_eq!(stats.tier2_superblock_memory_budget_bytes, 16 * 1024 * 1024);
+        assert_eq!(stats.tier2_superblock_summary_bytes, 0);
     }
 }

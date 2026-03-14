@@ -17,16 +17,16 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
 use crate::candidate::query_plan::{
-    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
+    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
 };
 #[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, GramSizes, HLL_DEFAULT_PRECISION,
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
     encode_grams_delta_u64, estimate_unique_grams_for_size_hll, read_candidate_shard_count,
-    scan_file_features_with_gram_sizes,
+    scan_file_features_with_gram_sizes, BoundedCache, CandidateConfig, CandidateStore, GramSizes,
+    HLL_DEFAULT_PRECISION,
 };
 use crate::perf;
 use crate::rpc::{
@@ -45,6 +45,7 @@ pub const DEFAULT_SEARCH_RESULT_CHUNK_SIZE: usize = 1024;
 pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
+pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 
@@ -223,7 +224,9 @@ fn effective_memory_budget_bytes(configured_budget_bytes: u64) -> u64 {
         return 0;
     }
     match available_memory_bytes() {
-        Some(available) if available > 0 => configured_budget_bytes.min(available.saturating_mul(3) / 4),
+        Some(available) if available > 0 => {
+            configured_budget_bytes.min(available.saturating_mul(3) / 4)
+        }
         _ => configured_budget_bytes,
     }
 }
@@ -521,7 +524,10 @@ fn count_input_files(paths: &[PathBuf]) -> Result<usize> {
     Ok(total)
 }
 
-fn stream_input_files(paths: &[PathBuf], mut visit: impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
+fn stream_input_files(
+    paths: &[PathBuf],
+    mut visit: impl FnMut(PathBuf) -> Result<()>,
+) -> Result<()> {
     for path in paths {
         visit_files_recursive(path, &mut visit)?;
     }
@@ -1127,7 +1133,11 @@ fn legacy_query_from_plan(plan: &crate::candidate::CompiledQueryPlan) -> Option<
                     .get(node.pattern_id.as_ref()?)
                     .cloned()
                     .unwrap_or_default();
-                if expr.is_empty() { None } else { Some(expr) }
+                if expr.is_empty() {
+                    None
+                } else {
+                    Some(expr)
+                }
             }
             "and" | "or" => {
                 let parts = node
@@ -1358,6 +1368,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 candidate_shards: args.shards.max(1),
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
+                tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
             },
             signals.shutdown.clone(),
             Some(signals.status_dump.clone()),
@@ -1617,7 +1628,9 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     scope.spawn(move || {
                         let produce = stream_input_files(&producer_roots, |file_path| {
                             producer_tx.send(file_path).map_err(|_| {
-                                TgsError::from("candidate ingest file producer terminated unexpectedly")
+                                TgsError::from(
+                                    "candidate ingest file producer terminated unexpectedly",
+                                )
                             })?;
                             Ok(())
                         });
@@ -1691,13 +1704,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     let started_scan = Instant::now();
                     let row = batch_row_to_wire(scan_index_batch_row(&file_path, policy)?);
                     scan_time += started_scan.elapsed();
-                    push_remote_batch_row(
-                        &client,
-                        &mut pending,
-                        row,
-                        batch_size,
-                        &mut processed,
-                    )?;
+                    push_remote_batch_row(&client, &mut pending, row, batch_size, &mut processed)?;
                     maybe_report_index_progress(
                         show_progress,
                         processed,
@@ -1729,7 +1736,9 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     scope.spawn(move || {
                         let produce = stream_input_files(&producer_roots, |file_path| {
                             producer_tx.send(file_path).map_err(|_| {
-                                TgsError::from("candidate ingest file producer terminated unexpectedly")
+                                TgsError::from(
+                                    "candidate ingest file producer terminated unexpectedly",
+                                )
                             })?;
                             Ok(())
                         });
@@ -1814,6 +1823,39 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             if let Some((server_current_rss_kb, server_peak_rss_kb)) = server_rss_kb {
                 eprintln!("verbose.index.server_current_rss_kb: {server_current_rss_kb}");
                 eprintln!("verbose.index.server_peak_rss_kb: {server_peak_rss_kb}");
+            }
+            if let Ok(stats) = rpc_client(&args.connection).candidate_stats() {
+                for (key, label) in [
+                    ("disk_usage_bytes", "verbose.index.server_disk_usage_bytes"),
+                    (
+                        "tier2_superblock_summary_bytes",
+                        "verbose.index.server_tier2_superblock_summary_bytes",
+                    ),
+                    (
+                        "tier2_superblock_memory_budget_bytes",
+                        "verbose.index.server_tier2_superblock_budget_bytes",
+                    ),
+                    (
+                        "tier2_superblock_docs",
+                        "verbose.index.server_tier2_superblock_docs_per_block",
+                    ),
+                    (
+                        "df_counts_delta_bytes",
+                        "verbose.index.server_df_counts_delta_bytes",
+                    ),
+                    (
+                        "df_counts_delta_entries",
+                        "verbose.index.server_df_counts_delta_entries",
+                    ),
+                    (
+                        "df_counts_delta_compact_threshold_bytes",
+                        "verbose.index.server_df_counts_delta_compact_threshold_bytes",
+                    ),
+                ] {
+                    if let Some(value) = stats.get(key).and_then(|value| value.as_u64()) {
+                        eprintln!("{label}: {value}");
+                    }
+                }
             }
         }
         Ok(0)
@@ -2317,7 +2359,10 @@ fn cmd_search_candidates(args: &SearchCommandArgs) -> i32 {
             eprintln!("verbose.search.query_ms: {query_ms:.3}");
             eprintln!("verbose.search.verify_ms: {verify_ms:.3}");
             eprintln!("verbose.search.max_candidates: {}", args.max_candidates);
-            eprintln!("verbose.search.max_anchors_per_pattern: {}", args.max_anchors_per_pattern);
+            eprintln!(
+                "verbose.search.max_anchors_per_pattern: {}",
+                args.max_anchors_per_pattern
+            );
             eprintln!("verbose.search.candidates: {total}");
             eprintln!("verbose.search.verify_enabled: {}", verify_yara_files);
             let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
@@ -2372,10 +2417,7 @@ fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
 }
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "yaya",
-    about = "YAYA server/client CLI (candidate mode only)."
-)]
+#[command(name = "yaya", about = "YAYA server/client CLI (candidate mode only).")]
 struct Cli {
     #[arg(
         long = "perf-report",
@@ -2517,6 +2559,12 @@ struct ServeArgs {
         help = "Configured indexing memory budget in GiB. Client-side indexing backpressure will use the lower of this value and available memory."
     )]
     memory_budget_gb: u64,
+    #[arg(
+        long = "tier2-superblock-budget-divisor",
+        default_value_t = DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+        help = "Divides the server memory budget to derive the per-shard Tier2 summary-memory budget. Lower values allow more RAM for Tier2 summaries."
+    )]
+    tier2_superblock_budget_divisor: u64,
     #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate storage root directory.")]
     root: String,
     #[arg(
@@ -2759,6 +2807,7 @@ mod tests {
             candidate_shards: shard_count,
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
         })
     }
 
@@ -2795,6 +2844,7 @@ mod tests {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
+            tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             shards: 256,
             filter_target_fp: 0.35,
@@ -2851,12 +2901,10 @@ mod tests {
             file_digest,
             path_identity_sha256(&sample).expect("path digest")
         );
-        assert!(
-            sha256_file(&sample, 0)
-                .expect_err("zero chunk size")
-                .to_string()
-                .contains("positive integer")
-        );
+        assert!(sha256_file(&sample, 0)
+            .expect_err("zero chunk size")
+            .to_string()
+            .contains("positive integer"));
 
         let mut files = Vec::new();
         collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -3720,6 +3768,7 @@ rule remote_q {
             candidate_shards: 1,
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
         });
 
         assert_eq!(
@@ -3786,24 +3835,18 @@ rule remote_q {
         let sample = tmp.path().join("sample.bin");
         fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-        assert!(
-            md5_file(&sample, 0)
-                .expect_err("md5 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha1_file(&sample, 0)
-                .expect_err("sha1 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha512_file(&sample, 0)
-                .expect_err("sha512 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
+        assert!(md5_file(&sample, 0)
+            .expect_err("md5 zero chunk")
+            .to_string()
+            .contains("positive integer"));
+        assert!(sha1_file(&sample, 0)
+            .expect_err("sha1 zero chunk")
+            .to_string()
+            .contains("positive integer"));
+        assert!(sha512_file(&sample, 0)
+            .expect_err("sha512 zero chunk")
+            .to_string()
+            .contains("positive integer"));
 
         assert_eq!(
             detect_digest_identity_source(&"aa".repeat(16)),

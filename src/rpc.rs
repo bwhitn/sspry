@@ -7,26 +7,25 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::candidate::store::{
-    CandidateCompactionResult, CandidateCompactionSnapshot, PreparedQueryArtifacts,
     build_prepared_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
-    write_compacted_snapshot,
+    write_compacted_snapshot, CandidateCompactionResult, CandidateCompactionSnapshot,
+    PreparedQueryArtifacts,
 };
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
-    candidate_shard_index, candidate_shard_root, decode_grams_delta_u64,
-    normalize_max_candidates,
-    read_candidate_shard_count, write_candidate_shard_count,
+    candidate_shard_index, candidate_shard_root, decode_grams_delta_u64, normalize_max_candidates,
+    read_candidate_shard_count, write_candidate_shard_count, BoundedCache, CandidateConfig,
+    CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
 };
 use crate::perf::{record_counter, scope};
 use crate::{Result, TgsError};
@@ -53,6 +52,33 @@ const ACTION_SHUTDOWN: u8 = 8;
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const DF_CACHE_CAPACITY: usize = 128;
 const QUERY_CACHE_CAPACITY: usize = 64;
+const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
+const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
+
+fn lock_candidate_store_with_timeout<'a>(
+    store_lock: &'a Mutex<CandidateStore>,
+    shard_idx: usize,
+    operation: &str,
+) -> Result<MutexGuard<'a, CandidateStore>> {
+    let timeout = Duration::from_millis(DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match store_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(TgsError::from("Candidate store lock poisoned."));
+            }
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(TgsError::from(format!(
+                        "candidate shard {shard_idx} busy during {operation}; retry later"
+                    )));
+                }
+                thread::sleep(Duration::from_millis(CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS));
+            }
+        }
+    }
+}
 
 fn current_process_memory_kb() -> (usize, usize) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -90,6 +116,7 @@ pub struct ServerConfig {
     pub candidate_shards: usize,
     pub search_workers: usize,
     pub memory_budget_bytes: u64,
+    pub tier2_superblock_budget_divisor: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -588,6 +615,26 @@ fn candidate_stats_json_from_parts(
         .iter()
         .map(|item| item.retired_generation_count)
         .sum::<usize>();
+    let df_counts_delta_bytes = stats_rows
+        .iter()
+        .map(|item| item.df_counts_delta_bytes)
+        .sum::<u64>();
+    let df_counts_delta_entries = stats_rows
+        .iter()
+        .map(|item| item.df_counts_delta_entries)
+        .sum::<usize>();
+    let df_counts_delta_compact_threshold_bytes = stats_rows
+        .iter()
+        .map(|item| item.df_counts_delta_compact_threshold_bytes)
+        .sum::<u64>();
+    let tier2_superblock_summary_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier2_superblock_summary_bytes)
+        .sum::<u64>();
+    let tier2_superblock_memory_budget_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier2_superblock_memory_budget_bytes)
+        .sum::<u64>();
     let mut merged_filter_bucket_counts = BTreeMap::<String, usize>::new();
     for row in filter_bucket_rows {
         for (key, count) in row {
@@ -610,6 +657,26 @@ fn candidate_stats_json_from_parts(
     out.insert("deleted_doc_count".to_owned(), json!(deleted_doc_count));
     out.insert("df_max".to_owned(), json!(stats.df_max));
     out.insert("df_min".to_owned(), json!(stats.df_min));
+    out.insert(
+        "df_counts_delta_bytes".to_owned(),
+        json!(df_counts_delta_bytes),
+    );
+    out.insert(
+        "df_counts_delta_entries".to_owned(),
+        json!(df_counts_delta_entries),
+    );
+    out.insert(
+        "df_counts_delta_compact_threshold_bytes".to_owned(),
+        json!(df_counts_delta_compact_threshold_bytes),
+    );
+    out.insert(
+        "tier2_superblock_summary_bytes".to_owned(),
+        json!(tier2_superblock_summary_bytes),
+    );
+    out.insert(
+        "tier2_superblock_memory_budget_bytes".to_owned(),
+        json!(tier2_superblock_memory_budget_bytes),
+    );
     out.insert("disk_usage_bytes".to_owned(), json!(disk_usage_under(root)));
     out.insert(
         "doc_count".to_owned(),
@@ -699,17 +766,15 @@ pub fn candidate_stats_json_for_stores(
 }
 
 fn start_compaction_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        loop {
-            if state.is_shutting_down() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(200));
-            if state.is_shutting_down() {
-                break;
-            }
-            let _ = state.run_compaction_cycle();
+    thread::spawn(move || loop {
+        if state.is_shutting_down() {
+            break;
         }
+        thread::sleep(Duration::from_millis(200));
+        if state.is_shutting_down() {
+            break;
+        }
+        let _ = state.run_compaction_cycle();
     })
 }
 
@@ -806,10 +871,8 @@ impl ServerState {
         let mut stats_rows = Vec::with_capacity(self.candidate_stores.len());
         let mut filter_bucket_rows = Vec::with_capacity(self.candidate_stores.len());
         let mut deleted_storage_bytes = 0u64;
-        for store_lock in &self.candidate_stores {
-            let store = store_lock
-                .lock()
-                .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+        for (shard_idx, store_lock) in self.candidate_stores.iter().enumerate() {
+            let store = lock_candidate_store_with_timeout(store_lock, shard_idx, "stats")?;
             stats_rows.push(store.stats());
             filter_bucket_rows.push(store.filter_bucket_counts());
             deleted_storage_bytes =
@@ -832,6 +895,10 @@ impl ServerState {
         stats.insert(
             "memory_budget_bytes".to_owned(),
             json!(self.config.memory_budget_bytes),
+        );
+        stats.insert(
+            "tier2_superblock_budget_divisor".to_owned(),
+            json!(self.config.tier2_superblock_budget_divisor),
         );
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
         stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
@@ -1100,10 +1167,8 @@ impl ServerState {
         record_counter("rpc.handle_candidate_query_prepared_cache_misses_total", 1);
         let mut filter_keys = HashSet::<(usize, usize)>::new();
         let mut secondary_filter_keys = HashSet::<(usize, usize)>::new();
-        for store_lock in &self.candidate_stores {
-            let store = store_lock
-                .lock()
-                .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+        for (shard_idx, store_lock) in self.candidate_stores.iter().enumerate() {
+            let store = lock_candidate_store_with_timeout(store_lock, shard_idx, "query prepare")?;
             filter_keys.extend(store.tier2_filter_keys());
             secondary_filter_keys.extend(store.secondary_filter_keys());
         }
@@ -1154,9 +1219,8 @@ impl ServerState {
     ) -> Result<CachedCandidateQuery> {
         let prepared = self.shared_prepared_query_artifacts(plan)?;
         if self.candidate_shard_count() == 1 {
-            let mut store = self.candidate_stores[0]
-                .lock()
-                .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            let mut store =
+                lock_candidate_store_with_timeout(&self.candidate_stores[0], 0, "query scan")?;
             let (mut hits, tier_used) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
             hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -1176,10 +1240,9 @@ impl ServerState {
         if worker_count <= 1 {
             let mut hits = Vec::<(String, u32)>::new();
             let mut tier_used = Vec::<String>::new();
-            for store_lock in &self.candidate_stores {
-                let mut store = store_lock
-                    .lock()
-                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            for (shard_idx, store_lock) in self.candidate_stores.iter().enumerate() {
+                let mut store =
+                    lock_candidate_store_with_timeout(store_lock, shard_idx, "query scan")?;
                 let (local_hits, local_tiers) =
                     Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
                 hits.extend(local_hits);
@@ -1210,9 +1273,11 @@ impl ServerState {
                             if shard_idx >= stores.len() {
                                 break;
                             }
-                            let mut store = stores[shard_idx]
-                                .lock()
-                                .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                            let mut store = lock_candidate_store_with_timeout(
+                                &stores[shard_idx],
+                                shard_idx,
+                                "query scan",
+                            )?;
                             let (hits, tiers) = Self::collect_query_matches_single_store(
                                 &mut store, plan, &prepared,
                             )?;
@@ -1420,9 +1485,11 @@ impl ServerState {
         let _scope = scope("rpc.handle_candidate_insert");
         let parsed = self.parse_candidate_insert_document(document, "request.payload")?;
         let shard_idx = self.candidate_store_index_for_sha256(&parsed.0);
-        let mut store = self.candidate_stores[shard_idx]
-            .lock()
-            .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+        let mut store = lock_candidate_store_with_timeout(
+            &self.candidate_stores[shard_idx],
+            shard_idx,
+            "insert",
+        )?;
         let result = store.insert_document(
             parsed.0,
             parsed.1,
@@ -1460,9 +1527,8 @@ impl ServerState {
 
         let mut results = vec![None; parsed_documents.len()];
         if self.candidate_shard_count() == 1 {
-            let mut store = self.candidate_stores[0]
-                .lock()
-                .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            let mut store =
+                lock_candidate_store_with_timeout(&self.candidate_stores[0], 0, "insert batch")?;
             let batch = parsed_documents
                 .iter()
                 .map(|row| {
@@ -1499,9 +1565,11 @@ impl ServerState {
                 grouped.entry(shard_idx).or_default().push((idx, row));
             }
             for (shard_idx, rows) in grouped {
-                let mut store = self.candidate_stores[shard_idx]
-                    .lock()
-                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                let mut store = lock_candidate_store_with_timeout(
+                    &self.candidate_stores[shard_idx],
+                    shard_idx,
+                    "insert batch",
+                )?;
                 let batch = rows
                     .iter()
                     .map(|(_, row)| {
@@ -1544,9 +1612,11 @@ impl ServerState {
         let _scope = scope("rpc.handle_candidate_delete");
         let decoded = decode_sha256(sha256)?;
         let shard_idx = self.candidate_store_index_for_sha256(&decoded);
-        let mut store = self.candidate_stores[shard_idx]
-            .lock()
-            .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+        let mut store = lock_candidate_store_with_timeout(
+            &self.candidate_stores[shard_idx],
+            shard_idx,
+            "delete",
+        )?;
         let result = store.delete_document(sha256)?;
         drop(store);
         self.invalidate_search_caches();
@@ -1615,9 +1685,11 @@ impl ServerState {
                     .push((idx, sha256_hex.clone()));
             }
             for (shard_idx, items) in by_shard {
-                let store = self.candidate_stores[shard_idx]
-                    .lock()
-                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                let store = lock_candidate_store_with_timeout(
+                    &self.candidate_stores[shard_idx],
+                    shard_idx,
+                    "query external ids",
+                )?;
                 let hashes = items
                     .iter()
                     .map(|(_, value)| value.clone())
@@ -1662,10 +1734,12 @@ impl ServerState {
             for gram in &key {
                 merged.insert(*gram, 0);
             }
-            for store_lock in &self.candidate_stores {
-                let store = store_lock
-                    .lock()
-                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            for (shard_idx, store_lock) in self.candidate_stores.iter().enumerate() {
+                let store = lock_candidate_store_with_timeout(
+                    store_lock,
+                    shard_idx,
+                    "document frequency lookup",
+                )?;
                 for (gram, count) in store.df_counts_for(&key) {
                     *merged.entry(gram).or_insert(0) += count;
                 }
@@ -2113,7 +2187,13 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(Vec<CandidateStore>
         shard_config.root = candidate_shard_root(root, shard_count, shard_idx);
         cleanup_removed_roots = cleanup_removed_roots
             .saturating_add(cleanup_abandoned_compaction_roots(&shard_config.root)?);
-        stores.push(ensure_candidate_store(shard_config)?);
+        let mut store = ensure_candidate_store(shard_config)?;
+        store.apply_runtime_limits(
+            config.memory_budget_bytes,
+            shard_count,
+            config.tier2_superblock_budget_divisor,
+        )?;
+        stores.push(store);
     }
     write_candidate_shard_count(root, shard_count)?;
     Ok((stores, cleanup_removed_roots))
@@ -2173,7 +2253,7 @@ mod tests {
     use std::net::TcpListener;
 
     use crate::candidate::{
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, encode_grams_delta_u64,
+        encode_grams_delta_u64, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
     };
     use base64::Engine;
     use tempfile::tempdir;
@@ -2189,6 +2269,8 @@ mod tests {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -2207,11 +2289,27 @@ mod tests {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
             .expect("server state"),
         )
+    }
+
+    #[test]
+    fn current_stats_json_returns_busy_error_when_shard_locked() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        let _guard = state.candidate_stores[0].lock().expect("lock store");
+        let err = state
+            .current_stats_json()
+            .expect_err("stats should time out");
+        assert!(
+            err.to_string().contains("busy during stats"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(unix)]
@@ -2236,6 +2334,8 @@ mod tests {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
             );
         });
@@ -2292,6 +2392,8 @@ mod tests {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
             );
         });
@@ -2335,6 +2437,8 @@ mod tests {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
                 server_shutdown,
             )
@@ -2522,17 +2626,15 @@ mod tests {
     fn frame_helpers_report_truncated_inputs() {
         let err = read_frame(&mut Cursor::new(vec![PROTOCOL_VERSION, ACTION_PING, 0]))
             .expect_err("truncated header must fail");
-        assert!(
-            err.to_string()
-                .contains("Connection closed while reading frame.")
-        );
+        assert!(err
+            .to_string()
+            .contains("Connection closed while reading frame."));
 
         let payload = vec![PROTOCOL_VERSION, ACTION_PING, 0, 0, 0, 3, b'a', b'b'];
         let err = read_frame(&mut Cursor::new(payload)).expect_err("truncated payload must fail");
-        assert!(
-            err.to_string()
-                .contains("Connection closed while reading frame.")
-        );
+        assert!(err
+            .to_string()
+            .contains("Connection closed while reading frame."));
 
         let parsed: Map<String, Value> = json_from_bytes(&[]).expect("empty object payload");
         assert!(parsed.is_empty());
@@ -2670,20 +2772,17 @@ mod tests {
         let err = client
             .candidate_insert_batch(&docs[..1])
             .expect_err("single oversized doc");
-        assert!(
-            err.to_string()
-                .contains("Single document insert request is too large")
-        );
+        assert!(err
+            .to_string()
+            .contains("Single document insert request is too large"));
     }
 
     #[test]
     fn query_plan_wire_validation_rejects_invalid_shapes() {
-        assert!(
-            compiled_query_plan_from_wire(&Value::Null)
-                .expect_err("null plan")
-                .to_string()
-                .contains("query plan payload must be an object")
-        );
+        assert!(compiled_query_plan_from_wire(&Value::Null)
+            .expect_err("null plan")
+            .to_string()
+            .contains("query plan payload must be an object"));
 
         assert!(
             compiled_query_plan_from_wire(&serde_json::json!({ "ast": {} }))
@@ -2692,25 +2791,21 @@ mod tests {
                 .contains("patterns list")
         );
 
-        assert!(
-            compiled_query_plan_from_wire(&serde_json::json!({
-                "patterns": [17],
-                "ast": { "kind": "pattern", "pattern_id": "$a" }
-            }))
-            .expect_err("bad pattern entry")
-            .to_string()
-            .contains("patterns entries must be objects")
-        );
+        assert!(compiled_query_plan_from_wire(&serde_json::json!({
+            "patterns": [17],
+            "ast": { "kind": "pattern", "pattern_id": "$a" }
+        }))
+        .expect_err("bad pattern entry")
+        .to_string()
+        .contains("patterns entries must be objects"));
 
-        assert!(
-            compiled_query_plan_from_wire(&serde_json::json!({
-                "patterns": [{ "id": "$a", "alternatives": [["bad-gram"]] }],
-                "ast": { "kind": "pattern", "pattern_id": "$a" }
-            }))
-            .expect_err("out of range gram")
-            .to_string()
-            .contains("out-of-range gram")
-        );
+        assert!(compiled_query_plan_from_wire(&serde_json::json!({
+            "patterns": [{ "id": "$a", "alternatives": [["bad-gram"]] }],
+            "ast": { "kind": "pattern", "pattern_id": "$a" }
+        }))
+        .expect_err("out of range gram")
+        .to_string()
+        .contains("out-of-range gram"));
 
         assert_eq!(
             compiled_query_plan_from_wire(&serde_json::json!({
@@ -2726,19 +2821,15 @@ mod tests {
 
     #[test]
     fn query_node_wire_validation_rejects_invalid_nodes() {
-        assert!(
-            query_node_from_wire(&Value::Null)
-                .expect_err("node object")
-                .to_string()
-                .contains("must be an object")
-        );
+        assert!(query_node_from_wire(&Value::Null)
+            .expect_err("node object")
+            .to_string()
+            .contains("must be an object"));
 
-        assert!(
-            query_node_from_wire(&serde_json::json!({}))
-                .expect_err("missing kind")
-                .to_string()
-                .contains("missing kind")
-        );
+        assert!(query_node_from_wire(&serde_json::json!({}))
+            .expect_err("missing kind")
+            .to_string()
+            .contains("missing kind"));
 
         assert!(
             query_node_from_wire(&serde_json::json!({ "kind": "pattern" }))
@@ -2754,23 +2845,19 @@ mod tests {
                 .contains("requires at least one child")
         );
 
-        assert!(
-            query_node_from_wire(&serde_json::json!({
-                "kind": "n_of",
-                "threshold": 0,
-                "children": [{ "kind": "pattern", "pattern_id": "$a" }]
-            }))
-            .expect_err("n_of threshold")
-            .to_string()
-            .contains("threshold must be > 0")
-        );
+        assert!(query_node_from_wire(&serde_json::json!({
+            "kind": "n_of",
+            "threshold": 0,
+            "children": [{ "kind": "pattern", "pattern_id": "$a" }]
+        }))
+        .expect_err("n_of threshold")
+        .to_string()
+        .contains("threshold must be > 0"));
 
-        assert!(
-            query_node_from_wire(&serde_json::json!({ "kind": "wat" }))
-                .expect_err("unsupported kind")
-                .to_string()
-                .contains("Unsupported ast node kind")
-        );
+        assert!(query_node_from_wire(&serde_json::json!({ "kind": "wat" }))
+            .expect_err("unsupported kind")
+            .to_string()
+            .contains("Unsupported ast node kind"));
     }
 
     #[test]
@@ -2782,18 +2869,14 @@ mod tests {
         );
         assert!(decode_sha256(&upper).is_ok());
 
-        assert!(
-            normalize_sha256_hex("abc")
-                .expect_err("short hex")
-                .to_string()
-                .contains("64 hexadecimal characters")
-        );
-        assert!(
-            decode_sha256(&"zz".repeat(32))
-                .expect_err("bad hex")
-                .to_string()
-                .contains("64 hexadecimal characters")
-        );
+        assert!(normalize_sha256_hex("abc")
+            .expect_err("short hex")
+            .to_string()
+            .contains("64 hexadecimal characters"));
+        assert!(decode_sha256(&"zz".repeat(32))
+            .expect_err("bad hex")
+            .to_string()
+            .contains("64 hexadecimal characters"));
     }
 
     #[test]
@@ -2810,11 +2893,9 @@ mod tests {
             .expect("serve bad version");
         let (_, status, payload) = bad_version.written_frame();
         assert_eq!(status, STATUS_ERROR);
-        assert!(
-            String::from_utf8(payload)
-                .expect("utf8")
-                .contains("Unsupported protocol version")
-        );
+        assert!(String::from_utf8(payload)
+            .expect("utf8")
+            .contains("Unsupported protocol version"));
 
         let mut oversized = MockStream::new({
             let mut payload = Vec::new();
@@ -2824,11 +2905,9 @@ mod tests {
         serve_connection(&mut oversized, state.clone(), 4).expect("serve oversized");
         let (_, status, payload) = oversized.written_frame();
         assert_eq!(status, STATUS_ERROR);
-        assert!(
-            String::from_utf8(payload)
-                .expect("utf8")
-                .contains("Request is too large.")
-        );
+        assert!(String::from_utf8(payload)
+            .expect("utf8")
+            .contains("Request is too large."));
 
         let mut unsupported = MockStream::new({
             let mut payload = Vec::new();
@@ -2839,11 +2918,9 @@ mod tests {
             .expect("serve unsupported");
         let (_, status, payload) = unsupported.written_frame();
         assert_eq!(status, STATUS_ERROR);
-        assert!(
-            String::from_utf8(payload)
-                .expect("utf8")
-                .contains("Unsupported action code: 250")
-        );
+        assert!(String::from_utf8(payload)
+            .expect("utf8")
+            .contains("Unsupported action code: 250"));
 
         let mut invalid_query = MockStream::new({
             let mut payload = Vec::new();
@@ -2855,11 +2932,9 @@ mod tests {
             .expect("serve invalid payload");
         let (_, status, payload) = invalid_query.written_frame();
         assert_eq!(status, STATUS_ERROR);
-        assert!(
-            String::from_utf8(payload)
-                .expect("utf8")
-                .contains("EOF while parsing")
-        );
+        assert!(String::from_utf8(payload)
+            .expect("utf8")
+            .contains("EOF while parsing"));
     }
 
     #[test]
@@ -3055,38 +3130,32 @@ rule q {
             Duration::from_millis(50),
             None,
         ));
-        assert!(
-            client
-                .request_bytes(ACTION_PING, b"{}")
-                .expect_err("invalid tcp address")
-                .to_string()
-                .contains("Invalid TCP address")
-        );
+        assert!(client
+            .request_bytes(ACTION_PING, b"{}")
+            .expect_err("invalid tcp address")
+            .to_string()
+            .contains("Invalid TCP address"));
 
         let bad_version_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_frame(&mut stream, PROTOCOL_VERSION + 1, STATUS_OK, b"{}")
                 .expect("write version mismatch");
         }));
-        assert!(
-            bad_version_client
-                .request_bytes(ACTION_PING, b"{}")
-                .expect_err("version mismatch")
-                .to_string()
-                .contains("Unsupported protocol version")
-        );
+        assert!(bad_version_client
+            .request_bytes(ACTION_PING, b"{}")
+            .expect_err("version mismatch")
+            .to_string()
+            .contains("Unsupported protocol version"));
 
         let error_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_error_frame(&mut stream, "server boom").expect("write error frame");
         }));
-        assert!(
-            error_client
-                .request_bytes(ACTION_PING, b"{}")
-                .expect_err("server error")
-                .to_string()
-                .contains("server boom")
-        );
+        assert!(error_client
+            .request_bytes(ACTION_PING, b"{}")
+            .expect_err("server error")
+            .to_string()
+            .contains("server boom"));
 
         let object_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
@@ -3099,13 +3168,11 @@ rule q {
             )
             .expect("write array frame");
         }));
-        assert!(
-            object_client
-                .request_json_value(ACTION_CANDIDATE_STATS, &json!({}))
-                .expect_err("non-object stats")
-                .to_string()
-                .contains("invalid JSON object")
-        );
+        assert!(object_client
+            .request_json_value(ACTION_CANDIDATE_STATS, &json!({}))
+            .expect_err("non-object stats")
+            .to_string()
+            .contains("invalid JSON object"));
 
         let df_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
@@ -3135,13 +3202,11 @@ rule q {
             )
             .expect("write error payload");
         }));
-        assert!(
-            default_error_client
-                .request_bytes(ACTION_PING, b"{}")
-                .expect_err("default server error")
-                .to_string()
-                .contains("Server returned an error")
-        );
+        assert!(default_error_client
+            .request_bytes(ACTION_PING, b"{}")
+            .expect_err("default server error")
+            .to_string()
+            .contains("Server returned an error"));
     }
 
     #[cfg(unix)]
@@ -3300,6 +3365,8 @@ rule q {
                 candidate_shards: 1,
                 search_workers: 1,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                tier2_superblock_budget_divisor:
+                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             },
             Arc::new(AtomicBool::new(true)),
         )
@@ -3351,10 +3418,9 @@ rule q {
             let err = state
                 .dispatch(action, payload)
                 .expect_err("mutation rejected");
-            assert!(
-                err.to_string()
-                    .contains("server is shutting down; mutating requests are disabled")
-            );
+            assert!(err
+                .to_string()
+                .contains("server is shutting down; mutating requests are disabled"));
         }
 
         let ping: Value =
@@ -3494,69 +3560,63 @@ rule q {
         let df_after_delete = state.handle_candidate_df(&[gram]).expect("df after delete");
         assert_eq!(df_after_delete.df.get(&gram.to_string()).copied(), Some(1));
 
-        assert!(
-            state
-                .handle_candidate_insert(&CandidateDocumentWire {
-                    sha256: "ab".repeat(32),
-                    file_size: 1,
-                    bloom_filter_b64: "**".to_owned(),
-                    gram_count_estimate: None,
-                    bloom_hashes: None,
-                    tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
-                    external_id: None,
-                })
-                .expect_err("invalid bloom base64")
-                .to_string()
-                .contains("bloom_filter_b64 must be valid base64")
-        );
-        assert!(
-            state
-                .handle_candidate_insert(&CandidateDocumentWire {
-                    sha256: "ab".repeat(32),
-                    file_size: 1,
-                    bloom_filter_b64: bloom_filter_b64.clone(),
-                    gram_count_estimate: None,
-                    bloom_hashes: None,
-                    tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
-                    grams_delta_b64: Some("**".to_owned()),
-                    grams: Vec::new(),
-                    grams_complete: true,
-                    effective_diversity: None,
-                    external_id: None,
-                })
-                .expect_err("invalid grams_delta base64")
-                .to_string()
-                .contains("grams_delta_b64 must be valid base64")
-        );
-        assert!(
-            state
-                .handle_candidate_insert(&CandidateDocumentWire {
-                    sha256: "not hex".to_owned(),
-                    file_size: 1,
-                    bloom_filter_b64,
-                    gram_count_estimate: None,
-                    bloom_hashes: None,
-                    tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
-                    external_id: None,
-                })
-                .expect_err("invalid sha")
-                .to_string()
-                .contains("64 hexadecimal characters")
-        );
+        assert!(state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: "ab".repeat(32),
+                file_size: 1,
+                bloom_filter_b64: "**".to_owned(),
+                gram_count_estimate: None,
+                bloom_hashes: None,
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: vec![gram],
+                grams_complete: true,
+                effective_diversity: None,
+                external_id: None,
+            })
+            .expect_err("invalid bloom base64")
+            .to_string()
+            .contains("bloom_filter_b64 must be valid base64"));
+        assert!(state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: "ab".repeat(32),
+                file_size: 1,
+                bloom_filter_b64: bloom_filter_b64.clone(),
+                gram_count_estimate: None,
+                bloom_hashes: None,
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: Some("**".to_owned()),
+                grams: Vec::new(),
+                grams_complete: true,
+                effective_diversity: None,
+                external_id: None,
+            })
+            .expect_err("invalid grams_delta base64")
+            .to_string()
+            .contains("grams_delta_b64 must be valid base64"));
+        assert!(state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: "not hex".to_owned(),
+                file_size: 1,
+                bloom_filter_b64,
+                gram_count_estimate: None,
+                bloom_hashes: None,
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: vec![gram],
+                grams_complete: true,
+                effective_diversity: None,
+                external_id: None,
+            })
+            .expect_err("invalid sha")
+            .to_string()
+            .contains("64 hexadecimal characters"));
     }
 
     #[test]
@@ -3596,20 +3656,19 @@ rule q {
             true,
         )
         .expect("init single root");
-        assert!(
-            ensure_candidate_stores(&ServerConfig {
-                candidate_config: CandidateConfig {
-                    root: single_root.clone(),
-                    ..CandidateConfig::default()
-                },
-                candidate_shards: 2,
-                search_workers: 1,
-                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            })
-            .expect_err("single-shard mismatch")
-            .to_string()
-            .contains("single-shard store")
-        );
+        assert!(ensure_candidate_stores(&ServerConfig {
+            candidate_config: CandidateConfig {
+                root: single_root.clone(),
+                ..CandidateConfig::default()
+            },
+            candidate_shards: 2,
+            search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+        })
+        .expect_err("single-shard mismatch")
+        .to_string()
+        .contains("single-shard store"));
 
         let sharded_root = tmp.path().join("sharded");
         CandidateStore::init(
@@ -3620,20 +3679,19 @@ rule q {
             true,
         )
         .expect("init orphaned shard");
-        assert!(
-            ensure_candidate_stores(&ServerConfig {
-                candidate_config: CandidateConfig {
-                    root: sharded_root.clone(),
-                    ..CandidateConfig::default()
-                },
-                candidate_shards: 1,
-                search_workers: 1,
-                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            })
-            .expect_err("sharded mismatch")
-            .to_string()
-            .contains("sharded store")
-        );
+        assert!(ensure_candidate_stores(&ServerConfig {
+            candidate_config: CandidateConfig {
+                root: sharded_root.clone(),
+                ..CandidateConfig::default()
+            },
+            candidate_shards: 1,
+            search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+        })
+        .expect_err("sharded mismatch")
+        .to_string()
+        .contains("sharded store"));
 
         let manifest_root = tmp.path().join("manifest");
         let (stores, _) = ensure_candidate_stores(&ServerConfig {
@@ -3644,23 +3702,23 @@ rule q {
             candidate_shards: 2,
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
         })
         .expect("create sharded stores");
         assert_eq!(stores.len(), 2);
-        assert!(
-            ensure_candidate_stores(&ServerConfig {
-                candidate_config: CandidateConfig {
-                    root: manifest_root,
-                    ..CandidateConfig::default()
-                },
-                candidate_shards: 1,
-                search_workers: 1,
-                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            })
-            .expect_err("manifest mismatch")
-            .to_string()
-            .contains("candidate shard manifest")
-        );
+        assert!(ensure_candidate_stores(&ServerConfig {
+            candidate_config: CandidateConfig {
+                root: manifest_root,
+                ..CandidateConfig::default()
+            },
+            candidate_shards: 1,
+            search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+        })
+        .expect_err("manifest mismatch")
+        .to_string()
+        .contains("candidate shard manifest"));
     }
 
     #[test]
@@ -3763,6 +3821,8 @@ rule q {
                 candidate_shards: 2,
                 search_workers: 2,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                tier2_superblock_budget_divisor:
+                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             },
             Arc::new(AtomicBool::new(false)),
         )
@@ -3863,6 +3923,7 @@ rule q {
             candidate_shards: 2,
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
         })
         .expect("ensure stores");
         assert_eq!(stores.len(), 2);
@@ -3885,6 +3946,8 @@ rule q {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -3976,6 +4039,8 @@ rule q {
                     candidate_shards: 4,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -4058,6 +4123,8 @@ rule q {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
