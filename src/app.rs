@@ -17,16 +17,16 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
 use crate::candidate::query_plan::{
-    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
+    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
 };
 #[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
+    BoundedCache, CandidateConfig, CandidateStore, GramSizes, HLL_DEFAULT_PRECISION,
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
     encode_grams_delta_u64, estimate_unique_grams_for_size_hll, read_candidate_shard_count,
-    scan_file_features_with_gram_sizes, BoundedCache, CandidateConfig, CandidateStore, GramSizes,
-    HLL_DEFAULT_PRECISION,
+    scan_file_features_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -1133,11 +1133,7 @@ fn legacy_query_from_plan(plan: &crate::candidate::CompiledQueryPlan) -> Option<
                     .get(node.pattern_id.as_ref()?)
                     .cloned()
                     .unwrap_or_default();
-                if expr.is_empty() {
-                    None
-                } else {
-                    Some(expr)
-                }
+                if expr.is_empty() { None } else { Some(expr) }
             }
             "and" | "or" => {
                 let parts = node
@@ -1369,6 +1365,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
                 tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
+                workspace_mode: args.workspace_mode,
             },
             signals.shutdown.clone(),
             Some(signals.status_dump.clone()),
@@ -1825,6 +1822,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 eprintln!("verbose.index.server_peak_rss_kb: {server_peak_rss_kb}");
             }
             if let Ok(stats) = rpc_client(&args.connection).candidate_stats() {
+                let stats_scope = stats
+                    .get("work")
+                    .and_then(serde_json::Value::as_object)
+                    .unwrap_or(&stats);
                 for (key, label) in [
                     ("disk_usage_bytes", "verbose.index.server_disk_usage_bytes"),
                     (
@@ -1852,7 +1853,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         "verbose.index.server_df_counts_delta_compact_threshold_bytes",
                     ),
                 ] {
-                    if let Some(value) = stats.get(key).and_then(|value| value.as_u64()) {
+                    if let Some(value) = stats_scope.get(key).and_then(|value| value.as_u64()) {
                         eprintln!("{label}: {value}");
                     }
                 }
@@ -2416,6 +2417,20 @@ fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
     }
 }
 
+fn cmd_publish(args: &PublishArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let response = rpc_client(&args.connection).publish()?;
+        println!("{response}");
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "yaya", about = "YAYA server/client CLI (candidate mode only).")]
 struct Cli {
@@ -2438,6 +2453,7 @@ enum Commands {
     Delete(DeleteArgs),
     Search(SearchCommandArgs),
     Info(InfoCommandArgs),
+    Publish(PublishArgs),
     Shutdown(ShutdownArgs),
     Yara(YaraArgs),
 }
@@ -2517,6 +2533,12 @@ struct ShutdownArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct PublishArgs {
+    #[command(flatten)]
+    connection: ClientConnectionArgs,
+}
+
+#[derive(Debug, clap::Args)]
 struct YaraArgs {
     #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
     rule: String,
@@ -2565,6 +2587,12 @@ struct ServeArgs {
         help = "Divides the server memory budget to derive the per-shard Tier2 summary-memory budget. Lower values allow more RAM for Tier2 summaries."
     )]
     tier2_superblock_budget_divisor: u64,
+    #[arg(
+        long = "workspace-mode",
+        action = ArgAction::SetTrue,
+        help = "Search only the published current root while indexing and deletes write to a separate work root; use `yaya publish` to promote work to current."
+    )]
+    workspace_mode: bool,
     #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate storage root directory.")]
     root: String,
     #[arg(
@@ -2757,6 +2785,7 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
         Commands::Delete(args) => cmd_delete(&args),
         Commands::Search(args) => cmd_search_candidates(&args),
         Commands::Info(args) => cmd_info(&args),
+        Commands::Publish(args) => cmd_publish(&args),
         Commands::Shutdown(args) => cmd_shutdown(&args),
         Commands::Yara(args) => cmd_yara_check(&args),
     };
@@ -2808,6 +2837,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            workspace_mode: false,
         })
     }
 
@@ -2845,6 +2875,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            workspace_mode: false,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             shards: 256,
             filter_target_fp: 0.35,
@@ -2901,10 +2932,12 @@ mod tests {
             file_digest,
             path_identity_sha256(&sample).expect("path digest")
         );
-        assert!(sha256_file(&sample, 0)
-            .expect_err("zero chunk size")
-            .to_string()
-            .contains("positive integer"));
+        assert!(
+            sha256_file(&sample, 0)
+                .expect_err("zero chunk size")
+                .to_string()
+                .contains("positive integer")
+        );
 
         let mut files = Vec::new();
         collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -3769,6 +3802,7 @@ rule remote_q {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            workspace_mode: false,
         });
 
         assert_eq!(
@@ -3835,18 +3869,24 @@ rule remote_q {
         let sample = tmp.path().join("sample.bin");
         fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-        assert!(md5_file(&sample, 0)
-            .expect_err("md5 zero chunk")
-            .to_string()
-            .contains("positive integer"));
-        assert!(sha1_file(&sample, 0)
-            .expect_err("sha1 zero chunk")
-            .to_string()
-            .contains("positive integer"));
-        assert!(sha512_file(&sample, 0)
-            .expect_err("sha512 zero chunk")
-            .to_string()
-            .contains("positive integer"));
+        assert!(
+            md5_file(&sample, 0)
+                .expect_err("md5 zero chunk")
+                .to_string()
+                .contains("positive integer")
+        );
+        assert!(
+            sha1_file(&sample, 0)
+                .expect_err("sha1 zero chunk")
+                .to_string()
+                .contains("positive integer")
+        );
+        assert!(
+            sha512_file(&sample, 0)
+                .expect_err("sha512 zero chunk")
+                .to_string()
+                .contains("positive integer")
+        );
 
         assert_eq!(
             detect_digest_identity_source(&"aa".repeat(16)),
