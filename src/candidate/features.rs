@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -461,7 +462,9 @@ fn push_unique(vec: &mut Vec<u64>, gram: u64) {
 
 #[allow(clippy::too_many_arguments)]
 fn flush_entropy_window(
-    window: EntropyWindow,
+    window_index: usize,
+    entropy: f64,
+    unique_grams: &[u64],
     total_windows: usize,
     region_count: usize,
     bucket_region_remaining: &mut [Vec<usize>],
@@ -471,25 +474,25 @@ fn flush_entropy_window(
     global_pool: &mut HashSet<u64>,
     bucket_window_counts: &mut [u64; 6],
 ) -> bool {
-    let bucket = entropy_bucket(window.entropy);
+    let bucket = entropy_bucket(entropy);
     bucket_window_counts[bucket] = bucket_window_counts[bucket].saturating_add(1);
-    let region = ((window.window_index.saturating_mul(region_count)) / total_windows.max(1))
+    let region = ((window_index.saturating_mul(region_count)) / total_windows.max(1))
         .min(region_count.saturating_sub(1));
     let mut truncated = false;
-    for gram in window.unique_grams {
-        if global_pool.contains(&gram) {
+    for gram in unique_grams {
+        if global_pool.contains(gram) {
             continue;
         }
         if bucket_region_remaining[bucket][region] > 0 {
-            bucket_region_grams[bucket][region].push(gram);
+            bucket_region_grams[bucket][region].push(*gram);
             bucket_region_remaining[bucket][region] -= 1;
-            global_pool.insert(gram);
+            global_pool.insert(*gram);
             continue;
         }
         if bucket_spill_remaining[bucket] > 0 {
-            bucket_spill_grams[bucket].push(gram);
+            bucket_spill_grams[bucket].push(*gram);
             bucket_spill_remaining[bucket] -= 1;
-            global_pool.insert(gram);
+            global_pool.insert(*gram);
             continue;
         }
         truncated = true;
@@ -499,7 +502,7 @@ fn flush_entropy_window(
 
 #[allow(clippy::too_many_arguments)]
 fn push_ready_window(
-    queue: &mut Vec<EntropyWindow>,
+    queue: &mut VecDeque<EntropyWindow>,
     window: EntropyWindow,
     total_windows: usize,
     region_count: usize,
@@ -510,18 +513,16 @@ fn push_ready_window(
     global_pool: &mut HashSet<u64>,
     bucket_window_counts: &mut [u64; 6],
 ) -> bool {
-    queue.push(window);
+    queue.push_back(window);
     if queue.len() < 3 {
         return false;
     }
-    let middle = queue[1].clone();
     let smoothed = (queue[0].entropy + queue[1].entropy + queue[2].entropy) / 3.0;
+    let middle = queue.get(1).expect("queue has middle window");
     let truncated = flush_entropy_window(
-        EntropyWindow {
-            window_index: middle.window_index,
-            entropy: smoothed,
-            unique_grams: middle.unique_grams,
-        },
+        middle.window_index,
+        smoothed,
+        &middle.unique_grams,
         total_windows,
         region_count,
         bucket_region_remaining,
@@ -531,7 +532,7 @@ fn push_ready_window(
         global_pool,
         bucket_window_counts,
     );
-    queue.remove(0);
+    queue.pop_front();
     truncated
 }
 
@@ -753,7 +754,7 @@ pub fn scan_file_features_with_gram_sizes(
     let mut bucket_window_counts = [0u64; 6];
     let mut global_pool = HashSet::<u64>::new();
     let mut pending_window: Option<EntropyWindow> = None;
-    let mut smoothing_queue: Vec<EntropyWindow> = Vec::new();
+    let mut smoothing_queue = VecDeque::<EntropyWindow>::new();
     let mut current_window_index = 0usize;
     let mut stream_buffer = Vec::<u8>::new();
     let mut buffer_start = 0usize;
@@ -884,13 +885,18 @@ pub fn scan_file_features_with_gram_sizes(
         }
 
         if let Some(window) = pending_window.take() {
-            smoothing_queue.push(window);
+            smoothing_queue.push_back(window);
         }
         match smoothing_queue.len() {
             0 => {}
             1 => {
+                let window = smoothing_queue
+                    .pop_front()
+                    .expect("single smoothing window");
                 truncated = flush_entropy_window(
-                    smoothing_queue.remove(0),
+                    window.window_index,
+                    window.entropy,
+                    &window.unique_grams,
                     total_windows,
                     region_count,
                     &mut bucket_region_remaining,
@@ -903,13 +909,11 @@ pub fn scan_file_features_with_gram_sizes(
             }
             _ => {
                 let avg = (smoothing_queue[0].entropy + smoothing_queue[1].entropy) / 2.0;
-                while let Some(window) = smoothing_queue.pop() {
+                while let Some(window) = smoothing_queue.pop_back() {
                     truncated = flush_entropy_window(
-                        EntropyWindow {
-                            window_index: window.window_index,
-                            entropy: avg,
-                            unique_grams: window.unique_grams,
-                        },
+                        window.window_index,
+                        avg,
+                        &window.unique_grams,
                         total_windows,
                         region_count,
                         &mut bucket_region_remaining,
@@ -1158,6 +1162,7 @@ pub fn scan_file_features_with_tier2_gram_size(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
 
     use hashbrown::HashSet;
@@ -1303,11 +1308,9 @@ mod tests {
         let mut global_pool = HashSet::<u64>::new();
         let mut bucket_window_counts = [0u64; 6];
         let truncated = flush_entropy_window(
-            EntropyWindow {
-                window_index: 0,
-                entropy: 3.0,
-                unique_grams: vec![1, 2],
-            },
+            0,
+            3.0,
+            &[1, 2],
             2,
             2,
             &mut bucket_region_remaining,
@@ -1321,7 +1324,7 @@ mod tests {
         assert_eq!(bucket_window_counts[0], 1);
         assert_eq!(bucket_region_grams[0][0], vec![1]);
 
-        let mut queue = Vec::new();
+        let mut queue = VecDeque::new();
         let mut bucket_region_remaining = vec![vec![2usize; 2]; 6];
         let mut bucket_spill_remaining = vec![1usize; 6];
         let mut bucket_region_grams = vec![vec![Vec::<u64>::new(); 2]; 6];
