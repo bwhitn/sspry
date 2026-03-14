@@ -315,6 +315,8 @@ struct ServerState {
     last_publish_swap_ms: AtomicU64,
     last_publish_promote_work_ms: AtomicU64,
     last_publish_init_work_ms: AtomicU64,
+    last_publish_persist_tier2_superblocks_ms: AtomicU64,
+    last_publish_tier2_snapshot_persist_failures: AtomicU64,
     last_publish_reused_work_stores: AtomicBool,
     publish_runs_total: AtomicU64,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
@@ -359,6 +361,8 @@ struct StoreRootStartupProfile {
     store_open_rebuild_indexes_ms: u64,
     store_open_rebuild_df_counts_ms: u64,
     store_open_rebuild_sha_index_ms: u64,
+    store_open_load_tier2_superblocks_ms: u64,
+    store_open_loaded_tier2_superblocks_from_snapshot_shards: u64,
     store_open_rebuild_tier2_superblocks_ms: u64,
 }
 
@@ -1061,6 +1065,8 @@ impl ServerState {
             last_publish_swap_ms: AtomicU64::new(0),
             last_publish_promote_work_ms: AtomicU64::new(0),
             last_publish_init_work_ms: AtomicU64::new(0),
+            last_publish_persist_tier2_superblocks_ms: AtomicU64::new(0),
+            last_publish_tier2_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_reused_work_stores: AtomicBool::new(false),
             publish_runs_total: AtomicU64::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
@@ -1452,6 +1458,8 @@ impl ServerState {
                 "store_open_rebuild_indexes_ms": profile.store_open_rebuild_indexes_ms,
                 "store_open_rebuild_df_counts_ms": profile.store_open_rebuild_df_counts_ms,
                 "store_open_rebuild_sha_index_ms": profile.store_open_rebuild_sha_index_ms,
+                "store_open_load_tier2_superblocks_ms": profile.store_open_load_tier2_superblocks_ms,
+                "store_open_loaded_tier2_superblocks_from_snapshot_shards": profile.store_open_loaded_tier2_superblocks_from_snapshot_shards,
                 "store_open_rebuild_tier2_superblocks_ms": profile.store_open_rebuild_tier2_superblocks_ms,
             })
         };
@@ -1601,6 +1609,20 @@ impl ServerState {
             publish.insert(
                 "last_publish_init_work_ms".to_owned(),
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_persist_tier2_superblocks_ms".to_owned(),
+                json!(
+                    self.last_publish_persist_tier2_superblocks_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_tier2_snapshot_persist_failures".to_owned(),
+                json!(
+                    self.last_publish_tier2_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_reused_work_stores".to_owned(),
@@ -2500,6 +2522,10 @@ impl ServerState {
         let publish_started_unix_ms = current_unix_ms();
         self.last_publish_started_unix_ms
             .store(publish_started_unix_ms, Ordering::SeqCst);
+        self.last_publish_persist_tier2_superblocks_ms
+            .store(0, Ordering::SeqCst);
+        self.last_publish_tier2_snapshot_persist_failures
+            .store(0, Ordering::SeqCst);
         let _op = self
             .operation_gate
             .write()
@@ -2636,6 +2662,28 @@ impl ServerState {
                 reuse_work_stores = false;
                 published_store_set
             };
+            let persist_tier2_started = Instant::now();
+            let mut tier2_snapshot_persist_failures = 0u64;
+            for store_lock in &published_store_set.stores {
+                let store = store_lock
+                    .lock()
+                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                if store.persist_tier2_superblocks_snapshot().is_err() {
+                    tier2_snapshot_persist_failures =
+                        tier2_snapshot_persist_failures.saturating_add(1);
+                }
+            }
+            self.last_publish_persist_tier2_superblocks_ms.store(
+                persist_tier2_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            self.last_publish_tier2_snapshot_persist_failures
+                .store(tier2_snapshot_persist_failures, Ordering::SeqCst);
+
             let removed_retired_roots = prune_workspace_retired_roots(
                 &retired_parent,
                 DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP,
@@ -3107,6 +3155,14 @@ fn apply_store_open_profile(
     aggregate.store_open_rebuild_sha_index_ms = aggregate
         .store_open_rebuild_sha_index_ms
         .saturating_add(profile.rebuild_sha_index_ms);
+    aggregate.store_open_load_tier2_superblocks_ms = aggregate
+        .store_open_load_tier2_superblocks_ms
+        .saturating_add(profile.load_tier2_superblocks_ms);
+    if profile.loaded_tier2_superblocks_from_snapshot {
+        aggregate.store_open_loaded_tier2_superblocks_from_snapshot_shards = aggregate
+            .store_open_loaded_tier2_superblocks_from_snapshot_shards
+            .saturating_add(1);
+    }
     aggregate.store_open_rebuild_tier2_superblocks_ms = aggregate
         .store_open_rebuild_tier2_superblocks_ms
         .saturating_add(profile.rebuild_tier2_superblocks_ms);

@@ -23,6 +23,7 @@ use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, TgsError};
 
 const STORE_VERSION: u32 = 1;
+const TIER2_SUPERBLOCKS_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_FILTER_BYTES: usize = 2048;
 const DEFAULT_BLOOM_HASHES: usize = 7;
 const DEFAULT_FILTER_MIN_BYTES: usize = 1;
@@ -260,7 +261,9 @@ pub struct CandidateStoreOpenProfile {
     pub rebuild_indexes_ms: u64,
     pub rebuild_df_counts_ms: u64,
     pub rebuild_sha_index_ms: u64,
+    pub load_tier2_superblocks_ms: u64,
     pub rebuild_tier2_superblocks_ms: u64,
+    pub loaded_tier2_superblocks_from_snapshot: bool,
     pub total_ms: u64,
 }
 
@@ -268,7 +271,9 @@ pub struct CandidateStoreOpenProfile {
 struct CandidateStoreRebuildProfile {
     df_counts_ms: u64,
     sha_index_ms: u64,
+    load_tier2_superblocks_ms: u64,
     tier2_superblocks_ms: u64,
+    loaded_tier2_superblocks_from_snapshot: bool,
     total_ms: u64,
 }
 
@@ -1144,6 +1149,7 @@ impl CandidateStore {
             let _ = fs::remove_file(&external_ids_path);
             let _ = fs::remove_file(&df_counts_path);
             let _ = fs::remove_file(&df_delta_path);
+            let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
         }
 
         let mut store = Self {
@@ -1268,7 +1274,10 @@ impl CandidateStore {
             rebuild_indexes_ms: rebuild_profile.total_ms,
             rebuild_df_counts_ms: rebuild_profile.df_counts_ms,
             rebuild_sha_index_ms: rebuild_profile.sha_index_ms,
+            load_tier2_superblocks_ms: rebuild_profile.load_tier2_superblocks_ms,
             rebuild_tier2_superblocks_ms: rebuild_profile.tier2_superblocks_ms,
+            loaded_tier2_superblocks_from_snapshot: rebuild_profile
+                .loaded_tier2_superblocks_from_snapshot,
             total_ms: started_total
                 .elapsed()
                 .as_millis()
@@ -3070,23 +3079,183 @@ impl CandidateStore {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let tier2_started = Instant::now();
-        self.rebuild_tier2_superblocks()?;
-        let tier2_superblocks_ms = tier2_started
+        let load_tier2_started = Instant::now();
+        let expected_active_doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
+        let maybe_snapshot = self
+            .load_tier2_superblocks_snapshot(self.docs.len(), expected_active_doc_count)
+            .ok()
+            .flatten();
+        let load_tier2_superblocks_ms = load_tier2_started
             .elapsed()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
+        let (loaded_tier2_superblocks_from_snapshot, tier2_superblocks_ms) =
+            if let Some(snapshot) = maybe_snapshot {
+                self.tier2_superblocks = snapshot;
+                (true, 0)
+            } else {
+                let tier2_started = Instant::now();
+                self.rebuild_tier2_superblocks()?;
+                let tier2_superblocks_ms = tier2_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                (false, tier2_superblocks_ms)
+            };
         Ok(CandidateStoreRebuildProfile {
             df_counts_ms,
             sha_index_ms,
+            load_tier2_superblocks_ms,
             tier2_superblocks_ms,
+            loaded_tier2_superblocks_from_snapshot,
             total_ms: started_total
                 .elapsed()
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX),
         })
+    }
+
+    pub(crate) fn persist_tier2_superblocks_snapshot(&self) -> Result<()> {
+        fs::create_dir_all(&self.root)?;
+        let path = tier2_superblocks_path(&self.root);
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut payload = Vec::<u8>::new();
+        append_u32(&mut payload, TIER2_SUPERBLOCKS_SNAPSHOT_VERSION);
+        append_u64(&mut payload, self.docs.len() as u64);
+        append_u64(
+            &mut payload,
+            self.docs.iter().filter(|doc| !doc.deleted).count() as u64,
+        );
+        append_u64(&mut payload, self.tier2_superblocks.docs_per_block as u64);
+        append_u64(
+            &mut payload,
+            self.tier2_superblocks.keys_per_block.len() as u64,
+        );
+        for keys in &self.tier2_superblocks.keys_per_block {
+            append_u64(&mut payload, keys.len() as u64);
+            for (filter_bytes, bloom_hashes) in keys {
+                append_u64(&mut payload, *filter_bytes as u64);
+                append_u64(&mut payload, *bloom_hashes as u64);
+            }
+        }
+        append_u64(
+            &mut payload,
+            self.tier2_superblocks.masks_by_bucket.len() as u64,
+        );
+        for ((filter_bucket, bloom_hashes), blocks) in &self.tier2_superblocks.masks_by_bucket {
+            append_u64(&mut payload, *filter_bucket as u64);
+            append_u64(&mut payload, *bloom_hashes as u64);
+            let summary_bytes = self
+                .tier2_superblocks
+                .summary_bytes_by_bucket
+                .get(&(*filter_bucket, *bloom_hashes))
+                .copied()
+                .unwrap_or_else(|| tier2_superblock_summary_bytes(*filter_bucket));
+            append_u64(&mut payload, summary_bytes as u64);
+            append_u64(&mut payload, blocks.len() as u64);
+            for block in blocks {
+                append_u64(&mut payload, block.len() as u64);
+                payload.extend_from_slice(block);
+            }
+        }
+        fs::write(&tmp_path, payload)?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    fn load_tier2_superblocks_snapshot(
+        &self,
+        expected_doc_count: usize,
+        expected_active_doc_count: usize,
+    ) -> Result<Option<Tier2SuperblockIndex>> {
+        let path = tier2_superblocks_path(&self.root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        let mut cursor = 0usize;
+        let version = read_u32(&bytes, &mut cursor)?;
+        if version != TIER2_SUPERBLOCKS_SNAPSHOT_VERSION {
+            return Ok(None);
+        }
+        let stored_doc_count = read_u64(&bytes, &mut cursor)? as usize;
+        let stored_active_doc_count = read_u64(&bytes, &mut cursor)? as usize;
+        if stored_doc_count != expected_doc_count
+            || stored_active_doc_count != expected_active_doc_count
+        {
+            return Ok(None);
+        }
+        let docs_per_block = read_u64(&bytes, &mut cursor)? as usize;
+        let block_count = read_u64(&bytes, &mut cursor)? as usize;
+        let mut keys_per_block = Vec::with_capacity(block_count);
+        let mut bucket_for_key = BTreeMap::new();
+        for _ in 0..block_count {
+            let key_count = read_u64(&bytes, &mut cursor)? as usize;
+            let mut keys = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                let filter_bytes = read_u64(&bytes, &mut cursor)? as usize;
+                let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
+                keys.push((filter_bytes, bloom_hashes));
+                bucket_for_key.insert(
+                    (filter_bytes, bloom_hashes),
+                    tier2_superblock_bucket_key(filter_bytes, bloom_hashes),
+                );
+            }
+            keys_per_block.push(keys);
+        }
+        let bucket_count = read_u64(&bytes, &mut cursor)? as usize;
+        let mut summary_bytes_by_bucket = BTreeMap::new();
+        let mut masks_by_bucket = BTreeMap::new();
+        let mut summary_memory_bytes = 0u64;
+        for _ in 0..bucket_count {
+            let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
+            let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
+            let summary_bytes = read_u64(&bytes, &mut cursor)? as usize;
+            let expected_summary_bytes = tier2_superblock_summary_bytes(filter_bucket);
+            if summary_bytes != expected_summary_bytes {
+                return Ok(None);
+            }
+            let blocks_len = read_u64(&bytes, &mut cursor)? as usize;
+            let mut blocks = Vec::with_capacity(blocks_len);
+            for _ in 0..blocks_len {
+                let block_len = read_u64(&bytes, &mut cursor)? as usize;
+                if block_len != summary_bytes {
+                    return Ok(None);
+                }
+                let end = cursor.saturating_add(block_len);
+                if end > bytes.len() {
+                    return Ok(None);
+                }
+                blocks.push(bytes[cursor..end].to_vec());
+                cursor = end;
+            }
+            summary_memory_bytes = summary_memory_bytes
+                .saturating_add((summary_bytes as u64).saturating_mul(blocks_len as u64));
+            summary_bytes_by_bucket.insert((filter_bucket, bloom_hashes), summary_bytes);
+            masks_by_bucket.insert((filter_bucket, bloom_hashes), blocks);
+        }
+        for keys in &keys_per_block {
+            for (filter_bytes, bloom_hashes) in keys {
+                let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
+                if !masks_by_bucket.contains_key(&bucket_key) {
+                    return Ok(None);
+                }
+            }
+        }
+        if cursor != bytes.len() {
+            return Ok(None);
+        }
+        Ok(Some(Tier2SuperblockIndex {
+            docs_per_block: docs_per_block.max(1),
+            keys_per_block,
+            bucket_for_key,
+            summary_bytes_by_bucket,
+            masks_by_bucket,
+            summary_memory_bytes,
+        }))
     }
 
     fn prepared_query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
@@ -3284,6 +3453,10 @@ fn grams_indexed_path(root: &Path) -> PathBuf {
 
 fn external_ids_path(root: &Path) -> PathBuf {
     root.join("external_ids.dat")
+}
+
+fn tier2_superblocks_path(root: &Path) -> PathBuf {
+    root.join("tier2_superblocks.bin")
 }
 
 fn df_counts_path(root: &Path) -> PathBuf {
@@ -3558,6 +3731,34 @@ fn persist_df_counts_snapshot_to_root(
     fs::rename(tmp_path, snapshot_path)?;
     fs::write(df_counts_delta_path(root), [])?;
     Ok(())
+}
+
+fn append_u32(payload: &mut Vec<u8>, value: u32) {
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_u64(payload: &mut Vec<u8>, value: u64) {
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let end = cursor.saturating_add(4);
+    if end > bytes.len() {
+        return Err(TgsError::from("Invalid tier2 superblocks snapshot"));
+    }
+    let value = u32::from_le_bytes(bytes[*cursor..end].try_into().expect("u32 slice"));
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
+    let end = cursor.saturating_add(8);
+    if end > bytes.len() {
+        return Err(TgsError::from("Invalid tier2 superblocks snapshot"));
+    }
+    let value = u64::from_le_bytes(bytes[*cursor..end].try_into().expect("u64 slice"));
+    *cursor = end;
+    Ok(value)
 }
 
 fn current_df_counts_delta_bytes(root: &Path) -> u64 {
@@ -6275,5 +6476,165 @@ rule q {
         );
         assert_eq!(stats.tier2_superblock_memory_budget_bytes, 16 * 1024 * 1024);
         assert_eq!(stats.tier2_superblock_summary_bytes, 0);
+    }
+
+    #[test]
+    fn tier2_superblocks_snapshot_roundtrips_on_open() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let sha256 = [0x41; 32];
+        let file_size = 4096u64;
+        let grams_received = [pack_exact_gram(&[1, 2, 3]), pack_exact_gram(&[2, 3, 4])];
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(grams_received.len()))
+            .expect("primary filter bytes");
+        let bloom_hashes =
+            store.resolve_bloom_hashes_for_document(filter_bytes, Some(grams_received.len()), None);
+        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("primary");
+        for gram in grams_received {
+            primary_bloom.add(gram).expect("add primary gram");
+        }
+        let tier2_filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(1))
+            .expect("tier2 filter bytes");
+        let tier2_bloom_hashes =
+            store.resolve_bloom_hashes_for_document(tier2_filter_bytes, Some(1), None);
+        let mut tier2_bloom =
+            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("tier2 bloom");
+        tier2_bloom
+            .add(pack_exact_gram(&[1, 2, 3, 4]))
+            .expect("add tier2 gram");
+
+        store
+            .insert_document(
+                sha256,
+                file_size,
+                Some(grams_received.len()),
+                Some(bloom_hashes),
+                Some(1),
+                Some(tier2_bloom_hashes),
+                filter_bytes,
+                &primary_bloom.into_bytes(),
+                tier2_filter_bytes,
+                &tier2_bloom.into_bytes(),
+                &grams_received,
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect("insert");
+        let expected_summary_bytes = store.tier2_superblocks.summary_memory_bytes;
+        store
+            .persist_tier2_superblocks_snapshot()
+            .expect("persist snapshot");
+
+        let (reopened, profile) = CandidateStore::open_profiled(&root).expect("reopen");
+        assert!(profile.loaded_tier2_superblocks_from_snapshot);
+        assert_eq!(profile.rebuild_tier2_superblocks_ms, 0);
+        assert_eq!(
+            reopened.tier2_superblocks.summary_memory_bytes,
+            expected_summary_bytes
+        );
+    }
+
+    #[test]
+    fn stale_tier2_superblocks_snapshot_falls_back_to_rebuild() {
+        fn make_doc(
+            store: &CandidateStore,
+            file_size: u64,
+            sha_byte: u8,
+            gram: u64,
+        ) -> ([u8; 32], Vec<u64>, usize, usize, Vec<u8>) {
+            let grams = vec![gram];
+            let filter_bytes = store
+                .resolve_filter_bytes_for_file_size(file_size, Some(grams.len()))
+                .expect("filter bytes");
+            let bloom_hashes =
+                store.resolve_bloom_hashes_for_document(filter_bytes, Some(grams.len()), None);
+            let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
+            for value in &grams {
+                bloom.add(*value).expect("add gram");
+            }
+            (
+                [sha_byte; 32],
+                grams,
+                filter_bytes,
+                bloom_hashes,
+                bloom.into_bytes(),
+            )
+        }
+
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let file_size = 4096u64;
+        let (sha_one, grams_one, filter_bytes, bloom_hashes, bloom_one) =
+            make_doc(&store, file_size, 0x51, pack_exact_gram(&[1, 2, 3, 4]));
+        store
+            .insert_document(
+                sha_one,
+                file_size,
+                Some(grams_one.len()),
+                Some(bloom_hashes),
+                Some(1),
+                Some(bloom_hashes),
+                filter_bytes,
+                &bloom_one,
+                filter_bytes,
+                &bloom_one,
+                &grams_one,
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect("insert first");
+        store
+            .persist_tier2_superblocks_snapshot()
+            .expect("persist snapshot");
+
+        let (sha_two, grams_two, _, _, bloom_two) =
+            make_doc(&store, file_size, 0x52, pack_exact_gram(&[2, 3, 4, 5]));
+        store
+            .insert_document(
+                sha_two,
+                file_size,
+                Some(grams_two.len()),
+                Some(bloom_hashes),
+                Some(1),
+                Some(bloom_hashes),
+                filter_bytes,
+                &bloom_two,
+                filter_bytes,
+                &bloom_two,
+                &grams_two,
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect("insert second");
+
+        let (reopened, profile) = CandidateStore::open_profiled(&root).expect("reopen");
+        assert!(!profile.loaded_tier2_superblocks_from_snapshot);
+        assert!(reopened.tier2_superblocks.summary_memory_bytes > 0);
     }
 }

@@ -1981,6 +1981,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_init_work_ms",
                         ),
                         (
+                            "last_publish_persist_tier2_superblocks_ms",
+                            "verbose.index.server_last_publish_persist_tier2_superblocks_ms",
+                        ),
+                        (
+                            "last_publish_tier2_snapshot_persist_failures",
+                            "verbose.index.server_last_publish_tier2_snapshot_persist_failures",
+                        ),
+                        (
                             "publish_runs_total",
                             "verbose.index.server_publish_runs_total",
                         ),
