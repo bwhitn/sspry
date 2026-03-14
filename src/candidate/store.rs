@@ -315,8 +315,10 @@ pub struct ImportedCandidateDocument {
     pub tier2_bloom_hashes: usize,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
-    pub grams_received: Vec<u64>,
-    pub grams_indexed: Vec<u64>,
+    pub grams_received_bytes: Vec<u8>,
+    pub grams_received_count: usize,
+    pub grams_indexed_bytes: Vec<u8>,
+    pub grams_indexed_count: usize,
     pub grams_complete: bool,
     pub external_id: Option<String>,
 }
@@ -2293,7 +2295,8 @@ impl CandidateStore {
         })
     }
 
-    pub fn export_live_documents(&self) -> Result<Vec<ImportedCandidateDocument>> {
+    pub fn export_live_documents(&mut self) -> Result<Vec<ImportedCandidateDocument>> {
+        self.sidecars.refresh_maps()?;
         let mut out = Vec::with_capacity(self.docs.len());
         for pos in 0..self.docs.len() {
             let doc = &self.docs[pos];
@@ -2312,11 +2315,10 @@ impl CandidateStore {
                 tier2_bloom_hashes: doc.tier2_bloom_hashes,
                 bloom_filter: self.doc_bloom_bytes(pos)?.into_owned(),
                 tier2_bloom_filter: self.doc_tier2_bloom_bytes(pos)?.into_owned(),
-                grams_received: self.doc_grams_received(pos)?,
-                grams_indexed: decode_exact_gram_vec(
-                    self.doc_indexed_bytes(pos)?.as_ref(),
-                    self.meta.exact_gram_bytes(),
-                )?,
+                grams_received_bytes: self.doc_received_bytes(pos)?.into_owned(),
+                grams_received_count: self.doc_rows[pos].grams_received_count as usize,
+                grams_indexed_bytes: self.doc_indexed_bytes(pos)?.into_owned(),
+                grams_indexed_count: self.doc_rows[pos].grams_indexed_count as usize,
                 grams_complete: doc.grams_complete,
                 external_id: self.doc_external_id(pos)?,
             });
@@ -2387,16 +2389,16 @@ impl CandidateStore {
         for document in documents {
             total_scope.add_bytes(document.file_size);
             let sha256_hex = document.sha256_hex.clone();
-            let received_len = document.grams_received.len() as u64;
-            let indexed_len = document.grams_indexed.len() as u64;
+            let received_len = document.grams_received_count as u64;
+            let indexed_len = document.grams_indexed_count as u64;
             received_grams_total = received_grams_total.saturating_add(received_len);
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
             let df_deltas = document
-                .grams_received
-                .iter()
-                .map(|gram| (*gram, 1))
+                .grams_received_bytes
+                .chunks_exact(gram_bytes)
+                .map(|chunk| (decode_packed_exact_gram(chunk), 1))
                 .collect::<Vec<_>>();
 
             if !assume_new {
@@ -2437,8 +2439,8 @@ impl CandidateStore {
                         snapshot.deleted,
                         document.external_id.as_deref(),
                         &document.bloom_filter,
-                        &document.grams_received,
-                        &document.grams_indexed,
+                        &decode_exact_gram_vec(&document.grams_received_bytes, gram_bytes)?,
+                        &decode_exact_gram_vec(&document.grams_indexed_bytes, gram_bytes)?,
                     )?;
                     let tier2_row = self.build_doc_row5(
                         snapshot.tier2_filter_bytes,
@@ -2459,8 +2461,8 @@ impl CandidateStore {
                             status: "restored".to_owned(),
                             doc_id: snapshot.doc_id,
                             sha256: sha256_hex,
-                            grams_received: document.grams_received.len(),
-                            grams_indexed: document.grams_indexed.len(),
+                            grams_received: document.grams_received_count,
+                            grams_indexed: document.grams_indexed_count,
                             grams_complete: document.grams_complete,
                         });
                     }
@@ -2530,16 +2532,10 @@ impl CandidateStore {
 
                 let grams_received_offset =
                     grams_received_base + grams_received_payload.len() as u64;
-                for value in &document.grams_received {
-                    let encoded = value.to_le_bytes();
-                    grams_received_payload.extend_from_slice(&encoded[..gram_bytes]);
-                }
+                grams_received_payload.extend_from_slice(&document.grams_received_bytes);
 
                 let grams_indexed_offset = grams_indexed_base + grams_indexed_payload.len() as u64;
-                for value in &document.grams_indexed {
-                    let encoded = value.to_le_bytes();
-                    grams_indexed_payload.extend_from_slice(&encoded[..gram_bytes]);
-                }
+                grams_indexed_payload.extend_from_slice(&document.grams_indexed_bytes);
 
                 let (external_id_offset, external_id_len) =
                     if let Some(external_id) = document.external_id.as_deref() {
@@ -2572,9 +2568,9 @@ impl CandidateStore {
                     bloom_offset,
                     bloom_len: document.bloom_filter.len() as u32,
                     grams_received_offset,
-                    grams_received_count: document.grams_received.len() as u32,
+                    grams_received_count: document.grams_received_count as u32,
                     grams_indexed_offset,
-                    grams_indexed_count: document.grams_indexed.len() as u32,
+                    grams_indexed_count: document.grams_indexed_count as u32,
                     external_id_offset,
                     external_id_len,
                 };
@@ -2602,8 +2598,8 @@ impl CandidateStore {
                     document.filter_bytes,
                     document.bloom_hashes,
                     document.bloom_filter.as_slice(),
-                    document.grams_received.len(),
-                    document.grams_indexed.len(),
+                    document.grams_received_count,
+                    document.grams_indexed_count,
                     document.grams_complete,
                 ));
             }
@@ -3031,6 +3027,17 @@ impl CandidateStore {
             row.grams_received_offset,
             row.grams_received_count,
             self.meta.exact_gram_bytes(),
+            "grams_received",
+            doc.doc_id,
+        )
+    }
+
+    fn doc_received_bytes<'a>(&'a self, pos: usize) -> Result<Cow<'a, [u8]>> {
+        let doc = &self.docs[pos];
+        let row = self.doc_rows[pos];
+        self.sidecars.grams_received.read_bytes(
+            row.grams_received_offset,
+            row.grams_received_count as usize * self.meta.exact_gram_bytes(),
             "grams_received",
             doc.doc_id,
         )

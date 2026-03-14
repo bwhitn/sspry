@@ -3145,7 +3145,7 @@ impl ServerState {
                 let mut import_profile_total = CandidateImportBatchProfile::default();
                 let mut imported_docs_total = 0u64;
                 let mut imported_shards_total = 0u64;
-                for (shard_idx, work_store) in work_stores.into_iter().enumerate() {
+                for (shard_idx, mut work_store) in work_stores.into_iter().enumerate() {
                     let export_started = Instant::now();
                     let imported = work_store.export_live_documents()?;
                     export_ms_total =
