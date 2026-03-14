@@ -2554,6 +2554,8 @@ impl CandidateStore {
                 .tier2_doc_meta
                 .append(&tier2_doc_meta_payload)?;
 
+            let mut tier2_updates =
+                Vec::<(usize, usize, usize, Vec<u8>)>::with_capacity(prepared.len());
             for (
                 doc,
                 row,
@@ -2570,7 +2572,7 @@ impl CandidateStore {
                 let pos = self.docs.len();
                 self.docs.push(doc.clone());
                 self.sha_to_pos.insert(sha256_hex.clone(), pos);
-                self.update_tier2_superblocks_for_doc_bytes_inner(pos, &bloom_filter)?;
+                tier2_updates.push((pos, doc.filter_bytes, doc.bloom_hashes, bloom_filter));
                 results.push(CandidateInsertResult {
                     status: "inserted".to_owned(),
                     doc_id: doc.doc_id,
@@ -2580,6 +2582,7 @@ impl CandidateStore {
                     grams_complete,
                 });
             }
+            self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
         }
 
         if modified {
@@ -3132,6 +3135,97 @@ impl CandidateStore {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn update_tier2_superblocks_for_doc_bytes_batch(
+        &mut self,
+        updates: &[(usize, usize, usize, Vec<u8>)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
+        let mut max_needed_blocks = self.tier2_superblocks.keys_per_block.len();
+        let mut keys_by_block = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+        let mut max_block_by_bucket = BTreeMap::<(usize, usize), usize>::new();
+        let mut aggregated = BTreeMap::<(usize, (usize, usize)), Vec<u8>>::new();
+
+        for (pos, filter_bytes, bloom_hashes, bloom_bytes) in updates {
+            let block_idx = *pos / docs_per_block;
+            max_needed_blocks = max_needed_blocks.max(block_idx + 1);
+            let filter_key = (*filter_bytes, *bloom_hashes);
+            let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
+            let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0).max(1);
+            keys_by_block.entry(block_idx).or_default().push(filter_key);
+            max_block_by_bucket
+                .entry(bucket_key)
+                .and_modify(|value| *value = (*value).max(block_idx))
+                .or_insert(block_idx);
+            let folded = aggregated
+                .entry((block_idx, filter_key))
+                .or_insert_with(|| vec![0u8; summary_bytes]);
+            for (source_idx, src) in bloom_bytes.iter().copied().enumerate() {
+                let folded_idx = source_idx % summary_bytes;
+                folded[folded_idx] |= src;
+            }
+        }
+
+        if self.tier2_superblocks.keys_per_block.len() < max_needed_blocks {
+            self.tier2_superblocks
+                .keys_per_block
+                .resize_with(max_needed_blocks, Vec::new);
+        }
+
+        for (bucket_key, max_block_idx) in max_block_by_bucket {
+            let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0);
+            self.tier2_superblocks
+                .summary_bytes_by_bucket
+                .insert(bucket_key, summary_bytes);
+            let blocks = self
+                .tier2_superblocks
+                .masks_by_bucket
+                .entry(bucket_key)
+                .or_insert_with(Vec::new);
+            while blocks.len() <= max_block_idx {
+                blocks.push(vec![0u8; summary_bytes]);
+                self.tier2_superblocks.summary_memory_bytes = self
+                    .tier2_superblocks
+                    .summary_memory_bytes
+                    .saturating_add(summary_bytes as u64);
+            }
+        }
+
+        for (block_idx, mut filter_keys) in keys_by_block {
+            filter_keys.sort_unstable();
+            filter_keys.dedup();
+            let keys = &mut self.tier2_superblocks.keys_per_block[block_idx];
+            let before_len = keys.len();
+            for filter_key in filter_keys {
+                let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
+                self.tier2_superblocks
+                    .bucket_for_key
+                    .insert(filter_key, bucket_key);
+                if !keys.contains(&filter_key) {
+                    keys.push(filter_key);
+                }
+            }
+            if keys.len() != before_len {
+                keys.sort_unstable();
+            }
+        }
+
+        for ((block_idx, filter_key), folded) in aggregated {
+            let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
+            if let Some(blocks) = self.tier2_superblocks.masks_by_bucket.get_mut(&bucket_key) {
+                if let Some(block) = blocks.get_mut(block_idx) {
+                    for (dst, src) in block.iter_mut().zip(folded.iter()) {
+                        *dst |= *src;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
