@@ -58,7 +58,7 @@ const DF_CACHE_CAPACITY: usize = 128;
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
-const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
+pub const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
 const DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP: usize = 1;
 
 fn lock_candidate_store_with_timeout<'a>(
@@ -123,6 +123,7 @@ pub struct ServerConfig {
     pub search_workers: usize,
     pub memory_budget_bytes: u64,
     pub tier2_superblock_budget_divisor: u64,
+    pub auto_publish_idle_ms: u64,
     pub workspace_mode: bool,
 }
 
@@ -1488,7 +1489,8 @@ impl ServerState {
         } else {
             now_unix_ms.saturating_sub(last_mutation)
         };
-        let idle_remaining_ms = DEFAULT_AUTO_PUBLISH_IDLE_MS.saturating_sub(idle_elapsed_ms);
+        let idle_threshold_ms = self.config.auto_publish_idle_ms;
+        let idle_remaining_ms = idle_threshold_ms.saturating_sub(idle_elapsed_ms);
         let eligible = self.config.workspace_mode
             && work_dirty
             && active_index_sessions == 0
@@ -1496,7 +1498,7 @@ impl ServerState {
             && !publish_in_progress
             && !mutations_paused
             && last_mutation != 0
-            && idle_elapsed_ms >= DEFAULT_AUTO_PUBLISH_IDLE_MS;
+            && idle_elapsed_ms >= idle_threshold_ms;
         let blocked_reason = if !self.config.workspace_mode {
             "workspace_disabled"
         } else if !work_dirty {
@@ -1511,7 +1513,7 @@ impl ServerState {
             "active_mutations"
         } else if last_mutation == 0 {
             "awaiting_work_mutation_timestamp"
-        } else if idle_elapsed_ms < DEFAULT_AUTO_PUBLISH_IDLE_MS {
+        } else if idle_elapsed_ms < idle_threshold_ms {
             "waiting_for_idle_window"
         } else {
             "ready"
@@ -1593,7 +1595,7 @@ impl ServerState {
         );
         stats.insert(
             "auto_publish_idle_ms".to_owned(),
-            json!(DEFAULT_AUTO_PUBLISH_IDLE_MS),
+            json!(self.config.auto_publish_idle_ms),
         );
         stats.insert(
             "search_workers".to_owned(),
@@ -3884,6 +3886,7 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -3905,6 +3908,7 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -3926,6 +3930,7 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: true,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -4126,6 +4131,37 @@ mod tests {
                 .and_then(Value::as_u64)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn publish_readiness_allows_zero_idle_window() {
+        let tmp = tempdir().expect("tmp");
+        let mut config = ServerConfig {
+            candidate_config: CandidateConfig {
+                root: tmp.path().join("candidate_workspace_zero_idle"),
+                ..CandidateConfig::default()
+            },
+            candidate_shards: 1,
+            search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_idle_ms: 0,
+            workspace_mode: true,
+        };
+        let state = Arc::new(
+            ServerState::new(config.clone(), Arc::new(AtomicBool::new(false))).expect("state"),
+        );
+        state.mark_work_mutation();
+        let readiness = state.publish_readiness(current_unix_ms());
+        assert!(readiness.eligible);
+        assert_eq!(readiness.idle_remaining_ms, 0);
+
+        config.auto_publish_idle_ms = 1;
+        let state =
+            Arc::new(ServerState::new(config, Arc::new(AtomicBool::new(false))).expect("state"));
+        state.mark_work_mutation();
+        let readiness = state.publish_readiness(current_unix_ms());
+        assert!(!readiness.eligible);
     }
 
     #[test]
@@ -4492,6 +4528,7 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
             );
@@ -4551,6 +4588,7 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
             );
@@ -4597,6 +4635,7 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
                 server_shutdown,
@@ -5565,6 +5604,7 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                 workspace_mode: false,
             },
             Arc::new(AtomicBool::new(true)),
@@ -5873,6 +5913,7 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                 workspace_mode: false,
             })
             .expect_err("single-shard mismatch")
@@ -5900,6 +5941,7 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                 workspace_mode: false,
             })
             .expect_err("sharded mismatch")
@@ -5917,6 +5959,7 @@ rule q {
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
             workspace_mode: false,
         })
         .expect("create sharded stores");
@@ -5938,6 +5981,7 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                 workspace_mode: false,
             })
             .expect_err("manifest mismatch")
@@ -6048,6 +6092,7 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                 workspace_mode: false,
             },
             Arc::new(AtomicBool::new(false)),
@@ -6150,6 +6195,7 @@ rule q {
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
             workspace_mode: false,
         })
         .expect("ensure stores");
@@ -6181,6 +6227,7 @@ rule q {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -6275,6 +6322,7 @@ rule q {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -6360,6 +6408,7 @@ rule q {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),

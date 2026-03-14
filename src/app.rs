@@ -46,6 +46,7 @@ pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
 pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
+pub const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = rpc::DEFAULT_AUTO_PUBLISH_IDLE_MS;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
 pub const DEFAULT_INCREMENTAL_SHARDS: usize = 64;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
@@ -1420,6 +1421,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
                 tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
+                auto_publish_idle_ms: args.auto_publish_idle_ms,
                 workspace_mode: true,
             },
             signals.shutdown.clone(),
@@ -2893,6 +2895,12 @@ struct ServeArgs {
     )]
     tier2_superblock_budget_divisor: u64,
     #[arg(
+        long = "auto-publish-idle-ms",
+        default_value_t = DEFAULT_AUTO_PUBLISH_IDLE_MS,
+        help = "Temporary fixed idle window before auto-publish. 0 publishes immediately once active index sessions and mutations are drained."
+    )]
+    auto_publish_idle_ms: u64,
+    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. YAYA will manage current/, work/, and retired/ under this path."
@@ -3145,6 +3153,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
             workspace_mode: true,
         })
     }
@@ -3183,6 +3192,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
@@ -4128,6 +4138,7 @@ rule remote_q {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
             workspace_mode: true,
         });
 
