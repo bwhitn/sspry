@@ -1046,12 +1046,18 @@ fn median_value(values: &mut [f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let middle = values.len() / 2;
+    let cmp =
+        |left: &f64, right: &f64| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal);
     if values.len() % 2 == 0 {
-        (values[middle - 1] + values[middle]) / 2.0
+        let (left, right) = values.split_at_mut(middle);
+        let (_, upper, _) = right.select_nth_unstable_by(0, cmp);
+        let upper_value = *upper;
+        let lower_value = left.iter().copied().max_by(cmp).unwrap_or(upper_value);
+        (lower_value + upper_value) / 2.0
     } else {
-        values[middle]
+        let (_, median, _) = values.select_nth_unstable_by(middle, cmp);
+        *median
     }
 }
 
@@ -1756,7 +1762,14 @@ impl CandidateStore {
             return (Vec::new(), false);
         }
 
+        let base_budget = match gram_count_estimate {
+            Some(estimate) if DEFAULT_TIER1_GRAM_BUDGET > 0 => {
+                scale_tier1_gram_budget(DEFAULT_TIER1_GRAM_BUDGET, estimate)
+            }
+            _ => DEFAULT_TIER1_GRAM_BUDGET,
+        };
         let mut eligible = Vec::<Tier1DfEntry>::new();
+        let mut commonness_values = Vec::<f64>::new();
         let mut complete = true;
         for entry in self.projected_tier1_df_entries_with_active_docs(dedup_received, active_docs) {
             if entry.projected_df < self.meta.df_min
@@ -1765,6 +1778,7 @@ impl CandidateStore {
                 complete = false;
                 continue;
             }
+            commonness_values.push(entry.commonness);
             eligible.push(entry);
         }
         if eligible.len() == dedup_received.len() && DEFAULT_TIER1_GRAM_BUDGET == 0 {
@@ -1779,18 +1793,21 @@ impl CandidateStore {
             return (Vec::new(), false);
         }
 
-        let mut commonness_values = eligible
-            .iter()
-            .map(|entry| entry.commonness)
-            .collect::<Vec<_>>();
-        let doc_commonness = median_value(&mut commonness_values);
         let doc_diversity = effective_diversity.unwrap_or(0.5).clamp(0.0, 1.0);
-        let base_budget = match gram_count_estimate {
-            Some(estimate) if DEFAULT_TIER1_GRAM_BUDGET > 0 => {
-                scale_tier1_gram_budget(DEFAULT_TIER1_GRAM_BUDGET, estimate)
-            }
-            _ => DEFAULT_TIER1_GRAM_BUDGET,
+        let min_adjusted_budget = if base_budget == 0 {
+            eligible.len()
+        } else {
+            ((base_budget as f64) * 0.80).floor() as usize
         };
+        if min_adjusted_budget >= eligible.len() {
+            let mut grams = eligible
+                .into_iter()
+                .map(|entry| entry.gram)
+                .collect::<Vec<_>>();
+            grams.sort_unstable();
+            return (grams, complete);
+        }
+        let doc_commonness = median_value(&mut commonness_values);
         let adjusted_budget = if base_budget == 0 {
             eligible.len()
         } else {
