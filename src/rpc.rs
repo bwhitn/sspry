@@ -494,6 +494,34 @@ impl TgsdbClient {
         }
     }
 
+    pub(crate) fn candidate_insert_batch_serialized_rows(
+        &self,
+        rows: &[Vec<u8>],
+    ) -> Result<CandidateInsertBatchResponse> {
+        if rows.is_empty() {
+            return Ok(CandidateInsertBatchResponse {
+                inserted_count: 0,
+                results: Vec::new(),
+            });
+        }
+        let payload = serialized_candidate_insert_batch_payload(rows);
+        match self.request_typed_bytes(ACTION_CANDIDATE_INSERT_BATCH, &payload) {
+            Ok(response) => Ok(response),
+            Err(err) if rows.len() > 1 && is_payload_too_large_error(&err) => {
+                let mid = rows.len() / 2;
+                let mut left = self.candidate_insert_batch_serialized_rows(&rows[..mid])?;
+                let right = self.candidate_insert_batch_serialized_rows(&rows[mid..])?;
+                left.inserted_count += right.inserted_count;
+                left.results.extend(right.results);
+                Ok(left)
+            }
+            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => Err(TgsError::from(
+                "Single document insert request is too large to send.",
+            )),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn candidate_insert_batch_payload_size(
         documents: &[CandidateDocumentWire],
     ) -> Result<usize> {
@@ -3528,6 +3556,23 @@ fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
 
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(TgsError::from)
+}
+
+pub(crate) fn serialized_candidate_insert_batch_payload(rows: &[Vec<u8>]) -> Vec<u8> {
+    let payload_len = rows.iter().map(Vec::len).sum::<usize>()
+        + rows.len().saturating_sub(1)
+        + br#"{"documents":["#.len()
+        + b"]}".len();
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.extend_from_slice(br#"{"documents":["#);
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 {
+            payload.push(b',');
+        }
+        payload.extend_from_slice(row);
+    }
+    payload.extend_from_slice(b"]}");
+    payload
 }
 
 fn json_from_bytes<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {

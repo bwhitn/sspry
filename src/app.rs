@@ -777,7 +777,7 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
 const REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES: usize = DEFAULT_MAX_REQUEST_BYTES - 1024;
 
 struct RemotePendingBatch {
-    documents: Vec<CandidateDocumentWire>,
+    rows: Vec<Vec<u8>>,
     payload_size: usize,
 }
 
@@ -785,8 +785,8 @@ fn empty_remote_batch_payload_size() -> Result<usize> {
     TgsdbClient::candidate_insert_batch_payload_size(&[])
 }
 
-fn candidate_document_wire_payload_size(document: &CandidateDocumentWire) -> Result<usize> {
-    Ok(serde_json::to_vec(document)?.len())
+fn serialize_candidate_document_wire(document: &CandidateDocumentWire) -> Result<Vec<u8>> {
+    serde_json::to_vec(document).map_err(TgsError::from)
 }
 
 fn flush_remote_batch(
@@ -795,13 +795,13 @@ fn flush_remote_batch(
     processed: &mut usize,
     empty_payload_size: usize,
 ) -> Result<()> {
-    if pending.documents.is_empty() {
+    if pending.rows.is_empty() {
         return Ok(());
     }
     *processed += client
-        .candidate_insert_batch(&pending.documents)?
+        .candidate_insert_batch_serialized_rows(&pending.rows)?
         .inserted_count;
-    pending.documents.clear();
+    pending.rows.clear();
     pending.payload_size = empty_payload_size;
     Ok(())
 }
@@ -814,8 +814,9 @@ fn push_remote_batch_row(
     processed: &mut usize,
     empty_payload_size: usize,
 ) -> Result<()> {
-    let row_payload_size = candidate_document_wire_payload_size(&row)?;
-    let separator_bytes = usize::from(!pending.documents.is_empty());
+    let row_bytes = serialize_candidate_document_wire(&row)?;
+    let row_payload_size = row_bytes.len();
+    let separator_bytes = usize::from(!pending.rows.is_empty());
     let payload_size = pending
         .payload_size
         .saturating_add(separator_bytes)
@@ -829,13 +830,13 @@ fn push_remote_batch_row(
                 single_payload_size
             )));
         }
-        pending.documents.push(row);
+        pending.rows.push(row_bytes);
         pending.payload_size = single_payload_size;
     } else {
-        pending.documents.push(row);
+        pending.rows.push(row_bytes);
         pending.payload_size = payload_size;
     }
-    if pending.documents.len() >= batch_size {
+    if pending.rows.len() >= batch_size {
         flush_remote_batch(client, pending, processed, empty_payload_size)?;
     }
     Ok(())
@@ -1804,7 +1805,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
             let empty_payload_size = empty_remote_batch_payload_size()?;
             let mut pending = RemotePendingBatch {
-                documents: Vec::new(),
+                rows: Vec::new(),
                 payload_size: empty_payload_size,
             };
             let mut last_server_progress_reported = 0usize;
@@ -3354,13 +3355,12 @@ mod tests {
             },
         ];
         let mut running = empty;
-        let mut pending_docs = Vec::new();
+        let mut pending_rows = Vec::new();
         for doc in docs {
-            let row_size = candidate_document_wire_payload_size(&doc).expect("row payload size");
-            running += row_size + usize::from(!pending_docs.is_empty());
-            pending_docs.push(doc);
-            let exact = TgsdbClient::candidate_insert_batch_payload_size(&pending_docs)
-                .expect("batch payload size");
+            let row = serialize_candidate_document_wire(&doc).expect("row payload size");
+            running += row.len() + usize::from(!pending_rows.is_empty());
+            pending_rows.push(row);
+            let exact = crate::rpc::serialized_candidate_insert_batch_payload(&pending_rows).len();
             assert_eq!(running, exact);
         }
     }
