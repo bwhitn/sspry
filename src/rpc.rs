@@ -314,6 +314,12 @@ struct ServerState {
     last_publish_duration_ms: AtomicU64,
     last_publish_swap_ms: AtomicU64,
     last_publish_promote_work_ms: AtomicU64,
+    last_publish_promote_work_export_ms: AtomicU64,
+    last_publish_promote_work_import_ms: AtomicU64,
+    last_publish_promote_work_remove_work_root_ms: AtomicU64,
+    last_publish_promote_work_other_ms: AtomicU64,
+    last_publish_promote_work_imported_docs: AtomicU64,
+    last_publish_promote_work_imported_shards: AtomicU64,
     last_publish_persist_df_counts_ms: AtomicU64,
     last_publish_df_snapshot_persist_failures: AtomicU64,
     last_publish_init_work_ms: AtomicU64,
@@ -1093,6 +1099,12 @@ impl ServerState {
             last_publish_duration_ms: AtomicU64::new(0),
             last_publish_swap_ms: AtomicU64::new(0),
             last_publish_promote_work_ms: AtomicU64::new(0),
+            last_publish_promote_work_export_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_ms: AtomicU64::new(0),
+            last_publish_promote_work_remove_work_root_ms: AtomicU64::new(0),
+            last_publish_promote_work_other_ms: AtomicU64::new(0),
+            last_publish_promote_work_imported_docs: AtomicU64::new(0),
+            last_publish_promote_work_imported_shards: AtomicU64::new(0),
             last_publish_persist_df_counts_ms: AtomicU64::new(0),
             last_publish_df_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_init_work_ms: AtomicU64::new(0),
@@ -1731,6 +1743,48 @@ impl ServerState {
             publish.insert(
                 "last_publish_promote_work_ms".to_owned(),
                 json!(self.last_publish_promote_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_promote_work_export_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_export_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_remove_work_root_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_remove_work_root_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_other_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_other_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_imported_docs".to_owned(),
+                json!(
+                    self.last_publish_promote_work_imported_docs
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_imported_shards".to_owned(),
+                json!(
+                    self.last_publish_promote_work_imported_shards
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_persist_df_counts_ms".to_owned(),
@@ -2684,6 +2738,19 @@ impl ServerState {
         let publish_started_unix_ms = current_unix_ms();
         self.last_publish_started_unix_ms
             .store(publish_started_unix_ms, Ordering::SeqCst);
+        self.last_publish_promote_work_ms.store(0, Ordering::SeqCst);
+        self.last_publish_promote_work_export_ms
+            .store(0, Ordering::SeqCst);
+        self.last_publish_promote_work_import_ms
+            .store(0, Ordering::SeqCst);
+        self.last_publish_promote_work_remove_work_root_ms
+            .store(0, Ordering::SeqCst);
+        self.last_publish_promote_work_other_ms
+            .store(0, Ordering::SeqCst);
+        self.last_publish_promote_work_imported_docs
+            .store(0, Ordering::SeqCst);
+        self.last_publish_promote_work_imported_shards
+            .store(0, Ordering::SeqCst);
         self.last_publish_persist_df_counts_ms
             .store(0, Ordering::SeqCst);
         self.last_publish_df_snapshot_persist_failures
@@ -2815,28 +2882,60 @@ impl ServerState {
                     TgsError::from("work stores are still busy during publish; retry later")
                 })?;
                 let work_stores = work_store_set.into_stores()?;
+                let mut export_ms_total = 0u128;
+                let mut import_ms_total = 0u128;
+                let mut imported_docs_total = 0u64;
+                let mut imported_shards_total = 0u64;
                 for (shard_idx, work_store) in work_stores.into_iter().enumerate() {
+                    let export_started = Instant::now();
                     let imported = work_store.export_live_documents()?;
+                    export_ms_total =
+                        export_ms_total.saturating_add(export_started.elapsed().as_millis());
                     if imported.is_empty() {
                         continue;
                     }
                     changed_shards[shard_idx] = true;
+                    imported_docs_total = imported_docs_total.saturating_add(imported.len() as u64);
+                    imported_shards_total = imported_shards_total.saturating_add(1);
+                    let import_started = Instant::now();
                     let mut published_store = published_store_set.stores[shard_idx]
                         .lock()
                         .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
                     let _ = published_store.import_documents_batch(&imported)?;
+                    import_ms_total =
+                        import_ms_total.saturating_add(import_started.elapsed().as_millis());
                 }
+                let remove_started = Instant::now();
                 if work_root.exists() {
                     fs::remove_dir_all(&work_root)?;
                 }
-                self.last_publish_promote_work_ms.store(
-                    promote_started
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
+                let remove_ms = remove_started.elapsed().as_millis();
+                let promote_ms = promote_started.elapsed().as_millis();
+                self.last_publish_promote_work_ms
+                    .store(promote_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
+                self.last_publish_promote_work_export_ms.store(
+                    export_ms_total.try_into().unwrap_or(u64::MAX),
                     Ordering::SeqCst,
                 );
+                self.last_publish_promote_work_import_ms.store(
+                    import_ms_total.try_into().unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+                self.last_publish_promote_work_remove_work_root_ms
+                    .store(remove_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
+                self.last_publish_promote_work_other_ms.store(
+                    promote_ms
+                        .saturating_sub(export_ms_total)
+                        .saturating_sub(import_ms_total)
+                        .saturating_sub(remove_ms)
+                        .try_into()
+                        .unwrap_or(0),
+                    Ordering::SeqCst,
+                );
+                self.last_publish_promote_work_imported_docs
+                    .store(imported_docs_total, Ordering::SeqCst);
+                self.last_publish_promote_work_imported_shards
+                    .store(imported_shards_total, Ordering::SeqCst);
                 reuse_work_stores = false;
                 published_store_set
             };

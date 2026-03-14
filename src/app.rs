@@ -1977,6 +1977,30 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_promote_work_ms",
                         ),
                         (
+                            "last_publish_promote_work_export_ms",
+                            "verbose.index.server_last_publish_promote_work_export_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_ms",
+                            "verbose.index.server_last_publish_promote_work_import_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_remove_work_root_ms",
+                            "verbose.index.server_last_publish_promote_work_remove_work_root_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_other_ms",
+                            "verbose.index.server_last_publish_promote_work_other_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_imported_docs",
+                            "verbose.index.server_last_publish_promote_work_imported_docs",
+                        ),
+                        (
+                            "last_publish_promote_work_imported_shards",
+                            "verbose.index.server_last_publish_promote_work_imported_shards",
+                        ),
+                        (
                             "last_publish_persist_df_counts_ms",
                             "verbose.index.server_last_publish_persist_df_counts_ms",
                         ),
