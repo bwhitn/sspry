@@ -948,6 +948,9 @@ pub fn serve_with_signal_flags(
         }
         thread::sleep(Duration::from_millis(25));
     }
+    if let Err(err) = state.flush_store_meta_if_dirty() {
+        eprintln!("yaya: failed to flush dirty store metadata during shutdown: {err}");
+    }
     eprintln!("yaya: shutdown complete");
     accept_result
 }
@@ -1424,6 +1427,43 @@ impl ServerState {
             StoreMode::Direct { stores } => stores.clone(),
             StoreMode::Workspace { work, .. } => work.clone(),
         })
+    }
+
+    fn flush_store_meta_if_dirty(&self) -> Result<()> {
+        let mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+        match &*mode {
+            StoreMode::Direct { stores } => {
+                for (shard_idx, store_lock) in stores.stores.iter().enumerate() {
+                    let mut store =
+                        lock_candidate_store_with_timeout(store_lock, shard_idx, "flush meta")?;
+                    let _ = store.persist_meta_if_dirty()?;
+                }
+            }
+            StoreMode::Workspace {
+                published, work, ..
+            } => {
+                for (shard_idx, store_lock) in published.stores.iter().enumerate() {
+                    let mut store = lock_candidate_store_with_timeout(
+                        store_lock,
+                        shard_idx,
+                        "flush published meta",
+                    )?;
+                    let _ = store.persist_meta_if_dirty()?;
+                }
+                for (shard_idx, store_lock) in work.stores.iter().enumerate() {
+                    let mut store = lock_candidate_store_with_timeout(
+                        store_lock,
+                        shard_idx,
+                        "flush work meta",
+                    )?;
+                    let _ = store.persist_meta_if_dirty()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn workspace_roots(&self) -> Result<Option<(PathBuf, PathBuf)>> {

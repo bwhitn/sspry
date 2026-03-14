@@ -230,6 +230,20 @@ impl DfCountsState {
         }
     }
 
+    fn apply_unit_deltas(&mut self, grams: &[u64]) {
+        self.delta.reserve(grams.len());
+        for gram in grams {
+            match self.delta.entry(*gram) {
+                FastEntry::Occupied(mut entry) => {
+                    *entry.get_mut() += 1;
+                }
+                FastEntry::Vacant(entry) => {
+                    entry.insert(1);
+                }
+            }
+        }
+    }
+
     fn refresh_snapshot(&mut self, root: &Path) -> Result<()> {
         let fresh = Self::load(root, self.gram_bytes)?;
         self.snapshot = fresh.snapshot;
@@ -1056,6 +1070,7 @@ pub struct CandidateStore {
     tier2_superblock_memory_budget_divisor: u64,
     tier2_superblock_memory_budget_bytes: u64,
     df_counts_delta_compact_threshold_bytes: u64,
+    meta_persist_dirty: bool,
     last_insert_batch_profile: CandidateInsertBatchProfile,
     last_import_batch_profile: CandidateImportBatchProfile,
 }
@@ -1263,6 +1278,7 @@ impl CandidateStore {
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+            meta_persist_dirty: false,
             last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
@@ -1334,6 +1350,7 @@ impl CandidateStore {
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+            meta_persist_dirty: false,
             last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
@@ -1345,6 +1362,7 @@ impl CandidateStore {
         let normalized_next_doc_id = store.docs.len() as u64 + 1;
         if store.meta.next_doc_id != normalized_next_doc_id {
             store.meta.next_doc_id = normalized_next_doc_id;
+            store.meta_persist_dirty = true;
         }
         let rebuild_profile = store.rebuild_indexes_profiled()?;
         let profile = CandidateStoreOpenProfile {
@@ -1639,8 +1657,12 @@ impl CandidateStore {
         )
     }
 
-    fn projected_tier1_df_entries(&self, grams: &[u64]) -> Vec<Tier1DfEntry> {
-        let active_docs = self.docs.iter().filter(|doc| !doc.deleted).count().max(1);
+    fn projected_tier1_df_entries_with_active_docs(
+        &self,
+        grams: &[u64],
+        active_docs: usize,
+    ) -> Vec<Tier1DfEntry> {
+        let active_docs = active_docs.max(1);
         let mut entries = Vec::with_capacity(grams.len());
         for gram in grams {
             let projected_df = self.df_counts.get(*gram) + 1;
@@ -1660,13 +1682,28 @@ impl CandidateStore {
         gram_count_estimate: Option<usize>,
         effective_diversity: Option<f64>,
     ) -> (Vec<u64>, bool) {
+        self.select_indexed_grams_with_active_docs(
+            dedup_received,
+            gram_count_estimate,
+            effective_diversity,
+            self.docs.iter().filter(|doc| !doc.deleted).count(),
+        )
+    }
+
+    fn select_indexed_grams_with_active_docs(
+        &self,
+        dedup_received: &[u64],
+        gram_count_estimate: Option<usize>,
+        effective_diversity: Option<f64>,
+        active_docs: usize,
+    ) -> (Vec<u64>, bool) {
         if dedup_received.is_empty() {
             return (Vec::new(), false);
         }
 
         let mut eligible = Vec::<Tier1DfEntry>::new();
         let mut complete = true;
-        for entry in self.projected_tier1_df_entries(dedup_received) {
+        for entry in self.projected_tier1_df_entries_with_active_docs(dedup_received, active_docs) {
             if entry.projected_df < self.meta.df_min
                 || (self.meta.df_max != 0 && entry.projected_df > self.meta.df_max)
             {
@@ -1853,10 +1890,13 @@ impl CandidateStore {
 
         let status;
         let doc_id;
-        let df_deltas = dedup_received
-            .iter()
-            .map(|gram| (*gram, 1))
-            .collect::<Vec<_>>();
+        let mut df_unit_delta_payload =
+            Vec::with_capacity(dedup_received.len() * self.meta.exact_gram_bytes());
+        extend_unit_df_payload_from_values(
+            &mut df_unit_delta_payload,
+            &dedup_received,
+            self.meta.exact_gram_bytes(),
+        );
         if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
             if !self.docs[existing_pos].deleted {
                 let existing = &self.docs[existing_pos];
@@ -1870,7 +1910,7 @@ impl CandidateStore {
                     grams_complete: existing.grams_complete,
                 });
             }
-            self.df_counts.apply_deltas(&df_deltas);
+            self.df_counts.apply_unit_deltas(&dedup_received);
             let snapshot = {
                 let existing = &mut self.docs[existing_pos];
                 existing.file_size = file_size;
@@ -1931,7 +1971,7 @@ impl CandidateStore {
                 grams_complete: complete,
                 deleted: false,
             };
-            self.df_counts.apply_deltas(&df_deltas);
+            self.df_counts.apply_unit_deltas(&dedup_received);
             {
                 let _scope = scope("candidate.insert_document.persist");
                 let row = self.build_doc_row(
@@ -1950,7 +1990,7 @@ impl CandidateStore {
                     doc.tier2_bloom_hashes,
                     tier2_bloom_filter,
                 )?;
-                self.persist_meta()?;
+                self.mark_meta_dirty();
                 self.append_new_doc(&sha256, row, tier2_row)?;
                 self.doc_rows.push(row);
                 self.tier2_doc_rows.push(tier2_row);
@@ -1963,10 +2003,9 @@ impl CandidateStore {
             status = "inserted".to_owned();
         }
 
-        append_df_count_deltas_with_writer(
-            &mut self.append_writers.df_counts_delta,
-            self.meta.exact_gram_bytes(),
-            &df_deltas,
+        append_df_count_unit_payload_with_writer(
+            &mut self.append_writers.df_counts_unit_delta,
+            &df_unit_delta_payload,
         )?;
         self.maybe_compact_df_counts()?;
         self.sidecars.invalidate_all();
@@ -2025,7 +2064,7 @@ impl CandidateStore {
 
         let mut total_scope = scope("candidate.insert_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
-        let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
+        let mut aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut modified = false;
         let mut meta_dirty = false;
         let mut insert_profile = CandidateInsertBatchProfile::default();
@@ -2033,6 +2072,7 @@ impl CandidateStore {
         let mut indexed_grams_total = 0u64;
         let mut max_received_grams = 0u64;
         let mut max_indexed_grams = 0u64;
+        let mut active_docs = self.docs.iter().filter(|doc| !doc.deleted).count();
 
         for document in documents {
             let (
@@ -2134,10 +2174,11 @@ impl CandidateStore {
                 dedup
             };
 
-            let (indexed, selection_complete) = self.select_indexed_grams(
+            let (indexed, selection_complete) = self.select_indexed_grams_with_active_docs(
                 &dedup_received,
                 *gram_count_estimate,
                 *effective_diversity,
+                active_docs,
             );
             let complete =
                 *grams_complete && selection_complete && indexed.len() == dedup_received.len();
@@ -2147,10 +2188,11 @@ impl CandidateStore {
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
-            let df_deltas = dedup_received
-                .iter()
-                .map(|gram| (*gram, 1))
-                .collect::<Vec<_>>();
+            extend_unit_df_payload_from_values(
+                &mut aggregate_df_unit_delta_payload,
+                &dedup_received,
+                self.meta.exact_gram_bytes(),
+            );
 
             if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
                 if !self.docs[existing_pos].deleted {
@@ -2174,11 +2216,10 @@ impl CandidateStore {
                     .classify_us
                     .saturating_add(elapsed_us(classify_started));
                 let apply_df_counts_started = Instant::now();
-                self.df_counts.apply_deltas(&df_deltas);
+                self.df_counts.apply_unit_deltas(&dedup_received);
                 insert_profile.apply_df_counts_us = insert_profile
                     .apply_df_counts_us
                     .saturating_add(elapsed_us(apply_df_counts_started));
-                aggregate_df_deltas.extend(df_deltas.iter().copied());
                 let write_existing_started = Instant::now();
                 let snapshot = {
                     let existing = &mut self.docs[existing_pos];
@@ -2232,6 +2273,7 @@ impl CandidateStore {
                     grams_indexed: indexed.len(),
                     grams_complete: complete,
                 });
+                active_docs = active_docs.saturating_add(1);
                 continue;
             }
 
@@ -2256,11 +2298,10 @@ impl CandidateStore {
                 deleted: false,
             };
             let apply_df_counts_started = Instant::now();
-            self.df_counts.apply_deltas(&df_deltas);
+            self.df_counts.apply_unit_deltas(&dedup_received);
             insert_profile.apply_df_counts_us = insert_profile
                 .apply_df_counts_us
                 .saturating_add(elapsed_us(apply_df_counts_started));
-            aggregate_df_deltas.extend(df_deltas.iter().copied());
             let append_sidecars_started = Instant::now();
             let row = self.build_doc_row(
                 doc.file_size,
@@ -2306,21 +2347,17 @@ impl CandidateStore {
                 grams_indexed: indexed.len(),
                 grams_complete: complete,
             });
+            active_docs = active_docs.saturating_add(1);
         }
 
         if modified {
             if meta_dirty {
-                let persist_meta_started = Instant::now();
-                self.persist_meta()?;
-                insert_profile.persist_meta_us = insert_profile
-                    .persist_meta_us
-                    .saturating_add(elapsed_us(persist_meta_started));
+                self.mark_meta_dirty();
             }
             let append_df_delta_started = Instant::now();
-            append_df_count_deltas_with_writer(
-                &mut self.append_writers.df_counts_delta,
-                self.meta.exact_gram_bytes(),
-                &aggregate_df_deltas,
+            append_df_count_unit_payload_with_writer(
+                &mut self.append_writers.df_counts_unit_delta,
+                &aggregate_df_unit_delta_payload,
             )?;
             insert_profile.append_df_delta_us = insert_profile
                 .append_df_delta_us
@@ -2788,13 +2825,7 @@ impl CandidateStore {
 
         if modified {
             if meta_dirty {
-                let persist_meta_started = Instant::now();
-                self.persist_meta()?;
-                import_profile.persist_meta_ms = persist_meta_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
+                self.mark_meta_dirty();
             }
             let append_df_delta_started = Instant::now();
             append_df_count_unit_payload_with_writer(
@@ -3178,7 +3209,20 @@ impl CandidateStore {
     fn persist_meta(&mut self) -> Result<()> {
         fs::create_dir_all(&self.root)?;
         write_json(meta_path(&self.root), &self.meta)?;
+        self.meta_persist_dirty = false;
         Ok(())
+    }
+
+    fn mark_meta_dirty(&mut self) {
+        self.meta_persist_dirty = true;
+    }
+
+    pub(crate) fn persist_meta_if_dirty(&mut self) -> Result<bool> {
+        if !self.meta_persist_dirty {
+            return Ok(false);
+        }
+        self.persist_meta()?;
+        Ok(true)
     }
 
     pub(crate) fn persist_df_counts_snapshot(&self) -> Result<()> {
@@ -4308,6 +4352,13 @@ fn extend_unit_df_payload_from_packed(
     Ok(())
 }
 
+fn extend_unit_df_payload_from_values(payload: &mut Vec<u8>, grams: &[u64], gram_bytes: usize) {
+    payload.reserve(grams.len() * gram_bytes);
+    for gram in grams {
+        payload.extend_from_slice(&gram.to_le_bytes()[..gram_bytes]);
+    }
+}
+
 #[cfg(test)]
 fn append_u32_slice(path: PathBuf, values: &[u32]) -> Result<u64> {
     let widened = values
@@ -5387,6 +5438,70 @@ rule q {
         assert_eq!(reopened.stats().retired_generation_count, 1);
         assert_eq!(reopened.stats().doc_count, 1);
         assert_eq!(reopened.stats().deleted_doc_count, 0);
+    }
+
+    #[test]
+    fn reopen_normalizes_next_doc_id_after_deferred_meta_persist() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("candidate_db");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                filter_target_fp: None,
+                compaction_idle_cooldown_s: 0.0,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let filter_bytes = 8;
+        let mut bloom_a = BloomFilter::new(filter_bytes, DEFAULT_BLOOM_HASHES).expect("bloom a");
+        bloom_a.add(0x4443_4241).expect("add gram a");
+        let inserted_a = store
+            .insert_document(
+                [0x11; 32],
+                8,
+                Some(1),
+                Some(DEFAULT_BLOOM_HASHES),
+                Some(0),
+                Some(0),
+                filter_bytes,
+                &bloom_a.into_bytes(),
+                filter_bytes,
+                &[],
+                &[0x4443_4241],
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect("insert a");
+        assert_eq!(inserted_a.doc_id, 1);
+
+        let mut reopened = CandidateStore::open(&root).expect("reopen");
+        let mut bloom_b = BloomFilter::new(filter_bytes, DEFAULT_BLOOM_HASHES).expect("bloom b");
+        bloom_b.add(0x5A59_5857).expect("add gram b");
+        let inserted_b = reopened
+            .insert_document(
+                [0x22; 32],
+                8,
+                Some(1),
+                Some(DEFAULT_BLOOM_HASHES),
+                Some(0),
+                Some(0),
+                filter_bytes,
+                &bloom_b.into_bytes(),
+                filter_bytes,
+                &[],
+                &[0x5A59_5857],
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect("insert b");
+        assert_eq!(inserted_b.doc_id, 2);
     }
 
     #[test]
