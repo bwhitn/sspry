@@ -606,29 +606,6 @@ struct ScannedIndexBatchRow {
     scan_elapsed: Duration,
 }
 
-fn maybe_report_remote_index_session_progress(
-    client: &TgsdbClient,
-    processed: usize,
-    total: usize,
-    last_reported: &mut usize,
-    last_report_at: &mut Instant,
-    force: bool,
-) -> Result<()> {
-    if total == 0 {
-        return Ok(());
-    }
-    let now = Instant::now();
-    let processed_delta = processed.saturating_sub(*last_reported);
-    let time_ready = now.duration_since(*last_report_at) >= Duration::from_secs(5);
-    if !force && processed_delta < 250 && !time_ready {
-        return Ok(());
-    }
-    client.update_index_session_progress(Some(total), processed, processed)?;
-    *last_reported = processed;
-    *last_report_at = now;
-    Ok(())
-}
-
 #[cfg(test)]
 fn json_usize(
     stats: &serde_json::Map<String, serde_json::Value>,
@@ -1808,8 +1785,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 rows: Vec::new(),
                 payload_size: empty_payload_size,
             };
-            let mut last_server_progress_reported = 0usize;
-            let mut last_server_progress_at = Instant::now();
             if args.workers <= 1 {
                 stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
@@ -1836,16 +1811,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         &mut last_progress_at,
                         false,
                     );
-                    let started_progress_rpc = Instant::now();
-                    maybe_report_remote_index_session_progress(
-                        &client,
-                        processed,
-                        total_files,
-                        &mut last_server_progress_reported,
-                        &mut last_server_progress_at,
-                        false,
-                    )?;
-                    progress_rpc_time += started_progress_rpc.elapsed();
                     Ok(())
                 })?;
             } else {
@@ -1919,16 +1884,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             &mut last_progress_at,
                             false,
                         );
-                        let started_progress_rpc = Instant::now();
-                        maybe_report_remote_index_session_progress(
-                            &client,
-                            processed,
-                            total_files,
-                            &mut last_server_progress_reported,
-                            &mut last_server_progress_at,
-                            false,
-                        )?;
-                        progress_rpc_time += started_progress_rpc.elapsed();
                     }
                     Ok::<(), TgsError>(())
                 })?;
@@ -1945,16 +1900,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 &mut last_progress_at,
                 empty_payload_size,
             )?;
-            let started_progress_rpc = Instant::now();
-            maybe_report_remote_index_session_progress(
-                &client,
-                processed,
-                total_files,
-                &mut last_server_progress_reported,
-                &mut last_server_progress_at,
-                true,
-            )?;
-            progress_rpc_time += started_progress_rpc.elapsed();
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");

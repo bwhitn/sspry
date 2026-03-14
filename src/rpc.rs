@@ -1514,6 +1514,19 @@ impl ServerState {
         })
     }
 
+    fn record_index_session_insert_progress(&self, inserted_count: usize) {
+        if inserted_count == 0 || self.active_index_sessions.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let inserted_count = inserted_count as u64;
+        self.index_session_submitted_documents
+            .fetch_add(inserted_count, Ordering::SeqCst);
+        self.index_session_processed_documents
+            .fetch_add(inserted_count, Ordering::SeqCst);
+        self.index_session_last_update_unix_ms
+            .store(current_unix_ms(), Ordering::SeqCst);
+    }
+
     fn handle_end_index_session(&self) -> Result<CandidateIndexSessionResponse> {
         let previous = self.active_index_sessions.swap(0, Ordering::SeqCst);
         if previous == 0 {
@@ -2691,6 +2704,7 @@ impl ServerState {
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
         }
+        self.record_index_session_insert_progress(1);
         Ok(Self::candidate_insert_response(result))
     }
 
@@ -2794,6 +2808,7 @@ impl ServerState {
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
         }
+        self.record_index_session_insert_progress(results.len());
         Ok(CandidateInsertBatchResponse {
             inserted_count: results.len(),
             results,
@@ -4278,6 +4293,93 @@ mod tests {
             Some("active_index_sessions")
         );
         assert_eq!(publish.get("pending").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn insert_batch_advances_active_index_session_progress() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.handle_begin_index_session().expect("start session");
+        state
+            .handle_update_index_session_progress(&CandidateIndexSessionProgressRequest {
+                total_documents: Some(10),
+                submitted_documents: 0,
+                processed_documents: 0,
+            })
+            .expect("set total");
+        let sample_a = tmp.path().join("session-a.bin");
+        let sample_b = tmp.path().join("session-b.bin");
+        fs::write(&sample_a, b"xxABCDyy").expect("sample a");
+        fs::write(&sample_b, b"zzWXYZqq").expect("sample b");
+        let features_a = crate::candidate::scan_file_features(
+            &sample_a, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features a");
+        let features_b = crate::candidate::scan_file_features(
+            &sample_b, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features b");
+        let docs = vec![
+            CandidateDocumentWire {
+                sha256: hex::encode(features_a.sha256),
+                file_size: features_a.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features_a.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features_a.unique_grams,
+                grams_complete: true,
+                effective_diversity: None,
+                external_id: None,
+            },
+            CandidateDocumentWire {
+                sha256: hex::encode(features_b.sha256),
+                file_size: features_b.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features_b.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features_b.unique_grams,
+                grams_complete: true,
+                effective_diversity: None,
+                external_id: None,
+            },
+        ];
+        let inserted = state
+            .handle_candidate_insert_batch(&docs)
+            .expect("insert batch");
+        assert_eq!(inserted.inserted_count, 2);
+        let stats = state.current_stats_json().expect("stats");
+        let index_session = stats
+            .get("index_session")
+            .and_then(Value::as_object)
+            .expect("index session object");
+        assert_eq!(
+            index_session
+                .get("submitted_documents")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            index_session
+                .get("processed_documents")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            index_session
+                .get("remaining_documents")
+                .and_then(Value::as_u64),
+            Some(8)
+        );
     }
 
     #[test]
