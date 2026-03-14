@@ -2787,7 +2787,7 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn persist_df_counts_snapshot(&self) -> Result<()> {
+    pub(crate) fn persist_df_counts_snapshot(&self) -> Result<()> {
         persist_df_counts_snapshot_to_root(
             &self.root,
             &self.df_counts.materialize(),

@@ -314,6 +314,8 @@ struct ServerState {
     last_publish_duration_ms: AtomicU64,
     last_publish_swap_ms: AtomicU64,
     last_publish_promote_work_ms: AtomicU64,
+    last_publish_persist_df_counts_ms: AtomicU64,
+    last_publish_df_snapshot_persist_failures: AtomicU64,
     last_publish_init_work_ms: AtomicU64,
     last_publish_persist_tier2_superblocks_ms: AtomicU64,
     last_publish_tier2_snapshot_persist_failures: AtomicU64,
@@ -1064,6 +1066,8 @@ impl ServerState {
             last_publish_duration_ms: AtomicU64::new(0),
             last_publish_swap_ms: AtomicU64::new(0),
             last_publish_promote_work_ms: AtomicU64::new(0),
+            last_publish_persist_df_counts_ms: AtomicU64::new(0),
+            last_publish_df_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_init_work_ms: AtomicU64::new(0),
             last_publish_persist_tier2_superblocks_ms: AtomicU64::new(0),
             last_publish_tier2_snapshot_persist_failures: AtomicU64::new(0),
@@ -1605,6 +1609,20 @@ impl ServerState {
             publish.insert(
                 "last_publish_promote_work_ms".to_owned(),
                 json!(self.last_publish_promote_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_persist_df_counts_ms".to_owned(),
+                json!(
+                    self.last_publish_persist_df_counts_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_df_snapshot_persist_failures".to_owned(),
+                json!(
+                    self.last_publish_df_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_init_work_ms".to_owned(),
@@ -2522,6 +2540,10 @@ impl ServerState {
         let publish_started_unix_ms = current_unix_ms();
         self.last_publish_started_unix_ms
             .store(publish_started_unix_ms, Ordering::SeqCst);
+        self.last_publish_persist_df_counts_ms
+            .store(0, Ordering::SeqCst);
+        self.last_publish_df_snapshot_persist_failures
+            .store(0, Ordering::SeqCst);
         self.last_publish_persist_tier2_superblocks_ms
             .store(0, Ordering::SeqCst);
         self.last_publish_tier2_snapshot_persist_failures
@@ -2662,6 +2684,27 @@ impl ServerState {
                 reuse_work_stores = false;
                 published_store_set
             };
+            let persist_df_started = Instant::now();
+            let mut df_snapshot_persist_failures = 0u64;
+            for store_lock in &published_store_set.stores {
+                let store = store_lock
+                    .lock()
+                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                if store.persist_df_counts_snapshot().is_err() {
+                    df_snapshot_persist_failures = df_snapshot_persist_failures.saturating_add(1);
+                }
+            }
+            self.last_publish_persist_df_counts_ms.store(
+                persist_df_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            self.last_publish_df_snapshot_persist_failures
+                .store(df_snapshot_persist_failures, Ordering::SeqCst);
+
             let persist_tier2_started = Instant::now();
             let mut tier2_snapshot_persist_failures = 0u64;
             for store_lock in &published_store_set.stores {

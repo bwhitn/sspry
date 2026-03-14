@@ -1977,6 +1977,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_promote_work_ms",
                         ),
                         (
+                            "last_publish_persist_df_counts_ms",
+                            "verbose.index.server_last_publish_persist_df_counts_ms",
+                        ),
+                        (
+                            "last_publish_df_snapshot_persist_failures",
+                            "verbose.index.server_last_publish_df_snapshot_persist_failures",
+                        ),
+                        (
                             "last_publish_init_work_ms",
                             "verbose.index.server_last_publish_init_work_ms",
                         ),
