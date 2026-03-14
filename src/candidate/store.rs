@@ -600,6 +600,80 @@ impl StoreSidecars {
     }
 }
 
+#[derive(Debug)]
+struct AppendFile {
+    path: PathBuf,
+    handle: Option<fs::File>,
+    offset: u64,
+}
+
+impl AppendFile {
+    fn new(path: PathBuf) -> Result<Self> {
+        let offset = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(Self {
+            path,
+            handle: None,
+            offset,
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<u64> {
+        let offset = self.offset;
+        if bytes.is_empty() {
+            return Ok(offset);
+        }
+        if self.handle.is_none() {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            self.handle = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| TgsError::from("append handle unexpectedly unavailable"))?;
+        handle.write_all(bytes)?;
+        self.offset = self.offset.saturating_add(bytes.len() as u64);
+        Ok(offset)
+    }
+}
+
+#[derive(Debug)]
+struct StoreAppendWriters {
+    blooms: AppendFile,
+    tier2_blooms: AppendFile,
+    grams_received: AppendFile,
+    grams_indexed: AppendFile,
+    external_ids: AppendFile,
+    sha_by_docid: AppendFile,
+    doc_meta: AppendFile,
+    tier2_doc_meta: AppendFile,
+    df_counts_delta: AppendFile,
+}
+
+impl StoreAppendWriters {
+    fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            blooms: AppendFile::new(blooms_path(root))?,
+            tier2_blooms: AppendFile::new(tier2_blooms_path(root))?,
+            grams_received: AppendFile::new(grams_received_path(root))?,
+            grams_indexed: AppendFile::new(grams_indexed_path(root))?,
+            external_ids: AppendFile::new(external_ids_path(root))?,
+            sha_by_docid: AppendFile::new(sha_by_docid_path(root))?,
+            doc_meta: AppendFile::new(doc_meta_path(root))?,
+            tier2_doc_meta: AppendFile::new(tier2_doc_meta_path(root))?,
+            df_counts_delta: AppendFile::new(df_counts_delta_path(root))?,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Tier2SuperblockIndex {
     docs_per_block: usize,
@@ -823,6 +897,7 @@ pub struct CandidateStore {
     doc_rows: Vec<DocMetaRow>,
     tier2_doc_rows: Vec<Tier2DocMetaRow>,
     sidecars: StoreSidecars,
+    append_writers: StoreAppendWriters,
     sha_to_pos: HashMap<String, usize>,
     df_counts: DfCountsState,
     mutation_counter: u64,
@@ -1023,6 +1098,7 @@ impl CandidateStore {
             doc_rows: Vec::new(),
             tier2_doc_rows: Vec::new(),
             sidecars: StoreSidecars::new(&config.root),
+            append_writers: StoreAppendWriters::new(&config.root)?,
             sha_to_pos: HashMap::new(),
             df_counts: DfCountsState::default(),
             mutation_counter: 0,
@@ -1067,6 +1143,7 @@ impl CandidateStore {
             doc_rows,
             tier2_doc_rows,
             sidecars: StoreSidecars::map_existing(root.as_path())?,
+            append_writers: StoreAppendWriters::new(root.as_path())?,
             sha_to_pos: HashMap::new(),
             df_counts: DfCountsState::default(),
             mutation_counter: 0,
@@ -1082,6 +1159,10 @@ impl CandidateStore {
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
         };
+        let normalized_next_doc_id = store.docs.len() as u64 + 1;
+        if store.meta.next_doc_id != normalized_next_doc_id {
+            store.meta.next_doc_id = normalized_next_doc_id;
+        }
         store.rebuild_indexes()?;
         Ok(store)
     }
@@ -1616,13 +1697,13 @@ impl CandidateStore {
             doc_id = snapshot.doc_id;
             {
                 let _scope = scope("candidate.insert_document.persist");
-                self.sidecars.invalidate_all();
                 self.doc_rows[existing_pos] = row;
                 self.tier2_doc_rows[existing_pos] = tier2_row;
                 self.write_doc_row(snapshot.doc_id, row)?;
                 self.write_doc_row5(snapshot.doc_id, tier2_row)?;
             }
-            self.update_tier2_superblocks_for_doc(existing_pos)?;
+            self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
+            self.maybe_rebalance_tier2_superblocks()?;
         } else {
             doc_id = self.meta.next_doc_id;
             self.meta.next_doc_id += 1;
@@ -1661,7 +1742,6 @@ impl CandidateStore {
                     tier2_bloom_filter,
                 )?;
                 self.persist_meta()?;
-                self.sidecars.invalidate_all();
                 self.append_new_doc(&sha256, row, tier2_row)?;
                 self.doc_rows.push(row);
                 self.tier2_doc_rows.push(tier2_row);
@@ -1669,12 +1749,18 @@ impl CandidateStore {
             self.docs.push(doc.clone());
             self.sha_to_pos
                 .insert(sha256_hex.clone(), self.docs.len() - 1);
-            self.update_tier2_superblocks_for_doc(self.docs.len() - 1)?;
+            self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
+            self.maybe_rebalance_tier2_superblocks()?;
             status = "inserted".to_owned();
         }
 
-        append_df_count_deltas(&self.root, self.meta.exact_gram_bytes(), &df_deltas)?;
+        append_df_count_deltas_with_writer(
+            &mut self.append_writers.df_counts_delta,
+            self.meta.exact_gram_bytes(),
+            &df_deltas,
+        )?;
         self.maybe_compact_df_counts()?;
+        self.sidecars.invalidate_all();
 
         self.mark_write_activity();
         total_scope.add_items(dedup_received.len() as u64);
@@ -1724,42 +1810,278 @@ impl CandidateStore {
             bool,
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
+        let mut total_scope = scope("candidate.insert_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
-        for (
-            sha256,
-            file_size,
-            gram_count_estimate,
-            bloom_hashes,
-            tier2_gram_count_estimate,
-            tier2_bloom_hashes,
-            filter_bytes,
-            bloom_filter,
-            tier2_filter_bytes,
-            tier2_bloom_filter,
-            grams_received,
-            grams_complete,
-            effective_diversity,
-            external_id,
-            grams_sorted_unique,
-        ) in documents
-        {
-            results.push(self.insert_document(
-                *sha256,
-                *file_size,
-                *gram_count_estimate,
-                *bloom_hashes,
-                *tier2_gram_count_estimate,
-                *tier2_bloom_hashes,
-                *filter_bytes,
+        let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
+        let mut modified = false;
+        let mut meta_dirty = false;
+        let mut received_grams_total = 0u64;
+        let mut indexed_grams_total = 0u64;
+        let mut max_received_grams = 0u64;
+        let mut max_indexed_grams = 0u64;
+
+        for document in documents {
+            let (
+                sha256,
+                file_size,
+                gram_count_estimate,
+                bloom_hashes,
+                tier2_gram_count_estimate,
+                tier2_bloom_hashes,
+                filter_bytes,
                 bloom_filter,
-                *tier2_filter_bytes,
+                tier2_filter_bytes,
                 tier2_bloom_filter,
                 grams_received,
-                *grams_complete,
+                grams_complete,
+                effective_diversity,
+                external_id,
+                grams_sorted_unique,
+            ) = document;
+            total_scope.add_bytes(*file_size);
+            if *filter_bytes == 0 {
+                return Err(TgsError::from("filter_bytes must be > 0"));
+            }
+            let expected_filter_bytes =
+                self.resolve_filter_bytes_for_file_size(*file_size, *gram_count_estimate)?;
+            let expected_bloom_hashes = self.resolve_bloom_hashes_for_document(
+                expected_filter_bytes,
+                *gram_count_estimate,
+                *bloom_hashes,
+            );
+            if *filter_bytes != expected_filter_bytes {
+                return Err(TgsError::from(format!(
+                    "filter_bytes must equal expected filter size ({expected_filter_bytes})"
+                )));
+            }
+            if bloom_filter.len() != expected_filter_bytes {
+                return Err(TgsError::from(format!(
+                    "bloom_filter length must equal filter_bytes ({expected_filter_bytes})"
+                )));
+            }
+            let expected_tier2_filter_bytes =
+                self.resolve_filter_bytes_for_file_size(*file_size, *tier2_gram_count_estimate)?;
+            let expected_tier2_bloom_hashes = self.resolve_bloom_hashes_for_document(
+                expected_tier2_filter_bytes,
+                *tier2_gram_count_estimate,
+                *tier2_bloom_hashes,
+            );
+            if !tier2_bloom_filter.is_empty() {
+                if *tier2_filter_bytes != expected_tier2_filter_bytes {
+                    return Err(TgsError::from(format!(
+                        "tier2_filter_bytes must equal expected filter size ({expected_tier2_filter_bytes})"
+                    )));
+                }
+                if tier2_bloom_filter.len() != expected_tier2_filter_bytes {
+                    return Err(TgsError::from(format!(
+                        "tier2_bloom_filter length must equal tier2_filter_bytes ({expected_tier2_filter_bytes})"
+                    )));
+                }
+            }
+
+            let sha256_hex = hex::encode(sha256);
+            let dedup_received = if *grams_sorted_unique {
+                let mut ordered = Vec::with_capacity(grams_received.len());
+                let mut prev = None;
+                let mut valid = true;
+                for gram in grams_received {
+                    if prev.is_some_and(|value| *gram <= value) {
+                        valid = false;
+                        break;
+                    }
+                    ordered.push(*gram);
+                    prev = Some(*gram);
+                }
+                if valid {
+                    ordered
+                } else {
+                    let mut dedup: Vec<u64> = grams_received
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    dedup.sort_unstable();
+                    dedup
+                }
+            } else {
+                let mut dedup: Vec<u64> = grams_received
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                dedup.sort_unstable();
+                dedup
+            };
+
+            let (indexed, selection_complete) = self.select_indexed_grams(
+                &dedup_received,
+                *gram_count_estimate,
                 *effective_diversity,
-                external_id.clone(),
-                *grams_sorted_unique,
-            )?);
+            );
+            let complete =
+                *grams_complete && selection_complete && indexed.len() == dedup_received.len();
+            let received_len = dedup_received.len() as u64;
+            let indexed_len = indexed.len() as u64;
+            received_grams_total = received_grams_total.saturating_add(received_len);
+            indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
+            max_received_grams = max_received_grams.max(received_len);
+            max_indexed_grams = max_indexed_grams.max(indexed_len);
+            let df_deltas = dedup_received
+                .iter()
+                .map(|gram| (*gram, 1))
+                .collect::<Vec<_>>();
+
+            if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
+                if !self.docs[existing_pos].deleted {
+                    let existing = &self.docs[existing_pos];
+                    let existing_row = self.doc_rows[existing_pos];
+                    results.push(CandidateInsertResult {
+                        status: "already_exists".to_owned(),
+                        doc_id: existing.doc_id,
+                        sha256: existing.sha256.clone(),
+                        grams_received: existing_row.grams_received_count as usize,
+                        grams_indexed: existing_row.grams_indexed_count as usize,
+                        grams_complete: existing.grams_complete,
+                    });
+                    continue;
+                }
+
+                self.df_counts.apply_deltas(&df_deltas);
+                aggregate_df_deltas.extend(df_deltas.iter().copied());
+                let snapshot = {
+                    let existing = &mut self.docs[existing_pos];
+                    existing.file_size = *file_size;
+                    existing.filter_bytes = *filter_bytes;
+                    existing.bloom_hashes = expected_bloom_hashes;
+                    existing.tier2_filter_bytes = *tier2_filter_bytes;
+                    existing.tier2_bloom_hashes = if tier2_bloom_filter.is_empty() {
+                        0
+                    } else {
+                        expected_tier2_bloom_hashes
+                    };
+                    existing.grams_complete = complete;
+                    existing.deleted = false;
+                    existing.clone()
+                };
+                let row = self.build_doc_row(
+                    snapshot.file_size,
+                    snapshot.filter_bytes,
+                    snapshot.bloom_hashes,
+                    snapshot.grams_complete,
+                    snapshot.deleted,
+                    external_id.as_deref(),
+                    bloom_filter,
+                    &dedup_received,
+                    &indexed,
+                )?;
+                let tier2_row = self.build_doc_row5(
+                    snapshot.tier2_filter_bytes,
+                    snapshot.tier2_bloom_hashes,
+                    tier2_bloom_filter,
+                )?;
+                self.doc_rows[existing_pos] = row;
+                self.tier2_doc_rows[existing_pos] = tier2_row;
+                self.write_doc_row(snapshot.doc_id, row)?;
+                self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
+                modified = true;
+                results.push(CandidateInsertResult {
+                    status: "restored".to_owned(),
+                    doc_id: snapshot.doc_id,
+                    sha256: sha256_hex,
+                    grams_received: dedup_received.len(),
+                    grams_indexed: indexed.len(),
+                    grams_complete: complete,
+                });
+                continue;
+            }
+
+            let doc_id = self.meta.next_doc_id;
+            self.meta.next_doc_id += 1;
+            let doc = CandidateDoc {
+                doc_id,
+                sha256: sha256_hex.clone(),
+                file_size: *file_size,
+                filter_bytes: *filter_bytes,
+                bloom_hashes: expected_bloom_hashes,
+                tier2_filter_bytes: *tier2_filter_bytes,
+                tier2_bloom_hashes: if tier2_bloom_filter.is_empty() {
+                    0
+                } else {
+                    expected_tier2_bloom_hashes
+                },
+                grams_complete: complete,
+                deleted: false,
+            };
+            self.df_counts.apply_deltas(&df_deltas);
+            aggregate_df_deltas.extend(df_deltas.iter().copied());
+            let row = self.build_doc_row(
+                doc.file_size,
+                doc.filter_bytes,
+                doc.bloom_hashes,
+                doc.grams_complete,
+                doc.deleted,
+                external_id.as_deref(),
+                bloom_filter,
+                &dedup_received,
+                &indexed,
+            )?;
+            let tier2_row = self.build_doc_row5(
+                doc.tier2_filter_bytes,
+                doc.tier2_bloom_hashes,
+                tier2_bloom_filter,
+            )?;
+            self.append_new_doc(sha256, row, tier2_row)?;
+            self.doc_rows.push(row);
+            self.tier2_doc_rows.push(tier2_row);
+            self.docs.push(doc.clone());
+            self.sha_to_pos
+                .insert(sha256_hex.clone(), self.docs.len() - 1);
+            self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
+            modified = true;
+            meta_dirty = true;
+            results.push(CandidateInsertResult {
+                status: "inserted".to_owned(),
+                doc_id,
+                sha256: sha256_hex,
+                grams_received: dedup_received.len(),
+                grams_indexed: indexed.len(),
+                grams_complete: complete,
+            });
+        }
+
+        if modified {
+            if meta_dirty {
+                self.persist_meta()?;
+            }
+            append_df_count_deltas_with_writer(
+                &mut self.append_writers.df_counts_delta,
+                self.meta.exact_gram_bytes(),
+                &aggregate_df_deltas,
+            )?;
+            self.maybe_compact_df_counts()?;
+            self.maybe_rebalance_tier2_superblocks()?;
+            self.sidecars.invalidate_all();
+            self.mark_write_activity();
+            total_scope.add_items(received_grams_total);
+            record_counter(
+                "candidate.insert_document_received_grams_total",
+                received_grams_total,
+            );
+            record_counter(
+                "candidate.insert_document_indexed_grams_total",
+                indexed_grams_total,
+            );
+            record_max(
+                "candidate.insert_document_max_received_grams",
+                max_received_grams,
+            );
+            record_max(
+                "candidate.insert_document_max_indexed_grams",
+                max_indexed_grams,
+            );
         }
         Ok(results)
     }
@@ -1796,7 +2118,11 @@ impl CandidateStore {
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
             self.rebuild_tier2_superblocks()?;
-            append_df_count_deltas(&self.root, self.meta.exact_gram_bytes(), &df_deltas)?;
+            append_df_count_deltas_with_writer(
+                &mut self.append_writers.df_counts_delta,
+                self.meta.exact_gram_bytes(),
+                &df_deltas,
+            )?;
             self.maybe_compact_df_counts()?;
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
@@ -2140,12 +2466,14 @@ impl CandidateStore {
         if len >= self.df_counts_delta_compact_threshold_bytes {
             self.persist_df_counts_snapshot()?;
             self.df_counts.refresh_snapshot(&self.root)?;
+            self.append_writers.df_counts_delta =
+                AppendFile::new(df_counts_delta_path(&self.root))?;
         }
         Ok(())
     }
 
     fn build_doc_row(
-        &self,
+        &mut self,
         file_size: u64,
         filter_bytes: usize,
         bloom_hashes: usize,
@@ -2156,17 +2484,22 @@ impl CandidateStore {
         grams_received: &[u64],
         grams_indexed: &[u64],
     ) -> Result<DocMetaRow> {
-        fs::create_dir_all(&self.root)?;
         let gram_bytes = self.meta.exact_gram_bytes();
-        let bloom_offset = append_blob(blooms_path(&self.root), bloom_filter)?;
-        let grams_received_offset =
-            append_exact_gram_slice(grams_received_path(&self.root), grams_received, gram_bytes)?;
-        let grams_indexed_offset =
-            append_exact_gram_slice(grams_indexed_path(&self.root), grams_indexed, gram_bytes)?;
+        let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
+        let grams_received_offset = append_exact_gram_slice_with_writer(
+            &mut self.append_writers.grams_received,
+            grams_received,
+            gram_bytes,
+        )?;
+        let grams_indexed_offset = append_exact_gram_slice_with_writer(
+            &mut self.append_writers.grams_indexed,
+            grams_indexed,
+            gram_bytes,
+        )?;
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
             (
-                append_blob(external_ids_path(&self.root), bytes)?,
+                self.append_writers.external_ids.append(bytes)?,
                 bytes.len() as u32,
             )
         } else {
@@ -2190,16 +2523,18 @@ impl CandidateStore {
     }
 
     fn build_doc_row5(
-        &self,
+        &mut self,
         tier2_filter_bytes: usize,
         tier2_bloom_hashes: usize,
         tier2_bloom_filter: &[u8],
     ) -> Result<Tier2DocMetaRow> {
-        fs::create_dir_all(&self.root)?;
         if tier2_bloom_filter.is_empty() {
             return Ok(Tier2DocMetaRow::default());
         }
-        let bloom_offset = append_blob(tier2_blooms_path(&self.root), tier2_bloom_filter)?;
+        let bloom_offset = self
+            .append_writers
+            .tier2_blooms
+            .append(tier2_bloom_filter)?;
         Ok(Tier2DocMetaRow {
             filter_bytes: tier2_filter_bytes as u32,
             bloom_hashes: tier2_bloom_hashes.min(u8::MAX as usize) as u8,
@@ -2209,15 +2544,16 @@ impl CandidateStore {
     }
 
     fn append_new_doc(
-        &self,
+        &mut self,
         sha256: &[u8; 32],
         row: DocMetaRow,
         tier2_row: Tier2DocMetaRow,
     ) -> Result<()> {
-        fs::create_dir_all(&self.root)?;
-        append_blob(sha_by_docid_path(&self.root), sha256)?;
-        append_blob(doc_meta_path(&self.root), &row.encode())?;
-        append_blob(tier2_doc_meta_path(&self.root), &tier2_row.encode())?;
+        self.append_writers.sha_by_docid.append(sha256)?;
+        self.append_writers.doc_meta.append(&row.encode())?;
+        self.append_writers
+            .tier2_doc_meta
+            .append(&tier2_row.encode())?;
         Ok(())
     }
 
@@ -2283,7 +2619,11 @@ impl CandidateStore {
         }
     }
 
-    fn update_tier2_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+    fn update_tier2_superblocks_for_doc_bytes_inner(
+        &mut self,
+        pos: usize,
+        bloom_bytes: &[u8],
+    ) -> Result<()> {
         if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
@@ -2291,14 +2631,6 @@ impl CandidateStore {
         let filter_bytes = self.docs[pos].filter_bytes;
         let bloom_hashes = self.docs[pos].bloom_hashes;
         self.ensure_tier2_superblock_capacity(block_idx, filter_bytes, bloom_hashes);
-        let doc_id = self.docs[pos].doc_id;
-        let row = self.doc_rows[pos];
-        let bloom_bytes = self.sidecars.blooms.read_bytes(
-            row.bloom_offset,
-            row.bloom_len as usize,
-            "bloom",
-            doc_id,
-        )?;
         let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
         if let Some(blocks) = self.tier2_superblocks.masks_by_bucket.get_mut(&bucket_key) {
             if let Some(block) = blocks.get_mut(block_idx) {
@@ -2312,9 +2644,20 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn update_tier2_superblocks_for_doc(&mut self, pos: usize) -> Result<()> {
-        self.update_tier2_superblocks_for_doc_inner(pos)?;
-        self.maybe_rebalance_tier2_superblocks()
+    fn update_tier2_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
+            return Ok(());
+        }
+        let doc_id = self.docs[pos].doc_id;
+        let row = self.doc_rows[pos];
+        let bloom_bytes = self.sidecars.blooms.read_bytes(
+            row.bloom_offset,
+            row.bloom_len as usize,
+            "bloom",
+            doc_id,
+        )?;
+        let owned_bloom_bytes = bloom_bytes.into_owned();
+        self.update_tier2_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
     }
 
     fn rebuild_tier2_superblocks_with_docs_per_block(
@@ -2734,6 +3077,19 @@ fn append_exact_gram_slice(path: PathBuf, values: &[u64], gram_bytes: usize) -> 
     append_blob(path, &payload)
 }
 
+fn append_exact_gram_slice_with_writer(
+    writer: &mut AppendFile,
+    values: &[u64],
+    gram_bytes: usize,
+) -> Result<u64> {
+    let mut payload = Vec::with_capacity(values.len() * gram_bytes);
+    for value in values {
+        let encoded = value.to_le_bytes();
+        payload.extend_from_slice(&encoded[..gram_bytes]);
+    }
+    writer.append(&payload)
+}
+
 fn write_at(path: PathBuf, offset: u64, bytes: &[u8]) -> Result<()> {
     let mut handle = OpenOptions::new()
         .create(true)
@@ -2853,17 +3209,20 @@ fn current_df_counts_delta_bytes(root: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn append_df_count_deltas(root: &Path, gram_bytes: usize, deltas: &[(u64, i32)]) -> Result<()> {
+fn append_df_count_deltas_with_writer(
+    writer: &mut AppendFile,
+    gram_bytes: usize,
+    deltas: &[(u64, i32)],
+) -> Result<()> {
     if deltas.is_empty() {
         return Ok(());
     }
-    let path = df_counts_delta_path(root);
     let mut payload = Vec::with_capacity(deltas.len() * (gram_bytes + 4));
     for (gram, delta) in deltas {
         payload.extend_from_slice(&gram.to_le_bytes()[..gram_bytes]);
         payload.extend_from_slice(&delta.to_le_bytes());
     }
-    append_blob(path, &payload)?;
+    writer.append(&payload)?;
     Ok(())
 }
 
