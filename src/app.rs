@@ -1997,6 +1997,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_tier2_snapshot_persist_failures",
                         ),
                         (
+                            "last_publish_persisted_snapshot_shards",
+                            "verbose.index.server_last_publish_persisted_snapshot_shards",
+                        ),
+                        (
                             "publish_runs_total",
                             "verbose.index.server_publish_runs_total",
                         ),

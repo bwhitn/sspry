@@ -319,6 +319,7 @@ struct ServerState {
     last_publish_init_work_ms: AtomicU64,
     last_publish_persist_tier2_superblocks_ms: AtomicU64,
     last_publish_tier2_snapshot_persist_failures: AtomicU64,
+    last_publish_persisted_snapshot_shards: AtomicU64,
     last_publish_reused_work_stores: AtomicBool,
     publish_runs_total: AtomicU64,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
@@ -1071,6 +1072,7 @@ impl ServerState {
             last_publish_init_work_ms: AtomicU64::new(0),
             last_publish_persist_tier2_superblocks_ms: AtomicU64::new(0),
             last_publish_tier2_snapshot_persist_failures: AtomicU64::new(0),
+            last_publish_persisted_snapshot_shards: AtomicU64::new(0),
             last_publish_reused_work_stores: AtomicBool::new(false),
             publish_runs_total: AtomicU64::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
@@ -1639,6 +1641,13 @@ impl ServerState {
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
                 json!(
                     self.last_publish_tier2_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_persisted_snapshot_shards".to_owned(),
+                json!(
+                    self.last_publish_persisted_snapshot_shards
                         .load(Ordering::Acquire)
                 ),
             );
@@ -2548,6 +2557,8 @@ impl ServerState {
             .store(0, Ordering::SeqCst);
         self.last_publish_tier2_snapshot_persist_failures
             .store(0, Ordering::SeqCst);
+        self.last_publish_persisted_snapshot_shards
+            .store(0, Ordering::SeqCst);
         let _op = self
             .operation_gate
             .write()
@@ -2590,6 +2601,7 @@ impl ServerState {
             let publish_shard_count = self.candidate_shard_count();
             let mut removed_current = 0usize;
             let reuse_work_stores;
+            let mut changed_shards = vec![false; publish_shard_count];
             let published_store_set = if published_is_empty {
                 let swap_started = Instant::now();
                 if current_root.exists() {
@@ -2652,6 +2664,14 @@ impl ServerState {
                     Ordering::SeqCst,
                 );
                 reuse_work_stores = reused_work_stores;
+                for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
+                    let store = store_lock
+                        .lock()
+                        .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                    if store.stats().doc_count > 0 {
+                        changed_shards[shard_idx] = true;
+                    }
+                }
                 published_store_set
             } else {
                 self.last_publish_swap_ms.store(0, Ordering::SeqCst);
@@ -2665,6 +2685,7 @@ impl ServerState {
                     if imported.is_empty() {
                         continue;
                     }
+                    changed_shards[shard_idx] = true;
                     let mut published_store = published_store_set.stores[shard_idx]
                         .lock()
                         .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
@@ -2686,7 +2707,12 @@ impl ServerState {
             };
             let persist_df_started = Instant::now();
             let mut df_snapshot_persist_failures = 0u64;
-            for store_lock in &published_store_set.stores {
+            let persisted_snapshot_shards =
+                changed_shards.iter().filter(|changed| **changed).count();
+            for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
+                if !changed_shards[shard_idx] {
+                    continue;
+                }
                 let store = store_lock
                     .lock()
                     .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
@@ -2704,10 +2730,17 @@ impl ServerState {
             );
             self.last_publish_df_snapshot_persist_failures
                 .store(df_snapshot_persist_failures, Ordering::SeqCst);
+            self.last_publish_persisted_snapshot_shards.store(
+                persisted_snapshot_shards.try_into().unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
 
             let persist_tier2_started = Instant::now();
             let mut tier2_snapshot_persist_failures = 0u64;
-            for store_lock in &published_store_set.stores {
+            for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
+                if !changed_shards[shard_idx] {
+                    continue;
+                }
                 let store = store_lock
                     .lock()
                     .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
