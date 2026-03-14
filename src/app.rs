@@ -30,8 +30,8 @@ use crate::candidate::{
 };
 use crate::perf;
 use crate::rpc::{
-    self, CandidateDocumentWire, ClientConfig as RpcClientConfig, ServerConfig as RpcServerConfig,
-    TgsdbClient,
+    self, CandidateDocumentWire, ClientConfig as RpcClientConfig, PersistentTgsdbClient,
+    ServerConfig as RpcServerConfig, TgsdbClient,
 };
 use crate::{Result, TgsError};
 
@@ -730,16 +730,6 @@ fn rpc_client(connection: &ClientConnectionArgs) -> TgsdbClient {
     ))
 }
 
-struct RemoteIndexSessionGuard<'a> {
-    client: &'a TgsdbClient,
-}
-
-impl Drop for RemoteIndexSessionGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.client.end_index_session();
-    }
-}
-
 struct ScannedIndexBatchRow {
     row: IndexBatchRow,
     scan_elapsed: Duration,
@@ -906,7 +896,7 @@ fn serialize_candidate_document_wire(document: &CandidateDocumentWire) -> Result
 }
 
 fn flush_remote_batch(
-    client: &TgsdbClient,
+    client: &mut PersistentTgsdbClient,
     pending: &mut RemotePendingBatch,
     processed: &mut usize,
     empty_payload_size: usize,
@@ -923,7 +913,7 @@ fn flush_remote_batch(
 }
 
 fn push_remote_batch_row(
-    client: &TgsdbClient,
+    client: &mut PersistentTgsdbClient,
     pending: &mut RemotePendingBatch,
     row: CandidateDocumentWire,
     batch_size: usize,
@@ -1003,7 +993,7 @@ fn flush_local_pending_rows(
 }
 
 fn flush_remote_pending_rows(
-    client: &TgsdbClient,
+    client: &mut PersistentTgsdbClient,
     pending: &mut RemotePendingBatch,
     processed: &mut usize,
     submit_time: &mut Duration,
@@ -1926,9 +1916,9 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 store_path: server_policy.store_path,
                 id_source: server_policy.id_source,
             };
-            let client = rpc_client(&args.connection);
+            let base_client = rpc_client(&args.connection);
+            let mut client = base_client.connect_persistent()?;
             client.begin_index_session()?;
-            let _session = RemoteIndexSessionGuard { client: &client };
             let started_progress_rpc = Instant::now();
             client.update_index_session_progress(Some(total_files), 0, 0)?;
             progress_rpc_time += started_progress_rpc.elapsed();
@@ -1940,90 +1930,18 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 rows: Vec::new(),
                 payload_size: empty_payload_size,
             };
-            if workers <= 1 {
-                stream_input_files(&input_roots, |file_path| {
-                    let started_scan = Instant::now();
-                    let scanned = scan_index_batch_row(&file_path, policy)?;
-                    scan_time += started_scan.elapsed();
-                    let started_encode = Instant::now();
-                    let row = batch_row_to_wire(scanned);
-                    encode_time += started_encode.elapsed();
-                    let started_buffer = Instant::now();
-                    push_remote_batch_row(
-                        &client,
-                        &mut pending,
-                        row,
-                        batch_size,
-                        &mut processed,
-                        empty_payload_size,
-                    )?;
-                    client_buffer_time += started_buffer.elapsed();
-                    maybe_report_index_progress(
-                        show_progress,
-                        processed,
-                        total_files,
-                        &mut last_progress_reported,
-                        &mut last_progress_at,
-                        false,
-                    );
-                    Ok(())
-                })?;
-            } else {
-                let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
-                let (result_tx, result_rx) =
-                    bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
-                let worker_count = workers;
-                thread::scope(|scope| {
-                    for _ in 0..worker_count {
-                        let job_rx = job_rx.clone();
-                        let result_tx = result_tx.clone();
-                        scope.spawn(move || {
-                            for file_path in job_rx.iter() {
-                                let started_scan = Instant::now();
-                                let result = scan_index_batch_row(&file_path, policy).map(|row| {
-                                    ScannedIndexBatchRow {
-                                        row,
-                                        scan_elapsed: started_scan.elapsed(),
-                                    }
-                                });
-                                let _ = result_tx.send(result);
-                            }
-                        });
-                    }
-                    let producer_tx = job_tx.clone();
-                    let producer_result_tx = result_tx.clone();
-                    let producer_roots = input_roots.clone();
-                    scope.spawn(move || {
-                        let produce = stream_input_files(&producer_roots, |file_path| {
-                            producer_tx.send(file_path).map_err(|_| {
-                                TgsError::from(
-                                    "candidate ingest file producer terminated unexpectedly",
-                                )
-                            })?;
-                            Ok(())
-                        });
-                        if let Err(err) = produce {
-                            let _ = producer_result_tx.send(Err(err));
-                        }
-                        drop(producer_tx);
-                    });
-
-                    drop(job_tx);
-                    drop(result_tx);
-
-                    for _ in 0..total_files {
-                        let started_wait = Instant::now();
-                        let scanned = result_rx.recv().map_err(|_| {
-                            TgsError::from("candidate ingest workers terminated unexpectedly")
-                        })??;
-                        result_wait_time += started_wait.elapsed();
-                        scan_time += scanned.scan_elapsed;
+            let remote_result = (|| -> Result<()> {
+                if workers <= 1 {
+                    stream_input_files(&input_roots, |file_path| {
+                        let started_scan = Instant::now();
+                        let scanned = scan_index_batch_row(&file_path, policy)?;
+                        scan_time += started_scan.elapsed();
                         let started_encode = Instant::now();
-                        let row = batch_row_to_wire(scanned.row);
+                        let row = batch_row_to_wire(scanned);
                         encode_time += started_encode.elapsed();
                         let started_buffer = Instant::now();
                         push_remote_batch_row(
-                            &client,
+                            &mut client,
                             &mut pending,
                             row,
                             batch_size,
@@ -2039,22 +1957,101 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             &mut last_progress_at,
                             false,
                         );
-                    }
-                    Ok::<(), TgsError>(())
-                })?;
-            }
+                        Ok(())
+                    })?;
+                } else {
+                    let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                    let (result_tx, result_rx) =
+                        bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
+                    let worker_count = workers;
+                    thread::scope(|scope| {
+                        for _ in 0..worker_count {
+                            let job_rx = job_rx.clone();
+                            let result_tx = result_tx.clone();
+                            scope.spawn(move || {
+                                for file_path in job_rx.iter() {
+                                    let started_scan = Instant::now();
+                                    let result =
+                                        scan_index_batch_row(&file_path, policy).map(|row| {
+                                            ScannedIndexBatchRow {
+                                                row,
+                                                scan_elapsed: started_scan.elapsed(),
+                                            }
+                                        });
+                                    let _ = result_tx.send(result);
+                                }
+                            });
+                        }
+                        let producer_tx = job_tx.clone();
+                        let producer_result_tx = result_tx.clone();
+                        let producer_roots = input_roots.clone();
+                        scope.spawn(move || {
+                            let produce = stream_input_files(&producer_roots, |file_path| {
+                                producer_tx.send(file_path).map_err(|_| {
+                                    TgsError::from(
+                                        "candidate ingest file producer terminated unexpectedly",
+                                    )
+                                })?;
+                                Ok(())
+                            });
+                            if let Err(err) = produce {
+                                let _ = producer_result_tx.send(Err(err));
+                            }
+                            drop(producer_tx);
+                        });
 
-            flush_remote_pending_rows(
-                &client,
-                &mut pending,
-                &mut processed,
-                &mut submit_time,
-                show_progress,
-                total_files,
-                &mut last_progress_reported,
-                &mut last_progress_at,
-                empty_payload_size,
-            )?;
+                        drop(job_tx);
+                        drop(result_tx);
+
+                        for _ in 0..total_files {
+                            let started_wait = Instant::now();
+                            let scanned = result_rx.recv().map_err(|_| {
+                                TgsError::from("candidate ingest workers terminated unexpectedly")
+                            })??;
+                            result_wait_time += started_wait.elapsed();
+                            scan_time += scanned.scan_elapsed;
+                            let started_encode = Instant::now();
+                            let row = batch_row_to_wire(scanned.row);
+                            encode_time += started_encode.elapsed();
+                            let started_buffer = Instant::now();
+                            push_remote_batch_row(
+                                &mut client,
+                                &mut pending,
+                                row,
+                                batch_size,
+                                &mut processed,
+                                empty_payload_size,
+                            )?;
+                            client_buffer_time += started_buffer.elapsed();
+                            maybe_report_index_progress(
+                                show_progress,
+                                processed,
+                                total_files,
+                                &mut last_progress_reported,
+                                &mut last_progress_at,
+                                false,
+                            );
+                        }
+                        Ok::<(), TgsError>(())
+                    })?;
+                }
+
+                flush_remote_pending_rows(
+                    &mut client,
+                    &mut pending,
+                    &mut processed,
+                    &mut submit_time,
+                    show_progress,
+                    total_files,
+                    &mut last_progress_reported,
+                    &mut last_progress_at,
+                    empty_payload_size,
+                )?;
+                Ok(())
+            })();
+            let end_session_result = client.end_index_session();
+            remote_result?;
+            end_session_result?;
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");

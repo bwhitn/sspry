@@ -430,6 +430,11 @@ pub struct TgsdbClient {
     config: ClientConfig,
 }
 
+#[derive(Debug)]
+pub(crate) struct PersistentTgsdbClient {
+    stream: ClientStream,
+}
+
 impl ClientConfig {
     pub fn new(host: String, port: u16, timeout: Duration, socket_path: Option<PathBuf>) -> Self {
         Self {
@@ -494,32 +499,10 @@ impl TgsdbClient {
         }
     }
 
-    pub(crate) fn candidate_insert_batch_serialized_rows(
-        &self,
-        rows: &[Vec<u8>],
-    ) -> Result<CandidateInsertBatchResponse> {
-        if rows.is_empty() {
-            return Ok(CandidateInsertBatchResponse {
-                inserted_count: 0,
-                results: Vec::new(),
-            });
-        }
-        let payload = serialized_candidate_insert_batch_payload(rows);
-        match self.request_typed_bytes(ACTION_CANDIDATE_INSERT_BATCH, &payload) {
-            Ok(response) => Ok(response),
-            Err(err) if rows.len() > 1 && is_payload_too_large_error(&err) => {
-                let mid = rows.len() / 2;
-                let mut left = self.candidate_insert_batch_serialized_rows(&rows[..mid])?;
-                let right = self.candidate_insert_batch_serialized_rows(&rows[mid..])?;
-                left.inserted_count += right.inserted_count;
-                left.results.extend(right.results);
-                Ok(left)
-            }
-            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => Err(TgsError::from(
-                "Single document insert request is too large to send.",
-            )),
-            Err(err) => Err(err),
-        }
+    pub(crate) fn connect_persistent(&self) -> Result<PersistentTgsdbClient> {
+        Ok(PersistentTgsdbClient {
+            stream: self.connect()?,
+        })
     }
 
     pub fn candidate_insert_batch_payload_size(
@@ -704,9 +687,105 @@ impl TgsdbClient {
                 .map_err(|_| TgsError::from("Invalid TCP address."))?,
             self.config.timeout,
         )?;
+        stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(self.config.timeout))?;
         stream.set_write_timeout(Some(self.config.timeout))?;
         Ok(ClientStream::Tcp(stream))
+    }
+}
+
+impl PersistentTgsdbClient {
+    pub(crate) fn begin_index_session(&mut self) -> Result<String> {
+        let response: CandidateIndexSessionResponse =
+            self.request_typed_json(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
+        Ok(response.message)
+    }
+
+    pub(crate) fn update_index_session_progress(
+        &mut self,
+        total_documents: Option<usize>,
+        submitted_documents: usize,
+        processed_documents: usize,
+    ) -> Result<()> {
+        let _: CandidateIndexSessionResponse = self.request_typed_json(
+            ACTION_INDEX_SESSION_PROGRESS,
+            &CandidateIndexSessionProgressRequest {
+                total_documents: total_documents.map(|value| value as u64),
+                submitted_documents: submitted_documents as u64,
+                processed_documents: processed_documents as u64,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn end_index_session(&mut self) -> Result<String> {
+        let response: CandidateIndexSessionResponse =
+            self.request_typed_json(ACTION_INDEX_SESSION_END, &json!({}))?;
+        Ok(response.message)
+    }
+
+    pub(crate) fn candidate_insert_batch_serialized_rows(
+        &mut self,
+        rows: &[Vec<u8>],
+    ) -> Result<CandidateInsertBatchResponse> {
+        if rows.is_empty() {
+            return Ok(CandidateInsertBatchResponse {
+                inserted_count: 0,
+                results: Vec::new(),
+            });
+        }
+        let payload = serialized_candidate_insert_batch_payload(rows);
+        match self.request_typed_bytes(ACTION_CANDIDATE_INSERT_BATCH, &payload) {
+            Ok(response) => Ok(response),
+            Err(err) if rows.len() > 1 && is_payload_too_large_error(&err) => {
+                let mid = rows.len() / 2;
+                let mut left = self.candidate_insert_batch_serialized_rows(&rows[..mid])?;
+                let right = self.candidate_insert_batch_serialized_rows(&rows[mid..])?;
+                left.inserted_count += right.inserted_count;
+                left.results.extend(right.results);
+                Ok(left)
+            }
+            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => Err(TgsError::from(
+                "Single document insert request is too large to send.",
+            )),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn request_typed_json<T, U>(&mut self, action: u8, payload: &U) -> Result<T>
+    where
+        T: DeserializeOwned,
+        U: Serialize,
+    {
+        let bytes = serde_json::to_vec(payload)?;
+        self.request_typed_bytes(action, &bytes)
+    }
+
+    fn request_typed_bytes<T>(&mut self, action: u8, payload: &[u8]) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let bytes = self.request_bytes(action, payload)?;
+        serde_json::from_slice(&bytes).map_err(TgsError::from)
+    }
+
+    fn request_bytes(&mut self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
+        write_frame(&mut self.stream, PROTOCOL_VERSION, action, payload)?;
+        let (version, status, response_payload) = read_frame(&mut self.stream)?;
+        if version != PROTOCOL_VERSION {
+            return Err(TgsError::from(format!(
+                "Unsupported protocol version from server: {version}"
+            )));
+        }
+        if status == STATUS_OK {
+            return Ok(response_payload);
+        }
+        let value: Value = serde_json::from_slice(&response_payload)?;
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Server returned an error.");
+        Err(TgsError::from(message.to_owned()))
     }
 }
 
@@ -3449,6 +3528,7 @@ fn accept_tcp(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
                 let state = state.clone();
                 state.active_connections.fetch_add(1, Ordering::AcqRel);
                 thread::spawn(move || {
@@ -3488,31 +3568,28 @@ fn serve_connection<S>(
 where
     S: Read + Write,
 {
-    let (version, action, payload) = match read_frame(&mut stream) {
-        Ok(frame) => frame,
-        Err(err) => {
-            let _ = write_error_frame(&mut stream, &err.to_string());
+    loop {
+        let Some((version, action, payload)) = read_frame_optional(&mut stream)? else {
+            return Ok(());
+        };
+        if version != PROTOCOL_VERSION {
+            write_error_frame(
+                &mut stream,
+                &format!("Unsupported protocol version: {version}"),
+            )?;
             return Ok(());
         }
-    };
-    if version != PROTOCOL_VERSION {
-        write_error_frame(
-            &mut stream,
-            &format!("Unsupported protocol version: {version}"),
-        )?;
-        return Ok(());
-    }
-    if payload.len() > max_request_bytes {
-        write_error_frame(&mut stream, "Request is too large.")?;
-        return Ok(());
-    }
-    match state.dispatch(action, &payload) {
-        Ok(response_payload) => {
-            write_frame(&mut stream, PROTOCOL_VERSION, STATUS_OK, &response_payload)?
+        if payload.len() > max_request_bytes {
+            write_error_frame(&mut stream, "Request is too large.")?;
+            return Ok(());
         }
-        Err(err) => write_error_frame(&mut stream, &err.to_string())?,
+        match state.dispatch(action, &payload) {
+            Ok(response_payload) => {
+                write_frame(&mut stream, PROTOCOL_VERSION, STATUS_OK, &response_payload)?
+            }
+            Err(err) => write_error_frame(&mut stream, &err.to_string())?,
+        }
     }
-    Ok(())
 }
 
 fn write_frame<W: Write>(
@@ -3555,6 +3632,28 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<(u8, u8, Vec<u8>)> {
         read_exact(reader, &mut payload)?;
     }
     Ok((version, status_or_action, payload))
+}
+
+fn read_frame_optional<R: Read>(reader: &mut R) -> Result<Option<(u8, u8, Vec<u8>)>> {
+    let mut header = [0u8; HEADER_LEN];
+    let first = match reader.read(&mut header[..1])? {
+        0 => return Ok(None),
+        n => n,
+    };
+    if first < 1 {
+        return Ok(None);
+    }
+    if HEADER_LEN > 1 {
+        read_exact(reader, &mut header[1..])?;
+    }
+    let version = header[0];
+    let status_or_action = header[1];
+    let payload_len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        read_exact(reader, &mut payload)?;
+    }
+    Ok(Some((version, status_or_action, payload)))
 }
 
 fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
@@ -5069,6 +5168,15 @@ mod tests {
             let mut cursor = Cursor::new(self.output.clone());
             read_frame(&mut cursor).expect("decode frame")
         }
+
+        fn written_frames(&self) -> Vec<(u8, u8, Vec<u8>)> {
+            let mut cursor = Cursor::new(self.output.clone());
+            let mut frames = Vec::new();
+            while let Some(frame) = read_frame_optional(&mut cursor).expect("decode frame") {
+                frames.push(frame);
+            }
+            frames
+        }
     }
 
     impl Read for MockStream {
@@ -5553,6 +5661,42 @@ mod tests {
             String::from_utf8(payload)
                 .expect("utf8")
                 .contains("EOF while parsing")
+        );
+    }
+
+    #[test]
+    fn serve_connection_handles_multiple_frames_per_connection() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+
+        let mut payload = Vec::new();
+        write_frame(&mut payload, PROTOCOL_VERSION, ACTION_PING, b"{}").expect("ping frame");
+        write_frame(&mut payload, PROTOCOL_VERSION, 250, b"{}").expect("bad frame");
+        write_frame(&mut payload, PROTOCOL_VERSION, ACTION_PING, b"{}").expect("ping frame");
+
+        let mut stream = MockStream::new(payload);
+        serve_connection(&mut stream, state, DEFAULT_MAX_REQUEST_BYTES)
+            .expect("serve multi-frame stream");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].1, STATUS_OK);
+        assert!(
+            String::from_utf8(frames[0].2.clone())
+                .expect("utf8")
+                .contains("pong")
+        );
+        assert_eq!(frames[1].1, STATUS_ERROR);
+        assert!(
+            String::from_utf8(frames[1].2.clone())
+                .expect("utf8")
+                .contains("Unsupported action code: 250")
+        );
+        assert_eq!(frames[2].1, STATUS_OK);
+        assert!(
+            String::from_utf8(frames[2].2.clone())
+                .expect("utf8")
+                .contains("pong")
         );
     }
 
