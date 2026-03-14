@@ -335,6 +335,13 @@ struct ServerState {
     last_published_df_snapshot_seal_persisted_shards: AtomicU64,
     last_published_df_snapshot_seal_failures: AtomicU64,
     last_published_df_snapshot_seal_completed_unix_ms: AtomicU64,
+    pending_published_tier2_snapshot_shards: Mutex<HashSet<usize>>,
+    published_tier2_snapshot_seal_in_progress: AtomicBool,
+    published_tier2_snapshot_seal_runs_total: AtomicU64,
+    last_published_tier2_snapshot_seal_duration_ms: AtomicU64,
+    last_published_tier2_snapshot_seal_persisted_shards: AtomicU64,
+    last_published_tier2_snapshot_seal_failures: AtomicU64,
+    last_published_tier2_snapshot_seal_completed_unix_ms: AtomicU64,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
@@ -699,6 +706,8 @@ pub fn serve_with_signal_flags(
     let compaction_worker = start_compaction_worker(state.clone());
     let auto_publish_worker = start_auto_publish_worker(state.clone());
     let published_df_snapshot_seal_worker = start_published_df_snapshot_seal_worker(state.clone());
+    let published_tier2_snapshot_seal_worker =
+        start_published_tier2_snapshot_seal_worker(state.clone());
     let status_worker = start_status_dump_worker(state.clone(), status_dump);
 
     let accept_result = if let Some(path) = socket_path {
@@ -743,6 +752,7 @@ pub fn serve_with_signal_flags(
     let _ = compaction_worker.join();
     let _ = auto_publish_worker.join();
     let _ = published_df_snapshot_seal_worker.join();
+    let _ = published_tier2_snapshot_seal_worker.join();
     let mut last_reported_connections = usize::MAX;
     while state.active_connections.load(Ordering::Acquire) > 0 {
         let active_connections = state.active_connections.load(Ordering::Acquire);
@@ -999,6 +1009,23 @@ fn start_published_df_snapshot_seal_worker(state: Arc<ServerState>) -> thread::J
     })
 }
 
+fn start_published_tier2_snapshot_seal_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            if state.is_shutting_down()
+                && state
+                    .pending_published_tier2_snapshot_shard_count()
+                    .unwrap_or(0)
+                    == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+            let _ = state.run_published_tier2_snapshot_seal_cycle();
+        }
+    })
+}
+
 fn start_status_dump_worker(
     state: Arc<ServerState>,
     status_dump: Option<Arc<AtomicBool>>,
@@ -1120,6 +1147,13 @@ impl ServerState {
             last_published_df_snapshot_seal_persisted_shards: AtomicU64::new(0),
             last_published_df_snapshot_seal_failures: AtomicU64::new(0),
             last_published_df_snapshot_seal_completed_unix_ms: AtomicU64::new(0),
+            pending_published_tier2_snapshot_shards: Mutex::new(HashSet::new()),
+            published_tier2_snapshot_seal_in_progress: AtomicBool::new(false),
+            published_tier2_snapshot_seal_runs_total: AtomicU64::new(0),
+            last_published_tier2_snapshot_seal_duration_ms: AtomicU64::new(0),
+            last_published_tier2_snapshot_seal_persisted_shards: AtomicU64::new(0),
+            last_published_tier2_snapshot_seal_failures: AtomicU64::new(0),
+            last_published_tier2_snapshot_seal_completed_unix_ms: AtomicU64::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -1218,6 +1252,28 @@ impl ServerState {
         Ok(pending.len())
     }
 
+    fn enqueue_published_tier2_snapshot_shards<I>(&self, shard_indexes: I) -> Result<()>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut pending = self
+            .pending_published_tier2_snapshot_shards
+            .lock()
+            .map_err(|_| TgsError::from("Published Tier2 snapshot queue lock poisoned."))?;
+        for shard_idx in shard_indexes {
+            pending.insert(shard_idx);
+        }
+        Ok(())
+    }
+
+    fn pending_published_tier2_snapshot_shard_count(&self) -> Result<usize> {
+        let pending = self
+            .pending_published_tier2_snapshot_shards
+            .lock()
+            .map_err(|_| TgsError::from("Published Tier2 snapshot queue lock poisoned."))?;
+        Ok(pending.len())
+    }
+
     fn run_published_df_snapshot_seal_cycle(&self) -> Result<()> {
         if self.publish_in_progress.load(Ordering::Acquire) {
             return Ok(());
@@ -1278,6 +1334,71 @@ impl ServerState {
             self.published_df_snapshot_seal_runs_total
                 .fetch_add(1, Ordering::SeqCst);
             self.last_published_df_snapshot_seal_completed_unix_ms
+                .store(current_unix_ms(), Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn run_published_tier2_snapshot_seal_cycle(&self) -> Result<()> {
+        if self.publish_in_progress.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let shard_idx = {
+            let mut pending = self
+                .pending_published_tier2_snapshot_shards
+                .lock()
+                .map_err(|_| TgsError::from("Published Tier2 snapshot queue lock poisoned."))?;
+            let Some(shard_idx) = pending.iter().next().copied() else {
+                return Ok(());
+            };
+            pending.remove(&shard_idx);
+            shard_idx
+        };
+
+        self.published_tier2_snapshot_seal_in_progress
+            .store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let result = (|| -> Result<(u64, u64)> {
+            let published = self.published_store_set()?;
+            let Some(store_lock) = published.stores.get(shard_idx) else {
+                return Ok((0, 0));
+            };
+            match store_lock.try_lock() {
+                Ok(store) => {
+                    store.persist_tier2_superblocks_snapshot()?;
+                    Ok((1, 0))
+                }
+                Err(TryLockError::WouldBlock) => {
+                    self.enqueue_published_tier2_snapshot_shards([shard_idx])?;
+                    Ok((0, 0))
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    Err(TgsError::from("Candidate store lock poisoned."))
+                }
+            }
+        })();
+        self.published_tier2_snapshot_seal_in_progress
+            .store(false, Ordering::SeqCst);
+
+        let (persisted_shards, failures) = match result {
+            Ok(values) => values,
+            Err(_) => {
+                let _ = self.enqueue_published_tier2_snapshot_shards([shard_idx]);
+                (0, 1)
+            }
+        };
+        self.last_published_tier2_snapshot_seal_duration_ms.store(
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+        self.last_published_tier2_snapshot_seal_persisted_shards
+            .store(persisted_shards, Ordering::SeqCst);
+        self.last_published_tier2_snapshot_seal_failures
+            .store(failures, Ordering::SeqCst);
+        if persisted_shards > 0 || failures > 0 {
+            self.published_tier2_snapshot_seal_runs_total
+                .fetch_add(1, Ordering::SeqCst);
+            self.last_published_tier2_snapshot_seal_completed_unix_ms
                 .store(current_unix_ms(), Ordering::SeqCst);
         }
         Ok(())
@@ -1846,6 +1967,18 @@ impl ServerState {
                     "last_persisted_shards": self.last_published_df_snapshot_seal_persisted_shards.load(Ordering::Acquire),
                     "last_failures": self.last_published_df_snapshot_seal_failures.load(Ordering::Acquire),
                     "last_completed_unix_ms": self.last_published_df_snapshot_seal_completed_unix_ms.load(Ordering::Acquire),
+                }),
+            );
+            stats.insert(
+                "published_tier2_snapshot_seal".to_owned(),
+                json!({
+                    "pending_shards": self.pending_published_tier2_snapshot_shard_count().unwrap_or(0),
+                    "in_progress": self.published_tier2_snapshot_seal_in_progress.load(Ordering::Acquire),
+                    "runs_total": self.published_tier2_snapshot_seal_runs_total.load(Ordering::Acquire),
+                    "last_duration_ms": self.last_published_tier2_snapshot_seal_duration_ms.load(Ordering::Acquire),
+                    "last_persisted_shards": self.last_published_tier2_snapshot_seal_persisted_shards.load(Ordering::Acquire),
+                    "last_failures": self.last_published_tier2_snapshot_seal_failures.load(Ordering::Acquire),
+                    "last_completed_unix_ms": self.last_published_tier2_snapshot_seal_completed_unix_ms.load(Ordering::Acquire),
                 }),
             );
         } else {
@@ -2557,6 +2690,7 @@ impl ServerState {
         drop(published_store);
         if published_result.status == "deleted" {
             let _ = self.enqueue_published_df_snapshot_shards([shard_idx]);
+            let _ = self.enqueue_published_tier2_snapshot_shards([shard_idx]);
         }
 
         let work = self.work_store_set()?;
@@ -2971,19 +3105,12 @@ impl ServerState {
             );
 
             let persist_tier2_started = Instant::now();
-            let mut tier2_snapshot_persist_failures = 0u64;
-            for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
-                if !changed_shards[shard_idx] {
-                    continue;
-                }
-                let store = store_lock
-                    .lock()
-                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
-                if store.persist_tier2_superblocks_snapshot().is_err() {
-                    tier2_snapshot_persist_failures =
-                        tier2_snapshot_persist_failures.saturating_add(1);
-                }
-            }
+            self.enqueue_published_tier2_snapshot_shards(
+                changed_shards
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(shard_idx, changed)| changed.then_some(shard_idx)),
+            )?;
             self.last_publish_persist_tier2_superblocks_ms.store(
                 persist_tier2_started
                     .elapsed()
@@ -2993,7 +3120,7 @@ impl ServerState {
                 Ordering::SeqCst,
             );
             self.last_publish_tier2_snapshot_persist_failures
-                .store(tier2_snapshot_persist_failures, Ordering::SeqCst);
+                .store(0, Ordering::SeqCst);
 
             let removed_retired_roots = prune_workspace_retired_roots(
                 &retired_parent,

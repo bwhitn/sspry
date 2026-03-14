@@ -2145,6 +2145,44 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         }
                     }
                 }
+                if let Some(seal) = stats
+                    .get("published_tier2_snapshot_seal")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    if let Some(value) = seal
+                        .get("pending_shards")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        eprintln!(
+                            "verbose.index.server_published_tier2_snapshot_seal_pending_shards: {value}"
+                        );
+                    }
+                    if let Some(value) =
+                        seal.get("in_progress").and_then(serde_json::Value::as_bool)
+                    {
+                        eprintln!(
+                            "verbose.index.server_published_tier2_snapshot_seal_in_progress: {value}"
+                        );
+                    }
+                    for (key, label) in [
+                        (
+                            "last_duration_ms",
+                            "verbose.index.server_published_tier2_snapshot_seal_last_duration_ms",
+                        ),
+                        (
+                            "last_persisted_shards",
+                            "verbose.index.server_published_tier2_snapshot_seal_last_persisted_shards",
+                        ),
+                        (
+                            "last_failures",
+                            "verbose.index.server_published_tier2_snapshot_seal_last_failures",
+                        ),
+                    ] {
+                        if let Some(value) = seal.get(key).and_then(serde_json::Value::as_u64) {
+                            eprintln!("{label}: {value}");
+                        }
+                    }
+                }
             }
         }
         Ok(0)
