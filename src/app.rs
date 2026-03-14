@@ -601,6 +601,11 @@ impl Drop for RemoteIndexSessionGuard<'_> {
     }
 }
 
+struct ScannedIndexBatchRow {
+    row: IndexBatchRow,
+    scan_elapsed: Duration,
+}
+
 fn maybe_report_remote_index_session_progress(
     client: &TgsdbClient,
     processed: usize,
@@ -771,44 +776,67 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
 
 const REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES: usize = DEFAULT_MAX_REQUEST_BYTES - 1024;
 
+struct RemotePendingBatch {
+    documents: Vec<CandidateDocumentWire>,
+    payload_size: usize,
+}
+
+fn empty_remote_batch_payload_size() -> Result<usize> {
+    TgsdbClient::candidate_insert_batch_payload_size(&[])
+}
+
+fn candidate_document_wire_payload_size(document: &CandidateDocumentWire) -> Result<usize> {
+    Ok(serde_json::to_vec(document)?.len())
+}
+
 fn flush_remote_batch(
     client: &TgsdbClient,
-    pending: &mut Vec<CandidateDocumentWire>,
+    pending: &mut RemotePendingBatch,
     processed: &mut usize,
+    empty_payload_size: usize,
 ) -> Result<()> {
-    if pending.is_empty() {
+    if pending.documents.is_empty() {
         return Ok(());
     }
-    *processed += client.candidate_insert_batch(pending)?.inserted_count;
-    pending.clear();
+    *processed += client
+        .candidate_insert_batch(&pending.documents)?
+        .inserted_count;
+    pending.documents.clear();
+    pending.payload_size = empty_payload_size;
     Ok(())
 }
 
 fn push_remote_batch_row(
     client: &TgsdbClient,
-    pending: &mut Vec<CandidateDocumentWire>,
+    pending: &mut RemotePendingBatch,
     row: CandidateDocumentWire,
     batch_size: usize,
     processed: &mut usize,
+    empty_payload_size: usize,
 ) -> Result<()> {
-    pending.push(row);
-    let payload_size = TgsdbClient::candidate_insert_batch_payload_size(pending)?;
+    let row_payload_size = candidate_document_wire_payload_size(&row)?;
+    let separator_bytes = usize::from(!pending.documents.is_empty());
+    let payload_size = pending
+        .payload_size
+        .saturating_add(separator_bytes)
+        .saturating_add(row_payload_size);
     if payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
-        let row = pending
-            .pop()
-            .ok_or_else(|| TgsError::from("remote ingest batch unexpectedly empty"))?;
-        flush_remote_batch(client, pending, processed)?;
-        pending.push(row);
-        let single_payload_size = TgsdbClient::candidate_insert_batch_payload_size(pending)?;
+        flush_remote_batch(client, pending, processed, empty_payload_size)?;
+        let single_payload_size = empty_payload_size.saturating_add(row_payload_size);
         if single_payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
             return Err(TgsError::from(format!(
                 "single document insert request exceeds payload limit ({} bytes)",
                 single_payload_size
             )));
         }
+        pending.documents.push(row);
+        pending.payload_size = single_payload_size;
+    } else {
+        pending.documents.push(row);
+        pending.payload_size = payload_size;
     }
-    if pending.len() >= batch_size {
-        flush_remote_batch(client, pending, processed)?;
+    if pending.documents.len() >= batch_size {
+        flush_remote_batch(client, pending, processed, empty_payload_size)?;
     }
     Ok(())
 }
@@ -859,16 +887,17 @@ fn flush_local_pending_rows(
 
 fn flush_remote_pending_rows(
     client: &TgsdbClient,
-    pending: &mut Vec<CandidateDocumentWire>,
+    pending: &mut RemotePendingBatch,
     processed: &mut usize,
     submit_time: &mut Duration,
     show_progress: bool,
     total_files: usize,
     last_progress_reported: &mut usize,
     last_progress_at: &mut Instant,
+    empty_payload_size: usize,
 ) -> Result<()> {
     let started_submit = Instant::now();
-    flush_remote_batch(client, pending, processed)?;
+    flush_remote_batch(client, pending, processed, empty_payload_size)?;
     *submit_time += started_submit.elapsed();
     maybe_report_index_progress(
         show_progress,
@@ -1608,6 +1637,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
         let mut scan_time = Duration::ZERO;
+        let mut result_wait_time = Duration::ZERO;
+        let mut encode_time = Duration::ZERO;
+        let mut client_buffer_time = Duration::ZERO;
+        let mut progress_rpc_time = Duration::ZERO;
         let mut submit_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
         let input_roots = normalize_input_paths(&args.paths);
@@ -1663,7 +1696,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 })?;
             } else {
                 let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
-                let (result_tx, result_rx) = bounded::<Result<IndexBatchRow>>(queue_capacity);
+                let (result_tx, result_rx) =
+                    bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
                 let worker_count = args.workers.max(1);
                 thread::scope(|scope| {
                     for _ in 0..worker_count {
@@ -1671,7 +1705,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         let result_tx = result_tx.clone();
                         scope.spawn(move || {
                             for file_path in job_rx.iter() {
-                                let result = scan_index_batch_row(&file_path, policy);
+                                let started_scan = Instant::now();
+                                let result = scan_index_batch_row(&file_path, policy).map(|row| {
+                                    ScannedIndexBatchRow {
+                                        row,
+                                        scan_elapsed: started_scan.elapsed(),
+                                    }
+                                });
                                 let _ = result_tx.send(result);
                             }
                         });
@@ -1698,11 +1738,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     drop(result_tx);
 
                     for _ in 0..total_files {
-                        let started_scan = Instant::now();
-                        pending.push(result_rx.recv().map_err(|_| {
+                        let started_wait = Instant::now();
+                        let scanned = result_rx.recv().map_err(|_| {
                             TgsError::from("candidate ingest workers terminated unexpectedly")
-                        })??);
-                        scan_time += started_scan.elapsed();
+                        })??;
+                        result_wait_time += started_wait.elapsed();
+                        scan_time += scanned.scan_elapsed;
+                        pending.push(scanned.row);
                         if pending.len() >= batch_size {
                             flush_local_pending_rows(
                                 &mut stores,
@@ -1751,19 +1793,37 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let client = rpc_client(&args.connection);
             client.begin_index_session()?;
             let _session = RemoteIndexSessionGuard { client: &client };
+            let started_progress_rpc = Instant::now();
             client.update_index_session_progress(Some(total_files), 0, 0)?;
+            progress_rpc_time += started_progress_rpc.elapsed();
             let configured_budget_bytes = server_policy.memory_budget_bytes;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
             let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
-            let mut pending = Vec::<CandidateDocumentWire>::new();
+            let empty_payload_size = empty_remote_batch_payload_size()?;
+            let mut pending = RemotePendingBatch {
+                documents: Vec::new(),
+                payload_size: empty_payload_size,
+            };
             let mut last_server_progress_reported = 0usize;
             let mut last_server_progress_at = Instant::now();
             if args.workers <= 1 {
                 stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
-                    let row = batch_row_to_wire(scan_index_batch_row(&file_path, policy)?);
+                    let scanned = scan_index_batch_row(&file_path, policy)?;
                     scan_time += started_scan.elapsed();
-                    push_remote_batch_row(&client, &mut pending, row, batch_size, &mut processed)?;
+                    let started_encode = Instant::now();
+                    let row = batch_row_to_wire(scanned);
+                    encode_time += started_encode.elapsed();
+                    let started_buffer = Instant::now();
+                    push_remote_batch_row(
+                        &client,
+                        &mut pending,
+                        row,
+                        batch_size,
+                        &mut processed,
+                        empty_payload_size,
+                    )?;
+                    client_buffer_time += started_buffer.elapsed();
                     maybe_report_index_progress(
                         show_progress,
                         processed,
@@ -1772,6 +1832,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         &mut last_progress_at,
                         false,
                     );
+                    let started_progress_rpc = Instant::now();
                     maybe_report_remote_index_session_progress(
                         &client,
                         processed,
@@ -1780,11 +1841,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         &mut last_server_progress_at,
                         false,
                     )?;
+                    progress_rpc_time += started_progress_rpc.elapsed();
                     Ok(())
                 })?;
             } else {
                 let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
-                let (result_tx, result_rx) = bounded::<Result<IndexBatchRow>>(queue_capacity);
+                let (result_tx, result_rx) =
+                    bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
                 let worker_count = args.workers.max(1);
                 thread::scope(|scope| {
                     for _ in 0..worker_count {
@@ -1792,7 +1855,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         let result_tx = result_tx.clone();
                         scope.spawn(move || {
                             for file_path in job_rx.iter() {
-                                let result = scan_index_batch_row(&file_path, policy);
+                                let started_scan = Instant::now();
+                                let result = scan_index_batch_row(&file_path, policy).map(|row| {
+                                    ScannedIndexBatchRow {
+                                        row,
+                                        scan_elapsed: started_scan.elapsed(),
+                                    }
+                                });
                                 let _ = result_tx.send(result);
                             }
                         });
@@ -1819,18 +1888,25 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     drop(result_tx);
 
                     for _ in 0..total_files {
-                        let started_scan = Instant::now();
-                        let row = batch_row_to_wire(result_rx.recv().map_err(|_| {
+                        let started_wait = Instant::now();
+                        let scanned = result_rx.recv().map_err(|_| {
                             TgsError::from("candidate ingest workers terminated unexpectedly")
-                        })??);
-                        scan_time += started_scan.elapsed();
+                        })??;
+                        result_wait_time += started_wait.elapsed();
+                        scan_time += scanned.scan_elapsed;
+                        let started_encode = Instant::now();
+                        let row = batch_row_to_wire(scanned.row);
+                        encode_time += started_encode.elapsed();
+                        let started_buffer = Instant::now();
                         push_remote_batch_row(
                             &client,
                             &mut pending,
                             row,
                             batch_size,
                             &mut processed,
+                            empty_payload_size,
                         )?;
+                        client_buffer_time += started_buffer.elapsed();
                         maybe_report_index_progress(
                             show_progress,
                             processed,
@@ -1839,6 +1915,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             &mut last_progress_at,
                             false,
                         );
+                        let started_progress_rpc = Instant::now();
                         maybe_report_remote_index_session_progress(
                             &client,
                             processed,
@@ -1847,6 +1924,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             &mut last_server_progress_at,
                             false,
                         )?;
+                        progress_rpc_time += started_progress_rpc.elapsed();
                     }
                     Ok::<(), TgsError>(())
                 })?;
@@ -1861,7 +1939,9 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 total_files,
                 &mut last_progress_reported,
                 &mut last_progress_at,
+                empty_payload_size,
             )?;
+            let started_progress_rpc = Instant::now();
             maybe_report_remote_index_session_progress(
                 &client,
                 processed,
@@ -1870,6 +1950,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 &mut last_server_progress_at,
                 true,
             )?;
+            progress_rpc_time += started_progress_rpc.elapsed();
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
@@ -1893,9 +1974,18 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
             let scan_ms = scan_time.as_secs_f64() * 1000.0;
             let submit_ms = submit_time.as_secs_f64() * 1000.0;
+            let result_wait_ms = result_wait_time.as_secs_f64() * 1000.0;
+            let encode_ms = encode_time.as_secs_f64() * 1000.0;
+            let client_buffer_ms = client_buffer_time.as_secs_f64() * 1000.0;
+            let progress_rpc_ms = progress_rpc_time.as_secs_f64() * 1000.0;
             eprintln!("verbose.index.total_ms: {total_ms:.3}");
             eprintln!("verbose.index.scan_ms: {scan_ms:.3}");
+            eprintln!("verbose.index.worker_scan_cpu_ms: {scan_ms:.3}");
+            eprintln!("verbose.index.result_wait_ms: {result_wait_ms:.3}");
+            eprintln!("verbose.index.encode_ms: {encode_ms:.3}");
+            eprintln!("verbose.index.client_buffer_ms: {client_buffer_ms:.3}");
             eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
+            eprintln!("verbose.index.progress_rpc_ms: {progress_rpc_ms:.3}");
             eprintln!("verbose.index.batch_size: {}", batch_size);
             eprintln!("verbose.index.workers: {}", args.workers.max(1));
             eprintln!("verbose.index.submitted_documents: {total_files}");
@@ -3223,6 +3313,53 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("test rpc server did not become ready");
+    }
+
+    #[test]
+    fn incremental_remote_batch_size_matches_full_payload_size() {
+        let empty = empty_remote_batch_payload_size().expect("empty payload size");
+        let docs = vec![
+            CandidateDocumentWire {
+                sha256: "11".repeat(32),
+                file_size: 123,
+                bloom_filter_b64: "AQID".to_owned(),
+                gram_count_estimate: Some(3),
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: Some("BAUG".to_owned()),
+                tier2_gram_count_estimate: Some(2),
+                tier2_bloom_hashes: Some(5),
+                grams_delta_b64: Some("BwgJ".to_owned()),
+                grams: Vec::new(),
+                grams_complete: true,
+                effective_diversity: Some(0.5),
+                external_id: Some("doc-1".to_owned()),
+            },
+            CandidateDocumentWire {
+                sha256: "22".repeat(32),
+                file_size: 456,
+                bloom_filter_b64: "CgsM".to_owned(),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: Some("DQ4P".to_owned()),
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: Some(5),
+                grams_delta_b64: Some("EBES".to_owned()),
+                grams: Vec::new(),
+                grams_complete: false,
+                effective_diversity: None,
+                external_id: None,
+            },
+        ];
+        let mut running = empty;
+        let mut pending_docs = Vec::new();
+        for doc in docs {
+            let row_size = candidate_document_wire_payload_size(&doc).expect("row payload size");
+            running += row_size + usize::from(!pending_docs.is_empty());
+            pending_docs.push(doc);
+            let exact = TgsdbClient::candidate_insert_batch_payload_size(&pending_docs)
+                .expect("batch payload size");
+            assert_eq!(running, exact);
+        }
     }
 
     fn default_serve_args() -> ServeArgs {
