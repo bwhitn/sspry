@@ -267,6 +267,9 @@ struct ServerState {
     shutdown: Arc<AtomicBool>,
     operation_gate: RwLock<()>,
     store_mode: Mutex<StoreMode>,
+    mutations_paused: AtomicBool,
+    publish_in_progress: AtomicBool,
+    active_mutations: AtomicUsize,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
@@ -292,6 +295,16 @@ struct CompactionRuntime {
     last_reclaimed_bytes: u64,
     last_completed_unix_ms: Option<u64>,
     last_error: Option<String>,
+}
+
+struct ActiveMutationGuard<'a> {
+    state: &'a ServerState,
+}
+
+impl Drop for ActiveMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.state.active_mutations.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
@@ -892,6 +905,9 @@ impl ServerState {
             shutdown,
             operation_gate: RwLock::new(()),
             store_mode: Mutex::new(store_mode),
+            mutations_paused: AtomicBool::new(false),
+            publish_in_progress: AtomicBool::new(false),
+            active_mutations: AtomicUsize::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -950,6 +966,17 @@ impl ServerState {
         Ok(matches!(*mode, StoreMode::Direct { .. }))
     }
 
+    fn begin_mutation(&self, operation: &str) -> Result<ActiveMutationGuard<'_>> {
+        self.active_mutations.fetch_add(1, Ordering::AcqRel);
+        if self.mutations_paused.load(Ordering::Acquire) {
+            self.active_mutations.fetch_sub(1, Ordering::AcqRel);
+            return Err(TgsError::from(format!(
+                "server is publishing; {operation} temporarily disabled; retry later"
+            )));
+        }
+        Ok(ActiveMutationGuard { state: self })
+    }
+
     fn candidate_stats_json_for_store_set(
         &self,
         store_set: &StoreSet,
@@ -983,6 +1010,18 @@ impl ServerState {
         stats.insert(
             "active_connections".to_owned(),
             json!(self.active_connections.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "active_mutations".to_owned(),
+            json!(self.active_mutations.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "mutations_paused".to_owned(),
+            json!(self.mutations_paused.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "publish_in_progress".to_owned(),
+            json!(self.publish_in_progress.load(Ordering::Acquire)),
         );
         stats.insert(
             "search_workers".to_owned(),
@@ -1611,6 +1650,7 @@ impl ServerState {
         document: &CandidateDocumentWire,
     ) -> Result<CandidateInsertResponse> {
         let _scope = scope("rpc.handle_candidate_insert");
+        let _mutation = self.begin_mutation("insert")?;
         let _op = self
             .operation_gate
             .read()
@@ -1649,6 +1689,7 @@ impl ServerState {
         documents: &[CandidateDocumentWire],
     ) -> Result<CandidateInsertBatchResponse> {
         let _scope = scope("rpc.handle_candidate_insert_batch");
+        let _mutation = self.begin_mutation("insert batch")?;
         let _op = self
             .operation_gate
             .read()
@@ -1748,6 +1789,7 @@ impl ServerState {
 
     fn handle_candidate_delete(&self, sha256: &str) -> Result<CandidateDeleteResponse> {
         let _scope = scope("rpc.handle_candidate_delete");
+        let _mutation = self.begin_mutation("delete")?;
         let _op = self
             .operation_gate
             .read()
@@ -1932,50 +1974,60 @@ impl ServerState {
     }
 
     fn handle_publish(&self) -> Result<CandidatePublishResponse> {
+        self.mutations_paused.store(true, Ordering::SeqCst);
+        while self.active_mutations.load(Ordering::Acquire) > 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.publish_in_progress.store(true, Ordering::SeqCst);
         let _op = self
             .operation_gate
             .write()
             .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
-        let mut store_mode = self
-            .store_mode
-            .lock()
-            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
-        let workspace_root = match &*store_mode {
-            StoreMode::Direct { .. } => {
-                return Err(TgsError::from(
-                    "publish is only available when the server is started with --workspace-mode",
-                ));
+        let result = (|| -> Result<CandidatePublishResponse> {
+            let mut store_mode = self
+                .store_mode
+                .lock()
+                .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+            let workspace_root = match &*store_mode {
+                StoreMode::Direct { .. } => {
+                    return Err(TgsError::from(
+                        "publish is only available when the server is started with --workspace-mode",
+                    ));
+                }
+                StoreMode::Workspace { root, .. } => root.clone(),
+            };
+
+            let current_root = workspace_current_root(&workspace_root);
+            let work_root = workspace_work_root(&workspace_root);
+            let retired_parent = workspace_retired_root(&workspace_root);
+            if current_root.exists() {
+                fs::create_dir_all(&retired_parent)?;
+                let retired_root = retired_parent.join(format!("published_{}", current_unix_ms()));
+                fs::rename(&current_root, &retired_root)?;
             }
-            StoreMode::Workspace { root, .. } => root.clone(),
-        };
+            fs::rename(&work_root, &current_root)?;
 
-        let current_root = workspace_current_root(&workspace_root);
-        let work_root = workspace_work_root(&workspace_root);
-        let retired_parent = workspace_retired_root(&workspace_root);
-        if current_root.exists() {
-            fs::create_dir_all(&retired_parent)?;
-            let retired_root = retired_parent.join(format!("published_{}", current_unix_ms()));
-            fs::rename(&current_root, &retired_root)?;
-        }
-        fs::rename(&work_root, &current_root)?;
-
-        let (published_stores, removed_current) =
-            ensure_candidate_stores_at_root(&self.config, &current_root)?;
-        let (work_stores, removed_work) =
-            ensure_candidate_stores_at_root(&self.config, &work_root)?;
-        *store_mode = StoreMode::Workspace {
-            root: workspace_root.clone(),
-            published: Arc::new(StoreSet::new(current_root.clone(), published_stores)),
-            work: Arc::new(StoreSet::new(work_root.clone(), work_stores)),
-        };
-        self.invalidate_search_caches();
-        Ok(CandidatePublishResponse {
-            message: format!(
-                "published work root to {} (startup cleanup removed {})",
-                current_root.display(),
-                removed_current.saturating_add(removed_work)
-            ),
-        })
+            let (published_stores, removed_current) =
+                ensure_candidate_stores_at_root(&self.config, &current_root)?;
+            let (work_stores, removed_work) =
+                ensure_candidate_stores_at_root(&self.config, &work_root)?;
+            *store_mode = StoreMode::Workspace {
+                root: workspace_root.clone(),
+                published: Arc::new(StoreSet::new(current_root.clone(), published_stores)),
+                work: Arc::new(StoreSet::new(work_root.clone(), work_stores)),
+            };
+            self.invalidate_search_caches();
+            Ok(CandidatePublishResponse {
+                message: format!(
+                    "published work root to {} (startup cleanup removed {})",
+                    current_root.display(),
+                    removed_current.saturating_add(removed_work)
+                ),
+            })
+        })();
+        self.publish_in_progress.store(false, Ordering::SeqCst);
+        self.mutations_paused.store(false, Ordering::SeqCst);
+        result
     }
 }
 
@@ -2601,6 +2653,53 @@ mod tests {
         assert!(
             err.to_string().contains("busy during stats"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn insert_is_rejected_while_publish_pauses_mutations() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        state.mutations_paused.store(true, Ordering::SeqCst);
+        let err = state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: "11".repeat(32),
+                file_size: 1,
+                bloom_filter_b64: String::new(),
+                gram_count_estimate: None,
+                bloom_hashes: None,
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: Vec::new(),
+                grams_complete: false,
+                effective_diversity: None,
+                external_id: None,
+            })
+            .expect_err("insert should be rejected");
+        assert!(
+            err.to_string().contains("server is publishing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn publish_waits_for_active_mutations_to_drain() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.active_mutations.store(1, Ordering::SeqCst);
+        let release = state.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            release.active_mutations.fetch_sub(1, Ordering::AcqRel);
+        });
+        let started = Instant::now();
+        let publish = state.handle_publish().expect("publish");
+        assert!(publish.message.contains("published work root"));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "publish did not wait for active mutations"
         );
     }
 
