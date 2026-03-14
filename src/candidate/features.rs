@@ -54,13 +54,9 @@ pub fn iter_grams_from_bytes_exact_u64(data: &[u8], gram_size: usize) -> Vec<u64
         .collect()
 }
 
-fn stable_gram_rank(gram: u64, sha256_prefix: &[u8], hash_seed: u64) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(hash_seed.to_le_bytes());
-    hasher.update(gram.to_le_bytes());
-    hasher.update(sha256_prefix);
-    let digest = hasher.finalize();
-    u64::from_le_bytes(digest[..8].try_into().unwrap_or([0u8; 8]))
+fn stable_gram_rank(gram: u64, sha256_prefix: u64, hash_seed: u64) -> u64 {
+    let seed_mix = mix_u64_to_u64(hash_seed ^ sha256_prefix.rotate_left(29));
+    mix_u64_to_u64(gram ^ seed_mix ^ sha256_prefix.rotate_right(11))
 }
 
 fn mix_u64_to_u64(value: u64) -> u64 {
@@ -616,7 +612,7 @@ pub fn select_tier1_grams(
         return Ok((unique_grams, false));
     }
 
-    let sha_prefix = &sha256[..8];
+    let sha_prefix = u64::from_le_bytes(sha256[..8].try_into().unwrap_or([0u8; 8]));
     let mut dropped = false;
     let mut ranked = Vec::with_capacity(unique_grams.len());
     for gram in unique_grams {
@@ -1481,6 +1477,18 @@ mod tests {
             estimate_unique_tier2_grams_hll(&path, 3, 4, 5).expect("estimate secondary");
         assert!(estimate5 > 0);
         assert!(estimate_secondary > 0);
+    }
+
+    #[test]
+    fn stable_gram_rank_is_deterministic_and_seeded() {
+        let prefix = u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
+        let rank_a = super::stable_gram_rank(123, prefix, 1337);
+        let rank_b = super::stable_gram_rank(123, prefix, 1337);
+        let rank_other_seed = super::stable_gram_rank(123, prefix, 7331);
+        let rank_other_prefix = super::stable_gram_rank(123, prefix ^ 0x55AA, 1337);
+        assert_eq!(rank_a, rank_b);
+        assert_ne!(rank_a, rank_other_seed);
+        assert_ne!(rank_a, rank_other_prefix);
     }
 
     #[test]
