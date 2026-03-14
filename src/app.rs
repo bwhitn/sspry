@@ -579,6 +579,29 @@ impl Drop for RemoteIndexSessionGuard<'_> {
     }
 }
 
+fn maybe_report_remote_index_session_progress(
+    client: &TgsdbClient,
+    processed: usize,
+    total: usize,
+    last_reported: &mut usize,
+    last_report_at: &mut Instant,
+    force: bool,
+) -> Result<()> {
+    if total == 0 {
+        return Ok(());
+    }
+    let now = Instant::now();
+    let processed_delta = processed.saturating_sub(*last_reported);
+    let time_ready = now.duration_since(*last_report_at) >= Duration::from_secs(5);
+    if !force && processed_delta < 250 && !time_ready {
+        return Ok(());
+    }
+    client.update_index_session_progress(Some(total), processed, processed)?;
+    *last_reported = processed;
+    *last_report_at = now;
+    Ok(())
+}
+
 #[cfg(test)]
 fn json_usize(
     stats: &serde_json::Map<String, serde_json::Value>,
@@ -1702,10 +1725,15 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 id_source: server_policy.id_source,
             };
             let client = rpc_client(&args.connection);
+            client.begin_index_session()?;
+            let _session = RemoteIndexSessionGuard { client: &client };
+            client.update_index_session_progress(Some(total_files), 0, 0)?;
             let configured_budget_bytes = server_policy.memory_budget_bytes;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
             let queue_capacity = index_queue_capacity(effective_budget_bytes, args.workers.max(1));
             let mut pending = Vec::<CandidateDocumentWire>::new();
+            let mut last_server_progress_reported = 0usize;
+            let mut last_server_progress_at = Instant::now();
             if args.workers <= 1 {
                 stream_input_files(&input_roots, |file_path| {
                     let started_scan = Instant::now();
@@ -1720,6 +1748,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         &mut last_progress_at,
                         false,
                     );
+                    maybe_report_remote_index_session_progress(
+                        &client,
+                        processed,
+                        total_files,
+                        &mut last_server_progress_reported,
+                        &mut last_server_progress_at,
+                        false,
+                    )?;
                     Ok(())
                 })?;
             } else {
@@ -1779,6 +1815,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             &mut last_progress_at,
                             false,
                         );
+                        maybe_report_remote_index_session_progress(
+                            &client,
+                            processed,
+                            total_files,
+                            &mut last_server_progress_reported,
+                            &mut last_server_progress_at,
+                            false,
+                        )?;
                     }
                     Ok::<(), TgsError>(())
                 })?;
@@ -1793,6 +1837,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 total_files,
                 &mut last_progress_reported,
                 &mut last_progress_at,
+            )?;
+            maybe_report_remote_index_session_progress(
+                &client,
+                processed,
+                total_files,
+                &mut last_server_progress_reported,
+                &mut last_server_progress_at,
+                true,
             )?;
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
@@ -1865,6 +1917,110 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 ] {
                     if let Some(value) = stats_scope.get(key).and_then(|value| value.as_u64()) {
                         eprintln!("{label}: {value}");
+                    }
+                }
+                if let Some(publish) = stats.get("publish").and_then(serde_json::Value::as_object) {
+                    for (key, label) in [
+                        ("pending", "verbose.index.server_publish_pending"),
+                        ("eligible", "verbose.index.server_publish_eligible"),
+                    ] {
+                        if let Some(value) = publish.get(key).and_then(|value| value.as_bool()) {
+                            eprintln!("{label}: {value}");
+                        }
+                    }
+                    if let Some(value) = publish
+                        .get("blocked_reason")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        eprintln!("verbose.index.server_publish_blocked_reason: {value}");
+                    }
+                    for (key, label) in [
+                        (
+                            "idle_elapsed_ms",
+                            "verbose.index.server_publish_idle_elapsed_ms",
+                        ),
+                        (
+                            "idle_remaining_ms",
+                            "verbose.index.server_publish_idle_remaining_ms",
+                        ),
+                        (
+                            "published_doc_count",
+                            "verbose.index.server_published_doc_count",
+                        ),
+                        ("work_doc_count", "verbose.index.server_work_doc_count"),
+                        (
+                            "work_doc_delta_vs_published",
+                            "verbose.index.server_work_doc_delta_vs_published",
+                        ),
+                        (
+                            "published_disk_usage_bytes",
+                            "verbose.index.server_published_disk_usage_bytes",
+                        ),
+                        (
+                            "work_disk_usage_bytes",
+                            "verbose.index.server_work_disk_usage_bytes",
+                        ),
+                        (
+                            "work_disk_usage_delta_vs_published",
+                            "verbose.index.server_work_disk_usage_delta_vs_published",
+                        ),
+                        (
+                            "last_publish_duration_ms",
+                            "verbose.index.server_last_publish_duration_ms",
+                        ),
+                        (
+                            "publish_runs_total",
+                            "verbose.index.server_publish_runs_total",
+                        ),
+                    ] {
+                        if let Some(value) = publish.get(key).and_then(|value| value.as_i64()) {
+                            eprintln!("{label}: {value}");
+                        } else if let Some(value) =
+                            publish.get(key).and_then(|value| value.as_u64())
+                        {
+                            eprintln!("{label}: {value}");
+                        }
+                    }
+                }
+                if let Some(index_session) = stats
+                    .get("index_session")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    if let Some(value) = index_session
+                        .get("active")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        eprintln!("verbose.index.server_index_session_active: {value}");
+                    }
+                    for (key, label) in [
+                        (
+                            "total_documents",
+                            "verbose.index.server_index_total_documents",
+                        ),
+                        (
+                            "submitted_documents",
+                            "verbose.index.server_index_submitted_documents",
+                        ),
+                        (
+                            "processed_documents",
+                            "verbose.index.server_index_processed_documents",
+                        ),
+                        (
+                            "remaining_documents",
+                            "verbose.index.server_index_remaining_documents",
+                        ),
+                    ] {
+                        if let Some(value) =
+                            index_session.get(key).and_then(serde_json::Value::as_u64)
+                        {
+                            eprintln!("{label}: {value}");
+                        }
+                    }
+                    if let Some(value) = index_session
+                        .get("progress_percent")
+                        .and_then(serde_json::Value::as_f64)
+                    {
+                        eprintln!("verbose.index.server_index_progress_percent: {value:.3}");
                     }
                 }
             }
@@ -2116,12 +2272,6 @@ fn cmd_ingest(args: &IndexArgs) -> i32 {
             return 1;
         }
     };
-    let client = rpc_client(&args.connection);
-    if let Err(err) = client.begin_index_session() {
-        println!("{err}");
-        return 1;
-    }
-    let _session = RemoteIndexSessionGuard { client: &client };
     cmd_internal_index_batch(&InternalIndexBatchArgs {
         connection: args.connection.clone(),
         paths: args.paths.clone(),
@@ -2433,20 +2583,6 @@ fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
     }
 }
 
-fn cmd_publish(args: &PublishArgs) -> i32 {
-    match (|| -> Result<i32> {
-        let response = rpc_client(&args.connection).publish()?;
-        println!("{response}");
-        Ok(0)
-    })() {
-        Ok(code) => code,
-        Err(err) => {
-            println!("{err}");
-            1
-        }
-    }
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "yaya", about = "YAYA server/client CLI (candidate mode only).")]
 struct Cli {
@@ -2469,7 +2605,6 @@ enum Commands {
     Delete(DeleteArgs),
     Search(SearchCommandArgs),
     Info(InfoCommandArgs),
-    Publish(PublishArgs),
     Shutdown(ShutdownArgs),
     Yara(YaraArgs),
 }
@@ -2544,12 +2679,6 @@ struct InfoCommandArgs {
 
 #[derive(Debug, clap::Args)]
 struct ShutdownArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-}
-
-#[derive(Debug, clap::Args)]
-struct PublishArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
 }
@@ -2799,7 +2928,6 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
         Commands::Delete(args) => cmd_delete(&args),
         Commands::Search(args) => cmd_search_candidates(&args),
         Commands::Info(args) => cmd_info(&args),
-        Commands::Publish(args) => cmd_publish(&args),
         Commands::Shutdown(args) => cmd_shutdown(&args),
         Commands::Yara(args) => cmd_yara_check(&args),
     };

@@ -89,6 +89,30 @@ fn wait_for_info(addr: &str) {
     panic!("server did not become ready on {addr}");
 }
 
+fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let output = Command::new(bin_path())
+            .args([
+                "search",
+                "--addr",
+                addr,
+                "--rule",
+                rule.to_str().expect("rule path"),
+            ])
+            .output()
+            .expect("run search");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains(&format!("candidates: {expected}")) {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("search did not reach {expected} candidates on {addr}");
+}
+
 fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
     let addr = tcp_addr(port);
     let mut command = Command::new(bin_path());
@@ -146,8 +170,7 @@ rule q {
     assert!(ingest.contains("submitted_documents: 2"));
     assert!(ingest.contains("processed_documents: 2"));
 
-    let publish_after_index = run_ok(&["publish", "--addr", &addr]);
-    assert!(publish_after_index.contains("published work root"));
+    wait_for_search_candidates(&addr, &rule, 2);
 
     let search = run_ok(&[
         "search",
@@ -194,6 +217,7 @@ fn help_surface_has_only_public_commands() {
     assert!(out.contains("info"));
     assert!(out.contains("shutdown"));
     assert!(out.contains("yara"));
+    assert!(!out.contains("publish"));
     assert!(!out.contains("candidate-init"));
     assert!(!out.contains("candidate-ingest"));
     assert!(!out.contains("candidate-query"));

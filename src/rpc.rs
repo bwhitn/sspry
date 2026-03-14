@@ -51,6 +51,7 @@ const ACTION_SHUTDOWN: u8 = 8;
 const ACTION_PUBLISH: u8 = 9;
 const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
 const ACTION_INDEX_SESSION_END: u8 = 11;
+const ACTION_INDEX_SESSION_PROGRESS: u8 = 12;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const DF_CACHE_CAPACITY: usize = 128;
@@ -226,6 +227,16 @@ struct CandidateIndexSessionResponse {
     message: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CandidateIndexSessionProgressRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_documents: Option<u64>,
+    #[serde(default)]
+    submitted_documents: u64,
+    #[serde(default)]
+    processed_documents: u64,
+}
+
 type ParsedCandidateInsertDocument = (
     [u8; 32],
     u64,
@@ -281,6 +292,15 @@ struct ServerState {
     active_index_sessions: AtomicUsize,
     work_dirty: AtomicBool,
     last_work_mutation_unix_ms: AtomicU64,
+    index_session_total_documents: AtomicU64,
+    index_session_submitted_documents: AtomicU64,
+    index_session_processed_documents: AtomicU64,
+    index_session_started_unix_ms: AtomicU64,
+    index_session_last_update_unix_ms: AtomicU64,
+    last_publish_started_unix_ms: AtomicU64,
+    last_publish_completed_unix_ms: AtomicU64,
+    last_publish_duration_ms: AtomicU64,
+    publish_runs_total: AtomicU64,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
@@ -310,6 +330,14 @@ struct CompactionRuntime {
 
 struct ActiveMutationGuard<'a> {
     state: &'a ServerState,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublishReadiness {
+    eligible: bool,
+    blocked_reason: &'static str,
+    idle_elapsed_ms: u64,
+    idle_remaining_ms: u64,
 }
 
 impl Drop for ActiveMutationGuard<'_> {
@@ -472,6 +500,23 @@ impl TgsdbClient {
         let response: CandidateIndexSessionResponse =
             self.request_typed_json(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
         Ok(response.message)
+    }
+
+    pub fn update_index_session_progress(
+        &self,
+        total_documents: Option<usize>,
+        submitted_documents: usize,
+        processed_documents: usize,
+    ) -> Result<()> {
+        let _: CandidateIndexSessionResponse = self.request_typed_json(
+            ACTION_INDEX_SESSION_PROGRESS,
+            &CandidateIndexSessionProgressRequest {
+                total_documents: total_documents.map(|value| value as u64),
+                submitted_documents: submitted_documents as u64,
+                processed_documents: processed_documents as u64,
+            },
+        )?;
+        Ok(())
     }
 
     pub fn end_index_session(&self) -> Result<String> {
@@ -902,6 +947,16 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn signed_delta_i64(current: u64, baseline: u64) -> i64 {
+    if current >= baseline {
+        let delta = current.saturating_sub(baseline);
+        delta.min(i64::MAX as u64) as i64
+    } else {
+        let delta = baseline.saturating_sub(current);
+        -(delta.min(i64::MAX as u64) as i64)
+    }
+}
+
 #[derive(Debug)]
 enum ClientStream {
     Tcp(TcpStream),
@@ -951,6 +1006,15 @@ impl ServerState {
             active_index_sessions: AtomicUsize::new(0),
             work_dirty: AtomicBool::new(false),
             last_work_mutation_unix_ms: AtomicU64::new(0),
+            index_session_total_documents: AtomicU64::new(0),
+            index_session_submitted_documents: AtomicU64::new(0),
+            index_session_processed_documents: AtomicU64::new(0),
+            index_session_started_unix_ms: AtomicU64::new(0),
+            index_session_last_update_unix_ms: AtomicU64::new(0),
+            last_publish_started_unix_ms: AtomicU64::new(0),
+            last_publish_completed_unix_ms: AtomicU64::new(0),
+            last_publish_duration_ms: AtomicU64::new(0),
+            publish_runs_total: AtomicU64::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -1038,13 +1102,50 @@ impl ServerState {
             .active_index_sessions
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
         {
-            Ok(_) => Ok(CandidateIndexSessionResponse {
-                message: "index session started".to_owned(),
-            }),
+            Ok(_) => {
+                let now = current_unix_ms();
+                self.index_session_total_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_submitted_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_processed_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_started_unix_ms
+                    .store(now, Ordering::SeqCst);
+                self.index_session_last_update_unix_ms
+                    .store(now, Ordering::SeqCst);
+                Ok(CandidateIndexSessionResponse {
+                    message: "index session started".to_owned(),
+                })
+            }
             Err(_) => Err(TgsError::from(
                 "another index session is already active; retry later",
             )),
         }
+    }
+
+    fn handle_update_index_session_progress(
+        &self,
+        request: &CandidateIndexSessionProgressRequest,
+    ) -> Result<CandidateIndexSessionResponse> {
+        if self.active_index_sessions.load(Ordering::Acquire) == 0 {
+            return Err(TgsError::from(
+                "no active index session; cannot update progress",
+            ));
+        }
+        if let Some(total) = request.total_documents {
+            self.index_session_total_documents
+                .store(total, Ordering::SeqCst);
+        }
+        self.index_session_submitted_documents
+            .store(request.submitted_documents, Ordering::SeqCst);
+        self.index_session_processed_documents
+            .store(request.processed_documents, Ordering::SeqCst);
+        self.index_session_last_update_unix_ms
+            .store(current_unix_ms(), Ordering::SeqCst);
+        Ok(CandidateIndexSessionResponse {
+            message: "index session progress updated".to_owned(),
+        })
     }
 
     fn handle_end_index_session(&self) -> Result<CandidateIndexSessionResponse> {
@@ -1054,35 +1155,64 @@ impl ServerState {
                 message: "no active index session".to_owned(),
             });
         }
+        self.index_session_last_update_unix_ms
+            .store(current_unix_ms(), Ordering::SeqCst);
         Ok(CandidateIndexSessionResponse {
             message: "index session finished".to_owned(),
         })
     }
 
-    fn run_auto_publish_cycle(&self) -> Result<()> {
-        if !self.config.workspace_mode {
-            return Ok(());
-        }
-        if !self.work_dirty.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        if self.active_index_sessions.load(Ordering::Acquire) > 0 {
-            return Ok(());
-        }
-        if self.active_mutations.load(Ordering::Acquire) > 0 {
-            return Ok(());
-        }
-        if self.publish_in_progress.load(Ordering::Acquire)
-            || self.mutations_paused.load(Ordering::Acquire)
-        {
-            return Ok(());
-        }
+    fn publish_readiness(&self, now_unix_ms: u64) -> PublishReadiness {
+        let work_dirty = self.work_dirty.load(Ordering::Acquire);
+        let publish_in_progress = self.publish_in_progress.load(Ordering::Acquire);
+        let mutations_paused = self.mutations_paused.load(Ordering::Acquire);
+        let active_index_sessions = self.active_index_sessions.load(Ordering::Acquire);
+        let active_mutations = self.active_mutations.load(Ordering::Acquire);
         let last_mutation = self.last_work_mutation_unix_ms.load(Ordering::Acquire);
-        if last_mutation == 0 {
-            return Ok(());
+        let idle_elapsed_ms = if last_mutation == 0 {
+            0
+        } else {
+            now_unix_ms.saturating_sub(last_mutation)
+        };
+        let idle_remaining_ms = DEFAULT_AUTO_PUBLISH_IDLE_MS.saturating_sub(idle_elapsed_ms);
+        let eligible = self.config.workspace_mode
+            && work_dirty
+            && active_index_sessions == 0
+            && active_mutations == 0
+            && !publish_in_progress
+            && !mutations_paused
+            && last_mutation != 0
+            && idle_elapsed_ms >= DEFAULT_AUTO_PUBLISH_IDLE_MS;
+        let blocked_reason = if !self.config.workspace_mode {
+            "workspace_disabled"
+        } else if !work_dirty {
+            "work_clean"
+        } else if publish_in_progress {
+            "publish_in_progress"
+        } else if mutations_paused {
+            "mutations_paused"
+        } else if active_index_sessions > 0 {
+            "active_index_sessions"
+        } else if active_mutations > 0 {
+            "active_mutations"
+        } else if last_mutation == 0 {
+            "awaiting_work_mutation_timestamp"
+        } else if idle_elapsed_ms < DEFAULT_AUTO_PUBLISH_IDLE_MS {
+            "waiting_for_idle_window"
+        } else {
+            "ready"
+        };
+        PublishReadiness {
+            eligible,
+            blocked_reason,
+            idle_elapsed_ms,
+            idle_remaining_ms,
         }
-        let elapsed = current_unix_ms().saturating_sub(last_mutation);
-        if elapsed < DEFAULT_AUTO_PUBLISH_IDLE_MS {
+    }
+
+    fn run_auto_publish_cycle(&self) -> Result<()> {
+        let readiness = self.publish_readiness(current_unix_ms());
+        if !readiness.eligible {
             return Ok(());
         }
         let _ = self.handle_publish()?;
@@ -1170,6 +1300,51 @@ impl ServerState {
             "startup_cleanup_removed_roots".to_owned(),
             json!(self.startup_cleanup_removed_roots),
         );
+        let index_total_documents = self.index_session_total_documents.load(Ordering::Acquire);
+        let index_processed_documents = self
+            .index_session_processed_documents
+            .load(Ordering::Acquire);
+        let index_submitted_documents = self
+            .index_session_submitted_documents
+            .load(Ordering::Acquire);
+        let index_remaining_documents =
+            index_total_documents.saturating_sub(index_processed_documents);
+        let index_progress_percent = if index_total_documents == 0 {
+            0.0
+        } else {
+            (index_processed_documents as f64 / index_total_documents as f64) * 100.0
+        };
+        let mut index_session = Map::new();
+        index_session.insert(
+            "active".to_owned(),
+            json!(self.active_index_sessions.load(Ordering::Acquire) > 0),
+        );
+        index_session.insert("total_documents".to_owned(), json!(index_total_documents));
+        index_session.insert(
+            "submitted_documents".to_owned(),
+            json!(index_submitted_documents),
+        );
+        index_session.insert(
+            "processed_documents".to_owned(),
+            json!(index_processed_documents),
+        );
+        index_session.insert(
+            "remaining_documents".to_owned(),
+            json!(index_remaining_documents),
+        );
+        index_session.insert("progress_percent".to_owned(), json!(index_progress_percent));
+        index_session.insert(
+            "started_unix_ms".to_owned(),
+            json!(self.index_session_started_unix_ms.load(Ordering::Acquire)),
+        );
+        index_session.insert(
+            "last_update_unix_ms".to_owned(),
+            json!(
+                self.index_session_last_update_unix_ms
+                    .load(Ordering::Acquire)
+            ),
+        );
+        stats.insert("index_session".to_owned(), Value::Object(index_session));
         if let Ok(runtime) = self.compaction_runtime.lock() {
             stats.insert(
                 "compaction_running".to_owned(),
@@ -1236,7 +1411,102 @@ impl ServerState {
                 "deleted_storage_bytes".to_owned(),
                 json!(work_deleted_storage_bytes),
             );
+            let now_unix_ms = current_unix_ms();
+            let readiness = self.publish_readiness(now_unix_ms);
+            let published_doc_count = stats.get("doc_count").and_then(Value::as_u64).unwrap_or(0);
+            let published_active_doc_count = stats
+                .get("active_doc_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let published_disk_usage_bytes = stats
+                .get("disk_usage_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let work_doc_count = work_stats
+                .get("doc_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let work_active_doc_count = work_stats
+                .get("active_doc_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let work_disk_usage_bytes = work_stats
+                .get("disk_usage_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let mut publish = Map::new();
+            publish.insert(
+                "pending".to_owned(),
+                json!(self.work_dirty.load(Ordering::Acquire)),
+            );
+            publish.insert("eligible".to_owned(), json!(readiness.eligible));
+            publish.insert(
+                "blocked_reason".to_owned(),
+                Value::String(readiness.blocked_reason.to_owned()),
+            );
+            publish.insert(
+                "idle_elapsed_ms".to_owned(),
+                json!(readiness.idle_elapsed_ms),
+            );
+            publish.insert(
+                "idle_remaining_ms".to_owned(),
+                json!(readiness.idle_remaining_ms),
+            );
+            publish.insert("published_doc_count".to_owned(), json!(published_doc_count));
+            publish.insert(
+                "published_active_doc_count".to_owned(),
+                json!(published_active_doc_count),
+            );
+            publish.insert(
+                "published_disk_usage_bytes".to_owned(),
+                json!(published_disk_usage_bytes),
+            );
+            publish.insert("work_doc_count".to_owned(), json!(work_doc_count));
+            publish.insert(
+                "work_active_doc_count".to_owned(),
+                json!(work_active_doc_count),
+            );
+            publish.insert(
+                "work_disk_usage_bytes".to_owned(),
+                json!(work_disk_usage_bytes),
+            );
+            publish.insert(
+                "work_doc_delta_vs_published".to_owned(),
+                json!(signed_delta_i64(work_doc_count, published_doc_count)),
+            );
+            publish.insert(
+                "work_active_doc_delta_vs_published".to_owned(),
+                json!(signed_delta_i64(
+                    work_active_doc_count,
+                    published_active_doc_count
+                )),
+            );
+            publish.insert(
+                "work_disk_usage_delta_vs_published".to_owned(),
+                json!(signed_delta_i64(
+                    work_disk_usage_bytes,
+                    published_disk_usage_bytes
+                )),
+            );
+            publish.insert(
+                "last_publish_started_unix_ms".to_owned(),
+                json!(self.last_publish_started_unix_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_completed_unix_ms".to_owned(),
+                json!(self.last_publish_completed_unix_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_duration_ms".to_owned(),
+                json!(self.last_publish_duration_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "publish_runs_total".to_owned(),
+                json!(self.publish_runs_total.load(Ordering::Acquire)),
+            );
+            publish.insert("observed_at_unix_ms".to_owned(), json!(now_unix_ms));
             stats.insert("work".to_owned(), Value::Object(work_stats));
+            stats.insert("publish".to_owned(), Value::Object(publish));
         } else {
             stats.insert("workspace_mode".to_owned(), json!(false));
         }
@@ -1616,6 +1886,7 @@ impl ServerState {
                     | ACTION_CANDIDATE_INSERT_BATCH
                     | ACTION_CANDIDATE_DELETE
                     | ACTION_INDEX_SESSION_BEGIN
+                    | ACTION_INDEX_SESSION_PROGRESS
                     | ACTION_PUBLISH
             )
         {
@@ -1627,6 +1898,10 @@ impl ServerState {
             ACTION_PING => json_bytes(&json!({ "message": "pong" })),
             ACTION_INDEX_SESSION_BEGIN => json_bytes(&self.handle_begin_index_session()?),
             ACTION_INDEX_SESSION_END => json_bytes(&self.handle_end_index_session()?),
+            ACTION_INDEX_SESSION_PROGRESS => {
+                let request: CandidateIndexSessionProgressRequest = json_from_bytes(payload)?;
+                json_bytes(&self.handle_update_index_session_progress(&request)?)
+            }
             ACTION_CANDIDATE_INSERT => {
                 let document: CandidateDocumentWire = json_from_bytes(payload)?;
                 json_bytes(&self.handle_candidate_insert(&document)?)
@@ -2116,6 +2391,9 @@ impl ServerState {
             thread::sleep(Duration::from_millis(10));
         }
         self.publish_in_progress.store(true, Ordering::SeqCst);
+        let publish_started_unix_ms = current_unix_ms();
+        self.last_publish_started_unix_ms
+            .store(publish_started_unix_ms, Ordering::SeqCst);
         let _op = self
             .operation_gate
             .write()
@@ -2128,7 +2406,7 @@ impl ServerState {
             let workspace_root = match &*store_mode {
                 StoreMode::Direct { .. } => {
                     return Err(TgsError::from(
-                        "publish is only available when the server is started with --workspace-mode",
+                        "publish is only available for workspace stores",
                     ));
                 }
                 StoreMode::Workspace { root, .. } => root.clone(),
@@ -2155,6 +2433,24 @@ impl ServerState {
             };
             self.work_dirty.store(false, Ordering::SeqCst);
             self.last_work_mutation_unix_ms.store(0, Ordering::SeqCst);
+            self.index_session_total_documents
+                .store(0, Ordering::SeqCst);
+            self.index_session_submitted_documents
+                .store(0, Ordering::SeqCst);
+            self.index_session_processed_documents
+                .store(0, Ordering::SeqCst);
+            self.index_session_started_unix_ms
+                .store(0, Ordering::SeqCst);
+            self.index_session_last_update_unix_ms
+                .store(0, Ordering::SeqCst);
+            let publish_completed_unix_ms = current_unix_ms();
+            self.last_publish_completed_unix_ms
+                .store(publish_completed_unix_ms, Ordering::SeqCst);
+            self.last_publish_duration_ms.store(
+                publish_completed_unix_ms.saturating_sub(publish_started_unix_ms),
+                Ordering::SeqCst,
+            );
+            self.publish_runs_total.fetch_add(1, Ordering::SeqCst);
             self.invalidate_search_caches();
             Ok(CandidatePublishResponse {
                 message: format!(
@@ -2638,7 +2934,7 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize)> 
 
     if root.join("meta.json").exists() || root.join("shard_000").join("meta.json").exists() {
         return Err(TgsError::from(format!(
-            "{} contains a direct store; move it under {}/current or start without --workspace-mode.",
+            "{} contains a direct store; move it under {}/current or use a fresh workspace root.",
             root.display(),
             root.display()
         )));
@@ -2839,6 +3135,115 @@ mod tests {
         );
         let finished = state.handle_end_index_session().expect("finish session");
         assert_eq!(finished.message, "index session finished");
+    }
+
+    #[test]
+    fn index_session_progress_is_reported_in_stats() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.handle_begin_index_session().expect("start session");
+        state
+            .handle_update_index_session_progress(&CandidateIndexSessionProgressRequest {
+                total_documents: Some(1000),
+                submitted_documents: 320,
+                processed_documents: 250,
+            })
+            .expect("update progress");
+        state.mark_work_mutation();
+
+        let stats = state.current_stats_json().expect("stats");
+        let index_session = stats
+            .get("index_session")
+            .and_then(Value::as_object)
+            .expect("index session object");
+        assert_eq!(
+            index_session.get("total_documents").and_then(Value::as_u64),
+            Some(1000)
+        );
+        assert_eq!(
+            index_session
+                .get("submitted_documents")
+                .and_then(Value::as_u64),
+            Some(320)
+        );
+        assert_eq!(
+            index_session
+                .get("processed_documents")
+                .and_then(Value::as_u64),
+            Some(250)
+        );
+        assert_eq!(
+            index_session
+                .get("remaining_documents")
+                .and_then(Value::as_u64),
+            Some(750)
+        );
+        let publish = stats
+            .get("publish")
+            .and_then(Value::as_object)
+            .expect("publish object");
+        assert_eq!(
+            publish.get("blocked_reason").and_then(Value::as_str),
+            Some("active_index_sessions")
+        );
+        assert_eq!(publish.get("pending").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn publish_stats_show_idle_readiness_and_last_publish_metadata() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.mark_work_mutation();
+        state.last_work_mutation_unix_ms.store(
+            current_unix_ms().saturating_sub(DEFAULT_AUTO_PUBLISH_IDLE_MS + 1),
+            Ordering::SeqCst,
+        );
+
+        let stats_before = state.current_stats_json().expect("stats before");
+        let publish_before = stats_before
+            .get("publish")
+            .and_then(Value::as_object)
+            .expect("publish before");
+        assert_eq!(
+            publish_before.get("eligible").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            publish_before.get("blocked_reason").and_then(Value::as_str),
+            Some("ready")
+        );
+
+        let response = state.handle_publish().expect("publish");
+        assert!(response.message.contains("published work root"));
+
+        let stats_after = state.current_stats_json().expect("stats after");
+        let publish_after = stats_after
+            .get("publish")
+            .and_then(Value::as_object)
+            .expect("publish after");
+        assert_eq!(
+            publish_after.get("pending").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            publish_after
+                .get("publish_runs_total")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            publish_after
+                .get("last_publish_completed_unix_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(
+            publish_after
+                .get("last_publish_duration_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
     }
 
     #[test]
