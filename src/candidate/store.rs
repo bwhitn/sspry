@@ -179,6 +179,45 @@ impl DfCountsState {
         out
     }
 
+    fn get_many_sorted_counts(&self, grams: &[u64]) -> Vec<usize> {
+        if grams.is_empty() {
+            return Vec::new();
+        }
+        let mut counts = Vec::with_capacity(grams.len());
+        let row_bytes = self.gram_bytes + 4;
+        let mut snapshot_idx = 0usize;
+        let snapshot = self.snapshot.as_deref().unwrap_or(&[]);
+        for gram in grams {
+            while snapshot_idx < self.snapshot_rows {
+                let start = snapshot_idx * row_bytes;
+                let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
+                if candidate < *gram {
+                    snapshot_idx += 1;
+                    continue;
+                }
+                break;
+            }
+            let base = if snapshot_idx < self.snapshot_rows {
+                let start = snapshot_idx * row_bytes;
+                let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
+                if candidate == *gram {
+                    u32::from_le_bytes(
+                        snapshot[start + self.gram_bytes..start + row_bytes]
+                            .try_into()
+                            .expect("df count"),
+                    ) as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let delta = self.delta.get(gram).copied().unwrap_or(0);
+            counts.push((base as i64 + delta).max(0) as usize);
+        }
+        counts
+    }
+
     fn materialize(&self) -> HashMap<u64, usize> {
         let mut counts =
             HashMap::<u64, usize>::with_capacity(self.snapshot_rows + self.delta.len());
@@ -255,6 +294,17 @@ impl DfCountsState {
     fn unique_count_hint(&self) -> usize {
         self.snapshot_rows + self.delta.len()
     }
+}
+
+fn is_strictly_sorted_unique(values: &[u64]) -> bool {
+    let mut prev = None;
+    for value in values {
+        if prev.is_some_and(|prior| *value <= prior) {
+            return false;
+        }
+        prev = Some(*value);
+    }
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -1663,9 +1713,14 @@ impl CandidateStore {
         active_docs: usize,
     ) -> Vec<Tier1DfEntry> {
         let active_docs = active_docs.max(1);
+        let projected = if is_strictly_sorted_unique(grams) {
+            self.df_counts.get_many_sorted_counts(grams)
+        } else {
+            grams.iter().map(|gram| self.df_counts.get(*gram)).collect()
+        };
         let mut entries = Vec::with_capacity(grams.len());
-        for gram in grams {
-            let projected_df = self.df_counts.get(*gram) + 1;
+        for (gram, current_df) in grams.iter().zip(projected.into_iter()) {
+            let projected_df = current_df + 1;
             entries.push(Tier1DfEntry {
                 gram: *gram,
                 projected_df,
@@ -2073,6 +2128,7 @@ impl CandidateStore {
         let mut max_received_grams = 0u64;
         let mut max_indexed_grams = 0u64;
         let mut active_docs = self.docs.iter().filter(|doc| !doc.deleted).count();
+        let mut tier2_updates = Vec::<(usize, usize, usize, &[u8])>::with_capacity(documents.len());
 
         for document in documents {
             let (
@@ -2259,11 +2315,12 @@ impl CandidateStore {
                 insert_profile.write_existing_us = insert_profile
                     .write_existing_us
                     .saturating_add(elapsed_us(write_existing_started));
-                let tier2_update_started = Instant::now();
-                self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
-                insert_profile.tier2_update_us = insert_profile
-                    .tier2_update_us
-                    .saturating_add(elapsed_us(tier2_update_started));
+                tier2_updates.push((
+                    existing_pos,
+                    *filter_bytes,
+                    expected_bloom_hashes,
+                    bloom_filter,
+                ));
                 modified = true;
                 results.push(CandidateInsertResult {
                     status: "restored".to_owned(),
@@ -2332,11 +2389,12 @@ impl CandidateStore {
             insert_profile.install_docs_us = insert_profile
                 .install_docs_us
                 .saturating_add(elapsed_us(install_docs_started));
-            let tier2_update_started = Instant::now();
-            self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
-            insert_profile.tier2_update_us = insert_profile
-                .tier2_update_us
-                .saturating_add(elapsed_us(tier2_update_started));
+            tier2_updates.push((
+                self.docs.len() - 1,
+                *filter_bytes,
+                expected_bloom_hashes,
+                bloom_filter,
+            ));
             modified = true;
             meta_dirty = true;
             results.push(CandidateInsertResult {
@@ -2351,6 +2409,11 @@ impl CandidateStore {
         }
 
         if modified {
+            let tier2_update_started = Instant::now();
+            self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
+            insert_profile.tier2_update_us = insert_profile
+                .tier2_update_us
+                .saturating_add(elapsed_us(tier2_update_started));
             if meta_dirty {
                 self.mark_meta_dirty();
             }
