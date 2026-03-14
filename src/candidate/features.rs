@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use hashbrown::HashSet;
 use sha2::{Digest, Sha256};
 
 use crate::candidate::BloomFilter;
@@ -1157,9 +1157,9 @@ pub fn scan_file_features_with_tier2_gram_size(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::fs;
 
+    use hashbrown::HashSet;
     use tempfile::tempdir;
 
     use super::{
@@ -1299,7 +1299,7 @@ mod tests {
         let mut bucket_spill_remaining = vec![0usize; 6];
         let mut bucket_region_grams = vec![vec![Vec::<u64>::new(); 2]; 6];
         let mut bucket_spill_grams = vec![Vec::<u64>::new(); 6];
-        let mut global_pool = std::collections::HashSet::<u64>::new();
+        let mut global_pool = HashSet::<u64>::new();
         let mut bucket_window_counts = [0u64; 6];
         let truncated = flush_entropy_window(
             EntropyWindow {
@@ -1325,7 +1325,7 @@ mod tests {
         let mut bucket_spill_remaining = vec![1usize; 6];
         let mut bucket_region_grams = vec![vec![Vec::<u64>::new(); 2]; 6];
         let mut bucket_spill_grams = vec![Vec::<u64>::new(); 6];
-        let mut global_pool = std::collections::HashSet::<u64>::new();
+        let mut global_pool = HashSet::<u64>::new();
         let mut bucket_window_counts = [0u64; 6];
         assert!(!push_ready_window(
             &mut queue,
