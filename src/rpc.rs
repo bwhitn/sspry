@@ -3040,11 +3040,11 @@ impl ServerState {
                     let all_known_new = imported.iter().all(|document| {
                         !published_store.contains_live_document_sha256(&document.sha256)
                     });
-                    let _ = if all_known_new {
-                        published_store.import_documents_batch_known_new(&imported)?
+                    if all_known_new {
+                        published_store.import_documents_batch_known_new_quiet(&imported)?
                     } else {
-                        published_store.import_documents_batch(&imported)?
-                    };
+                        published_store.import_documents_batch_quiet(&imported)?
+                    }
                     import_ms_total =
                         import_ms_total.saturating_add(import_started.elapsed().as_millis());
                 }

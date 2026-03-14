@@ -280,6 +280,7 @@ struct CandidateStoreRebuildProfile {
 #[derive(Clone, Debug)]
 pub struct ImportedCandidateDocument {
     pub sha256: [u8; 32],
+    pub sha256_hex: String,
     pub file_size: u64,
     pub filter_bytes: usize,
     pub bloom_hashes: usize,
@@ -2273,6 +2274,7 @@ impl CandidateStore {
             hex::decode_to_slice(&doc.sha256, &mut sha256)?;
             out.push(ImportedCandidateDocument {
                 sha256,
+                sha256_hex: doc.sha256.clone(),
                 file_size: doc.file_size,
                 filter_bytes: doc.filter_bytes,
                 bloom_hashes: doc.bloom_hashes,
@@ -2296,20 +2298,37 @@ impl CandidateStore {
         &mut self,
         documents: &[ImportedCandidateDocument],
     ) -> Result<Vec<CandidateInsertResult>> {
-        self.import_documents_batch_impl(documents, false)
+        self.import_documents_batch_impl(documents, false, true)
     }
 
     pub fn import_documents_batch_known_new(
         &mut self,
         documents: &[ImportedCandidateDocument],
     ) -> Result<Vec<CandidateInsertResult>> {
-        self.import_documents_batch_impl(documents, true)
+        self.import_documents_batch_impl(documents, true, true)
+    }
+
+    pub fn import_documents_batch_quiet(
+        &mut self,
+        documents: &[ImportedCandidateDocument],
+    ) -> Result<()> {
+        let _ = self.import_documents_batch_impl(documents, false, false)?;
+        Ok(())
+    }
+
+    pub fn import_documents_batch_known_new_quiet(
+        &mut self,
+        documents: &[ImportedCandidateDocument],
+    ) -> Result<()> {
+        let _ = self.import_documents_batch_impl(documents, true, false)?;
+        Ok(())
     }
 
     fn import_documents_batch_impl(
         &mut self,
         documents: &[ImportedCandidateDocument],
         assume_new: bool,
+        collect_results: bool,
     ) -> Result<Vec<CandidateInsertResult>> {
         struct PendingImportedInsert<'a> {
             doc_id: u64,
@@ -2318,7 +2337,11 @@ impl CandidateStore {
         }
 
         let mut total_scope = scope("candidate.import_documents_batch");
-        let mut results = Vec::with_capacity(documents.len());
+        let mut results = if collect_results {
+            Vec::with_capacity(documents.len())
+        } else {
+            Vec::new()
+        };
         let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
@@ -2331,7 +2354,7 @@ impl CandidateStore {
 
         for document in documents {
             total_scope.add_bytes(document.file_size);
-            let sha256_hex = hex::encode(document.sha256);
+            let sha256_hex = document.sha256_hex.clone();
             let received_len = document.grams_received.len() as u64;
             let indexed_len = document.grams_indexed.len() as u64;
             received_grams_total = received_grams_total.saturating_add(received_len);
@@ -2349,14 +2372,16 @@ impl CandidateStore {
                     if !self.docs[existing_pos].deleted {
                         let existing = &self.docs[existing_pos];
                         let existing_row = self.doc_rows[existing_pos];
-                        results.push(CandidateInsertResult {
-                            status: "already_exists".to_owned(),
-                            doc_id: existing.doc_id,
-                            sha256: existing.sha256.clone(),
-                            grams_received: existing_row.grams_received_count as usize,
-                            grams_indexed: existing_row.grams_indexed_count as usize,
-                            grams_complete: existing.grams_complete,
-                        });
+                        if collect_results {
+                            results.push(CandidateInsertResult {
+                                status: "already_exists".to_owned(),
+                                doc_id: existing.doc_id,
+                                sha256: existing.sha256.clone(),
+                                grams_received: existing_row.grams_received_count as usize,
+                                grams_indexed: existing_row.grams_indexed_count as usize,
+                                grams_complete: existing.grams_complete,
+                            });
+                        }
                         continue;
                     }
 
@@ -2397,14 +2422,16 @@ impl CandidateStore {
                         &document.bloom_filter,
                     )?;
                     modified = true;
-                    results.push(CandidateInsertResult {
-                        status: "restored".to_owned(),
-                        doc_id: snapshot.doc_id,
-                        sha256: sha256_hex,
-                        grams_received: document.grams_received.len(),
-                        grams_indexed: document.grams_indexed.len(),
-                        grams_complete: document.grams_complete,
-                    });
+                    if collect_results {
+                        results.push(CandidateInsertResult {
+                            status: "restored".to_owned(),
+                            doc_id: snapshot.doc_id,
+                            sha256: sha256_hex,
+                            grams_received: document.grams_received.len(),
+                            grams_indexed: document.grams_indexed.len(),
+                            grams_complete: document.grams_complete,
+                        });
+                    }
                     continue;
                 }
             }
@@ -2444,7 +2471,9 @@ impl CandidateStore {
                 DocMetaRow,
                 Tier2DocMetaRow,
                 String,
-                Vec<u8>,
+                usize,
+                usize,
+                &'_ [u8],
                 usize,
                 usize,
                 bool,
@@ -2526,7 +2555,9 @@ impl CandidateStore {
                     row,
                     tier2_row,
                     pending.sha256_hex,
-                    document.bloom_filter.clone(),
+                    document.filter_bytes,
+                    document.bloom_hashes,
+                    document.bloom_filter.as_slice(),
                     document.grams_received.len(),
                     document.grams_indexed.len(),
                     document.grams_complete,
@@ -2555,12 +2586,14 @@ impl CandidateStore {
                 .append(&tier2_doc_meta_payload)?;
 
             let mut tier2_updates =
-                Vec::<(usize, usize, usize, Vec<u8>)>::with_capacity(prepared.len());
+                Vec::<(usize, usize, usize, &'_ [u8])>::with_capacity(prepared.len());
             for (
                 doc,
                 row,
                 tier2_row,
                 sha256_hex,
+                filter_bytes,
+                bloom_hashes,
                 bloom_filter,
                 grams_received_len,
                 grams_indexed_len,
@@ -2572,15 +2605,17 @@ impl CandidateStore {
                 let pos = self.docs.len();
                 self.docs.push(doc.clone());
                 self.sha_to_pos.insert(sha256_hex.clone(), pos);
-                tier2_updates.push((pos, doc.filter_bytes, doc.bloom_hashes, bloom_filter));
-                results.push(CandidateInsertResult {
-                    status: "inserted".to_owned(),
-                    doc_id: doc.doc_id,
-                    sha256: sha256_hex,
-                    grams_received: grams_received_len,
-                    grams_indexed: grams_indexed_len,
-                    grams_complete,
-                });
+                tier2_updates.push((pos, filter_bytes, bloom_hashes, bloom_filter));
+                if collect_results {
+                    results.push(CandidateInsertResult {
+                        status: "inserted".to_owned(),
+                        doc_id: doc.doc_id,
+                        sha256: sha256_hex,
+                        grams_received: grams_received_len,
+                        grams_indexed: grams_indexed_len,
+                        grams_complete,
+                    });
+                }
             }
             self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
         }
@@ -3140,7 +3175,7 @@ impl CandidateStore {
 
     fn update_tier2_superblocks_for_doc_bytes_batch(
         &mut self,
-        updates: &[(usize, usize, usize, Vec<u8>)],
+        updates: &[(usize, usize, usize, &[u8])],
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
