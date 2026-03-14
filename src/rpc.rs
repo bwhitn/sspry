@@ -266,6 +266,17 @@ impl StoreSet {
             stores: stores.into_iter().map(Mutex::new).collect(),
         }
     }
+
+    fn into_stores(self) -> Result<Vec<CandidateStore>> {
+        self.stores
+            .into_iter()
+            .map(|store| {
+                store
+                    .into_inner()
+                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -300,6 +311,10 @@ struct ServerState {
     last_publish_started_unix_ms: AtomicU64,
     last_publish_completed_unix_ms: AtomicU64,
     last_publish_duration_ms: AtomicU64,
+    last_publish_swap_ms: AtomicU64,
+    last_publish_promote_work_ms: AtomicU64,
+    last_publish_init_work_ms: AtomicU64,
+    last_publish_reused_work_stores: AtomicBool,
     publish_runs_total: AtomicU64,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
@@ -1014,6 +1029,10 @@ impl ServerState {
             last_publish_started_unix_ms: AtomicU64::new(0),
             last_publish_completed_unix_ms: AtomicU64::new(0),
             last_publish_duration_ms: AtomicU64::new(0),
+            last_publish_swap_ms: AtomicU64::new(0),
+            last_publish_promote_work_ms: AtomicU64::new(0),
+            last_publish_init_work_ms: AtomicU64::new(0),
+            last_publish_reused_work_stores: AtomicBool::new(false),
             publish_runs_total: AtomicU64::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -1499,6 +1518,22 @@ impl ServerState {
             publish.insert(
                 "last_publish_duration_ms".to_owned(),
                 json!(self.last_publish_duration_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_swap_ms".to_owned(),
+                json!(self.last_publish_swap_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_promote_work_ms".to_owned(),
+                json!(self.last_publish_promote_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_init_work_ms".to_owned(),
+                json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_reused_work_stores".to_owned(),
+                json!(self.last_publish_reused_work_stores.load(Ordering::Acquire)),
             );
             publish.insert(
                 "publish_runs_total".to_owned(),
@@ -2415,20 +2450,89 @@ impl ServerState {
             let current_root = workspace_current_root(&workspace_root);
             let work_root = workspace_work_root(&workspace_root);
             let retired_parent = workspace_retired_root(&workspace_root);
+            let swap_started = Instant::now();
             if current_root.exists() {
                 fs::create_dir_all(&retired_parent)?;
                 let retired_root = retired_parent.join(format!("published_{}", current_unix_ms()));
                 fs::rename(&current_root, &retired_root)?;
             }
             fs::rename(&work_root, &current_root)?;
+            self.last_publish_swap_ms.store(
+                swap_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
 
-            let (published_stores, removed_current) =
-                ensure_candidate_stores_at_root(&self.config, &current_root)?;
+            let publish_shard_count = self.candidate_shard_count();
+            let prior_work = match &mut *store_mode {
+                StoreMode::Workspace { work, .. } => {
+                    std::mem::replace(work, Arc::new(StoreSet::new(work_root.clone(), Vec::new())))
+                }
+                StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+            };
+
+            let promote_started = Instant::now();
+            let (published_store_set, removed_current, reused_work_stores) =
+                match Arc::try_unwrap(prior_work) {
+                    Ok(work_store_set) => {
+                        let mut stores = work_store_set.into_stores()?;
+                        for (shard_idx, store) in stores.iter_mut().enumerate() {
+                            store.retarget_root(candidate_shard_root(
+                                &current_root,
+                                publish_shard_count,
+                                shard_idx,
+                            ));
+                        }
+                        (
+                            Arc::new(StoreSet::new(current_root.clone(), stores)),
+                            0usize,
+                            true,
+                        )
+                    }
+                    Err(work_store_set) => {
+                        let _ = match &mut *store_mode {
+                            StoreMode::Workspace { work, .. } => {
+                                std::mem::replace(work, work_store_set)
+                            }
+                            StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                        };
+                        let (published_stores, removed_current) =
+                            ensure_candidate_stores_at_root(&self.config, &current_root)?;
+                        (
+                            Arc::new(StoreSet::new(current_root.clone(), published_stores)),
+                            removed_current,
+                            false,
+                        )
+                    }
+                };
+            self.last_publish_promote_work_ms.store(
+                promote_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            self.last_publish_reused_work_stores
+                .store(reused_work_stores, Ordering::SeqCst);
+
+            let init_work_started = Instant::now();
             let (work_stores, removed_work) =
                 ensure_candidate_stores_at_root(&self.config, &work_root)?;
+            self.last_publish_init_work_ms.store(
+                init_work_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
             *store_mode = StoreMode::Workspace {
                 root: workspace_root.clone(),
-                published: Arc::new(StoreSet::new(current_root.clone(), published_stores)),
+                published: published_store_set,
                 work: Arc::new(StoreSet::new(work_root.clone(), work_stores)),
             };
             self.work_dirty.store(false, Ordering::SeqCst);
@@ -3241,6 +3345,30 @@ mod tests {
         assert!(
             publish_after
                 .get("last_publish_duration_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert_eq!(
+            publish_after
+                .get("last_publish_reused_work_stores")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            publish_after
+                .get("last_publish_swap_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            publish_after
+                .get("last_publish_promote_work_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            publish_after
+                .get("last_publish_init_work_ms")
                 .and_then(Value::as_u64)
                 .is_some()
         );

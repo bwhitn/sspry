@@ -527,6 +527,10 @@ impl BlobSidecar {
         self.mmap = None;
     }
 
+    fn retarget(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     fn read_bytes<'a>(
         &'a self,
         offset: u64,
@@ -598,6 +602,14 @@ impl StoreSidecars {
         self.grams_indexed.invalidate();
         self.external_ids.invalidate();
     }
+
+    fn retarget_root(&mut self, root: &Path) {
+        self.blooms.retarget(blooms_path(root));
+        self.tier2_blooms.retarget(tier2_blooms_path(root));
+        self.grams_received.retarget(grams_received_path(root));
+        self.grams_indexed.retarget(grams_indexed_path(root));
+        self.external_ids.retarget(external_ids_path(root));
+    }
 }
 
 #[derive(Debug)]
@@ -643,6 +655,10 @@ impl AppendFile {
         self.offset = self.offset.saturating_add(bytes.len() as u64);
         Ok(offset)
     }
+
+    fn retarget(&mut self, path: PathBuf) {
+        self.path = path;
+    }
 }
 
 #[derive(Debug)]
@@ -671,6 +687,18 @@ impl StoreAppendWriters {
             tier2_doc_meta: AppendFile::new(tier2_doc_meta_path(root))?,
             df_counts_delta: AppendFile::new(df_counts_delta_path(root))?,
         })
+    }
+
+    fn retarget_root(&mut self, root: &Path) {
+        self.blooms.retarget(blooms_path(root));
+        self.tier2_blooms.retarget(tier2_blooms_path(root));
+        self.grams_received.retarget(grams_received_path(root));
+        self.grams_indexed.retarget(grams_indexed_path(root));
+        self.external_ids.retarget(external_ids_path(root));
+        self.sha_by_docid.retarget(sha_by_docid_path(root));
+        self.doc_meta.retarget(doc_meta_path(root));
+        self.tier2_doc_meta.retarget(tier2_doc_meta_path(root));
+        self.df_counts_delta.retarget(df_counts_delta_path(root));
     }
 }
 
@@ -1199,6 +1227,13 @@ impl CandidateStore {
             df_max: self.meta.df_max,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
         }
+    }
+
+    pub fn retarget_root(&mut self, root: impl AsRef<Path>) {
+        let root = root.as_ref();
+        self.root = root.to_path_buf();
+        self.sidecars.retarget_root(root);
+        self.append_writers.retarget_root(root);
     }
 
     pub fn df_counts(&self) -> HashMap<u64, usize> {

@@ -1969,6 +1969,18 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_duration_ms",
                         ),
                         (
+                            "last_publish_swap_ms",
+                            "verbose.index.server_last_publish_swap_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_ms",
+                            "verbose.index.server_last_publish_promote_work_ms",
+                        ),
+                        (
+                            "last_publish_init_work_ms",
+                            "verbose.index.server_last_publish_init_work_ms",
+                        ),
+                        (
                             "publish_runs_total",
                             "verbose.index.server_publish_runs_total",
                         ),
@@ -1980,6 +1992,12 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         {
                             eprintln!("{label}: {value}");
                         }
+                    }
+                    if let Some(value) = publish
+                        .get("last_publish_reused_work_stores")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        eprintln!("verbose.index.server_last_publish_reused_work_stores: {value}");
                     }
                 }
                 if let Some(index_session) = stats
