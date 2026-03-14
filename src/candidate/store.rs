@@ -86,25 +86,50 @@ impl DfCountsState {
 
     fn load_delta(&mut self, root: &Path) -> Result<()> {
         let delta_path = df_counts_delta_path(root);
-        if !delta_path.exists() {
-            return Ok(());
+        if delta_path.exists() {
+            let bytes = fs::read(&delta_path)?;
+            let row_bytes = self.gram_bytes + 4;
+            if bytes.len() % row_bytes != 0 {
+                return Err(TgsError::from(format!(
+                    "Invalid df_counts delta at {}",
+                    delta_path.display()
+                )));
+            }
+            for chunk in bytes.chunks_exact(row_bytes) {
+                let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
+                let change = i32::from_le_bytes(
+                    chunk[self.gram_bytes..self.gram_bytes + 4]
+                        .try_into()
+                        .expect("df delta value"),
+                );
+                *self.delta.entry(gram).or_insert(0) += i64::from(change);
+            }
         }
-        let bytes = fs::read(&delta_path)?;
-        let row_bytes = self.gram_bytes + 4;
-        if bytes.len() % row_bytes != 0 {
-            return Err(TgsError::from(format!(
-                "Invalid df_counts delta at {}",
-                delta_path.display()
-            )));
-        }
-        for chunk in bytes.chunks_exact(row_bytes) {
-            let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
-            let change = i32::from_le_bytes(
-                chunk[self.gram_bytes..self.gram_bytes + 4]
-                    .try_into()
-                    .expect("df delta value"),
-            );
-            *self.delta.entry(gram).or_insert(0) += i64::from(change);
+        let unit_delta_path = df_counts_unit_delta_path(root);
+        if unit_delta_path.exists() {
+            let bytes = fs::read(&unit_delta_path)?;
+            if self.gram_bytes == 0 || bytes.len() % self.gram_bytes != 0 {
+                return Err(TgsError::from(format!(
+                    "Invalid df_counts unit delta at {}",
+                    unit_delta_path.display()
+                )));
+            }
+            self.delta.reserve(bytes.len() / self.gram_bytes);
+            for chunk in bytes.chunks_exact(self.gram_bytes) {
+                match self.delta.entry(decode_packed_exact_gram(chunk)) {
+                    FastEntry::Occupied(mut entry) => {
+                        let next = *entry.get() + 1;
+                        if next == 0 {
+                            entry.remove();
+                        } else {
+                            *entry.get_mut() = next;
+                        }
+                    }
+                    FastEntry::Vacant(entry) => {
+                        entry.insert(1);
+                    }
+                }
+            }
         }
         self.delta.retain(|_, value| *value != 0);
         Ok(())
@@ -200,6 +225,25 @@ impl DfCountsState {
                 }
                 FastEntry::Vacant(entry) => {
                     entry.insert(delta);
+                }
+            }
+        }
+    }
+
+    fn apply_unit_deltas(&mut self, grams: &[u64]) {
+        self.delta.reserve(grams.len());
+        for gram in grams {
+            match self.delta.entry(*gram) {
+                FastEntry::Occupied(mut entry) => {
+                    let next = *entry.get() + 1;
+                    if next == 0 {
+                        entry.remove();
+                    } else {
+                        *entry.get_mut() = next;
+                    }
+                }
+                FastEntry::Vacant(entry) => {
+                    entry.insert(1);
                 }
             }
         }
@@ -745,6 +789,7 @@ struct StoreAppendWriters {
     doc_meta: AppendFile,
     tier2_doc_meta: AppendFile,
     df_counts_delta: AppendFile,
+    df_counts_unit_delta: AppendFile,
 }
 
 impl StoreAppendWriters {
@@ -759,6 +804,7 @@ impl StoreAppendWriters {
             doc_meta: AppendFile::new(doc_meta_path(root))?,
             tier2_doc_meta: AppendFile::new(tier2_doc_meta_path(root))?,
             df_counts_delta: AppendFile::new(df_counts_delta_path(root))?,
+            df_counts_unit_delta: AppendFile::new(df_counts_unit_delta_path(root))?,
         })
     }
 
@@ -772,6 +818,8 @@ impl StoreAppendWriters {
         self.doc_meta.retarget(doc_meta_path(root));
         self.tier2_doc_meta.retarget(tier2_doc_meta_path(root));
         self.df_counts_delta.retarget(df_counts_delta_path(root));
+        self.df_counts_unit_delta
+            .retarget(df_counts_unit_delta_path(root));
     }
 }
 
@@ -1135,6 +1183,7 @@ impl CandidateStore {
         let external_ids_path = external_ids_path(&config.root);
         let df_counts_path = df_counts_path(&config.root);
         let df_delta_path = df_counts_delta_path(&config.root);
+        let df_unit_delta_path = df_counts_unit_delta_path(&config.root);
         if !force
             && (meta_path.exists()
                 || docs_path.exists()
@@ -1148,7 +1197,8 @@ impl CandidateStore {
                 || grams_indexed_path.exists()
                 || external_ids_path.exists()
                 || df_counts_path.exists()
-                || df_delta_path.exists())
+                || df_delta_path.exists()
+                || df_unit_delta_path.exists())
         {
             return Err(TgsError::from(format!(
                 "Candidate store already exists at {}. Use --force to overwrite.",
@@ -1180,6 +1230,7 @@ impl CandidateStore {
             let _ = fs::remove_file(&external_ids_path);
             let _ = fs::remove_file(&df_counts_path);
             let _ = fs::remove_file(&df_delta_path);
+            let _ = fs::remove_file(&df_unit_delta_path);
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
         }
 
@@ -2374,8 +2425,8 @@ impl CandidateStore {
         } else {
             Vec::new()
         };
-        let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
-        let mut aggregate_df_delta_payload = Vec::<u8>::new();
+        let mut aggregate_df_grams = Vec::<u64>::new();
+        let mut aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
         let mut meta_dirty = false;
@@ -2396,9 +2447,9 @@ impl CandidateStore {
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
-            extend_unit_df_deltas_and_payload_from_packed(
-                &mut aggregate_df_deltas,
-                &mut aggregate_df_delta_payload,
+            extend_unit_df_grams_and_payload_from_packed(
+                &mut aggregate_df_grams,
+                &mut aggregate_df_unit_delta_payload,
                 &document.grams_received_bytes,
                 gram_bytes,
             )?;
@@ -2488,7 +2539,7 @@ impl CandidateStore {
             .unwrap_or(u64::MAX);
 
         let apply_df_counts_started = Instant::now();
-        self.df_counts.apply_deltas(&aggregate_df_deltas);
+        self.df_counts.apply_unit_deltas(&aggregate_df_grams);
         import_profile.apply_df_counts_ms = apply_df_counts_started
             .elapsed()
             .as_millis()
@@ -2694,9 +2745,9 @@ impl CandidateStore {
                     .unwrap_or(u64::MAX);
             }
             let append_df_delta_started = Instant::now();
-            append_df_count_delta_payload_with_writer(
-                &mut self.append_writers.df_counts_delta,
-                &aggregate_df_delta_payload,
+            append_df_count_unit_payload_with_writer(
+                &mut self.append_writers.df_counts_unit_delta,
+                &aggregate_df_unit_delta_payload,
             )?;
             import_profile.append_df_delta_ms = append_df_delta_started
                 .elapsed()
@@ -3090,16 +3141,14 @@ impl CandidateStore {
     }
 
     fn maybe_compact_df_counts(&mut self) -> Result<()> {
-        let path = df_counts_delta_path(&self.root);
-        let len = match fs::metadata(&path) {
-            Ok(metadata) => metadata.len(),
-            Err(_) => 0,
-        };
+        let len = current_df_counts_delta_bytes(&self.root);
         if len >= self.df_counts_delta_compact_threshold_bytes {
             self.persist_df_counts_snapshot()?;
             self.df_counts.refresh_snapshot(&self.root)?;
             self.append_writers.df_counts_delta =
                 AppendFile::new(df_counts_delta_path(&self.root))?;
+            self.append_writers.df_counts_unit_delta =
+                AppendFile::new(df_counts_unit_delta_path(&self.root))?;
         }
         Ok(())
     }
@@ -3852,6 +3901,10 @@ fn df_counts_delta_path(root: &Path) -> PathBuf {
     root.join("df_counts.delta.bin")
 }
 
+fn df_counts_unit_delta_path(root: &Path) -> PathBuf {
+    root.join("df_counts.unit.delta.bin")
+}
+
 pub fn candidate_shard_manifest_path(root: &Path) -> PathBuf {
     root.join("shards.json")
 }
@@ -4115,6 +4168,7 @@ fn persist_df_counts_snapshot_to_root(
     fs::write(&tmp_path, payload)?;
     fs::rename(tmp_path, snapshot_path)?;
     fs::write(df_counts_delta_path(root), [])?;
+    fs::write(df_counts_unit_delta_path(root), [])?;
     Ok(())
 }
 
@@ -4150,6 +4204,11 @@ fn current_df_counts_delta_bytes(root: &Path) -> u64 {
     fs::metadata(df_counts_delta_path(root))
         .map(|metadata| metadata.len())
         .unwrap_or(0)
+        .saturating_add(
+            fs::metadata(df_counts_unit_delta_path(root))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+        )
 }
 
 fn append_df_count_deltas_with_writer(
@@ -4169,10 +4228,7 @@ fn append_df_count_deltas_with_writer(
     Ok(())
 }
 
-fn append_df_count_delta_payload_with_writer(
-    writer: &mut AppendFile,
-    payload: &[u8],
-) -> Result<()> {
+fn append_df_count_unit_payload_with_writer(writer: &mut AppendFile, payload: &[u8]) -> Result<()> {
     if payload.is_empty() {
         return Ok(());
     }
@@ -4180,8 +4236,8 @@ fn append_df_count_delta_payload_with_writer(
     Ok(())
 }
 
-fn extend_unit_df_deltas_and_payload_from_packed(
-    deltas: &mut Vec<(u64, i32)>,
+fn extend_unit_df_grams_and_payload_from_packed(
+    grams: &mut Vec<u64>,
     payload: &mut Vec<u8>,
     packed_grams: &[u8],
     gram_bytes: usize,
@@ -4190,12 +4246,11 @@ fn extend_unit_df_deltas_and_payload_from_packed(
         return Err(TgsError::from("Invalid packed exact gram payload."));
     }
     let count = packed_grams.len() / gram_bytes;
-    deltas.reserve(count);
-    payload.reserve(count * (gram_bytes + 4));
+    grams.reserve(count);
+    payload.reserve(packed_grams.len());
+    payload.extend_from_slice(packed_grams);
     for chunk in packed_grams.chunks_exact(gram_bytes) {
-        deltas.push((decode_packed_exact_gram(chunk), 1));
-        payload.extend_from_slice(chunk);
-        payload.extend_from_slice(&1i32.to_le_bytes());
+        grams.push(decode_packed_exact_gram(chunk));
     }
     Ok(())
 }
