@@ -250,6 +250,28 @@ pub struct CandidateDeleteResult {
     pub doc_id: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CandidateStoreOpenProfile {
+    pub doc_count: usize,
+    pub manifest_ms: u64,
+    pub meta_ms: u64,
+    pub load_state_ms: u64,
+    pub sidecars_ms: u64,
+    pub rebuild_indexes_ms: u64,
+    pub rebuild_df_counts_ms: u64,
+    pub rebuild_sha_index_ms: u64,
+    pub rebuild_tier2_superblocks_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CandidateStoreRebuildProfile {
+    df_counts_ms: u64,
+    sha_index_ms: u64,
+    tier2_superblocks_ms: u64,
+    total_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportedCandidateDocument {
     pub sha256: [u8; 32],
@@ -1167,19 +1189,43 @@ impl CandidateStore {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_profiled(root).map(|(store, _)| store)
+    }
+
+    pub fn open_profiled(root: impl AsRef<Path>) -> Result<(Self, CandidateStoreOpenProfile)> {
         let root = root.as_ref().to_path_buf();
+        let started_total = Instant::now();
+        let manifest_started = Instant::now();
         let compaction_manifest = ensure_shard_compaction_manifest(&root)?;
+        let manifest_ms = manifest_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let meta_started = Instant::now();
         let meta: StoreMeta =
             serde_json::from_slice(&fs::read(meta_path(&root))?).map_err(|_| {
                 TgsError::from(format!("Invalid candidate metadata at {}", root.display()))
             })?;
+        let meta_ms = meta_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         if meta.version != STORE_VERSION {
             return Err(TgsError::from(format!(
                 "Unsupported candidate store version: {}",
                 meta.version
             )));
         }
+        let load_state_started = Instant::now();
         let (docs, doc_rows, tier2_doc_rows) = load_candidate_store_state(&root, &meta)?;
+        let load_state_ms = load_state_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let sidecars_started = Instant::now();
         let mut store = Self {
             root: root.clone(),
             meta,
@@ -1203,12 +1249,33 @@ impl CandidateStore {
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
         };
+        let sidecars_ms = sidecars_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         let normalized_next_doc_id = store.docs.len() as u64 + 1;
         if store.meta.next_doc_id != normalized_next_doc_id {
             store.meta.next_doc_id = normalized_next_doc_id;
         }
-        store.rebuild_indexes()?;
-        Ok(store)
+        let rebuild_profile = store.rebuild_indexes_profiled()?;
+        let profile = CandidateStoreOpenProfile {
+            doc_count: store.docs.len(),
+            manifest_ms,
+            meta_ms,
+            load_state_ms,
+            sidecars_ms,
+            rebuild_indexes_ms: rebuild_profile.total_ms,
+            rebuild_df_counts_ms: rebuild_profile.df_counts_ms,
+            rebuild_sha_index_ms: rebuild_profile.sha_index_ms,
+            rebuild_tier2_superblocks_ms: rebuild_profile.tier2_superblocks_ms,
+            total_ms: started_total
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        };
+        Ok((store, profile))
     }
 
     pub fn apply_runtime_limits(
@@ -2978,9 +3045,17 @@ impl CandidateStore {
             .saturating_add(tier2_superblocks_skipped);
     }
 
-    fn rebuild_indexes(&mut self) -> Result<()> {
+    fn rebuild_indexes_profiled(&mut self) -> Result<CandidateStoreRebuildProfile> {
+        let started_total = Instant::now();
         self.sha_to_pos.clear();
+        let df_started = Instant::now();
         self.df_counts = DfCountsState::load(&self.root, self.meta.exact_gram_bytes())?;
+        let df_counts_ms = df_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let sha_started = Instant::now();
         for (index, doc) in self.docs.iter_mut().enumerate() {
             if doc.bloom_hashes == 0 {
                 doc.bloom_hashes = DEFAULT_BLOOM_HASHES;
@@ -2990,8 +3065,28 @@ impl CandidateStore {
             }
             self.sha_to_pos.insert(doc.sha256.clone(), index);
         }
+        let sha_index_ms = sha_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let tier2_started = Instant::now();
         self.rebuild_tier2_superblocks()?;
-        Ok(())
+        let tier2_superblocks_ms = tier2_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        Ok(CandidateStoreRebuildProfile {
+            df_counts_ms,
+            sha_index_ms,
+            tier2_superblocks_ms,
+            total_ms: started_total
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        })
     }
 
     fn prepared_query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {

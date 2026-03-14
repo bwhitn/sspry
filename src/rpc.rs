@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::candidate::store::{
-    CandidateCompactionResult, CandidateCompactionSnapshot, PreparedQueryArtifacts,
-    build_prepared_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
-    write_compacted_snapshot,
+    CandidateCompactionResult, CandidateCompactionSnapshot, CandidateStoreOpenProfile,
+    PreparedQueryArtifacts, build_prepared_query_artifacts, cleanup_abandoned_compaction_roots,
+    compaction_work_root, write_compacted_snapshot,
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
@@ -325,6 +325,7 @@ struct ServerState {
     next_compaction_shard: AtomicUsize,
     active_connections: AtomicUsize,
     startup_cleanup_removed_roots: usize,
+    startup_profile: StartupProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +343,30 @@ struct CompactionRuntime {
     last_reclaimed_bytes: u64,
     last_completed_unix_ms: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StoreRootStartupProfile {
+    total_ms: u64,
+    opened_existing_shards: u64,
+    initialized_new_shards: u64,
+    doc_count: u64,
+    store_open_total_ms: u64,
+    store_open_manifest_ms: u64,
+    store_open_meta_ms: u64,
+    store_open_load_state_ms: u64,
+    store_open_sidecars_ms: u64,
+    store_open_rebuild_indexes_ms: u64,
+    store_open_rebuild_df_counts_ms: u64,
+    store_open_rebuild_sha_index_ms: u64,
+    store_open_rebuild_tier2_superblocks_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StartupProfile {
+    total_ms: u64,
+    current: StoreRootStartupProfile,
+    work: StoreRootStartupProfile,
 }
 
 struct ActiveMutationGuard<'a> {
@@ -1010,7 +1035,10 @@ impl Write for ClientStream {
 
 impl ServerState {
     fn new(config: ServerConfig, shutdown: Arc<AtomicBool>) -> Result<Self> {
-        let (store_mode, startup_cleanup_removed_roots) = ensure_candidate_stores(&config)?;
+        let started = Instant::now();
+        let (store_mode, startup_cleanup_removed_roots, mut startup_profile) =
+            ensure_candidate_stores(&config)?;
+        startup_profile.total_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         Ok(Self {
             config,
             shutdown,
@@ -1043,6 +1071,7 @@ impl ServerState {
             next_compaction_shard: AtomicUsize::new(0),
             active_connections: AtomicUsize::new(0),
             startup_cleanup_removed_roots,
+            startup_profile,
         })
     }
 
@@ -1409,6 +1438,32 @@ impl ServerState {
                     .unwrap_or(Value::Null),
             );
         }
+        let startup_root_json = |profile: &StoreRootStartupProfile| {
+            json!({
+                "total_ms": profile.total_ms,
+                "opened_existing_shards": profile.opened_existing_shards,
+                "initialized_new_shards": profile.initialized_new_shards,
+                "doc_count": profile.doc_count,
+                "store_open_total_ms": profile.store_open_total_ms,
+                "store_open_manifest_ms": profile.store_open_manifest_ms,
+                "store_open_meta_ms": profile.store_open_meta_ms,
+                "store_open_load_state_ms": profile.store_open_load_state_ms,
+                "store_open_sidecars_ms": profile.store_open_sidecars_ms,
+                "store_open_rebuild_indexes_ms": profile.store_open_rebuild_indexes_ms,
+                "store_open_rebuild_df_counts_ms": profile.store_open_rebuild_df_counts_ms,
+                "store_open_rebuild_sha_index_ms": profile.store_open_rebuild_sha_index_ms,
+                "store_open_rebuild_tier2_superblocks_ms": profile.store_open_rebuild_tier2_superblocks_ms,
+            })
+        };
+        stats.insert(
+            "startup".to_owned(),
+            json!({
+                "total_ms": self.startup_profile.total_ms,
+                "startup_cleanup_removed_roots": self.startup_cleanup_removed_roots,
+                "current": startup_root_json(&self.startup_profile.current),
+                "work": startup_root_json(&self.startup_profile.work),
+            }),
+        );
         stats.insert(
             "deleted_storage_bytes".to_owned(),
             json!(deleted_storage_bytes),
@@ -2530,7 +2585,7 @@ impl ServerState {
                                     unreachable!("workspace already checked")
                                 }
                             };
-                            let (published_stores, removed_existing_current) =
+                            let (published_stores, removed_existing_current, _) =
                                 ensure_candidate_stores_at_root(&self.config, &current_root)?;
                             (
                                 Arc::new(StoreSet::new(current_root.clone(), published_stores)),
@@ -2589,7 +2644,7 @@ impl ServerState {
                 .store(reuse_work_stores, Ordering::SeqCst);
 
             let init_work_started = Instant::now();
-            let (work_stores, removed_work) =
+            let (work_stores, removed_work, _) =
                 ensure_candidate_stores_at_root(&self.config, &work_root)?;
             self.last_publish_init_work_ms.store(
                 init_work_started
@@ -3025,12 +3080,56 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
     })
 }
 
-fn ensure_candidate_store(config: CandidateConfig) -> Result<CandidateStore> {
+fn apply_store_open_profile(
+    aggregate: &mut StoreRootStartupProfile,
+    profile: &CandidateStoreOpenProfile,
+) {
+    aggregate.doc_count = aggregate.doc_count.saturating_add(profile.doc_count as u64);
+    aggregate.store_open_total_ms = aggregate
+        .store_open_total_ms
+        .saturating_add(profile.total_ms);
+    aggregate.store_open_manifest_ms = aggregate
+        .store_open_manifest_ms
+        .saturating_add(profile.manifest_ms);
+    aggregate.store_open_meta_ms = aggregate.store_open_meta_ms.saturating_add(profile.meta_ms);
+    aggregate.store_open_load_state_ms = aggregate
+        .store_open_load_state_ms
+        .saturating_add(profile.load_state_ms);
+    aggregate.store_open_sidecars_ms = aggregate
+        .store_open_sidecars_ms
+        .saturating_add(profile.sidecars_ms);
+    aggregate.store_open_rebuild_indexes_ms = aggregate
+        .store_open_rebuild_indexes_ms
+        .saturating_add(profile.rebuild_indexes_ms);
+    aggregate.store_open_rebuild_df_counts_ms = aggregate
+        .store_open_rebuild_df_counts_ms
+        .saturating_add(profile.rebuild_df_counts_ms);
+    aggregate.store_open_rebuild_sha_index_ms = aggregate
+        .store_open_rebuild_sha_index_ms
+        .saturating_add(profile.rebuild_sha_index_ms);
+    aggregate.store_open_rebuild_tier2_superblocks_ms = aggregate
+        .store_open_rebuild_tier2_superblocks_ms
+        .saturating_add(profile.rebuild_tier2_superblocks_ms);
+}
+
+fn ensure_candidate_store_profiled(
+    config: CandidateConfig,
+) -> Result<(CandidateStore, bool, CandidateStoreOpenProfile)> {
     let meta_path = config.root.join("meta.json");
     if !meta_path.exists() {
-        return CandidateStore::init(config, false);
+        let started = Instant::now();
+        let store = CandidateStore::init(config, false)?;
+        return Ok((
+            store,
+            true,
+            CandidateStoreOpenProfile {
+                total_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                ..CandidateStoreOpenProfile::default()
+            },
+        ));
     }
-    CandidateStore::open(&config.root)
+    let (store, profile) = CandidateStore::open_profiled(&config.root)?;
+    Ok((store, false, profile))
 }
 
 fn workspace_current_root(root: &Path) -> PathBuf {
@@ -3108,7 +3207,8 @@ fn prune_workspace_retired_roots(root: &Path, keep: usize) -> Result<usize> {
 fn ensure_candidate_stores_at_root(
     config: &ServerConfig,
     root: &Path,
-) -> Result<(Vec<CandidateStore>, usize)> {
+) -> Result<(Vec<CandidateStore>, usize, StoreRootStartupProfile)> {
+    let started_total = Instant::now();
     let shard_count = config.candidate_shards.max(1);
     let single_meta = root.join("meta.json");
     let sharded_meta = root.join("shard_000").join("meta.json");
@@ -3136,13 +3236,22 @@ fn ensure_candidate_stores_at_root(
 
     let mut stores = Vec::with_capacity(shard_count);
     let mut cleanup_removed_roots = 0usize;
+    let mut startup_profile = StoreRootStartupProfile::default();
     fs::create_dir_all(root)?;
     for shard_idx in 0..shard_count {
         let mut shard_config = config.candidate_config.clone();
         shard_config.root = candidate_shard_root(root, shard_count, shard_idx);
         cleanup_removed_roots = cleanup_removed_roots
             .saturating_add(cleanup_abandoned_compaction_roots(&shard_config.root)?);
-        let mut store = ensure_candidate_store(shard_config)?;
+        let (mut store, created_new, open_profile) = ensure_candidate_store_profiled(shard_config)?;
+        if created_new {
+            startup_profile.initialized_new_shards =
+                startup_profile.initialized_new_shards.saturating_add(1);
+        } else {
+            startup_profile.opened_existing_shards =
+                startup_profile.opened_existing_shards.saturating_add(1);
+        }
+        apply_store_open_profile(&mut startup_profile, &open_profile);
         store.apply_runtime_limits(
             config.memory_budget_bytes,
             shard_count,
@@ -3151,18 +3260,28 @@ fn ensure_candidate_stores_at_root(
         stores.push(store);
     }
     write_candidate_shard_count(root, shard_count)?;
-    Ok((stores, cleanup_removed_roots))
+    startup_profile.total_ms = started_total
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok((stores, cleanup_removed_roots, startup_profile))
 }
 
-fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize)> {
+fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, StartupProfile)> {
     let root = &config.candidate_config.root;
     if !config.workspace_mode {
-        let (stores, removed_roots) = ensure_candidate_stores_at_root(config, root)?;
+        let (stores, removed_roots, current_profile) =
+            ensure_candidate_stores_at_root(config, root)?;
         return Ok((
             StoreMode::Direct {
                 stores: Arc::new(StoreSet::new(root.clone(), stores)),
             },
             removed_roots,
+            StartupProfile {
+                current: current_profile,
+                ..StartupProfile::default()
+            },
         ));
     }
 
@@ -3179,8 +3298,9 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize)> 
     let retired_root = workspace_retired_root(root);
     let removed_retired =
         prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
-    let (published, removed_current) = ensure_candidate_stores_at_root(config, &current_root)?;
-    let (work, removed_work) = ensure_candidate_stores_at_root(config, &work_root)?;
+    let (published, removed_current, current_profile) =
+        ensure_candidate_stores_at_root(config, &current_root)?;
+    let (work, removed_work, work_profile) = ensure_candidate_stores_at_root(config, &work_root)?;
     Ok((
         StoreMode::Workspace {
             root: root.clone(),
@@ -3190,6 +3310,11 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize)> 
         removed_current
             .saturating_add(removed_work)
             .saturating_add(removed_retired),
+        StartupProfile {
+            current: current_profile,
+            work: work_profile,
+            ..StartupProfile::default()
+        },
     ))
 }
 
@@ -5289,7 +5414,7 @@ rule q {
         );
 
         let manifest_root = tmp.path().join("manifest");
-        let (stores, _) = ensure_candidate_stores(&ServerConfig {
+        let (stores, _, _) = ensure_candidate_stores(&ServerConfig {
             candidate_config: CandidateConfig {
                 root: manifest_root.clone(),
                 ..CandidateConfig::default()
@@ -5522,7 +5647,7 @@ rule q {
         let abandoned = compaction_work_root(&shard_root, "compact-orphan");
         fs::create_dir_all(abandoned.join("nested")).expect("create orphan root");
 
-        let (stores, removed_roots) = ensure_candidate_stores(&ServerConfig {
+        let (stores, removed_roots, _) = ensure_candidate_stores(&ServerConfig {
             candidate_config: CandidateConfig {
                 root: root.clone(),
                 ..CandidateConfig::default()
