@@ -244,6 +244,20 @@ pub struct CandidateInsertResult {
     pub grams_complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CandidateImportBatchProfile {
+    pub classify_ms: u64,
+    pub apply_df_counts_ms: u64,
+    pub build_payloads_ms: u64,
+    pub append_sidecars_ms: u64,
+    pub install_docs_ms: u64,
+    pub tier2_update_ms: u64,
+    pub persist_meta_ms: u64,
+    pub append_df_delta_ms: u64,
+    pub compact_df_counts_ms: u64,
+    pub rebalance_tier2_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct CandidateDeleteResult {
     pub status: String,
@@ -984,6 +998,7 @@ pub struct CandidateStore {
     tier2_superblock_memory_budget_divisor: u64,
     tier2_superblock_memory_budget_bytes: u64,
     df_counts_delta_compact_threshold_bytes: u64,
+    last_import_batch_profile: CandidateImportBatchProfile,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1186,6 +1201,7 @@ impl CandidateStore {
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+            last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
         store.df_counts = DfCountsState::load(&config.root, store.meta.exact_gram_bytes())?;
         store.persist_meta()?;
@@ -1255,6 +1271,7 @@ impl CandidateStore {
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+            last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
         let sidecars_ms = sidecars_started
             .elapsed()
@@ -2351,7 +2368,9 @@ impl CandidateStore {
         let mut max_received_grams = 0u64;
         let mut max_indexed_grams = 0u64;
         let gram_bytes = self.meta.exact_gram_bytes();
+        let mut import_profile = CandidateImportBatchProfile::default();
 
+        let classify_started = Instant::now();
         for document in documents {
             total_scope.add_bytes(document.file_size);
             let sha256_hex = document.sha256_hex.clone();
@@ -2447,8 +2466,19 @@ impl CandidateStore {
             modified = true;
             meta_dirty = true;
         }
+        import_profile.classify_ms = classify_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
+        let apply_df_counts_started = Instant::now();
         self.df_counts.apply_deltas(&aggregate_df_deltas);
+        import_profile.apply_df_counts_ms = apply_df_counts_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         if !pending_inserts.is_empty() {
             let bloom_base = self.append_writers.blooms.offset;
@@ -2479,6 +2509,7 @@ impl CandidateStore {
                 bool,
             )>::with_capacity(pending_inserts.len());
 
+            let build_payloads_started = Instant::now();
             for pending in pending_inserts {
                 let document = pending.document;
                 let bloom_offset = bloom_base + blooms_payload.len() as u64;
@@ -2563,7 +2594,13 @@ impl CandidateStore {
                     document.grams_complete,
                 ));
             }
+            import_profile.build_payloads_ms = build_payloads_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
 
+            let append_sidecars_started = Instant::now();
             self.append_writers.blooms.append(&blooms_payload)?;
             self.append_writers
                 .grams_received
@@ -2584,9 +2621,15 @@ impl CandidateStore {
             self.append_writers
                 .tier2_doc_meta
                 .append(&tier2_doc_meta_payload)?;
+            import_profile.append_sidecars_ms = append_sidecars_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
 
             let mut tier2_updates =
                 Vec::<(usize, usize, usize, &'_ [u8])>::with_capacity(prepared.len());
+            let install_docs_started = Instant::now();
             for (
                 doc,
                 row,
@@ -2617,20 +2660,55 @@ impl CandidateStore {
                     });
                 }
             }
+            import_profile.install_docs_ms = install_docs_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let tier2_update_started = Instant::now();
             self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
+            import_profile.tier2_update_ms = tier2_update_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
         }
 
         if modified {
             if meta_dirty {
+                let persist_meta_started = Instant::now();
                 self.persist_meta()?;
+                import_profile.persist_meta_ms = persist_meta_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
             }
+            let append_df_delta_started = Instant::now();
             append_df_count_deltas_with_writer(
                 &mut self.append_writers.df_counts_delta,
                 self.meta.exact_gram_bytes(),
                 &aggregate_df_deltas,
             )?;
+            import_profile.append_df_delta_ms = append_df_delta_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let compact_df_counts_started = Instant::now();
             self.maybe_compact_df_counts()?;
+            import_profile.compact_df_counts_ms = compact_df_counts_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
+            import_profile.rebalance_tier2_ms = rebalance_tier2_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
             self.sidecars.invalidate_all();
             self.mark_write_activity();
             total_scope.add_items(received_grams_total);
@@ -2652,7 +2730,13 @@ impl CandidateStore {
             );
         }
 
+        self.last_import_batch_profile = import_profile;
+
         Ok(results)
+    }
+
+    pub fn last_import_batch_profile(&self) -> CandidateImportBatchProfile {
+        self.last_import_batch_profile
     }
 
     pub fn contains_live_document_sha256(&self, sha256: &[u8; 32]) -> bool {

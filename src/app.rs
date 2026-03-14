@@ -2009,6 +2009,46 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_promote_work_import_ms",
                         ),
                         (
+                            "last_publish_promote_work_import_classify_ms",
+                            "verbose.index.server_last_publish_promote_work_import_classify_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_apply_df_counts_ms",
+                            "verbose.index.server_last_publish_promote_work_import_apply_df_counts_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_build_payloads_ms",
+                            "verbose.index.server_last_publish_promote_work_import_build_payloads_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_append_sidecars_ms",
+                            "verbose.index.server_last_publish_promote_work_import_append_sidecars_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_install_docs_ms",
+                            "verbose.index.server_last_publish_promote_work_import_install_docs_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_tier2_update_ms",
+                            "verbose.index.server_last_publish_promote_work_import_tier2_update_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_persist_meta_ms",
+                            "verbose.index.server_last_publish_promote_work_import_persist_meta_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_append_df_delta_ms",
+                            "verbose.index.server_last_publish_promote_work_import_append_df_delta_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_compact_df_counts_ms",
+                            "verbose.index.server_last_publish_promote_work_import_compact_df_counts_ms",
+                        ),
+                        (
+                            "last_publish_promote_work_import_rebalance_tier2_ms",
+                            "verbose.index.server_last_publish_promote_work_import_rebalance_tier2_ms",
+                        ),
+                        (
                             "last_publish_promote_work_remove_work_root_ms",
                             "verbose.index.server_last_publish_promote_work_remove_work_root_ms",
                         ),

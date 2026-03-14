@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::candidate::store::{
-    CandidateCompactionResult, CandidateCompactionSnapshot, CandidateStoreOpenProfile,
-    PreparedQueryArtifacts, build_prepared_query_artifacts, cleanup_abandoned_compaction_roots,
-    compaction_work_root, write_compacted_snapshot,
+    CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
+    CandidateStoreOpenProfile, PreparedQueryArtifacts, build_prepared_query_artifacts,
+    cleanup_abandoned_compaction_roots, compaction_work_root, write_compacted_snapshot,
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
@@ -317,6 +317,16 @@ struct ServerState {
     last_publish_promote_work_ms: AtomicU64,
     last_publish_promote_work_export_ms: AtomicU64,
     last_publish_promote_work_import_ms: AtomicU64,
+    last_publish_promote_work_import_classify_ms: AtomicU64,
+    last_publish_promote_work_import_apply_df_counts_ms: AtomicU64,
+    last_publish_promote_work_import_build_payloads_ms: AtomicU64,
+    last_publish_promote_work_import_append_sidecars_ms: AtomicU64,
+    last_publish_promote_work_import_install_docs_ms: AtomicU64,
+    last_publish_promote_work_import_tier2_update_ms: AtomicU64,
+    last_publish_promote_work_import_persist_meta_ms: AtomicU64,
+    last_publish_promote_work_import_append_df_delta_ms: AtomicU64,
+    last_publish_promote_work_import_compact_df_counts_ms: AtomicU64,
+    last_publish_promote_work_import_rebalance_tier2_ms: AtomicU64,
     last_publish_promote_work_remove_work_root_ms: AtomicU64,
     last_publish_promote_work_other_ms: AtomicU64,
     last_publish_promote_work_imported_docs: AtomicU64,
@@ -1129,6 +1139,16 @@ impl ServerState {
             last_publish_promote_work_ms: AtomicU64::new(0),
             last_publish_promote_work_export_ms: AtomicU64::new(0),
             last_publish_promote_work_import_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_classify_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_apply_df_counts_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_build_payloads_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_append_sidecars_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_install_docs_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_tier2_update_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_persist_meta_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_append_df_delta_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_compact_df_counts_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_rebalance_tier2_ms: AtomicU64::new(0),
             last_publish_promote_work_remove_work_root_ms: AtomicU64::new(0),
             last_publish_promote_work_other_ms: AtomicU64::new(0),
             last_publish_promote_work_imported_docs: AtomicU64::new(0),
@@ -1878,6 +1898,76 @@ impl ServerState {
                 "last_publish_promote_work_import_ms".to_owned(),
                 json!(
                     self.last_publish_promote_work_import_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_classify_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_classify_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_apply_df_counts_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_apply_df_counts_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_build_payloads_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_build_payloads_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_append_sidecars_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_append_sidecars_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_install_docs_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_install_docs_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_tier2_update_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_tier2_update_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_persist_meta_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_persist_meta_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_append_df_delta_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_append_df_delta_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_compact_df_counts_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_compact_df_counts_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_rebalance_tier2_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_rebalance_tier2_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -2957,6 +3047,38 @@ impl ServerState {
                     Ordering::SeqCst,
                 );
                 let promote_started = Instant::now();
+                self.last_publish_promote_work_export_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_classify_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_apply_df_counts_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_build_payloads_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_append_sidecars_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_install_docs_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_tier2_update_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_persist_meta_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_append_df_delta_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_compact_df_counts_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_rebalance_tier2_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_remove_work_root_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_other_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_imported_docs
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_imported_shards
+                    .store(0, Ordering::SeqCst);
                 let (published_store_set, removed_existing_current, reused_work_stores) =
                     match Arc::try_unwrap(prior_work) {
                         Ok(work_store_set) => {
@@ -3020,6 +3142,7 @@ impl ServerState {
                 let work_stores = work_store_set.into_stores()?;
                 let mut export_ms_total = 0u128;
                 let mut import_ms_total = 0u128;
+                let mut import_profile_total = CandidateImportBatchProfile::default();
                 let mut imported_docs_total = 0u64;
                 let mut imported_shards_total = 0u64;
                 for (shard_idx, work_store) in work_stores.into_iter().enumerate() {
@@ -3045,6 +3168,37 @@ impl ServerState {
                     } else {
                         published_store.import_documents_batch_quiet(&imported)?
                     }
+                    let import_profile = published_store.last_import_batch_profile();
+                    import_profile_total.classify_ms = import_profile_total
+                        .classify_ms
+                        .saturating_add(import_profile.classify_ms);
+                    import_profile_total.apply_df_counts_ms = import_profile_total
+                        .apply_df_counts_ms
+                        .saturating_add(import_profile.apply_df_counts_ms);
+                    import_profile_total.build_payloads_ms = import_profile_total
+                        .build_payloads_ms
+                        .saturating_add(import_profile.build_payloads_ms);
+                    import_profile_total.append_sidecars_ms = import_profile_total
+                        .append_sidecars_ms
+                        .saturating_add(import_profile.append_sidecars_ms);
+                    import_profile_total.install_docs_ms = import_profile_total
+                        .install_docs_ms
+                        .saturating_add(import_profile.install_docs_ms);
+                    import_profile_total.tier2_update_ms = import_profile_total
+                        .tier2_update_ms
+                        .saturating_add(import_profile.tier2_update_ms);
+                    import_profile_total.persist_meta_ms = import_profile_total
+                        .persist_meta_ms
+                        .saturating_add(import_profile.persist_meta_ms);
+                    import_profile_total.append_df_delta_ms = import_profile_total
+                        .append_df_delta_ms
+                        .saturating_add(import_profile.append_df_delta_ms);
+                    import_profile_total.compact_df_counts_ms = import_profile_total
+                        .compact_df_counts_ms
+                        .saturating_add(import_profile.compact_df_counts_ms);
+                    import_profile_total.rebalance_tier2_ms = import_profile_total
+                        .rebalance_tier2_ms
+                        .saturating_add(import_profile.rebalance_tier2_ms);
                     import_ms_total =
                         import_ms_total.saturating_add(import_started.elapsed().as_millis());
                 }
@@ -3064,6 +3218,26 @@ impl ServerState {
                     import_ms_total.try_into().unwrap_or(u64::MAX),
                     Ordering::SeqCst,
                 );
+                self.last_publish_promote_work_import_classify_ms
+                    .store(import_profile_total.classify_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_apply_df_counts_ms
+                    .store(import_profile_total.apply_df_counts_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_build_payloads_ms
+                    .store(import_profile_total.build_payloads_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_append_sidecars_ms
+                    .store(import_profile_total.append_sidecars_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_install_docs_ms
+                    .store(import_profile_total.install_docs_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_tier2_update_ms
+                    .store(import_profile_total.tier2_update_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_persist_meta_ms
+                    .store(import_profile_total.persist_meta_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_append_df_delta_ms
+                    .store(import_profile_total.append_df_delta_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_compact_df_counts_ms
+                    .store(import_profile_total.compact_df_counts_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_rebalance_tier2_ms
+                    .store(import_profile_total.rebalance_tier2_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_remove_work_root_ms
                     .store(remove_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
                 self.last_publish_promote_work_other_ms.store(
