@@ -46,6 +46,8 @@ pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
 pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
+pub const DEFAULT_STANDARD_SHARDS: usize = 256;
+pub const DEFAULT_INCREMENTAL_SHARDS: usize = 64;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 
@@ -132,6 +134,25 @@ fn default_search_workers() -> usize {
             .map(|value| value.get())
             .unwrap_or(1),
     )
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum ServeLayoutProfile {
+    Standard,
+    Incremental,
+}
+
+fn default_shards_for_profile(profile: ServeLayoutProfile) -> usize {
+    match profile {
+        ServeLayoutProfile::Standard => DEFAULT_STANDARD_SHARDS,
+        ServeLayoutProfile::Incremental => DEFAULT_INCREMENTAL_SHARDS,
+    }
+}
+
+fn serve_candidate_shard_count(args: &ServeArgs) -> usize {
+    args.shards
+        .unwrap_or_else(|| default_shards_for_profile(args.layout_profile))
+        .max(1)
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -1386,6 +1407,7 @@ fn cmd_yara_check(args: &YaraArgs) -> i32 {
 fn cmd_serve(args: &ServeArgs) -> i32 {
     match (|| -> Result<i32> {
         let (host, port) = parse_host_port(&args.addr)?;
+        let candidate_shards = serve_candidate_shard_count(args);
         let signals = serve_signal_flags()?;
         rpc::serve_with_signal_flags(
             &host,
@@ -1394,7 +1416,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
             args.max_request_bytes,
             RpcServerConfig {
                 candidate_config: store_config_from_serve_args(args),
-                candidate_shards: args.shards.max(1),
+                candidate_shards,
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
                 tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
@@ -2839,11 +2861,17 @@ struct ServeArgs {
     )]
     root: String,
     #[arg(
-        long = "shards",
-        default_value_t = 256,
-        help = "Number of independent candidate shards (lock stripes) for ingest/write paths."
+        long = "layout-profile",
+        value_enum,
+        default_value_t = ServeLayoutProfile::Standard,
+        help = "Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 64 shards for lower publish fanout."
     )]
-    shards: usize,
+    layout_profile: ServeLayoutProfile,
+    #[arg(
+        long = "shards",
+        help = "Number of independent candidate shards (lock stripes) for ingest/write paths. Overrides --layout-profile when set."
+    )]
+    shards: Option<usize>,
     #[arg(
         long = "set-fp",
         default_value_t = 0.35,
@@ -3118,12 +3146,31 @@ mod tests {
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
-            shards: 256,
+            layout_profile: ServeLayoutProfile::Standard,
+            shards: None,
             filter_target_fp: 0.35,
             id_source: CandidateIdSource::Sha256,
             store_path: false,
             gram_sizes: "3,4".to_owned(),
         }
+    }
+
+    #[test]
+    fn serve_candidate_shard_count_uses_profile_default() {
+        let mut args = default_serve_args();
+        args.layout_profile = ServeLayoutProfile::Incremental;
+        assert_eq!(
+            serve_candidate_shard_count(&args),
+            DEFAULT_INCREMENTAL_SHARDS
+        );
+    }
+
+    #[test]
+    fn serve_candidate_shard_count_explicit_override_wins() {
+        let mut args = default_serve_args();
+        args.layout_profile = ServeLayoutProfile::Incremental;
+        args.shards = Some(17);
+        assert_eq!(serve_candidate_shard_count(&args), 17);
     }
 
     #[test]

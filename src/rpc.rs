@@ -2901,7 +2901,14 @@ impl ServerState {
                     let mut published_store = published_store_set.stores[shard_idx]
                         .lock()
                         .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
-                    let _ = published_store.import_documents_batch(&imported)?;
+                    let all_known_new = imported.iter().all(|document| {
+                        !published_store.contains_live_document_sha256(&document.sha256)
+                    });
+                    let _ = if all_known_new {
+                        published_store.import_documents_batch_known_new(&imported)?
+                    } else {
+                        published_store.import_documents_batch(&imported)?
+                    };
                     import_ms_total =
                         import_ms_total.saturating_add(import_started.elapsed().as_millis());
                 }

@@ -2296,6 +2296,21 @@ impl CandidateStore {
         &mut self,
         documents: &[ImportedCandidateDocument],
     ) -> Result<Vec<CandidateInsertResult>> {
+        self.import_documents_batch_impl(documents, false)
+    }
+
+    pub fn import_documents_batch_known_new(
+        &mut self,
+        documents: &[ImportedCandidateDocument],
+    ) -> Result<Vec<CandidateInsertResult>> {
+        self.import_documents_batch_impl(documents, true)
+    }
+
+    fn import_documents_batch_impl(
+        &mut self,
+        documents: &[ImportedCandidateDocument],
+        assume_new: bool,
+    ) -> Result<Vec<CandidateInsertResult>> {
         struct PendingImportedInsert<'a> {
             doc_id: u64,
             sha256_hex: String,
@@ -2329,67 +2344,69 @@ impl CandidateStore {
                 .map(|gram| (*gram, 1))
                 .collect::<Vec<_>>();
 
-            if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
-                if !self.docs[existing_pos].deleted {
-                    let existing = &self.docs[existing_pos];
-                    let existing_row = self.doc_rows[existing_pos];
+            if !assume_new {
+                if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
+                    if !self.docs[existing_pos].deleted {
+                        let existing = &self.docs[existing_pos];
+                        let existing_row = self.doc_rows[existing_pos];
+                        results.push(CandidateInsertResult {
+                            status: "already_exists".to_owned(),
+                            doc_id: existing.doc_id,
+                            sha256: existing.sha256.clone(),
+                            grams_received: existing_row.grams_received_count as usize,
+                            grams_indexed: existing_row.grams_indexed_count as usize,
+                            grams_complete: existing.grams_complete,
+                        });
+                        continue;
+                    }
+
+                    aggregate_df_deltas.extend(df_deltas.iter().copied());
+                    let snapshot = {
+                        let existing = &mut self.docs[existing_pos];
+                        existing.file_size = document.file_size;
+                        existing.filter_bytes = document.filter_bytes;
+                        existing.bloom_hashes = document.bloom_hashes;
+                        existing.tier2_filter_bytes = document.tier2_filter_bytes;
+                        existing.tier2_bloom_hashes = document.tier2_bloom_hashes;
+                        existing.grams_complete = document.grams_complete;
+                        existing.deleted = false;
+                        existing.clone()
+                    };
+                    let row = self.build_doc_row(
+                        snapshot.file_size,
+                        snapshot.filter_bytes,
+                        snapshot.bloom_hashes,
+                        snapshot.grams_complete,
+                        snapshot.deleted,
+                        document.external_id.as_deref(),
+                        &document.bloom_filter,
+                        &document.grams_received,
+                        &document.grams_indexed,
+                    )?;
+                    let tier2_row = self.build_doc_row5(
+                        snapshot.tier2_filter_bytes,
+                        snapshot.tier2_bloom_hashes,
+                        &document.tier2_bloom_filter,
+                    )?;
+                    self.doc_rows[existing_pos] = row;
+                    self.tier2_doc_rows[existing_pos] = tier2_row;
+                    self.write_doc_row(snapshot.doc_id, row)?;
+                    self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                    self.update_tier2_superblocks_for_doc_bytes_inner(
+                        existing_pos,
+                        &document.bloom_filter,
+                    )?;
+                    modified = true;
                     results.push(CandidateInsertResult {
-                        status: "already_exists".to_owned(),
-                        doc_id: existing.doc_id,
-                        sha256: existing.sha256.clone(),
-                        grams_received: existing_row.grams_received_count as usize,
-                        grams_indexed: existing_row.grams_indexed_count as usize,
-                        grams_complete: existing.grams_complete,
+                        status: "restored".to_owned(),
+                        doc_id: snapshot.doc_id,
+                        sha256: sha256_hex,
+                        grams_received: document.grams_received.len(),
+                        grams_indexed: document.grams_indexed.len(),
+                        grams_complete: document.grams_complete,
                     });
                     continue;
                 }
-
-                aggregate_df_deltas.extend(df_deltas.iter().copied());
-                let snapshot = {
-                    let existing = &mut self.docs[existing_pos];
-                    existing.file_size = document.file_size;
-                    existing.filter_bytes = document.filter_bytes;
-                    existing.bloom_hashes = document.bloom_hashes;
-                    existing.tier2_filter_bytes = document.tier2_filter_bytes;
-                    existing.tier2_bloom_hashes = document.tier2_bloom_hashes;
-                    existing.grams_complete = document.grams_complete;
-                    existing.deleted = false;
-                    existing.clone()
-                };
-                let row = self.build_doc_row(
-                    snapshot.file_size,
-                    snapshot.filter_bytes,
-                    snapshot.bloom_hashes,
-                    snapshot.grams_complete,
-                    snapshot.deleted,
-                    document.external_id.as_deref(),
-                    &document.bloom_filter,
-                    &document.grams_received,
-                    &document.grams_indexed,
-                )?;
-                let tier2_row = self.build_doc_row5(
-                    snapshot.tier2_filter_bytes,
-                    snapshot.tier2_bloom_hashes,
-                    &document.tier2_bloom_filter,
-                )?;
-                self.doc_rows[existing_pos] = row;
-                self.tier2_doc_rows[existing_pos] = tier2_row;
-                self.write_doc_row(snapshot.doc_id, row)?;
-                self.write_doc_row5(snapshot.doc_id, tier2_row)?;
-                self.update_tier2_superblocks_for_doc_bytes_inner(
-                    existing_pos,
-                    &document.bloom_filter,
-                )?;
-                modified = true;
-                results.push(CandidateInsertResult {
-                    status: "restored".to_owned(),
-                    doc_id: snapshot.doc_id,
-                    sha256: sha256_hex,
-                    grams_received: document.grams_received.len(),
-                    grams_indexed: document.grams_indexed.len(),
-                    grams_complete: document.grams_complete,
-                });
-                continue;
             }
 
             let doc_id = self.meta.next_doc_id;
@@ -2598,6 +2615,15 @@ impl CandidateStore {
         }
 
         Ok(results)
+    }
+
+    pub fn contains_live_document_sha256(&self, sha256: &[u8; 32]) -> bool {
+        let sha256_hex = hex::encode(sha256);
+        self.sha_to_pos
+            .get(&sha256_hex)
+            .copied()
+            .map(|pos| !self.docs[pos].deleted)
+            .unwrap_or(false)
     }
 
     pub fn query_candidates(
