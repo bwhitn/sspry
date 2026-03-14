@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use hashbrown::{HashMap as FastHashMap, hash_map::Entry as FastEntry};
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +44,7 @@ struct DfCountsState {
     gram_bytes: usize,
     snapshot: Option<Mmap>,
     snapshot_rows: usize,
-    delta: HashMap<u64, i64>,
+    delta: FastHashMap<u64, i64>,
 }
 
 impl DfCountsState {
@@ -77,7 +78,7 @@ impl DfCountsState {
                 .map(|mmap| mmap.len() / (gram_bytes + 4))
                 .unwrap_or(0),
             snapshot,
-            delta: HashMap::new(),
+            delta: FastHashMap::new(),
         };
         state.load_delta(root)?;
         Ok(state)
@@ -182,12 +183,24 @@ impl DfCountsState {
     }
 
     fn apply_deltas(&mut self, deltas: &[(u64, i32)]) {
+        self.delta.reserve(deltas.len());
         for (gram, delta) in deltas {
-            let next = self.delta.get(gram).copied().unwrap_or(0) + i64::from(*delta);
-            if next == 0 {
-                self.delta.remove(gram);
-            } else {
-                self.delta.insert(*gram, next);
+            let delta = i64::from(*delta);
+            if delta == 0 {
+                continue;
+            }
+            match self.delta.entry(*gram) {
+                FastEntry::Occupied(mut entry) => {
+                    let next = *entry.get() + delta;
+                    if next == 0 {
+                        entry.remove();
+                    } else {
+                        *entry.get_mut() = next;
+                    }
+                }
+                FastEntry::Vacant(entry) => {
+                    entry.insert(delta);
+                }
             }
         }
     }
