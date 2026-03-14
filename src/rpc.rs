@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,12 +49,15 @@ const ACTION_CANDIDATE_STATS: u8 = 6;
 const ACTION_CANDIDATE_DF: u8 = 7;
 const ACTION_SHUTDOWN: u8 = 8;
 const ACTION_PUBLISH: u8 = 9;
+const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
+const ACTION_INDEX_SESSION_END: u8 = 11;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const DF_CACHE_CAPACITY: usize = 128;
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
+const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
 
 fn lock_candidate_store_with_timeout<'a>(
     store_lock: &'a Mutex<CandidateStore>,
@@ -218,6 +221,11 @@ struct CandidatePublishResponse {
     message: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CandidateIndexSessionResponse {
+    message: String,
+}
+
 type ParsedCandidateInsertDocument = (
     [u8; 32],
     u64,
@@ -270,6 +278,9 @@ struct ServerState {
     mutations_paused: AtomicBool,
     publish_in_progress: AtomicBool,
     active_mutations: AtomicUsize,
+    active_index_sessions: AtomicUsize,
+    work_dirty: AtomicBool,
+    last_work_mutation_unix_ms: AtomicU64,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
@@ -457,6 +468,18 @@ impl TgsdbClient {
         Ok(response.message)
     }
 
+    pub fn begin_index_session(&self) -> Result<String> {
+        let response: CandidateIndexSessionResponse =
+            self.request_typed_json(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
+        Ok(response.message)
+    }
+
+    pub fn end_index_session(&self) -> Result<String> {
+        let response: CandidateIndexSessionResponse =
+            self.request_typed_json(ACTION_INDEX_SESSION_END, &json!({}))?;
+        Ok(response.message)
+    }
+
     fn request_typed_json<T, U>(&self, action: u8, payload: &U) -> Result<T>
     where
         T: DeserializeOwned,
@@ -568,6 +591,7 @@ pub fn serve_with_signal_flags(
 ) -> Result<()> {
     let state = Arc::new(ServerState::new(config, shutdown)?);
     let compaction_worker = start_compaction_worker(state.clone());
+    let auto_publish_worker = start_auto_publish_worker(state.clone());
     let status_worker = start_status_dump_worker(state.clone(), status_dump);
 
     let accept_result = if let Some(path) = socket_path {
@@ -610,6 +634,7 @@ pub fn serve_with_signal_flags(
         let _ = worker.join();
     }
     let _ = compaction_worker.join();
+    let _ = auto_publish_worker.join();
     let mut last_reported_connections = usize::MAX;
     while state.active_connections.load(Ordering::Acquire) > 0 {
         let active_connections = state.active_connections.load(Ordering::Acquire);
@@ -834,6 +859,21 @@ fn start_compaction_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
     })
 }
 
+fn start_auto_publish_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            if state.is_shutting_down() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+            if state.is_shutting_down() {
+                break;
+            }
+            let _ = state.run_auto_publish_cycle();
+        }
+    })
+}
+
 fn start_status_dump_worker(
     state: Arc<ServerState>,
     status_dump: Option<Arc<AtomicBool>>,
@@ -908,6 +948,9 @@ impl ServerState {
             mutations_paused: AtomicBool::new(false),
             publish_in_progress: AtomicBool::new(false),
             active_mutations: AtomicUsize::new(0),
+            active_index_sessions: AtomicUsize::new(0),
+            work_dirty: AtomicBool::new(false),
+            last_work_mutation_unix_ms: AtomicU64::new(0),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -977,6 +1020,75 @@ impl ServerState {
         Ok(ActiveMutationGuard { state: self })
     }
 
+    fn mark_work_mutation(&self) {
+        self.work_dirty.store(true, Ordering::SeqCst);
+        self.last_work_mutation_unix_ms
+            .store(current_unix_ms(), Ordering::SeqCst);
+    }
+
+    fn handle_begin_index_session(&self) -> Result<CandidateIndexSessionResponse> {
+        if self.publish_in_progress.load(Ordering::Acquire)
+            || self.mutations_paused.load(Ordering::Acquire)
+        {
+            return Err(TgsError::from(
+                "server is publishing; index session unavailable; retry later",
+            ));
+        }
+        match self
+            .active_index_sessions
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Ok(CandidateIndexSessionResponse {
+                message: "index session started".to_owned(),
+            }),
+            Err(_) => Err(TgsError::from(
+                "another index session is already active; retry later",
+            )),
+        }
+    }
+
+    fn handle_end_index_session(&self) -> Result<CandidateIndexSessionResponse> {
+        let previous = self.active_index_sessions.swap(0, Ordering::SeqCst);
+        if previous == 0 {
+            return Ok(CandidateIndexSessionResponse {
+                message: "no active index session".to_owned(),
+            });
+        }
+        Ok(CandidateIndexSessionResponse {
+            message: "index session finished".to_owned(),
+        })
+    }
+
+    fn run_auto_publish_cycle(&self) -> Result<()> {
+        if !self.config.workspace_mode {
+            return Ok(());
+        }
+        if !self.work_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.active_index_sessions.load(Ordering::Acquire) > 0 {
+            return Ok(());
+        }
+        if self.active_mutations.load(Ordering::Acquire) > 0 {
+            return Ok(());
+        }
+        if self.publish_in_progress.load(Ordering::Acquire)
+            || self.mutations_paused.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let last_mutation = self.last_work_mutation_unix_ms.load(Ordering::Acquire);
+        if last_mutation == 0 {
+            return Ok(());
+        }
+        let elapsed = current_unix_ms().saturating_sub(last_mutation);
+        if elapsed < DEFAULT_AUTO_PUBLISH_IDLE_MS {
+            return Ok(());
+        }
+        let _ = self.handle_publish()?;
+        Ok(())
+    }
+
     fn candidate_stats_json_for_store_set(
         &self,
         store_set: &StoreSet,
@@ -1022,6 +1134,22 @@ impl ServerState {
         stats.insert(
             "publish_in_progress".to_owned(),
             json!(self.publish_in_progress.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "active_index_sessions".to_owned(),
+            json!(self.active_index_sessions.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "work_dirty".to_owned(),
+            json!(self.work_dirty.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "last_work_mutation_unix_ms".to_owned(),
+            json!(self.last_work_mutation_unix_ms.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "auto_publish_idle_ms".to_owned(),
+            json!(DEFAULT_AUTO_PUBLISH_IDLE_MS),
         );
         stats.insert(
             "search_workers".to_owned(),
@@ -1487,6 +1615,7 @@ impl ServerState {
                 ACTION_CANDIDATE_INSERT
                     | ACTION_CANDIDATE_INSERT_BATCH
                     | ACTION_CANDIDATE_DELETE
+                    | ACTION_INDEX_SESSION_BEGIN
                     | ACTION_PUBLISH
             )
         {
@@ -1496,6 +1625,8 @@ impl ServerState {
         }
         match action {
             ACTION_PING => json_bytes(&json!({ "message": "pong" })),
+            ACTION_INDEX_SESSION_BEGIN => json_bytes(&self.handle_begin_index_session()?),
+            ACTION_INDEX_SESSION_END => json_bytes(&self.handle_end_index_session()?),
             ACTION_CANDIDATE_INSERT => {
                 let document: CandidateDocumentWire = json_from_bytes(payload)?;
                 json_bytes(&self.handle_candidate_insert(&document)?)
@@ -1678,6 +1809,7 @@ impl ServerState {
             parsed.12,
         )?;
         drop(store);
+        self.mark_work_mutation();
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
         }
@@ -1778,6 +1910,9 @@ impl ServerState {
             }
         }
         let results = results.into_iter().flatten().collect::<Vec<_>>();
+        if !results.is_empty() {
+            self.mark_work_mutation();
+        }
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
         }
@@ -1975,7 +2110,9 @@ impl ServerState {
 
     fn handle_publish(&self) -> Result<CandidatePublishResponse> {
         self.mutations_paused.store(true, Ordering::SeqCst);
-        while self.active_mutations.load(Ordering::Acquire) > 0 {
+        while self.active_index_sessions.load(Ordering::Acquire) > 0
+            || self.active_mutations.load(Ordering::Acquire) > 0
+        {
             thread::sleep(Duration::from_millis(10));
         }
         self.publish_in_progress.store(true, Ordering::SeqCst);
@@ -2016,6 +2153,8 @@ impl ServerState {
                 published: Arc::new(StoreSet::new(current_root.clone(), published_stores)),
                 work: Arc::new(StoreSet::new(work_root.clone(), work_stores)),
             };
+            self.work_dirty.store(false, Ordering::SeqCst);
+            self.last_work_mutation_unix_ms.store(0, Ordering::SeqCst);
             self.invalidate_search_caches();
             Ok(CandidatePublishResponse {
                 message: format!(
@@ -2685,6 +2824,24 @@ mod tests {
     }
 
     #[test]
+    fn index_session_is_exclusive() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let started = state.handle_begin_index_session().expect("start session");
+        assert_eq!(started.message, "index session started");
+        let err = state
+            .handle_begin_index_session()
+            .expect_err("second session should fail");
+        assert!(
+            err.to_string()
+                .contains("another index session is already active"),
+            "unexpected error: {err}"
+        );
+        let finished = state.handle_end_index_session().expect("finish session");
+        assert_eq!(finished.message, "index session finished");
+    }
+
+    #[test]
     fn publish_waits_for_active_mutations_to_drain() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -2700,6 +2857,25 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(100),
             "publish did not wait for active mutations"
+        );
+    }
+
+    #[test]
+    fn publish_waits_for_active_index_sessions_to_drain() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        let release = state.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            release.active_index_sessions.store(0, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let publish = state.handle_publish().expect("publish");
+        assert!(publish.message.contains("published work root"));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "publish did not wait for active index session"
         );
     }
 
@@ -2802,6 +2978,79 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(0)
         );
+    }
+
+    #[test]
+    fn auto_publish_promotes_work_after_index_session_finishes() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let sample = tmp.path().join("auto-publish.bin");
+        fs::write(&sample, b"xxABCDyy").expect("sample");
+        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let features = crate::candidate::scan_file_features(
+            &sample, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features");
+        state
+            .handle_begin_index_session()
+            .expect("begin index session");
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(features.sha256),
+                file_size: features.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features.unique_grams,
+                grams_complete: !features.unique_grams_truncated,
+                effective_diversity: None,
+                external_id: Some("auto-publish-doc".to_owned()),
+            })
+            .expect("insert doc");
+        state.handle_end_index_session().expect("end index session");
+        state.last_work_mutation_unix_ms.store(
+            current_unix_ms().saturating_sub(DEFAULT_AUTO_PUBLISH_IDLE_MS + 1),
+            Ordering::SeqCst,
+        );
+        state.run_auto_publish_cycle().expect("auto publish");
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "$a".to_owned(),
+                alternatives: vec![vec![gram]],
+                tier2_alternatives: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+        let result = state
+            .handle_candidate_query(
+                CandidateQueryRequest {
+                    plan: Value::Null,
+                    cursor: 0,
+                    chunk_size: None,
+                    include_external_ids: false,
+                },
+                &plan,
+            )
+            .expect("query");
+        assert_eq!(result.total_candidates, 1);
+        assert!(!state.work_dirty.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]

@@ -569,6 +569,16 @@ fn rpc_client(connection: &ClientConnectionArgs) -> TgsdbClient {
     ))
 }
 
+struct RemoteIndexSessionGuard<'a> {
+    client: &'a TgsdbClient,
+}
+
+impl Drop for RemoteIndexSessionGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.end_index_session();
+    }
+}
+
 #[cfg(test)]
 fn json_usize(
     stats: &serde_json::Map<String, serde_json::Value>,
@@ -2106,6 +2116,12 @@ fn cmd_ingest(args: &IndexArgs) -> i32 {
             return 1;
         }
     };
+    let client = rpc_client(&args.connection);
+    if let Err(err) = client.begin_index_session() {
+        println!("{err}");
+        return 1;
+    }
+    let _session = RemoteIndexSessionGuard { client: &client };
     cmd_internal_index_batch(&InternalIndexBatchArgs {
         connection: args.connection.clone(),
         paths: args.paths.clone(),
