@@ -170,6 +170,8 @@ rule q {
         .candidate_insert_batch(&docs)
         .expect("candidate insert batch");
     assert_eq!(inserted_docs.inserted_count, 2);
+    let publish = client.publish().expect("publish");
+    assert!(publish.contains("published work root"));
 
     let plan = compile_query_plan_from_file(&rule, None, 8, false, true, 100_000).expect("plan");
     let mut grams = Vec::new();

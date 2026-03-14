@@ -145,8 +145,34 @@ fn serve_persists_candidate_shards() {
         parsed.get("candidate_shards").and_then(Value::as_u64),
         Some(2)
     );
-    assert!(root.join("shard_000").join("meta.json").exists());
-    assert!(root.join("shard_001").join("meta.json").exists());
+    assert_eq!(
+        parsed.get("workspace_mode").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        root.join("current")
+            .join("shard_000")
+            .join("meta.json")
+            .exists()
+    );
+    assert!(
+        root.join("current")
+            .join("shard_001")
+            .join("meta.json")
+            .exists()
+    );
+    assert!(
+        root.join("work")
+            .join("shard_000")
+            .join("meta.json")
+            .exists()
+    );
+    assert!(
+        root.join("work")
+            .join("shard_001")
+            .join("meta.json")
+            .exists()
+    );
 
     let _ = child.kill();
     let _ = child.wait();

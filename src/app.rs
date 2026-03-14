@@ -1365,7 +1365,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
                 tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
-                workspace_mode: args.workspace_mode,
+                workspace_mode: true,
             },
             signals.shutdown.clone(),
             Some(signals.status_dump.clone()),
@@ -2588,12 +2588,10 @@ struct ServeArgs {
     )]
     tier2_superblock_budget_divisor: u64,
     #[arg(
-        long = "workspace-mode",
-        action = ArgAction::SetTrue,
-        help = "Search only the published current root while indexing and deletes write to a separate work root; use `yaya publish` to promote work to current."
+        long = "root",
+        default_value = DEFAULT_CANDIDATE_ROOT,
+        help = "Workspace root directory. YAYA will manage current/, work/, and retired/ under this path."
     )]
-    workspace_mode: bool,
-    #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate storage root directory.")]
     root: String,
     #[arg(
         long = "shards",
@@ -2837,7 +2835,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            workspace_mode: false,
+            workspace_mode: true,
         })
     }
 
@@ -2875,7 +2873,6 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            workspace_mode: false,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             shards: 256,
             filter_target_fp: 0.35,
@@ -3802,7 +3799,7 @@ rule remote_q {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            workspace_mode: false,
+            workspace_mode: true,
         });
 
         assert_eq!(

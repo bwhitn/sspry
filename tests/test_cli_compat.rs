@@ -146,6 +146,9 @@ rule q {
     assert!(ingest.contains("submitted_documents: 2"));
     assert!(ingest.contains("processed_documents: 2"));
 
+    let publish_after_index = run_ok(&["publish", "--addr", &addr]);
+    assert!(publish_after_index.contains("published work root"));
+
     let search = run_ok(&[
         "search",
         "--addr",

@@ -1754,14 +1754,34 @@ impl ServerState {
             .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
         let decoded = decode_sha256(sha256)?;
         let shard_idx = self.candidate_store_index_for_sha256(&decoded);
+        let published = self.published_store_set()?;
+        let mut published_store = lock_candidate_store_with_timeout(
+            &published.stores[shard_idx],
+            shard_idx,
+            "delete published",
+        )?;
+        let published_result = published_store.delete_document(sha256)?;
+        drop(published_store);
+
         let work = self.work_store_set()?;
-        let mut store =
-            lock_candidate_store_with_timeout(&work.stores[shard_idx], shard_idx, "delete")?;
-        let result = store.delete_document(sha256)?;
-        drop(store);
-        if self.mutation_affects_published_queries()? {
-            self.invalidate_search_caches();
-        }
+        let work_result = if Arc::ptr_eq(&published, &work) {
+            None
+        } else {
+            let mut work_store = lock_candidate_store_with_timeout(
+                &work.stores[shard_idx],
+                shard_idx,
+                "delete work",
+            )?;
+            Some(work_store.delete_document(sha256)?)
+        };
+
+        let result = match work_result {
+            Some(result) if published_result.status != "deleted" && result.status == "deleted" => {
+                result
+            }
+            _ => published_result,
+        };
+        self.invalidate_search_caches();
         Ok(CandidateDeleteResponse {
             status: result.status,
             sha256: result.sha256,
