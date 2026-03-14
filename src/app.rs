@@ -2432,6 +2432,46 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "finalize_us",
                                 "verbose.index.server_index_insert_batch_finalize_us",
                             ),
+                            (
+                                "store_classify_us",
+                                "verbose.index.server_index_insert_batch_store_classify_us",
+                            ),
+                            (
+                                "store_apply_df_counts_us",
+                                "verbose.index.server_index_insert_batch_store_apply_df_counts_us",
+                            ),
+                            (
+                                "store_append_sidecars_us",
+                                "verbose.index.server_index_insert_batch_store_append_sidecars_us",
+                            ),
+                            (
+                                "store_write_existing_us",
+                                "verbose.index.server_index_insert_batch_store_write_existing_us",
+                            ),
+                            (
+                                "store_install_docs_us",
+                                "verbose.index.server_index_insert_batch_store_install_docs_us",
+                            ),
+                            (
+                                "store_tier2_update_us",
+                                "verbose.index.server_index_insert_batch_store_tier2_update_us",
+                            ),
+                            (
+                                "store_persist_meta_us",
+                                "verbose.index.server_index_insert_batch_store_persist_meta_us",
+                            ),
+                            (
+                                "store_append_df_delta_us",
+                                "verbose.index.server_index_insert_batch_store_append_df_delta_us",
+                            ),
+                            (
+                                "store_compact_df_counts_us",
+                                "verbose.index.server_index_insert_batch_store_compact_df_counts_us",
+                            ),
+                            (
+                                "store_rebalance_tier2_us",
+                                "verbose.index.server_index_insert_batch_store_rebalance_tier2_us",
+                            ),
                         ] {
                             if let Some(value) = server_insert_batch_profile
                                 .get(key)

@@ -283,6 +283,20 @@ pub struct CandidateInsertResult {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct CandidateInsertBatchProfile {
+    pub classify_us: u64,
+    pub apply_df_counts_us: u64,
+    pub append_sidecars_us: u64,
+    pub write_existing_us: u64,
+    pub install_docs_us: u64,
+    pub tier2_update_us: u64,
+    pub persist_meta_us: u64,
+    pub append_df_delta_us: u64,
+    pub compact_df_counts_us: u64,
+    pub rebalance_tier2_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateImportBatchProfile {
     pub classify_ms: u64,
     pub apply_df_counts_ms: u64,
@@ -1042,6 +1056,7 @@ pub struct CandidateStore {
     tier2_superblock_memory_budget_divisor: u64,
     tier2_superblock_memory_budget_bytes: u64,
     df_counts_delta_compact_threshold_bytes: u64,
+    last_insert_batch_profile: CandidateInsertBatchProfile,
     last_import_batch_profile: CandidateImportBatchProfile,
 }
 
@@ -1248,6 +1263,7 @@ impl CandidateStore {
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+            last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
         store.df_counts = DfCountsState::load(&config.root, store.meta.exact_gram_bytes())?;
@@ -1318,6 +1334,7 @@ impl CandidateStore {
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
             df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
+            last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
         let sidecars_ms = sidecars_started
@@ -2002,11 +2019,16 @@ impl CandidateStore {
             bool,
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
+        fn elapsed_us(started: Instant) -> u64 {
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+        }
+
         let mut total_scope = scope("candidate.insert_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
         let mut aggregate_df_deltas = Vec::<(u64, i32)>::new();
         let mut modified = false;
         let mut meta_dirty = false;
+        let mut insert_profile = CandidateInsertBatchProfile::default();
         let mut received_grams_total = 0u64;
         let mut indexed_grams_total = 0u64;
         let mut max_received_grams = 0u64;
@@ -2042,11 +2064,13 @@ impl CandidateStore {
                 *bloom_hashes,
             );
             if *filter_bytes != expected_filter_bytes {
+                self.last_insert_batch_profile = insert_profile;
                 return Err(TgsError::from(format!(
                     "filter_bytes must equal expected filter size ({expected_filter_bytes})"
                 )));
             }
             if bloom_filter.len() != expected_filter_bytes {
+                self.last_insert_batch_profile = insert_profile;
                 return Err(TgsError::from(format!(
                     "bloom_filter length must equal filter_bytes ({expected_filter_bytes})"
                 )));
@@ -2060,17 +2084,20 @@ impl CandidateStore {
             );
             if !tier2_bloom_filter.is_empty() {
                 if *tier2_filter_bytes != expected_tier2_filter_bytes {
+                    self.last_insert_batch_profile = insert_profile;
                     return Err(TgsError::from(format!(
                         "tier2_filter_bytes must equal expected filter size ({expected_tier2_filter_bytes})"
                     )));
                 }
                 if tier2_bloom_filter.len() != expected_tier2_filter_bytes {
+                    self.last_insert_batch_profile = insert_profile;
                     return Err(TgsError::from(format!(
                         "tier2_bloom_filter length must equal tier2_filter_bytes ({expected_tier2_filter_bytes})"
                     )));
                 }
             }
 
+            let classify_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
             let dedup_received = if *grams_sorted_unique {
                 let mut ordered = Vec::with_capacity(grams_received.len());
@@ -2137,11 +2164,22 @@ impl CandidateStore {
                         grams_indexed: existing_row.grams_indexed_count as usize,
                         grams_complete: existing.grams_complete,
                     });
+                    insert_profile.classify_us = insert_profile
+                        .classify_us
+                        .saturating_add(elapsed_us(classify_started));
                     continue;
                 }
 
+                insert_profile.classify_us = insert_profile
+                    .classify_us
+                    .saturating_add(elapsed_us(classify_started));
+                let apply_df_counts_started = Instant::now();
                 self.df_counts.apply_deltas(&df_deltas);
+                insert_profile.apply_df_counts_us = insert_profile
+                    .apply_df_counts_us
+                    .saturating_add(elapsed_us(apply_df_counts_started));
                 aggregate_df_deltas.extend(df_deltas.iter().copied());
+                let write_existing_started = Instant::now();
                 let snapshot = {
                     let existing = &mut self.docs[existing_pos];
                     existing.file_size = *file_size;
@@ -2177,7 +2215,14 @@ impl CandidateStore {
                 self.tier2_doc_rows[existing_pos] = tier2_row;
                 self.write_doc_row(snapshot.doc_id, row)?;
                 self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                insert_profile.write_existing_us = insert_profile
+                    .write_existing_us
+                    .saturating_add(elapsed_us(write_existing_started));
+                let tier2_update_started = Instant::now();
                 self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
+                insert_profile.tier2_update_us = insert_profile
+                    .tier2_update_us
+                    .saturating_add(elapsed_us(tier2_update_started));
                 modified = true;
                 results.push(CandidateInsertResult {
                     status: "restored".to_owned(),
@@ -2190,6 +2235,9 @@ impl CandidateStore {
                 continue;
             }
 
+            insert_profile.classify_us = insert_profile
+                .classify_us
+                .saturating_add(elapsed_us(classify_started));
             let doc_id = self.meta.next_doc_id;
             self.meta.next_doc_id += 1;
             let doc = CandidateDoc {
@@ -2207,8 +2255,13 @@ impl CandidateStore {
                 grams_complete: complete,
                 deleted: false,
             };
+            let apply_df_counts_started = Instant::now();
             self.df_counts.apply_deltas(&df_deltas);
+            insert_profile.apply_df_counts_us = insert_profile
+                .apply_df_counts_us
+                .saturating_add(elapsed_us(apply_df_counts_started));
             aggregate_df_deltas.extend(df_deltas.iter().copied());
+            let append_sidecars_started = Instant::now();
             let row = self.build_doc_row(
                 doc.file_size,
                 doc.filter_bytes,
@@ -2226,12 +2279,23 @@ impl CandidateStore {
                 tier2_bloom_filter,
             )?;
             self.append_new_doc(sha256, row, tier2_row)?;
+            insert_profile.append_sidecars_us = insert_profile
+                .append_sidecars_us
+                .saturating_add(elapsed_us(append_sidecars_started));
+            let install_docs_started = Instant::now();
             self.doc_rows.push(row);
             self.tier2_doc_rows.push(tier2_row);
             self.docs.push(doc.clone());
             self.sha_to_pos
                 .insert(sha256_hex.clone(), self.docs.len() - 1);
+            insert_profile.install_docs_us = insert_profile
+                .install_docs_us
+                .saturating_add(elapsed_us(install_docs_started));
+            let tier2_update_started = Instant::now();
             self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
+            insert_profile.tier2_update_us = insert_profile
+                .tier2_update_us
+                .saturating_add(elapsed_us(tier2_update_started));
             modified = true;
             meta_dirty = true;
             results.push(CandidateInsertResult {
@@ -2246,15 +2310,31 @@ impl CandidateStore {
 
         if modified {
             if meta_dirty {
+                let persist_meta_started = Instant::now();
                 self.persist_meta()?;
+                insert_profile.persist_meta_us = insert_profile
+                    .persist_meta_us
+                    .saturating_add(elapsed_us(persist_meta_started));
             }
+            let append_df_delta_started = Instant::now();
             append_df_count_deltas_with_writer(
                 &mut self.append_writers.df_counts_delta,
                 self.meta.exact_gram_bytes(),
                 &aggregate_df_deltas,
             )?;
+            insert_profile.append_df_delta_us = insert_profile
+                .append_df_delta_us
+                .saturating_add(elapsed_us(append_df_delta_started));
+            let compact_df_counts_started = Instant::now();
             self.maybe_compact_df_counts()?;
+            insert_profile.compact_df_counts_us = insert_profile
+                .compact_df_counts_us
+                .saturating_add(elapsed_us(compact_df_counts_started));
+            let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
+            insert_profile.rebalance_tier2_us = insert_profile
+                .rebalance_tier2_us
+                .saturating_add(elapsed_us(rebalance_tier2_started));
             self.sidecars.invalidate_all();
             self.mark_write_activity();
             total_scope.add_items(received_grams_total);
@@ -2275,6 +2355,7 @@ impl CandidateStore {
                 max_indexed_grams,
             );
         }
+        self.last_insert_batch_profile = insert_profile;
         Ok(results)
     }
 
@@ -2756,6 +2837,10 @@ impl CandidateStore {
         self.last_import_batch_profile = import_profile;
 
         Ok(results)
+    }
+
+    pub fn last_insert_batch_profile(&self) -> CandidateInsertBatchProfile {
+        self.last_insert_batch_profile
     }
 
     pub fn last_import_batch_profile(&self) -> CandidateImportBatchProfile {

@@ -19,8 +19,9 @@ use serde_json::{Map, Value, json};
 
 use crate::candidate::store::{
     CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
-    CandidateStoreOpenProfile, PreparedQueryArtifacts, build_prepared_query_artifacts,
-    cleanup_abandoned_compaction_roots, compaction_work_root, write_compacted_snapshot,
+    CandidateInsertBatchProfile, CandidateStoreOpenProfile, PreparedQueryArtifacts,
+    build_prepared_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
+    write_compacted_snapshot,
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
@@ -363,6 +364,16 @@ struct ServerState {
     index_session_server_insert_batch_build_us: AtomicU64,
     index_session_server_insert_batch_store_us: AtomicU64,
     index_session_server_insert_batch_finalize_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_us: AtomicU64,
+    index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64,
+    index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
+    index_session_server_insert_batch_store_write_existing_us: AtomicU64,
+    index_session_server_insert_batch_store_install_docs_us: AtomicU64,
+    index_session_server_insert_batch_store_tier2_update_us: AtomicU64,
+    index_session_server_insert_batch_store_persist_meta_us: AtomicU64,
+    index_session_server_insert_batch_store_append_df_delta_us: AtomicU64,
+    index_session_server_insert_batch_store_compact_df_counts_us: AtomicU64,
+    index_session_server_insert_batch_store_rebalance_tier2_us: AtomicU64,
     last_publish_started_unix_ms: AtomicU64,
     last_publish_completed_unix_ms: AtomicU64,
     last_publish_duration_ms: AtomicU64,
@@ -1324,6 +1335,16 @@ impl ServerState {
             index_session_server_insert_batch_build_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_us: AtomicU64::new(0),
             index_session_server_insert_batch_finalize_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_write_existing_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_install_docs_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_tier2_update_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_persist_meta_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_df_delta_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_compact_df_counts_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_rebalance_tier2_us: AtomicU64::new(0),
             last_publish_started_unix_ms: AtomicU64::new(0),
             last_publish_completed_unix_ms: AtomicU64::new(0),
             last_publish_duration_ms: AtomicU64::new(0),
@@ -1673,6 +1694,26 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_finalize_us
                     .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_apply_df_counts_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_sidecars_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_write_existing_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_install_docs_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_tier2_update_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_persist_meta_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_df_delta_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_rebalance_tier2_us
+                    .store(0, Ordering::SeqCst);
                 Ok(CandidateIndexSessionResponse {
                     message: "index session started".to_owned(),
                 })
@@ -1730,6 +1771,7 @@ impl ServerState {
         build: Duration,
         store: Duration,
         finalize: Duration,
+        store_profile: &CandidateInsertBatchProfile,
     ) {
         if documents == 0 || self.active_index_sessions.load(Ordering::Acquire) == 0 {
             return;
@@ -1765,6 +1807,26 @@ impl ServerState {
                 finalize.as_micros().min(u128::from(u64::MAX)) as u64,
                 Ordering::SeqCst,
             );
+        self.index_session_server_insert_batch_store_classify_us
+            .fetch_add(store_profile.classify_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_apply_df_counts_us
+            .fetch_add(store_profile.apply_df_counts_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_append_sidecars_us
+            .fetch_add(store_profile.append_sidecars_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_write_existing_us
+            .fetch_add(store_profile.write_existing_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_install_docs_us
+            .fetch_add(store_profile.install_docs_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_tier2_update_us
+            .fetch_add(store_profile.tier2_update_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_persist_meta_us
+            .fetch_add(store_profile.persist_meta_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_append_df_delta_us
+            .fetch_add(store_profile.append_df_delta_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_compact_df_counts_us
+            .fetch_add(store_profile.compact_df_counts_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_rebalance_tier2_us
+            .fetch_add(store_profile.rebalance_tier2_us, Ordering::SeqCst);
     }
 
     fn handle_end_index_session(&self) -> Result<CandidateIndexSessionResponse> {
@@ -1984,6 +2046,16 @@ impl ServerState {
             "build_us": self.index_session_server_insert_batch_build_us.load(Ordering::Acquire),
             "store_us": self.index_session_server_insert_batch_store_us.load(Ordering::Acquire),
             "finalize_us": self.index_session_server_insert_batch_finalize_us.load(Ordering::Acquire),
+            "store_classify_us": self.index_session_server_insert_batch_store_classify_us.load(Ordering::Acquire),
+            "store_apply_df_counts_us": self.index_session_server_insert_batch_store_apply_df_counts_us.load(Ordering::Acquire),
+            "store_append_sidecars_us": self.index_session_server_insert_batch_store_append_sidecars_us.load(Ordering::Acquire),
+            "store_write_existing_us": self.index_session_server_insert_batch_store_write_existing_us.load(Ordering::Acquire),
+            "store_install_docs_us": self.index_session_server_insert_batch_store_install_docs_us.load(Ordering::Acquire),
+            "store_tier2_update_us": self.index_session_server_insert_batch_store_tier2_update_us.load(Ordering::Acquire),
+            "store_persist_meta_us": self.index_session_server_insert_batch_store_persist_meta_us.load(Ordering::Acquire),
+            "store_append_df_delta_us": self.index_session_server_insert_batch_store_append_df_delta_us.load(Ordering::Acquire),
+            "store_compact_df_counts_us": self.index_session_server_insert_batch_store_compact_df_counts_us.load(Ordering::Acquire),
+            "store_rebalance_tier2_us": self.index_session_server_insert_batch_store_rebalance_tier2_us.load(Ordering::Acquire),
         });
         let mut index_session = Map::new();
         index_session.insert(
@@ -2521,6 +2593,16 @@ impl ServerState {
             "build_us": self.index_session_server_insert_batch_build_us.load(Ordering::Acquire),
             "store_us": self.index_session_server_insert_batch_store_us.load(Ordering::Acquire),
             "finalize_us": self.index_session_server_insert_batch_finalize_us.load(Ordering::Acquire),
+            "store_classify_us": self.index_session_server_insert_batch_store_classify_us.load(Ordering::Acquire),
+            "store_apply_df_counts_us": self.index_session_server_insert_batch_store_apply_df_counts_us.load(Ordering::Acquire),
+            "store_append_sidecars_us": self.index_session_server_insert_batch_store_append_sidecars_us.load(Ordering::Acquire),
+            "store_write_existing_us": self.index_session_server_insert_batch_store_write_existing_us.load(Ordering::Acquire),
+            "store_install_docs_us": self.index_session_server_insert_batch_store_install_docs_us.load(Ordering::Acquire),
+            "store_tier2_update_us": self.index_session_server_insert_batch_store_tier2_update_us.load(Ordering::Acquire),
+            "store_persist_meta_us": self.index_session_server_insert_batch_store_persist_meta_us.load(Ordering::Acquire),
+            "store_append_df_delta_us": self.index_session_server_insert_batch_store_append_df_delta_us.load(Ordering::Acquire),
+            "store_compact_df_counts_us": self.index_session_server_insert_batch_store_compact_df_counts_us.load(Ordering::Acquire),
+            "store_rebalance_tier2_us": self.index_session_server_insert_batch_store_rebalance_tier2_us.load(Ordering::Acquire),
         });
         stats.insert(
             "index_session".to_owned(),
@@ -3259,6 +3341,7 @@ impl ServerState {
         let mut group_elapsed = Duration::ZERO;
         let mut build_elapsed = Duration::ZERO;
         let mut store_elapsed = Duration::ZERO;
+        let mut store_profile_total = CandidateInsertBatchProfile::default();
         let shards_touched;
 
         let mut results = vec![None; parsed_documents.len()];
@@ -3298,6 +3381,37 @@ impl ServerState {
             {
                 results[idx] = Some(Self::candidate_insert_response(result));
             }
+            let store_profile = store.last_insert_batch_profile();
+            store_profile_total.classify_us = store_profile_total
+                .classify_us
+                .saturating_add(store_profile.classify_us);
+            store_profile_total.apply_df_counts_us = store_profile_total
+                .apply_df_counts_us
+                .saturating_add(store_profile.apply_df_counts_us);
+            store_profile_total.append_sidecars_us = store_profile_total
+                .append_sidecars_us
+                .saturating_add(store_profile.append_sidecars_us);
+            store_profile_total.write_existing_us = store_profile_total
+                .write_existing_us
+                .saturating_add(store_profile.write_existing_us);
+            store_profile_total.install_docs_us = store_profile_total
+                .install_docs_us
+                .saturating_add(store_profile.install_docs_us);
+            store_profile_total.tier2_update_us = store_profile_total
+                .tier2_update_us
+                .saturating_add(store_profile.tier2_update_us);
+            store_profile_total.persist_meta_us = store_profile_total
+                .persist_meta_us
+                .saturating_add(store_profile.persist_meta_us);
+            store_profile_total.append_df_delta_us = store_profile_total
+                .append_df_delta_us
+                .saturating_add(store_profile.append_df_delta_us);
+            store_profile_total.compact_df_counts_us = store_profile_total
+                .compact_df_counts_us
+                .saturating_add(store_profile.compact_df_counts_us);
+            store_profile_total.rebalance_tier2_us = store_profile_total
+                .rebalance_tier2_us
+                .saturating_add(store_profile.rebalance_tier2_us);
             store_elapsed += started_store.elapsed();
         } else {
             let started_group = Instant::now();
@@ -3345,6 +3459,37 @@ impl ServerState {
                 {
                     results[original_idx] = Some(Self::candidate_insert_response(result));
                 }
+                let store_profile = store.last_insert_batch_profile();
+                store_profile_total.classify_us = store_profile_total
+                    .classify_us
+                    .saturating_add(store_profile.classify_us);
+                store_profile_total.apply_df_counts_us = store_profile_total
+                    .apply_df_counts_us
+                    .saturating_add(store_profile.apply_df_counts_us);
+                store_profile_total.append_sidecars_us = store_profile_total
+                    .append_sidecars_us
+                    .saturating_add(store_profile.append_sidecars_us);
+                store_profile_total.write_existing_us = store_profile_total
+                    .write_existing_us
+                    .saturating_add(store_profile.write_existing_us);
+                store_profile_total.install_docs_us = store_profile_total
+                    .install_docs_us
+                    .saturating_add(store_profile.install_docs_us);
+                store_profile_total.tier2_update_us = store_profile_total
+                    .tier2_update_us
+                    .saturating_add(store_profile.tier2_update_us);
+                store_profile_total.persist_meta_us = store_profile_total
+                    .persist_meta_us
+                    .saturating_add(store_profile.persist_meta_us);
+                store_profile_total.append_df_delta_us = store_profile_total
+                    .append_df_delta_us
+                    .saturating_add(store_profile.append_df_delta_us);
+                store_profile_total.compact_df_counts_us = store_profile_total
+                    .compact_df_counts_us
+                    .saturating_add(store_profile.compact_df_counts_us);
+                store_profile_total.rebalance_tier2_us = store_profile_total
+                    .rebalance_tier2_us
+                    .saturating_add(store_profile.rebalance_tier2_us);
                 store_elapsed += started_store.elapsed();
             }
         }
@@ -3367,6 +3512,7 @@ impl ServerState {
             build_elapsed,
             store_elapsed,
             finalize_elapsed,
+            &store_profile_total,
         );
         Ok(CandidateInsertBatchResponse {
             inserted_count: results.len(),
@@ -5003,6 +5149,18 @@ mod tests {
                 .get("shards_touched_total")
                 .and_then(Value::as_u64),
             Some(1)
+        );
+        assert!(
+            server_insert_batch_profile
+                .get("store_apply_df_counts_us")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            server_insert_batch_profile
+                .get("store_append_sidecars_us")
+                .and_then(Value::as_u64)
+                .is_some()
         );
     }
 
