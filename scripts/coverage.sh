@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 COVERAGE_DIR="$ROOT_DIR/coverage"
-IGNORE_REGEX='(^|.*/)(usr/src/rustc[^/]*|rustc)/'
+IGNORE_REGEX='(^|.*/)(usr/src/rustc[^/]*|rustc)/|(^|.*/)\.cargo/registry/|(^|.*/)registry/src/index\.crates\.io-|(^|.*/)opt/cargo-[^/]+/registry/|(^|.*/)target/llvm-cov-target/|(^|.*/)coverage/target/|(^|.*/)debug/build/'
 
 LLVM_COV_DIR=${LLVM_COV_DIR:-}
 if [[ -z "$LLVM_COV_DIR" ]]; then
@@ -30,7 +30,7 @@ fi
 mkdir -p "$COVERAGE_DIR"
 cd "$ROOT_DIR"
 export PATH="$LLVM_COV_DIR:$PATH"
-export TGSDB_ENABLE_COMPRESSION=1
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$COVERAGE_DIR/target}"
 
 cargo llvm-cov clean --workspace
 cargo llvm-cov --workspace --all-features --tests --no-report
@@ -43,3 +43,5 @@ echo "Coverage artifacts:"
 echo "  HTML:  $COVERAGE_DIR/html/index.html"
 echo "  LCOV:  $COVERAGE_DIR/lcov.info"
 echo "  Text:  $COVERAGE_DIR/summary.txt"
+echo "  Target: $CARGO_TARGET_DIR"
+echo "  Scope: repo-focused (dependency registry paths ignored)"

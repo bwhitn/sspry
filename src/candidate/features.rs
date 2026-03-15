@@ -11,7 +11,7 @@ use crate::candidate::grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
 };
 use crate::perf::{record_counter, record_max, scope};
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 const ENTROPY_WINDOW_BYTES: usize = 1024;
 const ENTROPY_REGION_COUNT: usize = 16;
@@ -119,13 +119,13 @@ fn estimate_unique_grams_hll(
     precision: u8,
 ) -> Result<usize> {
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be > 0"));
+        return Err(SspryError::from("chunk_size must be > 0"));
     }
     if !(4..=18).contains(&precision) {
-        return Err(TgsError::from("precision must be in range 4..18"));
+        return Err(SspryError::from("precision must be in range 4..18"));
     }
     if gram_size == 0 {
-        return Err(TgsError::from("gram_size must be > 0"));
+        return Err(SspryError::from("gram_size must be > 0"));
     }
 
     let mut registers = vec![0u8; 1usize << precision];
@@ -170,13 +170,13 @@ pub fn estimate_unique_grams_pair_hll(
     precision: u8,
 ) -> Result<(usize, usize)> {
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be > 0"));
+        return Err(SspryError::from("chunk_size must be > 0"));
     }
     if !(4..=18).contains(&precision) {
-        return Err(TgsError::from("precision must be in range 4..18"));
+        return Err(SspryError::from("precision must be in range 4..18"));
     }
     if first_gram_size == 0 || second_gram_size == 0 {
-        return Err(TgsError::from("gram_size must be > 0"));
+        return Err(SspryError::from("gram_size must be > 0"));
     }
     if first_gram_size == second_gram_size {
         let estimate = estimate_unique_grams_hll(path, first_gram_size, chunk_size, precision)?;
@@ -257,7 +257,7 @@ pub fn estimate_unique_grams4_hll(
     estimate_unique_grams_for_size_hll(path, 4, chunk_size, precision)
 }
 
-pub fn estimate_unique_grams5_hll(
+pub fn estimate_unique_default_tier2_grams_hll(
     path: impl AsRef<Path>,
     chunk_size: usize,
     precision: u8,
@@ -278,7 +278,7 @@ pub fn iter_grams4_from_bytes(data: &[u8]) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, 4)
 }
 
-pub fn iter_grams5_from_bytes(data: &[u8]) -> Vec<u64> {
+pub fn iter_default_tier2_grams_from_bytes(data: &[u8]) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, 5)
 }
 
@@ -568,7 +568,7 @@ pub fn select_tier1_grams(
     tier1_gram_estimate: Option<usize>,
 ) -> Result<(Vec<u64>, bool)> {
     if tier1_gram_sample_mod == 0 {
-        return Err(TgsError::from("tier1_gram_sample_mod must be >= 1"));
+        return Err(SspryError::from("tier1_gram_sample_mod must be >= 1"));
     }
     let budget = match tier1_gram_estimate {
         Some(value) if tier1_gram_budget > 0 => scale_tier1_gram_budget(tier1_gram_budget, value),
@@ -686,11 +686,11 @@ pub fn scan_file_features_with_gram_sizes(
 ) -> Result<DocumentFeatures> {
     let mut total_scope = scope("candidate.scan_file_features");
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be > 0"));
+        return Err(SspryError::from("chunk_size must be > 0"));
     }
     if let Some(value) = max_unique_grams {
         if value == 0 {
-            return Err(TgsError::from("max_unique_grams must be > 0 when set"));
+            return Err(SspryError::from("max_unique_grams must be > 0 when set"));
         }
     }
 
@@ -1171,12 +1171,12 @@ mod tests {
     use super::{
         EntropyWindow, HLL_DEFAULT_PRECISION, bucket_selected_counter_name,
         bucket_window_counter_name, entropy_bucket, entropy_for_window,
-        estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
-        estimate_unique_grams4_hll, estimate_unique_grams5_hll, estimate_unique_tier2_grams_hll,
-        flush_entropy_window, iter_grams4_from_bytes, iter_grams5_from_bytes,
-        iter_tier2_grams_from_bytes, push_ready_window, push_unique, resolve_collection_budget,
-        scale_tier1_gram_budget, scan_file_features, scan_file_features_with_tier2_gram_size,
-        select_tier1_grams, split_evenly, split_weighted,
+        estimate_unique_default_tier2_grams_hll, estimate_unique_grams_for_size_hll,
+        estimate_unique_grams_pair_hll, estimate_unique_grams4_hll,
+        estimate_unique_tier2_grams_hll, flush_entropy_window, iter_default_tier2_grams_from_bytes,
+        iter_grams4_from_bytes, iter_tier2_grams_from_bytes, push_ready_window, push_unique,
+        resolve_collection_budget, scale_tier1_gram_budget, scan_file_features,
+        scan_file_features_with_tier2_gram_size, select_tier1_grams, split_evenly, split_weighted,
     };
     use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, GramSizes};
 
@@ -1471,20 +1471,21 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_iterators_and_hll_helpers_cover_secondary_sizes() {
+    fn wrapper_iterators_and_hll_helpers_cover_tier2_sizes() {
         let payload = b"ABCDEFG";
-        assert_eq!(iter_grams5_from_bytes(payload).len(), 3);
+        assert_eq!(iter_default_tier2_grams_from_bytes(payload).len(), 3);
         assert_eq!(iter_tier2_grams_from_bytes(payload, 3).len(), 5);
         assert!(iter_tier2_grams_from_bytes(b"AB", 3).is_empty());
 
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("wrappers.bin");
         fs::write(&path, payload).expect("write");
-        let estimate5 = estimate_unique_grams5_hll(&path, 4, 4).expect("estimate5");
-        let estimate_secondary =
-            estimate_unique_tier2_grams_hll(&path, 3, 4, 5).expect("estimate secondary");
-        assert!(estimate5 > 0);
-        assert!(estimate_secondary > 0);
+        let estimate_default_tier2 =
+            estimate_unique_default_tier2_grams_hll(&path, 4, 4).expect("estimate_default_tier2");
+        let estimate_tier2 =
+            estimate_unique_tier2_grams_hll(&path, 3, 4, 5).expect("estimate tier2");
+        assert!(estimate_default_tier2 > 0);
+        assert!(estimate_tier2 > 0);
     }
 
     #[test]
@@ -1507,10 +1508,11 @@ mod tests {
         fs::write(&path, payload).expect("write");
 
         let exact4 = estimate_unique_grams4_hll(&path, 8, 10).expect("exact4");
-        let exact5 = estimate_unique_grams5_hll(&path, 8, 10).expect("exact5");
+        let exact_default_tier2 =
+            estimate_unique_default_tier2_grams_hll(&path, 8, 10).expect("exact_default_tier2");
         let (paired4, paired5) = estimate_unique_grams_pair_hll(&path, 4, 5, 8, 10).expect("pair");
         assert_eq!(paired4, exact4);
-        assert_eq!(paired5, exact5);
+        assert_eq!(paired5, exact_default_tier2);
 
         let (same_left, same_right) =
             estimate_unique_grams_pair_hll(&path, 4, 4, 8, 10).expect("same");
@@ -1524,8 +1526,11 @@ mod tests {
         let path = tmp.path().join("short.bin");
         fs::write(&path, b"ABCD").expect("write");
         assert!(estimate_unique_grams4_hll(&path, 8, 4).expect("p4") > 0);
-        assert_eq!(estimate_unique_grams5_hll(&path, 8, 5).expect("p5"), 0);
-        assert!(estimate_unique_tier2_grams_hll(&path, 3, 8, 6).expect("p6 secondary") > 0);
+        assert_eq!(
+            estimate_unique_default_tier2_grams_hll(&path, 8, 5).expect("p5"),
+            0
+        );
+        assert!(estimate_unique_tier2_grams_hll(&path, 3, 8, 6).expect("p6 tier2") > 0);
 
         let features = scan_file_features_with_tier2_gram_size(
             &path,

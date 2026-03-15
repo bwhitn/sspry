@@ -1,4 +1,4 @@
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 fn encode_u32(mut value: u32, out: &mut Vec<u8>) {
     loop {
@@ -34,7 +34,7 @@ fn decode_u32(payload: &[u8], cursor: &mut usize) -> Result<u32> {
     loop {
         let byte = *payload
             .get(*cursor)
-            .ok_or_else(|| TgsError::from("truncated gram varint payload"))?;
+            .ok_or_else(|| SspryError::from("truncated gram varint payload"))?;
         *cursor += 1;
         value |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
@@ -42,7 +42,7 @@ fn decode_u32(payload: &[u8], cursor: &mut usize) -> Result<u32> {
         }
         shift += 7;
         if shift >= 35 {
-            return Err(TgsError::from("gram varint payload is too large"));
+            return Err(SspryError::from("gram varint payload is too large"));
         }
     }
 }
@@ -53,7 +53,7 @@ fn decode_u64(payload: &[u8], cursor: &mut usize) -> Result<u64> {
     loop {
         let byte = *payload
             .get(*cursor)
-            .ok_or_else(|| TgsError::from("truncated gram varint payload"))?;
+            .ok_or_else(|| SspryError::from("truncated gram varint payload"))?;
         *cursor += 1;
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
@@ -61,7 +61,7 @@ fn decode_u64(payload: &[u8], cursor: &mut usize) -> Result<u64> {
         }
         shift += 7;
         if shift >= 70 {
-            return Err(TgsError::from("gram varint payload is too large"));
+            return Err(SspryError::from("gram varint payload is too large"));
         }
     }
 }
@@ -95,7 +95,7 @@ pub fn decode_grams_delta_u32(payload: &[u8]) -> Result<Vec<u32>> {
     let count = decode_u32(payload, &mut cursor)? as usize;
     if count == 0 {
         if cursor != payload.len() {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "trailing bytes after empty gram delta payload",
             ));
         }
@@ -109,18 +109,18 @@ pub fn decode_grams_delta_u32(payload: &[u8]) -> Result<Vec<u32>> {
     for _ in 1..count {
         let delta = decode_u32(payload, &mut cursor)?;
         if delta == 0 {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "gram delta payload contains non-positive value",
             ));
         }
         let value = prev
             .checked_add(delta)
-            .ok_or_else(|| TgsError::from("decoded gram exceeds u32 range"))?;
+            .ok_or_else(|| SspryError::from("decoded gram exceeds u32 range"))?;
         values.push(value);
         prev = value;
     }
     if cursor != payload.len() {
-        return Err(TgsError::from("trailing bytes after gram delta payload"));
+        return Err(SspryError::from("trailing bytes after gram delta payload"));
     }
     Ok(values)
 }
@@ -154,7 +154,7 @@ pub fn decode_grams_delta_u64(payload: &[u8]) -> Result<Vec<u64>> {
     let count = decode_u32(payload, &mut cursor)? as usize;
     if count == 0 {
         if cursor != payload.len() {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "trailing bytes after empty gram delta payload",
             ));
         }
@@ -168,18 +168,18 @@ pub fn decode_grams_delta_u64(payload: &[u8]) -> Result<Vec<u64>> {
     for _ in 1..count {
         let delta = decode_u64(payload, &mut cursor)?;
         if delta == 0 {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "gram delta payload contains non-positive value",
             ));
         }
         let value = prev
             .checked_add(delta)
-            .ok_or_else(|| TgsError::from("decoded gram exceeds u64 range"))?;
+            .ok_or_else(|| SspryError::from("decoded gram exceeds u64 range"))?;
         values.push(value);
         prev = value;
     }
     if cursor != payload.len() {
-        return Err(TgsError::from("trailing bytes after gram delta payload"));
+        return Err(SspryError::from("trailing bytes after gram delta payload"));
     }
     Ok(values)
 }

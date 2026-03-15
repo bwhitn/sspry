@@ -1,4 +1,4 @@
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 pub const DEFAULT_TIER2_GRAM_SIZE: usize = 3;
 pub const DEFAULT_TIER1_GRAM_SIZE: usize = 4;
@@ -22,18 +22,18 @@ impl GramSizes {
     pub fn parse(text: &str) -> Result<Self> {
         let raw = text.trim();
         let Some((left, right)) = raw.split_once(',') else {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "candidate-gram-sizes must be '<tier2>,<tier1>' like '3,4'",
             ));
         };
         let left = left
             .trim()
             .parse::<usize>()
-            .map_err(|_| TgsError::from("candidate-gram-sizes must contain positive integers"))?;
+            .map_err(|_| SspryError::from("candidate-gram-sizes must contain positive integers"))?;
         let right = right
             .trim()
             .parse::<usize>()
-            .map_err(|_| TgsError::from("candidate-gram-sizes must contain positive integers"))?;
+            .map_err(|_| SspryError::from("candidate-gram-sizes must contain positive integers"))?;
         Self::new(left, right)
     }
 
@@ -41,7 +41,7 @@ impl GramSizes {
         let tier2 = a.min(b);
         let tier1 = a.max(b);
         if tier2 < 3 || tier1 < 4 || tier2 >= tier1 || tier1 > 8 {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "candidate gram sizes must satisfy 3 <= tier2 < tier1 <= 8",
             ));
         }

@@ -1,8 +1,9 @@
 [package]
-name = "yaya"
+name = "sspry"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
+description = "Scalable Screening and Prefiltering of Rules for YARA"
 
 [dependencies]
 hashbrown = "0.15.5"

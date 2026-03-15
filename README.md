@@ -1,10 +1,12 @@
-# YAYA
+# Scalable Screening and Prefiltering of Rules for YARA
+
+`sspry` is the command-line binary and crate name.
 
 A mutable file search database with fast candidate retrieval and optional YARA verification.
 
 ## What It Is
 
-`yaya` runs as a TCP server, indexes files into a mutable search store, and answers YARA-style searches by combining:
+`sspry` runs as a TCP server, indexes files into a mutable search store, and answers YARA-style searches by combining:
 
 - exact Tier1 gram postings
 - per-document Tier2 bloom filters

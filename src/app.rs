@@ -26,14 +26,15 @@ use crate::candidate::{
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
     encode_grams_delta_u64, estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
-    read_candidate_shard_count, scan_file_features_with_gram_sizes,
+    extract_compact_document_metadata, read_candidate_shard_count,
+    scan_file_features_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
-    self, CandidateDocumentWire, ClientConfig as RpcClientConfig, PersistentTgsdbClient,
-    ServerConfig as RpcServerConfig, TgsdbClient,
+    self, CandidateDocumentWire, ClientConfig as RpcClientConfig, PersistentSspryClient,
+    ServerConfig as RpcServerConfig, SspryClient,
 };
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 pub const DEFAULT_CANDIDATE_ROOT: &str = "candidate_db";
 pub const DEFAULT_RPC_HOST: &str = "127.0.0.1";
@@ -95,7 +96,7 @@ fn serve_signal_flags() -> Result<ServeSignalFlags> {
         }
     });
     if let Some(err) = INSTALL_ERROR.get() {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "failed to install shutdown handler: {err}"
         )));
     }
@@ -306,7 +307,7 @@ fn serve_candidate_shard_count(args: &ServeArgs) -> usize {
 struct ClientConnectionArgs {
     #[arg(
         long = "addr",
-        env = "YAYA_ADDR",
+        env = "SSPRY_ADDR",
         default_value = DEFAULT_RPC_ADDR,
         help = "Server address as host:port."
     )]
@@ -324,31 +325,33 @@ impl ClientConnectionArgs {
 fn parse_host_port(value: &str) -> Result<(String, u16)> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(TgsError::from("addr must be a non-empty host:port value."));
+        return Err(SspryError::from(
+            "addr must be a non-empty host:port value.",
+        ));
     }
     if let Some(rest) = trimmed.strip_prefix('[') {
         let (host, port_text) = rest
             .split_once("]:")
-            .ok_or_else(|| TgsError::from("addr must use [ipv6]:port for IPv6 addresses."))?;
+            .ok_or_else(|| SspryError::from("addr must use [ipv6]:port for IPv6 addresses."))?;
         let port = port_text
             .parse::<u16>()
-            .map_err(|_| TgsError::from("addr port must be a valid u16 value."))?;
+            .map_err(|_| SspryError::from("addr port must be a valid u16 value."))?;
         return Ok((host.to_owned(), port));
     }
     let (host, port_text) = trimmed
         .rsplit_once(':')
-        .ok_or_else(|| TgsError::from("addr must be formatted as host:port."))?;
+        .ok_or_else(|| SspryError::from("addr must be formatted as host:port."))?;
     if host.is_empty() {
-        return Err(TgsError::from("addr host must not be empty."));
+        return Err(SspryError::from("addr host must not be empty."));
     }
     let port = port_text
         .parse::<u16>()
-        .map_err(|_| TgsError::from("addr port must be a valid u16 value."))?;
+        .map_err(|_| SspryError::from("addr port must be a valid u16 value."))?;
     Ok((host.to_owned(), port))
 }
 
 fn resolved_file_path(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path).map_err(TgsError::from)
+    fs::canonicalize(path).map_err(SspryError::from)
 }
 
 fn current_process_memory_kb() -> (usize, usize) {
@@ -432,7 +435,7 @@ fn path_identity_sha256(path: &Path) -> Result<[u8; 32]> {
 
 fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"yaya-identity\0");
+    digest.update(b"sspry-identity\0");
     digest.update(kind.as_bytes());
     digest.update(b"\0");
     digest.update(bytes);
@@ -443,7 +446,7 @@ fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
 
 fn sha256_file(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be a positive integer."));
+        return Err(SspryError::from("chunk_size must be a positive integer."));
     }
 
     let mut digest = Sha256::new();
@@ -463,7 +466,7 @@ fn sha256_file(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
 
 fn md5_file(path: &Path, chunk_size: usize) -> Result<[u8; 16]> {
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be a positive integer."));
+        return Err(SspryError::from("chunk_size must be a positive integer."));
     }
 
     let mut digest = Md5::new();
@@ -483,7 +486,7 @@ fn md5_file(path: &Path, chunk_size: usize) -> Result<[u8; 16]> {
 
 fn sha1_file(path: &Path, chunk_size: usize) -> Result<[u8; 20]> {
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be a positive integer."));
+        return Err(SspryError::from("chunk_size must be a positive integer."));
     }
 
     let mut digest = Sha1::new();
@@ -503,7 +506,7 @@ fn sha1_file(path: &Path, chunk_size: usize) -> Result<[u8; 20]> {
 
 fn sha512_file(path: &Path, chunk_size: usize) -> Result<[u8; 64]> {
     if chunk_size == 0 {
-        return Err(TgsError::from("chunk_size must be a positive integer."));
+        return Err(SspryError::from("chunk_size must be a positive integer."));
     }
 
     let mut digest = Sha512::new();
@@ -525,7 +528,7 @@ fn sha512_file(path: &Path, chunk_size: usize) -> Result<[u8; 64]> {
 fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "sha256 must be exactly 64 hexadecimal characters.",
         ));
     }
@@ -537,7 +540,7 @@ fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
 fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != N * 2 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "{label} must be exactly {} hexadecimal characters.",
             N * 2
         )));
@@ -619,7 +622,7 @@ fn resolve_delete_identity(
         )?);
     }
     if count != 1 {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "Provide exactly one of `--sha256`, `--md5`, `--sha1`, `--sha512`, or `--file-path`.",
         ));
     }
@@ -628,7 +631,7 @@ fn resolve_delete_identity(
 
 fn sorted_directory_children(path: &Path) -> Result<Vec<PathBuf>> {
     let mut children = fs::read_dir(path)?
-        .map(|entry| entry.map(|value| value.path()).map_err(TgsError::from))
+        .map(|entry| entry.map(|value| value.path()).map_err(SspryError::from))
         .collect::<Result<Vec<_>>>()?;
     children.sort();
     Ok(children)
@@ -725,11 +728,11 @@ fn maybe_report_index_progress(
     *last_report_at = now;
 }
 
-fn rpc_client(connection: &ClientConnectionArgs) -> TgsdbClient {
+fn rpc_client(connection: &ClientConnectionArgs) -> SspryClient {
     let (host, port) = connection
         .host_port()
         .expect("client connection addr should parse");
-    TgsdbClient::new(RpcClientConfig::new(
+    SspryClient::new(RpcClientConfig::new(
         host,
         port,
         Duration::from_secs_f64(connection.timeout.max(0.0)),
@@ -782,7 +785,7 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
     let gram_sizes = stats
         .get("gram_sizes")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| TgsError::from("candidate stats missing gram_sizes"))?;
+        .ok_or_else(|| SspryError::from("candidate stats missing gram_sizes"))?;
     let gram_sizes = GramSizes::parse(gram_sizes)?;
     let id_source = CandidateIdSource::parse_config_value(
         stats
@@ -837,7 +840,7 @@ fn resolve_delete_value(
     let path = Path::new(value);
     if path.exists() {
         if !path.is_file() {
-            return Err(TgsError::from("delete value exists but is not a file."));
+            return Err(SspryError::from("delete value exists but is not a file."));
         }
         return Ok(hex::encode(identity_from_file(
             path,
@@ -846,12 +849,12 @@ fn resolve_delete_value(
         )?));
     }
     let detected = detect_digest_identity_source(value).ok_or_else(|| {
-        TgsError::from(
+        SspryError::from(
             "delete value is neither an existing file path nor a valid md5/sha1/sha256/sha512 hex digest.",
         )
     })?;
     if detected != server_id_source {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "delete value is a {} digest but the server identity source is {}.",
             detected.as_str(),
             server_id_source.as_str()
@@ -883,6 +886,10 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
         grams: Vec::new(),
         grams_complete: row.grams_complete,
         effective_diversity: row.effective_diversity,
+        metadata_b64: Some({
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(row.metadata)
+        }),
         external_id: row.external_id,
     }
 }
@@ -895,15 +902,15 @@ struct RemotePendingBatch {
 }
 
 fn empty_remote_batch_payload_size() -> Result<usize> {
-    TgsdbClient::candidate_insert_batch_payload_size(&[])
+    SspryClient::candidate_insert_batch_payload_size(&[])
 }
 
 fn serialize_candidate_document_wire(document: &CandidateDocumentWire) -> Result<Vec<u8>> {
-    serde_json::to_vec(document).map_err(TgsError::from)
+    serde_json::to_vec(document).map_err(SspryError::from)
 }
 
 fn flush_remote_batch(
-    client: &mut PersistentTgsdbClient,
+    client: &mut PersistentSspryClient,
     pending: &mut RemotePendingBatch,
     processed: &mut usize,
     empty_payload_size: usize,
@@ -928,7 +935,7 @@ fn prepare_remote_batch_row(
     let row_payload_size = row_bytes.len();
     let single_payload_size = empty_payload_size.saturating_add(row_payload_size);
     if single_payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "single document insert request exceeds payload limit ({} bytes)",
             single_payload_size
         )));
@@ -954,7 +961,7 @@ fn push_serialized_remote_batch_row(
         .saturating_add(separator_bytes)
         .saturating_add(row_payload_size);
     if payload_size > REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "remote batch row exceeded payload limit before flush",
         ));
     }
@@ -964,7 +971,7 @@ fn push_serialized_remote_batch_row(
 }
 
 fn push_remote_batch_row(
-    client: &mut PersistentTgsdbClient,
+    client: &mut PersistentSspryClient,
     pending: &mut RemotePendingBatch,
     row: CandidateDocumentWire,
     batch_size: usize,
@@ -1024,7 +1031,7 @@ fn flush_local_pending_rows(
     for row in pending.drain(..) {
         let started_submit = Instant::now();
         let shard_idx = candidate_shard_index(&row.sha256, stores.len());
-        let _ = stores[shard_idx].insert_document(
+        let _ = stores[shard_idx].insert_document_with_metadata(
             row.sha256,
             row.file_size,
             row.gram_count_estimate,
@@ -1038,6 +1045,7 @@ fn flush_local_pending_rows(
             &row.grams,
             row.grams_complete,
             row.effective_diversity,
+            &row.metadata,
             row.external_id,
             true,
         )?;
@@ -1056,7 +1064,7 @@ fn flush_local_pending_rows(
 }
 
 fn flush_remote_pending_rows(
-    client: &mut PersistentTgsdbClient,
+    client: &mut PersistentSspryClient,
     pending: &mut RemotePendingBatch,
     processed: &mut usize,
     submit_time: &mut Duration,
@@ -1194,6 +1202,7 @@ struct IndexBatchRow {
     grams: Vec<u64>,
     grams_complete: bool,
     effective_diversity: Option<f64>,
+    metadata: Vec<u8>,
     external_id: Option<String>,
 }
 
@@ -1221,7 +1230,7 @@ impl CandidateIdSource {
             "md5" => Ok(CandidateIdSource::Md5),
             "sha1" => Ok(CandidateIdSource::Sha1),
             "sha512" => Ok(CandidateIdSource::Sha512),
-            _ => Err(TgsError::from(format!(
+            _ => Err(SspryError::from(format!(
                 "invalid candidate id_source `{value}`; expected one of sha256, md5, sha1, sha512"
             ))),
         }
@@ -1344,6 +1353,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         grams: features.unique_grams,
         grams_complete: !features.unique_grams_truncated,
         effective_diversity: features.effective_diversity,
+        metadata: extract_compact_document_metadata(scan_path)?,
         external_id: resolved_path.map(|path| path.display().to_string()),
     })
 }
@@ -1445,7 +1455,7 @@ fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
     let mut compiler = YaraCompiler::new();
     compiler
         .add_source(source.as_str())
-        .map_err(|err| TgsError::from(err.to_string()))?;
+        .map_err(|err| SspryError::from(err.to_string()))?;
     Ok(compiler.build())
 }
 
@@ -1471,7 +1481,7 @@ fn compile_yara_verifier_cached(rule_path: &Path) -> Result<Arc<YaraRules>> {
     let key = yara_rule_cache_key(rule_path)?;
     if let Some(rules) = cache
         .lock()
-        .map_err(|_| TgsError::from("YARA verifier cache lock poisoned."))?
+        .map_err(|_| SspryError::from("YARA verifier cache lock poisoned."))?
         .get(&key)
     {
         return Ok(rules);
@@ -1479,7 +1489,7 @@ fn compile_yara_verifier_cached(rule_path: &Path) -> Result<Arc<YaraRules>> {
     let rules = Arc::new(compile_yara_verifier(rule_path)?);
     let mut guard = cache
         .lock()
-        .map_err(|_| TgsError::from("YARA verifier cache lock poisoned."))?;
+        .map_err(|_| SspryError::from("YARA verifier cache lock poisoned."))?;
     guard.insert(key, rules.clone());
     Ok(rules)
 }
@@ -1537,18 +1547,18 @@ fn verify_fixed_literal_plan_on_file(path: &Path, plan: &FixedLiteralMatchPlan) 
     evaluate_fixed_literal_match(&plan.root, &matches)
 }
 
-fn cmd_yara_check(args: &YaraArgs) -> i32 {
+fn cmd_yara(args: &YaraArgs) -> i32 {
     match (|| -> Result<i32> {
         let rule_path = Path::new(&args.rule);
         let file_path = Path::new(&args.file_path);
         if !rule_path.is_file() {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Rule file not found: {}",
                 rule_path.display()
             )));
         }
         if !file_path.is_file() {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Target file not found: {}",
                 file_path.display()
             )));
@@ -1573,7 +1583,7 @@ fn cmd_yara_check(args: &YaraArgs) -> i32 {
         scanner.set_timeout(Duration::from_secs(args.scan_timeout.max(1)));
         let scan = scanner
             .scan_file(file_path)
-            .map_err(|err| TgsError::from(err.to_string()))?;
+            .map_err(|err| SspryError::from(err.to_string()))?;
 
         let matches = scan
             .matching_rules()
@@ -1662,7 +1672,7 @@ fn cmd_internal_init(args: &InternalInitArgs) -> i32 {
                     }
                     return Ok(0);
                 }
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "{} already initialized with {existing} shard(s)",
                     args.root
                 )));
@@ -1730,7 +1740,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
             let mut stores = open_stores(Path::new(root))?;
             let config = stores
                 .first()
-                .ok_or_else(|| TgsError::from("Candidate store is not initialized."))?
+                .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .config();
             let id_source = CandidateIdSource::parse_config_value(&config.id_source)?;
             let gram_sizes = GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
@@ -1749,7 +1759,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
             )?;
             row.external_id = args.external_id.clone().or(row.external_id);
             let shard_idx = candidate_shard_index(&row.sha256, stores.len());
-            let result = stores[shard_idx].insert_document(
+            let result = stores[shard_idx].insert_document_with_metadata(
                 row.sha256,
                 row.file_size,
                 row.gram_count_estimate,
@@ -1763,6 +1773,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 &row.grams,
                 row.grams_complete,
                 row.effective_diversity,
+                &row.metadata,
                 row.external_id,
                 true,
             )?;
@@ -1822,7 +1833,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let input_roots = normalize_input_paths(&args.paths);
         let total_files = count_input_files(&input_roots)?;
         if total_files == 0 {
-            return Err(TgsError::from("No input files found."));
+            return Err(SspryError::from("No input files found."));
         }
         let show_progress = args.verbose && input_roots.iter().any(|path| path.is_dir());
         let mut last_progress_reported = 0usize;
@@ -1840,7 +1851,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let mut stores = open_stores(Path::new(root))?;
             let config = stores
                 .first()
-                .ok_or_else(|| TgsError::from("Candidate store is not initialized."))?
+                .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .config();
             let id_source = CandidateIdSource::parse_config_value(&config.id_source)?;
             let gram_sizes = GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
@@ -1905,7 +1916,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     scope.spawn(move || {
                         let produce = stream_input_files(&producer_roots, |file_path| {
                             producer_tx.send(file_path).map_err(|_| {
-                                TgsError::from(
+                                SspryError::from(
                                     "candidate ingest file producer terminated unexpectedly",
                                 )
                             })?;
@@ -1923,7 +1934,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     for _ in 0..total_files {
                         let started_wait = Instant::now();
                         let scanned = result_rx.recv().map_err(|_| {
-                            TgsError::from("candidate ingest workers terminated unexpectedly")
+                            SspryError::from("candidate ingest workers terminated unexpectedly")
                         })??;
                         result_wait_time += started_wait.elapsed();
                         scan_time += scanned.scan_elapsed;
@@ -1941,7 +1952,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             )?;
                         }
                     }
-                    Ok::<(), TgsError>(())
+                    Ok::<(), SspryError>(())
                 })?;
             }
 
@@ -2049,7 +2060,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         scope.spawn(move || {
                             let produce = stream_input_files(&producer_roots, |file_path| {
                                 producer_tx.send(file_path).map_err(|_| {
-                                    TgsError::from(
+                                    SspryError::from(
                                         "candidate ingest file producer terminated unexpectedly",
                                     )
                                 })?;
@@ -2067,7 +2078,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         for _ in 0..total_files {
                             let started_wait = Instant::now();
                             let scanned = result_rx.recv().map_err(|_| {
-                                TgsError::from("candidate ingest workers terminated unexpectedly")
+                                SspryError::from("candidate ingest workers terminated unexpectedly")
                             })??;
                             result_wait_time += started_wait.elapsed();
                             scan_time += scanned.scan_elapsed;
@@ -2088,7 +2099,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 empty_payload_size,
                             )?;
                         }
-                        Ok::<(), TgsError>(())
+                        Ok::<(), SspryError>(())
                     })?;
                 }
 
@@ -2682,7 +2693,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
 fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
     match (|| -> Result<i32> {
         if args.values.is_empty() {
-            return Err(TgsError::from("delete requires at least one value"));
+            return Err(SspryError::from("delete requires at least one value"));
         }
         let mut any_failed = false;
         let mut results = Vec::with_capacity(args.values.len());
@@ -2690,7 +2701,7 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
             let mut stores = open_stores(Path::new(root))?;
             let id_source = stores
                 .first()
-                .ok_or_else(|| TgsError::from("Candidate store is not initialized."))?
+                .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .config()
                 .id_source;
             let id_source = CandidateIdSource::parse_config_value(&id_source)?;
@@ -2907,7 +2918,7 @@ fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
     }
 }
 
-fn cmd_ingest(args: &IndexArgs) -> i32 {
+fn cmd_index(args: &IndexArgs) -> i32 {
     let server_policy = match server_scan_policy(&args.connection) {
         Ok(server_policy) => server_policy,
         Err(err) => {
@@ -2950,7 +2961,7 @@ fn cmd_delete(args: &DeleteArgs) -> i32 {
                         .unwrap_or_else(|| "None".to_owned())
                 );
                 if result.status != "deleted" {
-                    return Err(TgsError::from(format!(
+                    return Err(SspryError::from(format!(
                         "delete failed for `{value}`: {}",
                         result.status
                     )));
@@ -2974,7 +2985,7 @@ fn cmd_delete(args: &DeleteArgs) -> i32 {
     }
 }
 
-fn cmd_search_candidates(args: &SearchCommandArgs) -> i32 {
+fn cmd_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
         let mut plan_time = Duration::ZERO;
@@ -3093,7 +3104,7 @@ fn cmd_search_candidates(args: &SearchCommandArgs) -> i32 {
                                 );
                                 scanner
                                     .scan_file(&candidate_path)
-                                    .map_err(|err| TgsError::from(err.to_string()))?
+                                    .map_err(|err| SspryError::from(err.to_string()))?
                                     .matching_rules()
                                     .len()
                                     > 0
@@ -3107,7 +3118,7 @@ fn cmd_search_candidates(args: &SearchCommandArgs) -> i32 {
                             YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
                         scanner
                             .scan_file(&candidate_path)
-                            .map_err(|err| TgsError::from(err.to_string()))?
+                            .map_err(|err| SspryError::from(err.to_string()))?
                             .matching_rules()
                             .len()
                             > 0
@@ -3231,7 +3242,10 @@ fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "yaya", about = "YAYA server/client CLI (candidate mode only).")]
+#[command(
+    name = "sspry",
+    about = "Scalable Screening and Prefiltering of Rules for YARA."
+)]
 struct Cli {
     #[arg(
         long = "perf-report",
@@ -3359,7 +3373,7 @@ struct YaraArgs {
 struct ServeArgs {
     #[arg(
         long = "addr",
-        env = "YAYA_ADDR",
+        env = "SSPRY_ADDR",
         default_value = DEFAULT_RPC_ADDR,
         help = "Bind address as host:port."
     )]
@@ -3387,7 +3401,7 @@ struct ServeArgs {
     #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
-        help = "Workspace root directory. YAYA will manage current/, work/, and retired/ under this path."
+        help = "Workspace root directory. SSPRY will manage current/, work/, and retired/ under this path."
     )]
     root: String,
     #[arg(
@@ -3582,12 +3596,12 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
 
     let exit_code = match cli.command {
         Commands::Serve(args) => cmd_serve(&args),
-        Commands::Index(args) => cmd_ingest(&args),
+        Commands::Index(args) => cmd_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
-        Commands::Search(args) => cmd_search_candidates(&args),
+        Commands::Search(args) => cmd_search(&args),
         Commands::Info(args) => cmd_info(&args),
         Commands::Shutdown(args) => cmd_shutdown(&args),
-        Commands::Yara(args) => cmd_yara_check(&args),
+        Commands::Yara(args) => cmd_yara(&args),
     };
     if let Err(err) = perf::write_report(exit_code) {
         eprintln!("failed to write perf report: {err}");
@@ -3687,6 +3701,7 @@ mod tests {
                 grams: Vec::new(),
                 grams_complete: true,
                 effective_diversity: Some(0.5),
+                metadata_b64: None,
                 external_id: Some("doc-1".to_owned()),
             },
             CandidateDocumentWire {
@@ -3702,6 +3717,7 @@ mod tests {
                 grams: Vec::new(),
                 grams_complete: false,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             },
         ];
@@ -3881,6 +3897,7 @@ mod tests {
             grams: vec![1, 2, 3],
             grams_complete: true,
             effective_diversity: None,
+            metadata: vec![9, 8, 7],
             external_id: Some("x".to_owned()),
         });
         assert_eq!(wire.sha256, hex::encode([0xAA; 32]));
@@ -4293,7 +4310,7 @@ rule q {
         fs::write(&hit_path, b"well hello there").expect("hit");
 
         assert_eq!(
-            cmd_yara_check(&YaraArgs {
+            cmd_yara(&YaraArgs {
                 rule: rule_path.display().to_string(),
                 file_path: hit_path.display().to_string(),
                 scan_timeout: 1,
@@ -4302,7 +4319,7 @@ rule q {
             0
         );
         assert_eq!(
-            cmd_yara_check(&YaraArgs {
+            cmd_yara(&YaraArgs {
                 rule: tmp.path().join("missing.yar").display().to_string(),
                 file_path: hit_path.display().to_string(),
                 scan_timeout: 1,
@@ -4312,7 +4329,7 @@ rule q {
         );
         assert_eq!(
             main(Some(vec![
-                "yaya".to_owned(),
+                "sspry".to_owned(),
                 "yara".to_owned(),
                 "--rule".to_owned(),
                 rule_path.display().to_string(),
@@ -4505,7 +4522,7 @@ rule remote_q {
             0
         );
         assert_eq!(
-            cmd_ingest(&IndexArgs {
+            cmd_index(&IndexArgs {
                 connection: connection.clone(),
                 paths: vec![
                     sample_b.display().to_string(),
@@ -4548,7 +4565,7 @@ rule remote_q {
             0
         );
         assert_eq!(
-            cmd_search_candidates(&SearchCommandArgs {
+            cmd_search(&SearchCommandArgs {
                 connection: connection.clone(),
                 rule: rule_path.display().to_string(),
                 max_anchors_per_pattern: 2,
@@ -4559,7 +4576,7 @@ rule remote_q {
             0
         );
         assert_eq!(
-            cmd_search_candidates(&SearchCommandArgs {
+            cmd_search(&SearchCommandArgs {
                 connection: connection.clone(),
                 rule: rule_path.display().to_string(),
                 max_anchors_per_pattern: 2,
@@ -4592,7 +4609,7 @@ rule remote_q {
         );
         assert_eq!(
             main(Some(vec![
-                "yaya".to_owned(),
+                "sspry".to_owned(),
                 "--perf-report".to_owned(),
                 base.join("perf").join("stats.json").display().to_string(),
                 "info".to_owned(),
@@ -4620,7 +4637,7 @@ rule remote_q {
         fs::write(&hit_path, b"hello").expect("hit");
         assert_eq!(
             main(Some(vec![
-                "yaya".to_owned(),
+                "sspry".to_owned(),
                 "--perf-report".to_owned(),
                 perf_dir.display().to_string(),
                 "yara".to_owned(),
@@ -4724,7 +4741,7 @@ rule remote_q {
         });
 
         assert_eq!(
-            cmd_ingest(&IndexArgs {
+            cmd_index(&IndexArgs {
                 connection: connection.clone(),
                 paths: vec![sample.display().to_string()],
                 batch_size: 1,

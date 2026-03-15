@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 #[derive(Clone, Debug, Default)]
 struct StageStats {
@@ -274,7 +274,7 @@ pub fn write_report(exit_code: i32) -> Result<()> {
     let (report_path, stdout, value) = {
         let state = state()
             .lock()
-            .map_err(|_| TgsError::from("perf lock poisoned"))?;
+            .map_err(|_| SspryError::from("perf lock poisoned"))?;
         if !state.enabled {
             return Ok(());
         }

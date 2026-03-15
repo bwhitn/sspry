@@ -12,7 +12,7 @@
 .env
 .env.*
 
-# tgsdb runtime artifacts (default paths)
+# sspry runtime artifacts (default paths)
 /bins.bin
 /bins.bin.meta
 /bins.bin.insert_state.json
@@ -23,15 +23,19 @@
 /removed_hashes.bin
 /removed_hashes.bin.*
 
-# tgsdb sidecar/state files
+# sspry sidecar/state files
 *.meta
 *.shards.json
 *.loctbl
 *.locrec
 *.insert_state.json
+.sspry.insert.inflight.*.json
 .tgsdb.insert.inflight.*.json
 
-# tgsdb lock files
+# sspry lock files
+.sspry.write.lock
+.sspry.core.lock
+.sspry.bin.*.lock
 .tgsdb.write.lock
 .tgsdb.core.lock
 .tgsdb.bin.*.lock

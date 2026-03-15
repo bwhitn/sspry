@@ -1,4 +1,4 @@
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 fn mix64(mut value: u64, seed: u64) -> u64 {
     value ^= seed;
@@ -12,10 +12,10 @@ fn mix64(mut value: u64, seed: u64) -> u64 {
 
 pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec<usize>> {
     if bits == 0 {
-        return Err(TgsError::from("bits must be > 0"));
+        return Err(SspryError::from("bits must be > 0"));
     }
     if hash_count == 0 {
-        return Err(TgsError::from("hash_count must be > 0"));
+        return Err(SspryError::from("hash_count must be > 0"));
     }
     let h1 = mix64(value, 0x9E37_79B9_7F4A_7C15);
     let h2 = mix64(value, 0xD6E8_FEB8_6659_FD93) | 1;
@@ -32,10 +32,10 @@ pub fn bloom_byte_masks(
     hash_count: usize,
 ) -> Result<Vec<(usize, u8)>> {
     if size_bytes == 0 {
-        return Err(TgsError::from("size_bytes must be > 0"));
+        return Err(SspryError::from("size_bytes must be > 0"));
     }
     if hash_count == 0 {
-        return Err(TgsError::from("hash_count must be > 0"));
+        return Err(SspryError::from("hash_count must be > 0"));
     }
     let bits = size_bytes * 8;
     let mut masks = std::collections::BTreeMap::<usize, u8>::new();
@@ -70,10 +70,10 @@ pub struct BloomFilter {
 impl BloomFilter {
     pub fn new(size_bytes: usize, hash_count: usize) -> Result<Self> {
         if size_bytes == 0 {
-            return Err(TgsError::from("size_bytes must be > 0"));
+            return Err(SspryError::from("size_bytes must be > 0"));
         }
         if hash_count == 0 {
-            return Err(TgsError::from("hash_count must be > 0"));
+            return Err(SspryError::from("hash_count must be > 0"));
         }
         Ok(Self {
             hash_count,
@@ -83,10 +83,10 @@ impl BloomFilter {
 
     pub fn from_bytes(data: &[u8], hash_count: usize) -> Result<Self> {
         if data.is_empty() {
-            return Err(TgsError::from("bloom payload must not be empty"));
+            return Err(SspryError::from("bloom payload must not be empty"));
         }
         if hash_count == 0 {
-            return Err(TgsError::from("hash_count must be > 0"));
+            return Err(SspryError::from("hash_count must be > 0"));
         }
         Ok(Self {
             hash_count,

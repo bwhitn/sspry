@@ -1,6 +1,6 @@
 # Quickstart
 
-This is the shortest path from zero to a working `yaya` instance.
+This is the shortest path from zero to a working `sspry` instance.
 
 ## 1. Build
 
@@ -11,7 +11,7 @@ cargo build --release
 ## 2. Start the Server
 
 ```bash
-./target/release/yaya serve \
+./target/release/sspry serve \
   --addr 127.0.0.1:17653 \
   --root ./candidate_db
 ```
@@ -21,7 +21,7 @@ That initializes the store if it does not exist yet.
 ## 3. Ingest Files
 
 ```bash
-./target/release/yaya index \
+./target/release/sspry index \
   --addr 127.0.0.1:17653 \
   ./samples ./more-samples
 ```
@@ -31,7 +31,7 @@ If you want later verified searches to reopen the original files, start the serv
 ## 4. Check Store State
 
 ```bash
-./target/release/yaya info --addr 127.0.0.1:17653
+./target/release/sspry info --addr 127.0.0.1:17653
 ```
 
 ## 5. Run a Search
@@ -39,7 +39,7 @@ If you want later verified searches to reopen the original files, start the serv
 Unverified candidate search:
 
 ```bash
-./target/release/yaya search \
+./target/release/sspry search \
   --addr 127.0.0.1:17653 \
   --rule ./rule.yar
 ```
@@ -47,7 +47,7 @@ Unverified candidate search:
 Verified search:
 
 ```bash
-./target/release/yaya search \
+./target/release/sspry search \
   --addr 127.0.0.1:17653 \
   --rule ./rule.yar \
   --verify
@@ -58,7 +58,7 @@ Verified search:
 Delete one or more documents by digest or original file path:
 
 ```bash
-./target/release/yaya delete \
+./target/release/sspry delete \
   --addr 127.0.0.1:17653 \
   <digest-or-file-path> <digest-or-file-path>
 ```
@@ -68,7 +68,7 @@ Delete one or more documents by digest or original file path:
 Graceful remote shutdown:
 
 ```bash
-./target/release/yaya shutdown --addr 127.0.0.1:17653
+./target/release/sspry shutdown --addr 127.0.0.1:17653
 ```
 
 Signals:
@@ -79,7 +79,7 @@ Signals:
 ## Recommended First Server Config
 
 ```bash
-./target/release/yaya serve \
+./target/release/sspry serve \
   --addr 127.0.0.1:17653 \
   --root ./candidate_db \
   --shards 256 \

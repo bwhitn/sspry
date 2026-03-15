@@ -5,9 +5,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
+    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, metadata_field_is_boolean,
+    normalize_query_metadata_field, pack_exact_gram,
 };
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryNode {
@@ -58,16 +59,26 @@ struct PatternDef {
     alternatives: Vec<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Token {
     LParen,
     RParen,
     Comma,
+    EqEq,
     And,
     Or,
     Of,
     Int(usize),
+    Float(f64),
+    Bool(bool),
     Id(String),
+    Name(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumericReadKind {
+    Integer,
+    Float,
 }
 
 struct ConditionParser {
@@ -91,11 +102,11 @@ impl ConditionParser {
 
     fn consume(&mut self, expected: Option<&Token>) -> Result<Token> {
         let Some(token) = self.tokens.get(self.index).cloned() else {
-            return Err(TgsError::from("Unexpected end of condition."));
+            return Err(SspryError::from("Unexpected end of condition."));
         };
         if let Some(expected_token) = expected {
             if &token != expected_token {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "Expected token {:?}, got {:?}.",
                     expected_token, token
                 )));
@@ -107,11 +118,11 @@ impl ConditionParser {
 
     fn parse(&mut self) -> Result<QueryNode> {
         if self.tokens.is_empty() {
-            return Err(TgsError::from("Condition section is empty."));
+            return Err(SspryError::from("Condition section is empty."));
         }
         let node = self.parse_or()?;
         if let Some(token) = self.peek() {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Unexpected trailing token in condition: {token:?}"
             )));
         }
@@ -167,7 +178,7 @@ impl ConditionParser {
                     unreachable!();
                 };
                 if !self.known_patterns.contains(&raw_id) {
-                    return Err(TgsError::from(format!(
+                    return Err(SspryError::from(format!(
                         "Condition references unknown string id: {raw_id}"
                     )));
                 }
@@ -178,22 +189,102 @@ impl ConditionParser {
                     children: Vec::new(),
                 })
             }
+            Some(Token::Name(_)) => {
+                let Token::Name(field_name) = self.consume(None)? else {
+                    unreachable!();
+                };
+                if let Some(read_kind) = numeric_read_kind(&field_name)
+                    && matches!(self.peek(), Some(Token::LParen))
+                {
+                    self.consume(Some(&Token::LParen))?;
+                    let Token::Int(offset) = self.consume(None)? else {
+                        return Err(SspryError::from(format!(
+                            "{field_name} requires an integer byte offset."
+                        )));
+                    };
+                    self.consume(Some(&Token::RParen))?;
+                    self.consume(Some(&Token::EqEq))?;
+                    let literal_text = match (read_kind, self.consume(None)?) {
+                        (NumericReadKind::Integer, Token::Int(value)) => value.to_string(),
+                        (NumericReadKind::Float, Token::Int(value)) => value.to_string(),
+                        (NumericReadKind::Float, Token::Float(value)) => value.to_string(),
+                        _ => {
+                            return Err(SspryError::from(format!(
+                                "{field_name} requires equality against a literal constant."
+                            )));
+                        }
+                    };
+                    return Ok(QueryNode {
+                        kind: "verifier_only_eq".to_owned(),
+                        pattern_id: Some(format!("{field_name}({offset})=={literal_text}")),
+                        threshold: None,
+                        children: Vec::new(),
+                    });
+                }
+                let normalized = normalize_query_metadata_field(&field_name)
+                    .or_else(|| {
+                        if field_name == "filesize" {
+                            Some("filesize")
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| {
+                        SspryError::from(format!("Unsupported condition field: {field_name}"))
+                    })?;
+                if matches!(self.peek(), Some(Token::EqEq)) {
+                    self.consume(Some(&Token::EqEq))?;
+                    let threshold = match self.consume(None)? {
+                        Token::Int(value) => value,
+                        Token::Bool(value) if metadata_field_is_boolean(normalized) => {
+                            usize::from(value)
+                        }
+                        _ => {
+                            return Err(SspryError::from(format!(
+                                "Expected literal equality value after {field_name} ==."
+                            )));
+                        }
+                    };
+                    let kind = match normalized {
+                        "filesize" => "filesize_eq",
+                        "time.now" => "time_now_eq",
+                        _ => "metadata_eq",
+                    };
+                    Ok(QueryNode {
+                        kind: kind.to_owned(),
+                        pattern_id: Some(normalized.to_owned()),
+                        threshold: Some(threshold),
+                        children: Vec::new(),
+                    })
+                } else if metadata_field_is_boolean(normalized) {
+                    Ok(QueryNode {
+                        kind: "metadata_eq".to_owned(),
+                        pattern_id: Some(normalized.to_owned()),
+                        threshold: Some(1),
+                        children: Vec::new(),
+                    })
+                } else {
+                    Err(SspryError::from(format!(
+                        "Condition field {field_name} requires == <literal>."
+                    )))
+                }
+            }
             Some(Token::Int(_)) => {
                 let Token::Int(threshold) = self.consume(None)? else {
                     unreachable!();
                 };
                 if threshold == 0 {
-                    return Err(TgsError::from("N-of threshold must be > 0."));
+                    return Err(SspryError::from("N-of threshold must be > 0."));
                 }
                 self.consume(Some(&Token::Of))?;
                 self.consume(Some(&Token::LParen))?;
                 let mut children = Vec::new();
                 loop {
                     let Token::Id(raw_id) = self.consume(None)? else {
-                        return Err(TgsError::from("Expected pattern id in N-of expression."));
+                        return Err(SspryError::from("Expected pattern id in N-of expression."));
                     };
                     if !self.known_patterns.contains(&raw_id) {
-                        return Err(TgsError::from(format!(
+                        return Err(SspryError::from(format!(
                             "Condition references unknown string id: {raw_id}"
                         )));
                     }
@@ -212,11 +303,11 @@ impl ConditionParser {
                             break;
                         }
                         Some(token) => {
-                            return Err(TgsError::from(format!(
+                            return Err(SspryError::from(format!(
                                 "Expected ',' or ')' in N-of list, got {token:?}"
                             )));
                         }
-                        None => return Err(TgsError::from("Unterminated N-of expression.")),
+                        None => return Err(SspryError::from("Unterminated N-of expression.")),
                     }
                 }
                 Ok(QueryNode {
@@ -226,10 +317,10 @@ impl ConditionParser {
                     children,
                 })
             }
-            Some(token) => Err(TgsError::from(format!(
+            Some(token) => Err(SspryError::from(format!(
                 "Unsupported condition token: {token:?}"
             ))),
-            None => Err(TgsError::from("Unexpected end of condition.")),
+            None => Err(SspryError::from("Unexpected end of condition.")),
         }
     }
 }
@@ -260,6 +351,14 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 index += 1;
                 continue;
             }
+            '=' => {
+                if chars.get(index + 1) == Some(&'=') {
+                    tokens.push(Token::EqEq);
+                    index += 2;
+                    continue;
+                }
+                return Err(SspryError::from("Unsupported token in condition near: '='"));
+            }
             '$' => {
                 let start = index;
                 index += 1;
@@ -276,20 +375,57 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
         if ch.is_ascii_digit() {
             let start = index;
             index += 1;
+            if ch == '0' && matches!(chars.get(index), Some('x' | 'X')) {
+                index += 1;
+                while index < chars.len() && chars[index].is_ascii_hexdigit() {
+                    index += 1;
+                }
+                let raw: String = chars[start + 2..index].iter().collect();
+                if raw.is_empty() {
+                    return Err(SspryError::from("Invalid hexadecimal integer token: 0x"));
+                }
+                let value = usize::from_str_radix(&raw, 16).map_err(|_| {
+                    SspryError::from(format!("Invalid hexadecimal integer token: 0x{raw}"))
+                })?;
+                tokens.push(Token::Int(value));
+                continue;
+            }
             while index < chars.len() && chars[index].is_ascii_digit() {
                 index += 1;
+            }
+            if matches!(chars.get(index), Some('.')) {
+                let dot = index;
+                index += 1;
+                let frac_start = index;
+                while index < chars.len() && chars[index].is_ascii_digit() {
+                    index += 1;
+                }
+                if frac_start == index {
+                    let raw: String = chars[start..=dot].iter().collect();
+                    return Err(SspryError::from(format!("Invalid float token: {raw}")));
+                }
+                let raw: String = chars[start..index].iter().collect();
+                let value = raw
+                    .parse::<f64>()
+                    .map_err(|_| SspryError::from(format!("Invalid float token: {raw}")))?;
+                tokens.push(Token::Float(value));
+                continue;
             }
             let raw: String = chars[start..index].iter().collect();
             let value = raw
                 .parse::<usize>()
-                .map_err(|_| TgsError::from(format!("Invalid integer token: {raw}")))?;
+                .map_err(|_| SspryError::from(format!("Invalid integer token: {raw}")))?;
             tokens.push(Token::Int(value));
             continue;
         }
         if ch.is_ascii_alphabetic() {
             let start = index;
             index += 1;
-            while index < chars.len() && chars[index].is_ascii_alphabetic() {
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric()
+                    || chars[index] == '_'
+                    || chars[index] == '.')
+            {
                 index += 1;
             }
             let raw: String = chars[start..index].iter().collect();
@@ -297,15 +433,13 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 "and" => tokens.push(Token::And),
                 "or" => tokens.push(Token::Or),
                 "of" => tokens.push(Token::Of),
-                _ => {
-                    return Err(TgsError::from(format!(
-                        "Unsupported token in condition near: {raw:?}"
-                    )));
-                }
+                "true" => tokens.push(Token::Bool(true)),
+                "false" => tokens.push(Token::Bool(false)),
+                _ => tokens.push(Token::Name(raw.to_ascii_lowercase())),
             }
             continue;
         }
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Unsupported token in condition near: {:?}",
             chars[index..chars.len().min(index + 24)]
                 .iter()
@@ -368,12 +502,14 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
         }
     }
     if strings_lines.is_empty() {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "Rule does not contain a strings section with supported entries.",
         ));
     }
     if condition_lines.is_empty() {
-        return Err(TgsError::from("Rule does not contain a condition section."));
+        return Err(SspryError::from(
+            "Rule does not contain a condition section.",
+        ));
     }
     Ok((strings_lines, condition_lines.join(" ")))
 }
@@ -409,7 +545,7 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
         }
     }
     let Some(end_idx) = end_quote else {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Invalid literal string: {trimmed:?}"
         )));
     };
@@ -425,13 +561,13 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
     };
     for flag in &flags {
         if flag != "ascii" && flag != "wide" {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Unsupported literal flag(s) for {pattern_id}: {flag}"
             )));
         }
     }
     let literal_text: String = serde_json::from_str(&format!("\"{literal_raw}\""))
-        .map_err(|_| TgsError::from(format!("Invalid literal string: {literal_raw:?}")))?;
+        .map_err(|_| SspryError::from(format!("Invalid literal string: {literal_raw:?}")))?;
 
     let mut alternatives = Vec::new();
     if flags.contains("ascii") {
@@ -469,7 +605,7 @@ fn parse_hex_line_to_grams(
     }
     let body = rest[1..rest.len() - 1].trim();
     if body.is_empty() {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Hex pattern {pattern_id} is empty."
         )));
     }
@@ -481,7 +617,7 @@ fn parse_hex_line_to_grams(
         if token.len() == 2 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
             current.push(
                 u8::from_str_radix(token, 16)
-                    .map_err(|_| TgsError::from(format!("Invalid hex byte: {token}")))?,
+                    .map_err(|_| SspryError::from(format!("Invalid hex byte: {token}")))?,
             );
             continue;
         }
@@ -493,7 +629,7 @@ fn parse_hex_line_to_grams(
             }
             continue;
         }
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Unsupported hex token for {pattern_id}: {token:?}. Supported: concrete bytes, ??, [n], [n-m]."
         )));
     }
@@ -502,9 +638,9 @@ fn parse_hex_line_to_grams(
     }
 
     let mut seen = HashSet::new();
-    let mut seen5 = HashSet::new();
+    let mut seen_tier2 = HashSet::new();
     let mut grams = Vec::new();
-    let mut grams5 = Vec::new();
+    let mut tier2_grams = Vec::new();
     let fixed_literal = if !saw_gap && runs.len() == 1 {
         runs[0].clone()
     } else {
@@ -517,12 +653,17 @@ fn parse_hex_line_to_grams(
             }
         }
         for gram in grams_tier2_from_bytes(&run, gram_sizes.tier2) {
-            if seen5.insert(gram) {
-                grams5.push(gram);
+            if seen_tier2.insert(gram) {
+                tier2_grams.push(gram);
             }
         }
     }
-    Ok(Some((pattern_id.to_owned(), grams, grams5, fixed_literal)))
+    Ok(Some((
+        pattern_id.to_owned(),
+        grams,
+        tier2_grams,
+        fixed_literal,
+    )))
 }
 
 fn is_gap_token(token: &str) -> bool {
@@ -743,6 +884,22 @@ fn dedupe_pattern_alternatives(
     (kept_tier1, kept_tier2, kept_literals)
 }
 
+fn numeric_read_kind(name: &str) -> Option<NumericReadKind> {
+    match name {
+        "int32" | "uint32" | "int32be" | "uint32be" => Some(NumericReadKind::Integer),
+        "float32" | "float64" | "float32be" | "float64be" => Some(NumericReadKind::Float),
+        _ => None,
+    }
+}
+
+fn contains_verifier_only_eq(node: &QueryNode) -> bool {
+    node.kind == "verifier_only_eq" || node.children.iter().any(contains_verifier_only_eq)
+}
+
+fn contains_pattern_node(node: &QueryNode) -> bool {
+    node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
+}
+
 pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteralMatchPlan> {
     let mut literals = HashMap::<String, Vec<Vec<u8>>>::new();
     for pattern in &plan.patterns {
@@ -776,9 +933,21 @@ pub fn evaluate_fixed_literal_match(
             let pattern_id = node
                 .pattern_id
                 .as_ref()
-                .ok_or_else(|| TgsError::from("pattern node requires pattern_id"))?;
+                .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
             Ok(matches.get(pattern_id).copied().unwrap_or(false))
         }
+        "filesize_eq" => Err(SspryError::from(
+            "filesize_eq requires file metadata and cannot use the fixed-literal fast path",
+        )),
+        "verifier_only_eq" => Err(SspryError::from(
+            "verifier_only_eq requires file verification and cannot use the fixed-literal fast path",
+        )),
+        "metadata_eq" => Err(SspryError::from(
+            "metadata_eq requires stored metadata and cannot use the fixed-literal fast path",
+        )),
+        "time_now_eq" => Err(SspryError::from(
+            "time_now_eq requires runtime evaluation and cannot use the fixed-literal fast path",
+        )),
         "and" => {
             for child in &node.children {
                 if !evaluate_fixed_literal_match(child, matches)? {
@@ -798,7 +967,7 @@ pub fn evaluate_fixed_literal_match(
         "n_of" => {
             let threshold = node
                 .threshold
-                .ok_or_else(|| TgsError::from("n_of node requires threshold"))?;
+                .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
             let mut matched = 0usize;
             for child in &node.children {
                 if evaluate_fixed_literal_match(child, matches)? {
@@ -810,7 +979,7 @@ pub fn evaluate_fixed_literal_match(
             }
             Ok(false)
         }
-        other => Err(TgsError::from(format!(
+        other => Err(SspryError::from(format!(
             "Unsupported ast node kind: {other}"
         ))),
     }
@@ -833,6 +1002,7 @@ fn node_selectivity_score(
             .map(|child| node_selectivity_score(child, patterns, df_counts))
             .min()
             .unwrap_or(u128::MAX),
+        "filesize_eq" | "metadata_eq" | "time_now_eq" | "verifier_only_eq" => u128::MAX / 2,
         "or" => node
             .children
             .iter()
@@ -900,15 +1070,15 @@ pub fn compile_query_plan_with_gram_sizes(
             pattern_fixed_literals.insert(def.pattern_id, fixed_literals);
             continue;
         }
-        if let Some((pattern_id, grams, grams5, fixed_literal)) =
+        if let Some((pattern_id, grams, tier2_grams, fixed_literal)) =
             parse_hex_line_to_grams(&line, gram_sizes)?
         {
             pattern_alternatives.insert(pattern_id.clone(), vec![grams]);
-            pattern_tier2_alternatives.insert(pattern_id.clone(), vec![grams5]);
+            pattern_tier2_alternatives.insert(pattern_id.clone(), vec![tier2_grams]);
             pattern_fixed_literals.insert(pattern_id, vec![fixed_literal]);
             continue;
         }
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Unsupported strings declaration: {:?}. Supported forms: $id = \"...\" [ascii|wide], $id = {{ ... }}",
             line.trim()
         )));
@@ -919,6 +1089,11 @@ pub fn compile_query_plan_with_gram_sizes(
         pattern_alternatives.keys().cloned().collect(),
     )?;
     let mut root = parser.parse()?;
+    if !contains_pattern_node(&root) && contains_verifier_only_eq(&root) {
+        return Err(SspryError::from(
+            "Numeric read equality in indexed search currently requires at least one string or hex anchor.",
+        ));
+    }
     reorder_or_nodes_for_selectivity(&mut root, &pattern_alternatives, df_counts);
     dedupe_or_nodes(&mut root);
     let mut branch_budgets = HashMap::<String, usize>::new();
@@ -1099,6 +1274,94 @@ rule bad {
     }
 
     #[test]
+    fn compile_rule_with_filesize_equality_condition() {
+        let rule = r#"
+rule sized {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and filesize == 8
+}
+"#;
+        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.patterns.len(), 1);
+        assert_eq!(plan.root.kind, "and");
+        assert_eq!(plan.root.children.len(), 2);
+        assert!(
+            plan.root
+                .children
+                .iter()
+                .any(|child| child.kind == "filesize_eq"
+                    && child.pattern_id.as_deref() == Some("filesize")
+                    && child.threshold == Some(8))
+        );
+    }
+
+    #[test]
+    fn compile_rule_with_metadata_and_time_conditions() {
+        let rule = r#"
+rule module_meta {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true and ELF.OSABI == 3 and time.now == 42
+}
+"#;
+        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.patterns.len(), 1);
+        assert_eq!(plan.root.kind, "and");
+        assert_eq!(plan.root.children.len(), 6);
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("pe.is_pe")
+                && child.threshold == Some(1)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("pe.machine")
+                && child.threshold == Some(0x14c)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("pe.is_64bit")
+                && child.threshold == Some(1)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("elf.os_abi")
+                && child.threshold == Some(3)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "time_now_eq"
+                && child.pattern_id.as_deref() == Some("time.now")
+                && child.threshold == Some(42)
+        }));
+    }
+
+    #[test]
+    fn compile_rule_with_numeric_read_verifier_nodes() {
+        let rule = r#"
+rule numeric_reads {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and uint32(0) == 0x14c and float32be(4) == 2.5
+}
+"#;
+        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.patterns.len(), 1);
+        assert_eq!(plan.root.kind, "and");
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "verifier_only_eq"
+                && child.pattern_id.as_deref() == Some("uint32(0)==332")
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "verifier_only_eq"
+                && child.pattern_id.as_deref() == Some("float32be(4)==2.5")
+        }));
+    }
+
+    #[test]
     fn tokenizer_parser_and_rule_sections_cover_edge_cases() {
         assert!(
             tokenize_condition("")
@@ -1110,6 +1373,24 @@ rule bad {
                 .expect("tokenize supported condition")
                 .len()
                 > 4
+        );
+        assert!(
+            tokenize_condition("filesize == 32 or $a")
+                .expect("tokenize filesize condition")
+                .len()
+                > 4
+        );
+        assert!(
+            tokenize_condition("PE.Machine == 0x14c and pe.is_pe == true and time.now == 42")
+                .expect("tokenize metadata condition")
+                .len()
+                > 8
+        );
+        assert!(
+            tokenize_condition("uint32(0) == 0x14c and float64(8) == 3.5")
+                .expect("tokenize numeric-read condition")
+                .len()
+                > 8
         );
         assert!(
             tokenize_condition("@")
@@ -1156,6 +1437,29 @@ rule bad {
                 .expect_err("zero threshold")
                 .to_string()
                 .contains("threshold must be > 0")
+        );
+
+        let mut parser = ConditionParser::new(
+            "pe.machine",
+            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+        )
+        .expect("parser");
+        assert!(
+            parser
+                .parse()
+                .expect_err("missing metadata equality")
+                .to_string()
+                .contains("requires == <literal>")
+        );
+
+        let mut parser = ConditionParser::new("uint32(x) == 1", HashSet::from(["$a".to_owned()]))
+            .expect("parser");
+        assert!(
+            parser
+                .parse()
+                .expect_err("invalid numeric offset")
+                .to_string()
+                .contains("requires an integer byte offset")
         );
 
         let mut parser = ConditionParser::new(
@@ -1245,7 +1549,7 @@ rule empty {
                 .is_none()
         );
 
-        let (pattern_id, grams, grams5, fixed_literal) = parse_hex_line_to_grams(
+        let (pattern_id, grams, tier2_grams, fixed_literal) = parse_hex_line_to_grams(
             "$h = { 41 42 43 44 ?? 45 46 47 48 [2-4] 49 4A 4B 4C }",
             GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
                 .expect("default gram sizes"),
@@ -1254,7 +1558,7 @@ rule empty {
         .expect("parsed hex");
         assert_eq!(pattern_id, "$h");
         assert_eq!(grams.len(), 3);
-        assert_eq!(grams5.len(), 6);
+        assert_eq!(tier2_grams.len(), 6);
         assert!(fixed_literal.is_empty());
         assert!(is_gap_token("[3]"));
         assert!(is_gap_token("[1-9]"));
@@ -1357,6 +1661,48 @@ rule bad {
             .expect_err("unknown pattern in condition")
             .to_string()
             .contains("unknown string id")
+        );
+
+        assert!(
+            compile_query_plan(
+                r#"
+rule numeric_only {
+  strings:
+    $a = "ABCD"
+  condition:
+    uint32(0) == 1
+}
+"#,
+                None,
+                8,
+                false,
+                true,
+                100,
+            )
+            .expect_err("numeric-only indexed search")
+            .to_string()
+            .contains("requires at least one string or hex anchor")
+        );
+
+        assert!(
+            compile_query_plan(
+                r#"
+rule numeric_rhs {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and uint32(0) == filesize
+}
+"#,
+                None,
+                8,
+                false,
+                true,
+                100,
+            )
+            .expect_err("non-literal numeric rhs")
+            .to_string()
+            .contains("requires equality against a literal constant")
         );
     }
 
@@ -1482,11 +1828,13 @@ rule disk_rule {
                 .contains("Unsupported condition token")
         );
 
+        let mut parser = ConditionParser::new("xor == 7", HashSet::new()).expect("parser");
         assert!(
-            tokenize_condition("xor")
-                .expect_err("unsupported alpha token")
+            parser
+                .parse()
+                .expect_err("unsupported condition field")
                 .to_string()
-                .contains("Unsupported token in condition")
+                .contains("Unsupported condition field")
         );
 
         assert!(

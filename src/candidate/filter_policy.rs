@@ -1,4 +1,4 @@
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 const LN_2: f64 = std::f64::consts::LN_2;
 const LN_2_SQ: f64 = LN_2 * LN_2;
@@ -41,7 +41,7 @@ pub fn normalize_filter_policy(
     }
     if let Some(value) = filter_target_fp {
         if !(0.0 < value && value < 1.0) {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "filter_target_fp must be in range (0, 1) when set",
             ));
         }
@@ -55,7 +55,7 @@ pub fn derive_bloom_hash_count(target_fp: Option<f64>, fallback_hashes: usize) -
         return Ok(fallback);
     };
     if !(0.0 < fp && fp < 1.0) {
-        return Err(TgsError::from("target_fp must be in range (0, 1)"));
+        return Err(SspryError::from("target_fp must be in range (0, 1)"));
     }
     let estimate = (1.0 / fp).log2().round() as usize;
     Ok(estimate.clamp(1, 16))

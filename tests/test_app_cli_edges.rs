@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::tempdir;
 
 fn bin_path() -> String {
-    env!("CARGO_BIN_EXE_yaya").to_owned()
+    env!("CARGO_BIN_EXE_sspry").to_owned()
 }
 
 fn run_ok(args: &[&str]) -> String {
@@ -244,4 +244,49 @@ fn yara_reports_missing_inputs() {
         tmp.path().join("missing.bin").to_str().expect("file"),
     ]);
     assert!(file_err.contains("Target file not found"));
+}
+
+#[test]
+fn yara_supports_numeric_reads_and_filesize_conditions() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("numeric.yar");
+    let hit_path = tmp.path().join("numeric.bin");
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+    payload.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+    payload.extend_from_slice(&1.5f32.to_le_bytes());
+    payload.extend_from_slice(&2.5f32.to_be_bytes());
+    payload.extend_from_slice(&3.5f64.to_le_bytes());
+    payload.extend_from_slice(&4.5f64.to_be_bytes());
+    assert_eq!(payload.len(), 32);
+    fs::write(&hit_path, payload).expect("write payload");
+
+    fs::write(
+        &rule_path,
+        r#"
+rule NumericReads {
+  condition:
+    filesize == 32 and
+    uint32(0) == 16909060 and
+    int32(0) == 16909060 and
+    uint32be(4) == 16909060 and
+    int32be(4) == 16909060 and
+    float32(8) == 1.5 and
+    float32be(12) == 2.5 and
+    float64(16) == 3.5 and
+    float64be(24) == 4.5
+}
+"#,
+    )
+    .expect("write rule");
+
+    let out = run_ok(&[
+        "yara",
+        "--rule",
+        rule_path.to_str().expect("rule"),
+        hit_path.to_str().expect("hit"),
+    ]);
+    assert!(out.contains("matched: yes"));
+    assert!(out.contains("match_rule: NumericReads"));
 }

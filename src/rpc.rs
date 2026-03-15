@@ -25,11 +25,12 @@ use crate::candidate::store::{
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
-    candidate_shard_index, candidate_shard_root, decode_grams_delta_u64, normalize_max_candidates,
+    candidate_shard_index, candidate_shard_root, decode_grams_delta_u64, metadata_field_is_boolean,
+    metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
     read_candidate_shard_count, write_candidate_shard_count,
 };
 use crate::perf::{record_counter, scope};
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
 pub const DEFAULT_RPC_HOST: &str = "127.0.0.1";
 pub const DEFAULT_RPC_PORT: u16 = 17653;
@@ -74,11 +75,11 @@ fn lock_candidate_store_with_timeout<'a>(
         match store_lock.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(_)) => {
-                return Err(TgsError::from("Candidate store lock poisoned."));
+                return Err(SspryError::from("Candidate store lock poisoned."));
             }
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
-                    return Err(TgsError::from(format!(
+                    return Err(SspryError::from(format!(
                         "candidate shard {shard_idx} busy during {operation}; retry later"
                     )));
                 }
@@ -188,6 +189,8 @@ pub struct CandidateDocumentWire {
     pub grams_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_diversity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
 }
@@ -254,6 +257,7 @@ type ParsedCandidateInsertDocument = (
     Vec<u64>,
     bool,
     Option<f64>,
+    Vec<u8>,
     Option<String>,
     bool,
 );
@@ -286,7 +290,7 @@ impl StoreSet {
             .map(|store| {
                 store
                     .into_inner()
-                    .map_err(|_| TgsError::from("Candidate store lock poisoned."))
+                    .map_err(|_| SspryError::from("Candidate store lock poisoned."))
             })
             .collect()
     }
@@ -295,7 +299,7 @@ impl StoreSet {
         let cache = self
             .stats_cache
             .lock()
-            .map_err(|_| TgsError::from("Store set stats cache lock poisoned."))?;
+            .map_err(|_| SspryError::from("Store set stats cache lock poisoned."))?;
         Ok(cache
             .as_ref()
             .map(|entry| (entry.stats.clone(), entry.deleted_storage_bytes)))
@@ -309,7 +313,7 @@ impl StoreSet {
         let mut cache = self
             .stats_cache
             .lock()
-            .map_err(|_| TgsError::from("Store set stats cache lock poisoned."))?;
+            .map_err(|_| SspryError::from("Store set stats cache lock poisoned."))?;
         *cache = Some(CachedStoreSetStats {
             stats,
             deleted_storage_bytes,
@@ -321,7 +325,7 @@ impl StoreSet {
         let mut cache = self
             .stats_cache
             .lock()
-            .map_err(|_| TgsError::from("Store set stats cache lock poisoned."))?;
+            .map_err(|_| SspryError::from("Store set stats cache lock poisoned."))?;
         *cache = None;
         Ok(())
     }
@@ -582,7 +586,9 @@ impl AdaptivePublishState {
     fn recent_publishes_in_window(&self, now_unix_ms: u64) -> u64 {
         self.recent_publish_completed_unix_ms
             .iter()
-            .filter(|completed| now_unix_ms.saturating_sub(**completed) <= ADAPTIVE_PUBLISH_RATE_WINDOW_MS)
+            .filter(|completed| {
+                now_unix_ms.saturating_sub(**completed) <= ADAPTIVE_PUBLISH_RATE_WINDOW_MS
+            })
             .count()
             .try_into()
             .unwrap_or(u64::MAX)
@@ -650,7 +656,8 @@ impl AdaptivePublishState {
         let backlog_drained = !backlog_present
             && (self.last_df_pending_shards > 0 || self.last_tier2_pending_shards > 0);
         let one_shard_set = self.candidate_shards.max(1);
-        let backlog_high = df_pending_shards >= one_shard_set || tier2_pending_shards >= one_shard_set;
+        let backlog_high =
+            df_pending_shards >= one_shard_set || tier2_pending_shards >= one_shard_set;
 
         let (target_idle_ms, mode, reason) = if publish_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_P95_MS
             || backlog_high
@@ -771,12 +778,12 @@ impl Drop for ActiveMutationGuard<'_> {
 }
 
 #[derive(Debug)]
-pub struct TgsdbClient {
+pub struct SspryClient {
     config: ClientConfig,
 }
 
 #[derive(Debug)]
-pub(crate) struct PersistentTgsdbClient {
+pub(crate) struct PersistentSspryClient {
     stream: ClientStream,
 }
 
@@ -791,7 +798,7 @@ impl ClientConfig {
     }
 }
 
-impl TgsdbClient {
+impl SspryClient {
     pub fn new(config: ClientConfig) -> Self {
         Self { config }
     }
@@ -838,14 +845,14 @@ impl TgsdbClient {
                 Ok(left)
             }
             Err(err) if documents.len() == 1 && is_payload_too_large_error(&err) => Err(
-                TgsError::from("Single document insert request is too large to send."),
+                SspryError::from("Single document insert request is too large to send."),
             ),
             Err(err) => Err(err),
         }
     }
 
-    pub(crate) fn connect_persistent(&self) -> Result<PersistentTgsdbClient> {
-        Ok(PersistentTgsdbClient {
+    pub(crate) fn connect_persistent(&self) -> Result<PersistentSspryClient> {
+        Ok(PersistentSspryClient {
             stream: self.connect()?,
         })
     }
@@ -981,7 +988,7 @@ impl TgsdbClient {
         value
             .as_object()
             .cloned()
-            .ok_or_else(|| TgsError::from("Server returned invalid JSON object."))
+            .ok_or_else(|| SspryError::from("Server returned invalid JSON object."))
     }
 
     fn request_typed_bytes<T>(&self, action: u8, payload: &[u8]) -> Result<T>
@@ -989,7 +996,7 @@ impl TgsdbClient {
         T: DeserializeOwned,
     {
         let bytes = self.request_bytes(action, payload)?;
-        serde_json::from_slice(&bytes).map_err(TgsError::from)
+        serde_json::from_slice(&bytes).map_err(SspryError::from)
     }
 
     fn request_bytes(&self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
@@ -997,7 +1004,7 @@ impl TgsdbClient {
         write_frame(&mut stream, PROTOCOL_VERSION, action, payload)?;
         let (version, status, response_payload) = read_frame(&mut stream)?;
         if version != PROTOCOL_VERSION {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Unsupported protocol version from server: {version}"
             )));
         }
@@ -1009,7 +1016,7 @@ impl TgsdbClient {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("Server returned an error.");
-        Err(TgsError::from(message.to_owned()))
+        Err(SspryError::from(message.to_owned()))
     }
 
     fn connect(&self) -> Result<ClientStream> {
@@ -1024,7 +1031,7 @@ impl TgsdbClient {
             #[cfg(not(unix))]
             {
                 let _ = path;
-                return Err(TgsError::from(
+                return Err(SspryError::from(
                     "Unix sockets are not supported on this platform.",
                 ));
             }
@@ -1033,7 +1040,7 @@ impl TgsdbClient {
         let stream = TcpStream::connect_timeout(
             &format!("{}:{}", self.config.host, self.config.port)
                 .parse()
-                .map_err(|_| TgsError::from("Invalid TCP address."))?,
+                .map_err(|_| SspryError::from("Invalid TCP address."))?,
             self.config.timeout,
         )?;
         stream.set_nodelay(true)?;
@@ -1043,7 +1050,7 @@ impl TgsdbClient {
     }
 }
 
-impl PersistentTgsdbClient {
+impl PersistentSspryClient {
     pub(crate) fn begin_index_session(&mut self) -> Result<String> {
         let response: CandidateIndexSessionResponse =
             self.request_typed_json(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
@@ -1094,9 +1101,9 @@ impl PersistentTgsdbClient {
                 left.results.extend(right.results);
                 Ok(left)
             }
-            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => Err(TgsError::from(
-                "Single document insert request is too large to send.",
-            )),
+            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => Err(
+                SspryError::from("Single document insert request is too large to send."),
+            ),
             Err(err) => Err(err),
         }
     }
@@ -1115,14 +1122,14 @@ impl PersistentTgsdbClient {
         T: DeserializeOwned,
     {
         let bytes = self.request_bytes(action, payload)?;
-        serde_json::from_slice(&bytes).map_err(TgsError::from)
+        serde_json::from_slice(&bytes).map_err(SspryError::from)
     }
 
     fn request_bytes(&mut self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
         write_frame(&mut self.stream, PROTOCOL_VERSION, action, payload)?;
         let (version, status, response_payload) = read_frame(&mut self.stream)?;
         if version != PROTOCOL_VERSION {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Unsupported protocol version from server: {version}"
             )));
         }
@@ -1134,11 +1141,11 @@ impl PersistentTgsdbClient {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("Server returned an error.");
-        Err(TgsError::from(message.to_owned()))
+        Err(SspryError::from(message.to_owned()))
     }
 }
 
-fn is_payload_too_large_error(err: &TgsError) -> bool {
+fn is_payload_too_large_error(err: &SspryError) -> bool {
     let text = err.to_string();
     text.contains("Request payload is too large") || text.contains("Payload is too large")
 }
@@ -1187,25 +1194,25 @@ pub fn serve_with_signal_flags(
                 fs::create_dir_all(parent)?;
             }
             let listener = UnixListener::bind(path)?;
-            println!("yaya server listening on unix://{}", path.display());
+            println!("sspry server listening on unix://{}", path.display());
             accept_unix(listener, state.clone(), max_request_bytes)
         }
         #[cfg(not(unix))]
         {
             let _ = (path, state, max_request_bytes);
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "Unix sockets are not supported on this platform.",
             ));
         }
     } else {
         let listener = TcpListener::bind((host, port))?;
         let local = listener.local_addr()?;
-        println!("yaya server listening on {}:{}", local.ip(), local.port());
+        println!("sspry server listening on {}:{}", local.ip(), local.port());
         accept_tcp(listener, state.clone(), max_request_bytes)
     };
 
     if state.is_shutting_down() {
-        eprintln!("yaya: shutdown requested, draining");
+        eprintln!("sspry: shutdown requested, draining");
         if let Ok(stats) = state.current_stats_json() {
             if let Ok(text) = serde_json::to_string_pretty(&stats) {
                 eprintln!("{text}");
@@ -1224,15 +1231,15 @@ pub fn serve_with_signal_flags(
     while state.active_connections.load(Ordering::Acquire) > 0 {
         let active_connections = state.active_connections.load(Ordering::Acquire);
         if active_connections != last_reported_connections {
-            eprintln!("yaya: waiting for {active_connections} active connection(s) to drain");
+            eprintln!("sspry: waiting for {active_connections} active connection(s) to drain");
             last_reported_connections = active_connections;
         }
         thread::sleep(Duration::from_millis(25));
     }
     if let Err(err) = state.flush_store_meta_if_dirty() {
-        eprintln!("yaya: failed to flush dirty store metadata during shutdown: {err}");
+        eprintln!("sspry: failed to flush dirty store metadata during shutdown: {err}");
     }
-    eprintln!("yaya: shutdown complete");
+    eprintln!("sspry: shutdown complete");
     accept_result
 }
 
@@ -1723,7 +1730,7 @@ impl ServerState {
         let mode = self
             .store_mode
             .lock()
-            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
             StoreMode::Direct { stores } => stores.clone(),
             StoreMode::Workspace { published, .. } => published.clone(),
@@ -1734,7 +1741,7 @@ impl ServerState {
         let mode = self
             .store_mode
             .lock()
-            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
             StoreMode::Direct { stores } => stores.clone(),
             StoreMode::Workspace { work, .. } => work.clone(),
@@ -1745,7 +1752,7 @@ impl ServerState {
         let mode = self
             .store_mode
             .lock()
-            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         match &*mode {
             StoreMode::Direct { stores } => {
                 for (shard_idx, store_lock) in stores.stores.iter().enumerate() {
@@ -1782,7 +1789,7 @@ impl ServerState {
         let mode = self
             .store_mode
             .lock()
-            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
             StoreMode::Direct { .. } => None,
             StoreMode::Workspace {
@@ -1795,7 +1802,7 @@ impl ServerState {
         let mode = self
             .store_mode
             .lock()
-            .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(matches!(*mode, StoreMode::Direct { .. }))
     }
 
@@ -1803,7 +1810,7 @@ impl ServerState {
         self.active_mutations.fetch_add(1, Ordering::AcqRel);
         if self.mutations_paused.load(Ordering::Acquire) {
             self.active_mutations.fetch_sub(1, Ordering::AcqRel);
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "server is publishing; {operation} temporarily disabled; retry later"
             )));
         }
@@ -1834,7 +1841,7 @@ impl ServerState {
         let mut pending = self
             .pending_published_df_snapshot_shards
             .lock()
-            .map_err(|_| TgsError::from("Published DF snapshot queue lock poisoned."))?;
+            .map_err(|_| SspryError::from("Published DF snapshot queue lock poisoned."))?;
         for shard_idx in shard_indexes {
             pending.insert(shard_idx);
         }
@@ -1845,7 +1852,7 @@ impl ServerState {
         let pending = self
             .pending_published_df_snapshot_shards
             .lock()
-            .map_err(|_| TgsError::from("Published DF snapshot queue lock poisoned."))?;
+            .map_err(|_| SspryError::from("Published DF snapshot queue lock poisoned."))?;
         Ok(pending.len())
     }
 
@@ -1856,7 +1863,7 @@ impl ServerState {
         let mut pending = self
             .pending_published_tier2_snapshot_shards
             .lock()
-            .map_err(|_| TgsError::from("Published Tier2 snapshot queue lock poisoned."))?;
+            .map_err(|_| SspryError::from("Published Tier2 snapshot queue lock poisoned."))?;
         for shard_idx in shard_indexes {
             pending.insert(shard_idx);
         }
@@ -1867,7 +1874,7 @@ impl ServerState {
         let pending = self
             .pending_published_tier2_snapshot_shards
             .lock()
-            .map_err(|_| TgsError::from("Published Tier2 snapshot queue lock poisoned."))?;
+            .map_err(|_| SspryError::from("Published Tier2 snapshot queue lock poisoned."))?;
         Ok(pending.len())
     }
 
@@ -1877,7 +1884,7 @@ impl ServerState {
         let adaptive = self
             .adaptive_publish
             .lock()
-            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+            .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
         Ok(adaptive.snapshot(now_unix_ms, df_pending_shards, tier2_pending_shards))
     }
 
@@ -1910,7 +1917,7 @@ impl ServerState {
         let mut adaptive = self
             .adaptive_publish
             .lock()
-            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+            .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
         adaptive.update_completed_index_session(submit_ms, store_ms);
         Ok(())
     }
@@ -1922,7 +1929,7 @@ impl ServerState {
         let mut adaptive = self
             .adaptive_publish
             .lock()
-            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+            .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
         adaptive.update_completed_publish(
             now_unix_ms,
             visible_publish_ms,
@@ -1938,7 +1945,7 @@ impl ServerState {
         let mut adaptive = self
             .adaptive_publish
             .lock()
-            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+            .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
         adaptive.update_seal_backlog(now_unix_ms, df_pending_shards, tier2_pending_shards);
         Ok(())
     }
@@ -1951,7 +1958,7 @@ impl ServerState {
             let mut pending = self
                 .pending_published_df_snapshot_shards
                 .lock()
-                .map_err(|_| TgsError::from("Published DF snapshot queue lock poisoned."))?;
+                .map_err(|_| SspryError::from("Published DF snapshot queue lock poisoned."))?;
             let Some(shard_idx) = pending.iter().next().copied() else {
                 return Ok(());
             };
@@ -1977,7 +1984,7 @@ impl ServerState {
                     Ok((0, 0))
                 }
                 Err(TryLockError::Poisoned(_)) => {
-                    Err(TgsError::from("Candidate store lock poisoned."))
+                    Err(SspryError::from("Candidate store lock poisoned."))
                 }
             }
         })();
@@ -2020,7 +2027,7 @@ impl ServerState {
             let mut pending = self
                 .pending_published_tier2_snapshot_shards
                 .lock()
-                .map_err(|_| TgsError::from("Published Tier2 snapshot queue lock poisoned."))?;
+                .map_err(|_| SspryError::from("Published Tier2 snapshot queue lock poisoned."))?;
             let Some(shard_idx) = pending.iter().next().copied() else {
                 return Ok(());
             };
@@ -2046,7 +2053,7 @@ impl ServerState {
                     Ok((0, 0))
                 }
                 Err(TryLockError::Poisoned(_)) => {
-                    Err(TgsError::from("Candidate store lock poisoned."))
+                    Err(SspryError::from("Candidate store lock poisoned."))
                 }
             }
         })();
@@ -2082,7 +2089,7 @@ impl ServerState {
         if self.publish_in_progress.load(Ordering::Acquire)
             || self.mutations_paused.load(Ordering::Acquire)
         {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "server is publishing; index session unavailable; retry later",
             ));
         }
@@ -2168,7 +2175,7 @@ impl ServerState {
                     message: "index session started".to_owned(),
                 })
             }
-            Err(_) => Err(TgsError::from(
+            Err(_) => Err(SspryError::from(
                 "another index session is already active; retry later",
             )),
         }
@@ -2179,7 +2186,7 @@ impl ServerState {
         request: &CandidateIndexSessionProgressRequest,
     ) -> Result<CandidateIndexSessionResponse> {
         if self.active_index_sessions.load(Ordering::Acquire) == 0 {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "no active index session; cannot update progress",
             ));
         }
@@ -2467,7 +2474,7 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let published = self.published_store_set()?;
         let (mut stats, deleted_storage_bytes, published_stats_profile) =
             self.candidate_stats_json_for_store_set_profiled(&published, "stats")?;
@@ -2765,7 +2772,10 @@ impl ServerState {
                 "idle_remaining_ms".to_owned(),
                 json!(readiness.idle_remaining_ms),
             );
-            publish.insert("adaptive_idle_ms".to_owned(), json!(readiness.idle_threshold_ms));
+            publish.insert(
+                "adaptive_idle_ms".to_owned(),
+                json!(readiness.idle_threshold_ms),
+            );
             publish.insert(
                 "adaptive_mode".to_owned(),
                 Value::String(adaptive.mode.to_owned()),
@@ -3378,7 +3388,7 @@ impl ServerState {
         let work = self.work_store_set()?;
         let mut store = work.stores[shard_idx]
             .lock()
-            .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         let removed = store.garbage_collect_retired_generations()?;
         if removed > 0 {
             let _ = self.invalidate_work_stats_cache();
@@ -3415,7 +3425,7 @@ impl ServerState {
         let work = self.work_store_set()?;
         let store = work.stores[shard_idx]
             .lock()
-            .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         store.prepare_compaction_snapshot(false)
     }
 
@@ -3428,7 +3438,7 @@ impl ServerState {
         let work = self.work_store_set()?;
         let mut store = work.stores[shard_idx]
             .lock()
-            .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         store.apply_compaction_snapshot(snapshot, compacted_root)
     }
 
@@ -3436,7 +3446,7 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let Some((shard_idx, snapshot)) = self.find_compaction_candidate()? else {
             return Ok(());
         };
@@ -3445,7 +3455,7 @@ impl ServerState {
             let mut runtime = self
                 .compaction_runtime
                 .lock()
-                .map_err(|_| TgsError::from("Compaction runtime lock poisoned."))?;
+                .map_err(|_| SspryError::from("Compaction runtime lock poisoned."))?;
             runtime.running_shard = Some(shard_idx);
             runtime.last_error = None;
         }
@@ -3467,7 +3477,7 @@ impl ServerState {
                 let mut runtime = self
                     .compaction_runtime
                     .lock()
-                    .map_err(|_| TgsError::from("Compaction runtime lock poisoned."))?;
+                    .map_err(|_| SspryError::from("Compaction runtime lock poisoned."))?;
                 runtime.running_shard = None;
                 runtime.runs_total = runtime.runs_total.saturating_add(1);
                 runtime.last_reclaimed_docs = result.reclaimed_docs;
@@ -3480,7 +3490,7 @@ impl ServerState {
                 let mut runtime = self
                     .compaction_runtime
                     .lock()
-                    .map_err(|_| TgsError::from("Compaction runtime lock poisoned."))?;
+                    .map_err(|_| SspryError::from("Compaction runtime lock poisoned."))?;
                 runtime.running_shard = None;
                 runtime.mutation_retries_total = runtime.mutation_retries_total.saturating_add(1);
             }
@@ -3505,15 +3515,15 @@ impl ServerState {
     }
 
     fn query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
-        serde_json::to_string(&compiled_query_plan_to_wire(plan)).map_err(TgsError::from)
+        serde_json::to_string(&compiled_query_plan_to_wire(plan)).map_err(SspryError::from)
     }
 
     fn normalized_plan_from_wire(&self, value: &Value) -> Result<Arc<CompiledQueryPlan>> {
-        let key = serde_json::to_string(value).map_err(TgsError::from)?;
+        let key = serde_json::to_string(value).map_err(SspryError::from)?;
         if let Some(entry) = self
             .normalized_plan_cache
             .lock()
-            .map_err(|_| TgsError::from("Normalized plan cache lock poisoned."))?
+            .map_err(|_| SspryError::from("Normalized plan cache lock poisoned."))?
             .get(&key)
         {
             record_counter("rpc.handle_candidate_query_plan_cache_hits_total", 1);
@@ -3524,7 +3534,7 @@ impl ServerState {
         let mut cache = self
             .normalized_plan_cache
             .lock()
-            .map_err(|_| TgsError::from("Normalized plan cache lock poisoned."))?;
+            .map_err(|_| SspryError::from("Normalized plan cache lock poisoned."))?;
         cache.insert(key, entry.clone());
         Ok(entry)
     }
@@ -3537,7 +3547,7 @@ impl ServerState {
         if let Some(entry) = self
             .prepared_plan_cache
             .lock()
-            .map_err(|_| TgsError::from("Prepared plan cache lock poisoned."))?
+            .map_err(|_| SspryError::from("Prepared plan cache lock poisoned."))?
             .get(&key)
         {
             record_counter("rpc.handle_candidate_query_prepared_cache_hits_total", 1);
@@ -3545,27 +3555,27 @@ impl ServerState {
         }
         record_counter("rpc.handle_candidate_query_prepared_cache_misses_total", 1);
         let mut filter_keys = HashSet::<(usize, usize)>::new();
-        let mut secondary_filter_keys = HashSet::<(usize, usize)>::new();
+        let mut tier2_doc_filter_keys = HashSet::<(usize, usize)>::new();
         let published = self.published_store_set()?;
         for (shard_idx, store_lock) in published.stores.iter().enumerate() {
             let store = lock_candidate_store_with_timeout(store_lock, shard_idx, "query prepare")?;
-            filter_keys.extend(store.tier2_filter_keys());
-            secondary_filter_keys.extend(store.secondary_filter_keys());
+            filter_keys.extend(store.tier1_superblock_filter_keys());
+            tier2_doc_filter_keys.extend(store.tier2_doc_filter_keys());
         }
         let mut ordered_filter_keys = filter_keys.into_iter().collect::<Vec<_>>();
         ordered_filter_keys.sort_unstable();
-        let mut ordered_secondary_filter_keys =
-            secondary_filter_keys.into_iter().collect::<Vec<_>>();
-        ordered_secondary_filter_keys.sort_unstable();
+        let mut ordered_tier2_doc_filter_keys =
+            tier2_doc_filter_keys.into_iter().collect::<Vec<_>>();
+        ordered_tier2_doc_filter_keys.sort_unstable();
         let entry = build_prepared_query_artifacts(
             plan,
             &ordered_filter_keys,
-            &ordered_secondary_filter_keys,
+            &ordered_tier2_doc_filter_keys,
         )?;
         let mut cache = self
             .prepared_plan_cache
             .lock()
-            .map_err(|_| TgsError::from("Prepared plan cache lock poisoned."))?;
+            .map_err(|_| SspryError::from("Prepared plan cache lock poisoned."))?;
         cache.insert(key, entry.clone());
         Ok(entry)
     }
@@ -3674,10 +3684,10 @@ impl ServerState {
             for handle in handles {
                 let partial = handle
                     .join()
-                    .map_err(|_| TgsError::from("Candidate query worker panicked."))??;
+                    .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
                 merged.push(partial);
             }
-            Ok::<Vec<(Vec<(String, u32)>, Vec<String>)>, TgsError>(merged)
+            Ok::<Vec<(Vec<(String, u32)>, Vec<String>)>, SspryError>(merged)
         })?;
 
         let mut hits = Vec::<(String, u32)>::new();
@@ -3710,7 +3720,7 @@ impl ServerState {
                     | ACTION_PUBLISH
             )
         {
-            return Err(TgsError::from(
+            return Err(SspryError::from(
                 "server is shutting down; mutating requests are disabled",
             ));
         }
@@ -3758,7 +3768,9 @@ impl ServerState {
                 json_bytes(&json!({ "message": "shutdown requested" }))
             }
             ACTION_PUBLISH => json_bytes(&self.handle_publish()?),
-            _ => Err(TgsError::from(format!("Unsupported action code: {action}"))),
+            _ => Err(SspryError::from(format!(
+                "Unsupported action code: {action}"
+            ))),
         }
     }
 
@@ -3771,7 +3783,7 @@ impl ServerState {
         let bloom_filter = base64::engine::general_purpose::STANDARD
             .decode(document.bloom_filter_b64.as_bytes())
             .map_err(|_| {
-                TgsError::from(format!(
+                SspryError::from(format!(
                     "{field_prefix}.bloom_filter_b64 must be valid base64."
                 ))
             })?;
@@ -3779,7 +3791,7 @@ impl ServerState {
             base64::engine::general_purpose::STANDARD
                 .decode(payload.as_bytes())
                 .map_err(|_| {
-                    TgsError::from(format!(
+                    SspryError::from(format!(
                         "{field_prefix}.tier2_bloom_filter_b64 must be valid base64."
                     ))
                 })?
@@ -3790,13 +3802,13 @@ impl ServerState {
             let packed = base64::engine::general_purpose::STANDARD
                 .decode(payload.as_bytes())
                 .map_err(|_| {
-                    TgsError::from(format!(
+                    SspryError::from(format!(
                         "{field_prefix}.grams_delta_b64 must be valid base64."
                     ))
                 })?;
             (
                 decode_grams_delta_u64(&packed).map_err(|err| {
-                    TgsError::from(format!("{field_prefix}.grams_delta_b64 is invalid: {err}"))
+                    SspryError::from(format!("{field_prefix}.grams_delta_b64 is invalid: {err}"))
                 })?,
                 true,
             )
@@ -3807,7 +3819,7 @@ impl ServerState {
             .gram_count_estimate
             .map(|value| {
                 if value < 0 {
-                    Err(TgsError::from(format!(
+                    Err(SspryError::from(format!(
                         "{field_prefix}.gram_count_estimate must be >= 0."
                     )))
                 } else {
@@ -3827,11 +3839,20 @@ impl ServerState {
             dedup
         };
         let bloom_hashes = document.bloom_hashes.filter(|value| *value > 0);
+        let metadata = if let Some(payload) = &document.metadata_b64 {
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.as_bytes())
+                .map_err(|_| {
+                    SspryError::from(format!("{field_prefix}.metadata_b64 must be valid base64."))
+                })?
+        } else {
+            Vec::new()
+        };
         let tier2_gram_count_estimate = document
             .tier2_gram_count_estimate
             .map(|value| {
                 if value < 0 {
-                    Err(TgsError::from(format!(
+                    Err(SspryError::from(format!(
                         "{field_prefix}.tier2_gram_count_estimate must be >= 0."
                     )))
                 } else {
@@ -3854,6 +3875,7 @@ impl ServerState {
             document
                 .effective_diversity
                 .map(|value| value.clamp(0.0, 1.0)),
+            metadata,
             document.external_id.clone(),
             true,
         ))
@@ -3881,13 +3903,13 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let parsed = self.parse_candidate_insert_document(document, "request.payload")?;
         let shard_idx = self.candidate_store_index_for_sha256(&parsed.0);
         let work = self.work_store_set()?;
         let mut store =
             lock_candidate_store_with_timeout(&work.stores[shard_idx], shard_idx, "insert")?;
-        let result = store.insert_document(
+        let result = store.insert_document_with_metadata(
             parsed.0,
             parsed.1,
             parsed.2,
@@ -3901,8 +3923,9 @@ impl ServerState {
             &parsed.8,
             parsed.9,
             parsed.10,
-            parsed.11,
+            parsed.11.as_slice(),
             parsed.12,
+            parsed.13,
         )?;
         drop(store);
         self.mark_work_mutation();
@@ -3922,7 +3945,7 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let started_total = Instant::now();
         let started_parse = Instant::now();
         let mut parsed_documents = Vec::with_capacity(documents.len());
@@ -3963,7 +3986,8 @@ impl ServerState {
                         row.9,
                         row.10,
                         row.11.clone(),
-                        row.12,
+                        row.12.clone(),
+                        row.13,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4078,7 +4102,8 @@ impl ServerState {
                             row.9,
                             row.10,
                             row.11.clone(),
-                            row.12,
+                            row.12.clone(),
+                            row.13,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -4193,7 +4218,7 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let decoded = decode_sha256(sha256)?;
         let shard_idx = self.candidate_store_index_for_sha256(&decoded);
         let published = self.published_store_set()?;
@@ -4248,7 +4273,7 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let chunk_size = request
             .chunk_size
             .unwrap_or(DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE)
@@ -4258,7 +4283,7 @@ impl ServerState {
             let mut cache = self
                 .query_cache
                 .lock()
-                .map_err(|_| TgsError::from("Query cache lock poisoned."))?;
+                .map_err(|_| SspryError::from("Query cache lock poisoned."))?;
             cache.get(&cache_key)
         };
         let cached = if let Some(entry) = cached {
@@ -4270,7 +4295,7 @@ impl ServerState {
             let mut cache = self
                 .query_cache
                 .lock()
-                .map_err(|_| TgsError::from("Query cache lock poisoned."))?;
+                .map_err(|_| SspryError::from("Query cache lock poisoned."))?;
             cache.insert(cache_key, entry.clone());
             entry
         };
@@ -4337,13 +4362,13 @@ impl ServerState {
         let _op = self
             .operation_gate
             .read()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let key = Self::normalized_df_cache_key(grams);
         let cached = {
             let mut cache = self
                 .df_cache
                 .lock()
-                .map_err(|_| TgsError::from("DF cache lock poisoned."))?;
+                .map_err(|_| SspryError::from("DF cache lock poisoned."))?;
             cache.get(&key)
         };
         let counts = if let Some(entry) = cached {
@@ -4370,7 +4395,7 @@ impl ServerState {
             let mut cache = self
                 .df_cache
                 .lock()
-                .map_err(|_| TgsError::from("DF cache lock poisoned."))?;
+                .map_err(|_| SspryError::from("DF cache lock poisoned."))?;
             cache.insert(key.clone(), entry.clone());
             entry
         };
@@ -4418,15 +4443,15 @@ impl ServerState {
         let _op = self
             .operation_gate
             .write()
-            .map_err(|_| TgsError::from("Server operation gate lock poisoned."))?;
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let result = (|| -> Result<CandidatePublishResponse> {
             let mut store_mode = self
                 .store_mode
                 .lock()
-                .map_err(|_| TgsError::from("Server store mode lock poisoned."))?;
+                .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
             let workspace_root = match &*store_mode {
                 StoreMode::Direct { .. } => {
-                    return Err(TgsError::from(
+                    return Err(SspryError::from(
                         "publish is only available for workspace stores",
                     ));
                 }
@@ -4555,7 +4580,7 @@ impl ServerState {
                 for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
                     let store = store_lock
                         .lock()
-                        .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                        .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
                     if store.stats().doc_count > 0 {
                         changed_shards[shard_idx] = true;
                     }
@@ -4565,7 +4590,7 @@ impl ServerState {
                 self.last_publish_swap_ms.store(0, Ordering::SeqCst);
                 let promote_started = Instant::now();
                 let work_store_set = Arc::try_unwrap(prior_work).map_err(|_| {
-                    TgsError::from("work stores are still busy during publish; retry later")
+                    SspryError::from("work stores are still busy during publish; retry later")
                 })?;
                 let work_stores = work_store_set.into_stores()?;
                 let mut export_ms_total = 0u128;
@@ -4587,7 +4612,7 @@ impl ServerState {
                     let import_started = Instant::now();
                     let mut published_store = published_store_set.stores[shard_idx]
                         .lock()
-                        .map_err(|_| TgsError::from("Candidate store lock poisoned."))?;
+                        .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
                     let all_known_new = imported.iter().all(|document| {
                         !published_store.contains_live_document_sha256(&document.sha256)
                     });
@@ -4809,7 +4834,7 @@ fn accept_unix(
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(err) => return Err(TgsError::from(err.to_string())),
+            Err(err) => return Err(SspryError::from(err.to_string())),
         }
     }
 }
@@ -4837,7 +4862,7 @@ fn accept_tcp(
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(err) => return Err(TgsError::from(err.to_string())),
+            Err(err) => return Err(SspryError::from(err.to_string())),
         }
     }
 }
@@ -4896,7 +4921,8 @@ fn write_frame<W: Write>(
     status_or_action: u8,
     payload: &[u8],
 ) -> Result<()> {
-    let len = u32::try_from(payload.len()).map_err(|_| TgsError::from("Payload is too large."))?;
+    let len =
+        u32::try_from(payload.len()).map_err(|_| SspryError::from("Payload is too large."))?;
     let mut header = [0u8; HEADER_LEN];
     header[0] = version;
     header[1] = status_or_action;
@@ -4910,7 +4936,7 @@ fn write_frame<W: Write>(
 }
 
 fn write_error_frame<W: Write>(writer: &mut W, message: &str) -> Result<()> {
-    let payload = json!({ "type": "TgsError", "message": message });
+    let payload = json!({ "type": "Error", "message": message });
     write_frame(
         writer,
         PROTOCOL_VERSION,
@@ -4959,7 +4985,7 @@ fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
     while offset < buf.len() {
         let n = reader.read(&mut buf[offset..])?;
         if n == 0 {
-            return Err(TgsError::from("Connection closed while reading frame."));
+            return Err(SspryError::from("Connection closed while reading frame."));
         }
         offset += n;
     }
@@ -4967,7 +4993,7 @@ fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
 }
 
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(TgsError::from)
+    serde_json::to_vec(value).map_err(SspryError::from)
 }
 
 pub(crate) fn serialized_candidate_insert_batch_payload(rows: &[Vec<u8>]) -> Vec<u8> {
@@ -4989,9 +5015,9 @@ pub(crate) fn serialized_candidate_insert_batch_payload(rows: &[Vec<u8>]) -> Vec
 
 fn json_from_bytes<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
     if payload.is_empty() {
-        return serde_json::from_slice(b"{}").map_err(TgsError::from);
+        return serde_json::from_slice(b"{}").map_err(SspryError::from);
     }
-    serde_json::from_slice(payload).map_err(TgsError::from)
+    serde_json::from_slice(payload).map_err(SspryError::from)
 }
 
 fn compiled_query_plan_to_wire(plan: &CompiledQueryPlan) -> Value {
@@ -5017,30 +5043,30 @@ fn compiled_query_plan_to_wire(plan: &CompiledQueryPlan) -> Value {
 
 fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
     if !value.is_object() {
-        return Err(TgsError::from("query plan payload must be an object"));
+        return Err(SspryError::from("query plan payload must be an object"));
     }
     if value.get("ast").is_none() {
-        return serde_json::from_value(value.clone()).map_err(TgsError::from);
+        return serde_json::from_value(value.clone()).map_err(SspryError::from);
     }
 
     let patterns_raw = value
         .get("patterns")
         .and_then(Value::as_array)
-        .ok_or_else(|| TgsError::from("query plan must contain a patterns list"))?;
+        .ok_or_else(|| SspryError::from("query plan must contain a patterns list"))?;
     let mut patterns = Vec::with_capacity(patterns_raw.len());
     for item in patterns_raw {
         let object = item
             .as_object()
-            .ok_or_else(|| TgsError::from("query plan patterns entries must be objects"))?;
+            .ok_or_else(|| SspryError::from("query plan patterns entries must be objects"))?;
         let pattern_id = object
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| TgsError::from("invalid pattern id"))?
+            .ok_or_else(|| SspryError::from("invalid pattern id"))?
             .to_owned();
         let alternatives_raw = object
             .get("alternatives")
             .and_then(Value::as_array)
-            .ok_or_else(|| TgsError::from("pattern alternatives must be a list"))?;
+            .ok_or_else(|| SspryError::from("pattern alternatives must be a list"))?;
         let tier2_alternatives_raw = object
             .get("tier2_alternatives")
             .and_then(Value::as_array)
@@ -5052,12 +5078,12 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         for alt in alternatives_raw {
             let grams = alt
                 .as_array()
-                .ok_or_else(|| TgsError::from("pattern alternatives entries must be lists"))?
+                .ok_or_else(|| SspryError::from("pattern alternatives entries must be lists"))?
                 .iter()
                 .map(|value| {
                     value
                         .as_u64()
-                        .ok_or_else(|| TgsError::from("pattern contains out-of-range gram"))
+                        .ok_or_else(|| SspryError::from("pattern contains out-of-range gram"))
                 })
                 .collect::<Result<Vec<_>>>()?;
             alternatives.push(grams);
@@ -5065,12 +5091,14 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         for alt in tier2_alternatives_raw.into_iter().take(alt_count) {
             let grams = alt
                 .as_array()
-                .ok_or_else(|| TgsError::from("pattern tier2_alternatives entries must be lists"))?
+                .ok_or_else(|| {
+                    SspryError::from("pattern tier2_alternatives entries must be lists")
+                })?
                 .iter()
                 .map(|value| {
-                    value.as_u64().ok_or_else(|| {
-                        TgsError::from("pattern contains out-of-range secondary gram")
-                    })
+                    value
+                        .as_u64()
+                        .ok_or_else(|| SspryError::from("pattern contains out-of-range tier2 gram"))
                 })
                 .collect::<Result<Vec<_>>>()?;
             tier2_alternatives.push(grams);
@@ -5090,7 +5118,7 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
     let root = query_node_from_wire(
         value
             .get("ast")
-            .ok_or_else(|| TgsError::from("query plan missing ast"))?,
+            .ok_or_else(|| SspryError::from("query plan missing ast"))?,
     )?;
     let flags = value
         .get("flags")
@@ -5146,11 +5174,11 @@ fn query_node_to_wire(node: &QueryNode) -> Value {
 fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
     let object = value
         .as_object()
-        .ok_or_else(|| TgsError::from("query ast node must be an object"))?;
+        .ok_or_else(|| SspryError::from("query ast node must be an object"))?;
     let kind = object
         .get("kind")
         .and_then(Value::as_str)
-        .ok_or_else(|| TgsError::from("query ast node missing kind"))?
+        .ok_or_else(|| SspryError::from("query ast node missing kind"))?
         .to_owned();
     let pattern_id = object
         .get("pattern_id")
@@ -5175,30 +5203,112 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
     match kind.as_str() {
         "pattern" => {
             if pattern_id.is_none() {
-                return Err(TgsError::from("pattern node requires a pattern_id"));
+                return Err(SspryError::from("pattern node requires a pattern_id"));
             }
         }
         "and" | "or" => {
             if children.is_empty() {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "{kind} node requires at least one child"
                 )));
             }
         }
         "n_of" => {
             if threshold.unwrap_or(0) == 0 {
-                return Err(TgsError::from("n_of threshold must be > 0"));
+                return Err(SspryError::from("n_of threshold must be > 0"));
             }
             if children.is_empty() {
-                return Err(TgsError::from("n_of node requires children"));
+                return Err(SspryError::from("n_of node requires children"));
+            }
+        }
+        "filesize_eq" => {
+            if pattern_id.as_deref() != Some("filesize") {
+                return Err(SspryError::from(
+                    "filesize_eq node requires pattern_id=filesize",
+                ));
+            }
+            if threshold.is_none() {
+                return Err(SspryError::from("filesize_eq node requires a threshold"));
+            }
+            if !children.is_empty() {
+                return Err(SspryError::from("filesize_eq node must not have children"));
+            }
+        }
+        "metadata_eq" => {
+            let field = pattern_id
+                .as_deref()
+                .ok_or_else(|| SspryError::from("metadata_eq node requires a pattern_id"))?;
+            let normalized = normalize_query_metadata_field(field).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata_eq field: {field}"))
+            })?;
+            if threshold.is_none() {
+                return Err(SspryError::from("metadata_eq node requires a threshold"));
+            }
+            if !children.is_empty() {
+                return Err(SspryError::from("metadata_eq node must not have children"));
+            }
+            if normalized == "time.now" {
+                return Err(SspryError::from(
+                    "time.now must use a time_now_eq node, not metadata_eq",
+                ));
+            }
+            let expected = threshold.expect("threshold");
+            if metadata_field_is_boolean(normalized) && expected > 1 {
+                return Err(SspryError::from(
+                    "metadata_eq boolean fields require threshold 0 or 1",
+                ));
+            }
+            if !metadata_field_is_boolean(normalized) && !metadata_field_is_integer(normalized) {
+                return Err(SspryError::from(format!(
+                    "Unsupported metadata_eq field: {field}"
+                )));
+            }
+        }
+        "time_now_eq" => {
+            if pattern_id.as_deref() != Some("time.now") {
+                return Err(SspryError::from(
+                    "time_now_eq node requires pattern_id=time.now",
+                ));
+            }
+            if threshold.is_none() {
+                return Err(SspryError::from("time_now_eq node requires a threshold"));
+            }
+            if !children.is_empty() {
+                return Err(SspryError::from("time_now_eq node must not have children"));
+            }
+        }
+        "verifier_only_eq" => {
+            if pattern_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(SspryError::from(
+                    "verifier_only_eq node requires a non-empty pattern_id",
+                ));
+            }
+            if threshold.is_some() {
+                return Err(SspryError::from(
+                    "verifier_only_eq node must not use threshold",
+                ));
+            }
+            if !children.is_empty() {
+                return Err(SspryError::from(
+                    "verifier_only_eq node must not have children",
+                ));
             }
         }
         _ => {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Unsupported ast node kind: {kind:?}"
             )));
         }
     }
+
+    let pattern_id = match kind.as_str() {
+        "metadata_eq" => pattern_id
+            .as_deref()
+            .and_then(normalize_query_metadata_field)
+            .map(str::to_owned),
+        "time_now_eq" => Some("time.now".to_owned()),
+        _ => pattern_id,
+    };
 
     Ok(QueryNode {
         kind,
@@ -5330,7 +5440,7 @@ fn prune_workspace_retired_roots(root: &Path, keep: usize) -> Result<usize> {
                 removed = removed.saturating_add(1);
             }
             Err(err) => {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "Failed to remove retired workspace root {}: {err}",
                     path.display()
                 )));
@@ -5350,20 +5460,20 @@ fn ensure_candidate_stores_at_root(
     let sharded_meta = root.join("shard_000").join("meta.json");
     if let Some(existing) = read_candidate_shard_count(root)? {
         if existing != shard_count {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "{} contains a candidate shard manifest for {existing} shard(s); start with matching --candidate-shards.",
                 root.display()
             )));
         }
     } else {
         if shard_count > 1 && single_meta.exists() {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "{} contains a single-shard store; start with --candidate-shards 1 or re-init.",
                 root.display()
             )));
         }
         if shard_count == 1 && sharded_meta.exists() {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "{} contains a sharded store; start with matching --candidate-shards.",
                 root.display()
             )));
@@ -5422,7 +5532,7 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     }
 
     if root.join("meta.json").exists() || root.join("shard_000").join("meta.json").exists() {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "{} contains a direct store; move it under {}/current or use a fresh workspace root.",
             root.display(),
             root.display()
@@ -5464,7 +5574,7 @@ fn decode_sha256(value: &str) -> Result<[u8; 32]> {
 fn normalize_sha256_hex(value: &str) -> Result<String> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "sha256 must be exactly 64 hexadecimal characters.",
         ));
     }
@@ -5635,6 +5745,7 @@ mod tests {
                 grams: Vec::new(),
                 grams_complete: false,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             })
             .expect_err("insert should be rejected");
@@ -5753,6 +5864,7 @@ mod tests {
                 grams: features_a.unique_grams,
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             },
             CandidateDocumentWire {
@@ -5769,6 +5881,7 @@ mod tests {
                 grams: features_b.unique_grams,
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             },
         ];
@@ -5968,6 +6081,47 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_publish_backs_off_when_seal_backlog_starts_rising() {
+        let mut adaptive = AdaptivePublishState::new("solid-state".to_owned(), 0, 4);
+        adaptive.update_seal_backlog(1_000, 1, 0);
+
+        let snapshot = adaptive.snapshot(1_000, 1, 0);
+        assert_eq!(snapshot.mode, "backoff");
+        assert_eq!(snapshot.reason, "seal_backlog_rising");
+        assert_eq!(snapshot.current_idle_ms, 2_000);
+        assert_eq!(snapshot.df_pending_shards, 1);
+    }
+
+    #[test]
+    fn adaptive_publish_drops_back_to_fast_when_backlog_drains() {
+        let mut adaptive = AdaptivePublishState::new("solid-state".to_owned(), 2_000, 4);
+        adaptive.update_seal_backlog(1_000, 1, 0);
+        adaptive.update_seal_backlog(2_000, 0, 0);
+
+        let snapshot = adaptive.snapshot(2_000, 0, 0);
+        assert_eq!(snapshot.mode, "fast");
+        assert_eq!(snapshot.reason, "healthy");
+        assert_eq!(snapshot.current_idle_ms, 0);
+        assert_eq!(snapshot.healthy_cycles, 1);
+    }
+
+    #[test]
+    fn adaptive_publish_backs_off_on_submit_pressure() {
+        let mut adaptive = AdaptivePublishState::new("unknown".to_owned(), 0, 8);
+        adaptive.update_completed_index_session(ADAPTIVE_PUBLISH_BACKOFF_SUBMIT_MS + 1, 0);
+        adaptive.update_seal_backlog(5_000, 0, 0);
+
+        let snapshot = adaptive.snapshot(5_000, 0, 0);
+        assert_eq!(snapshot.mode, "backoff");
+        assert_eq!(snapshot.reason, "submit_pressure_high");
+        assert_eq!(snapshot.current_idle_ms, 2_500);
+        assert_eq!(
+            snapshot.recent_submit_p95_ms,
+            ADAPTIVE_PUBLISH_BACKOFF_SUBMIT_MS + 1
+        );
+    }
+
+    #[test]
     fn publish_waits_for_active_mutations_to_drain() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -6082,6 +6236,7 @@ mod tests {
                 grams: features.unique_grams,
                 grams_complete: !features.unique_grams_truncated,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("work-doc".to_owned()),
             })
             .expect("insert doc");
@@ -6186,6 +6341,7 @@ mod tests {
                 grams: features.unique_grams,
                 grams_complete: !features.unique_grams_truncated,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("auto-publish-doc".to_owned()),
             })
             .expect("insert doc");
@@ -6256,6 +6412,7 @@ mod tests {
                 grams: features_a.unique_grams,
                 grams_complete: !features_a.unique_grams_truncated,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("inc-a".to_owned()),
             })
             .expect("insert a");
@@ -6282,6 +6439,7 @@ mod tests {
                 grams: features_b.unique_grams,
                 grams_complete: !features_b.unique_grams_truncated,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("inc-b".to_owned()),
             })
             .expect("insert b");
@@ -6329,6 +6487,7 @@ mod tests {
                 grams: features.unique_grams,
                 grams_complete: !features.unique_grams_truncated,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             }
         }
@@ -6405,7 +6564,7 @@ mod tests {
             Duration::from_millis(250),
             Some(socket_path),
         );
-        let client = TgsdbClient::new(config.clone());
+        let client = SspryClient::new(config.clone());
         for _ in 0..100 {
             if client.ping().is_ok() {
                 return config;
@@ -6466,7 +6625,7 @@ mod tests {
             Duration::from_millis(250),
             None,
         );
-        let client = TgsdbClient::new(config.clone());
+        let client = SspryClient::new(config.clone());
         for _ in 0..100 {
             if client.ping().is_ok() {
                 return config;
@@ -6516,7 +6675,7 @@ mod tests {
             Duration::from_millis(250),
             None,
         );
-        let client = TgsdbClient::new(config);
+        let client = SspryClient::new(config);
         for _ in 0..100 {
             if client.ping().is_ok() {
                 break;
@@ -6753,7 +6912,7 @@ mod tests {
             )
             .expect("write response");
         });
-        let client = TgsdbClient::new(config);
+        let client = SspryClient::new(config);
         let df = client.candidate_df(&[1, 2, 3]).expect("candidate df");
         assert_eq!(df, HashMap::from([(123u64, 7usize)]));
 
@@ -6797,7 +6956,7 @@ mod tests {
                 }
             }
         });
-        let client = TgsdbClient::new(ClientConfig::new(
+        let client = SspryClient::new(ClientConfig::new(
             DEFAULT_RPC_HOST.to_owned(),
             port,
             Duration::from_millis(500),
@@ -6817,6 +6976,7 @@ mod tests {
                 grams: Vec::new(),
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             },
             CandidateDocumentWire {
@@ -6832,6 +6992,7 @@ mod tests {
                 grams: Vec::new(),
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             },
         ];
@@ -6845,7 +7006,7 @@ mod tests {
             let _ = read_frame(&mut stream).expect("read request");
             write_error_frame(&mut stream, "Payload is too large").expect("write too large");
         });
-        let client = TgsdbClient::new(config);
+        let client = SspryClient::new(config);
         let err = client
             .candidate_insert_batch(&docs[..1])
             .expect_err("single oversized doc");
@@ -6942,6 +7103,99 @@ mod tests {
             .expect_err("n_of threshold")
             .to_string()
             .contains("threshold must be > 0")
+        );
+
+        let filesize_eq = query_node_from_wire(&serde_json::json!({
+            "kind": "filesize_eq",
+            "pattern_id": "filesize",
+            "threshold": 8,
+            "children": []
+        }))
+        .expect("filesize_eq");
+        assert_eq!(filesize_eq.kind, "filesize_eq");
+        assert_eq!(filesize_eq.pattern_id.as_deref(), Some("filesize"));
+        assert_eq!(filesize_eq.threshold, Some(8));
+
+        let metadata_eq = query_node_from_wire(&serde_json::json!({
+            "kind": "metadata_eq",
+            "pattern_id": "PE.Machine",
+            "threshold": 0x14c,
+            "children": []
+        }))
+        .expect("metadata_eq");
+        assert_eq!(metadata_eq.kind, "metadata_eq");
+        assert_eq!(metadata_eq.pattern_id.as_deref(), Some("pe.machine"));
+        assert_eq!(metadata_eq.threshold, Some(0x14c));
+
+        let time_now_eq = query_node_from_wire(&serde_json::json!({
+            "kind": "time_now_eq",
+            "pattern_id": "time.now",
+            "threshold": 42,
+            "children": []
+        }))
+        .expect("time_now_eq");
+        assert_eq!(time_now_eq.kind, "time_now_eq");
+        assert_eq!(time_now_eq.pattern_id.as_deref(), Some("time.now"));
+        assert_eq!(time_now_eq.threshold, Some(42));
+
+        let verifier_only_eq = query_node_from_wire(&serde_json::json!({
+            "kind": "verifier_only_eq",
+            "pattern_id": "uint32(0)==332",
+            "children": []
+        }))
+        .expect("verifier_only_eq");
+        assert_eq!(verifier_only_eq.kind, "verifier_only_eq");
+        assert_eq!(
+            verifier_only_eq.pattern_id.as_deref(),
+            Some("uint32(0)==332")
+        );
+        assert_eq!(verifier_only_eq.threshold, None);
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "filesize_eq",
+                "pattern_id": "size",
+                "threshold": 8,
+                "children": []
+            }))
+            .expect_err("bad filesize_eq id")
+            .to_string()
+            .contains("pattern_id=filesize")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "metadata_eq",
+                "pattern_id": "bogus.field",
+                "threshold": 1,
+                "children": []
+            }))
+            .expect_err("bad metadata_eq field")
+            .to_string()
+            .contains("Unsupported metadata_eq field")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "time_now_eq",
+                "pattern_id": "clock.now",
+                "threshold": 1,
+                "children": []
+            }))
+            .expect_err("bad time_now_eq id")
+            .to_string()
+            .contains("pattern_id=time.now")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "verifier_only_eq",
+                "pattern_id": "",
+                "children": []
+            }))
+            .expect_err("empty verifier-only pattern id")
+            .to_string()
+            .contains("requires a non-empty pattern_id")
         );
 
         assert!(
@@ -7145,6 +7399,7 @@ rule q {
             grams: features_a.unique_grams,
             grams_complete: !features_a.unique_grams_truncated,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
         let doc_b = CandidateDocumentWire {
@@ -7164,6 +7419,7 @@ rule q {
             grams: Vec::new(),
             grams_complete: !features_b.unique_grams_truncated,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
 
@@ -7264,7 +7520,7 @@ rule q {
 
     #[test]
     fn client_request_helpers_cover_error_and_validation_paths() {
-        let client = TgsdbClient::new(ClientConfig::new(
+        let client = SspryClient::new(ClientConfig::new(
             "not an address".to_owned(),
             DEFAULT_RPC_PORT,
             Duration::from_millis(50),
@@ -7278,7 +7534,7 @@ rule q {
                 .contains("Invalid TCP address")
         );
 
-        let bad_version_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
+        let bad_version_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_frame(&mut stream, PROTOCOL_VERSION + 1, STATUS_OK, b"{}")
                 .expect("write version mismatch");
@@ -7291,7 +7547,7 @@ rule q {
                 .contains("Unsupported protocol version")
         );
 
-        let error_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
+        let error_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_error_frame(&mut stream, "server boom").expect("write error frame");
         }));
@@ -7303,7 +7559,7 @@ rule q {
                 .contains("server boom")
         );
 
-        let object_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
+        let object_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_frame(
                 &mut stream,
@@ -7322,7 +7578,7 @@ rule q {
                 .contains("invalid JSON object")
         );
 
-        let df_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
+        let df_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_frame(
                 &mut stream,
@@ -7339,13 +7595,13 @@ rule q {
         assert_eq!(df.get(&42).copied(), Some(7));
         assert_eq!(df.len(), 1);
 
-        let default_error_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
+        let default_error_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
             write_frame(
                 &mut stream,
                 PROTOCOL_VERSION,
                 STATUS_ERROR,
-                &serde_json::to_vec(&serde_json::json!({ "type": "TgsError" }))
+                &serde_json::to_vec(&serde_json::json!({ "type": "SspryError" }))
                     .expect("error payload"),
             )
             .expect("write error payload");
@@ -7364,7 +7620,7 @@ rule q {
     fn unix_client_server_roundtrip_covers_public_client_methods() {
         let tmp = tempdir().expect("tmp");
         let config = start_unix_server(tmp.path(), 2);
-        let client = TgsdbClient::new(config.clone());
+        let client = SspryClient::new(config.clone());
         assert_eq!(client.ping().expect("ping"), "pong");
 
         let cand_a = tmp.path().join("cand-a.bin");
@@ -7429,6 +7685,7 @@ rule q {
             grams: features_a.unique_grams.clone(),
             grams_complete: !features_a.unique_grams_truncated,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
         let doc_b = CandidateDocumentWire {
@@ -7448,6 +7705,7 @@ rule q {
             grams: Vec::new(),
             grams_complete: !features_b.unique_grams_truncated,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
 
@@ -7494,7 +7752,7 @@ rule q {
     #[test]
     fn tcp_server_roundtrip_covers_tcp_serve_branch() {
         let tmp = tempdir().expect("tmp");
-        let client = TgsdbClient::new(start_tcp_server(tmp.path(), 1));
+        let client = SspryClient::new(start_tcp_server(tmp.path(), 1));
         assert_eq!(client.ping().expect("tcp ping"), "pong");
         let stats = client.candidate_stats().expect("tcp stats");
         assert_eq!(
@@ -7518,7 +7776,7 @@ rule q {
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+                auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             },
             Arc::new(AtomicBool::new(true)),
@@ -7537,6 +7795,7 @@ rule q {
             grams: Vec::new(),
             grams_complete: false,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: None,
         })
         .expect("insert payload");
@@ -7554,6 +7813,7 @@ rule q {
                 grams: Vec::new(),
                 grams_complete: false,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: None,
             }],
         })
@@ -7636,6 +7896,7 @@ rule q {
                 grams: vec![gram],
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("shard-a".to_owned()),
             },
             CandidateDocumentWire {
@@ -7654,6 +7915,7 @@ rule q {
                 grams: Vec::new(),
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("shard-b".to_owned()),
             },
         ];
@@ -7729,6 +7991,7 @@ rule q {
                     grams: vec![gram],
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: None,
                 })
                 .expect_err("invalid bloom base64")
@@ -7750,6 +8013,7 @@ rule q {
                     grams: Vec::new(),
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: None,
                 })
                 .expect_err("invalid grams_delta base64")
@@ -7771,6 +8035,7 @@ rule q {
                     grams: vec![gram],
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: None,
                 })
                 .expect_err("invalid sha")
@@ -7828,7 +8093,7 @@ rule q {
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+                auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             })
             .expect_err("single-shard mismatch")
@@ -7857,7 +8122,7 @@ rule q {
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+                auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             })
             .expect_err("sharded mismatch")
@@ -7876,7 +8141,7 @@ rule q {
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+            auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
         })
         .expect("create sharded stores");
@@ -7899,7 +8164,7 @@ rule q {
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+                auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             })
             .expect_err("manifest mismatch")
@@ -7932,6 +8197,7 @@ rule q {
                 grams: vec![gram],
                 grams_complete: true,
                 effective_diversity: None,
+                metadata_b64: None,
                 external_id: Some("single-shard-id".to_owned()),
             })
             .expect("insert single-shard doc");
@@ -7971,7 +8237,7 @@ rule q {
             Some(vec![Some("single-shard-id".to_owned())])
         );
 
-        let delete_client = TgsdbClient::new(one_shot_tcp_config(|mut stream| {
+        let delete_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let (_, _, payload) = read_frame(&mut stream).expect("read delete request");
             let request: CandidateDeleteRequest =
                 serde_json::from_slice(&payload).expect("delete request");
@@ -8011,7 +8277,7 @@ rule q {
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+                auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             },
             Arc::new(AtomicBool::new(false)),
@@ -8052,6 +8318,7 @@ rule q {
                     grams: vec![gram],
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: Some(format!("parallel-{index}")),
                 })
                 .expect("insert doc");
@@ -8115,7 +8382,7 @@ rule q {
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
-                    auto_publish_storage_class: "unknown".to_owned(),
+            auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
         })
         .expect("ensure stores");
@@ -8177,6 +8444,7 @@ rule q {
                     grams: vec![gram],
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
                 .expect("insert doc");
@@ -8276,6 +8544,7 @@ rule q {
                     grams: vec![gram],
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
                 .expect("insert doc");
@@ -8360,6 +8629,7 @@ rule q {
                     grams: vec![gram],
                     grams_complete: true,
                     effective_diversity: None,
+                    metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
                 .expect("insert doc");

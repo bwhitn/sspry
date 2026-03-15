@@ -1,3 +1,3 @@
 fn main() {
-    std::process::exit(yaya::app::main(None));
+    std::process::exit(sspry::app::main(None));
 }

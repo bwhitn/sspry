@@ -7,10 +7,10 @@ use std::io;
 
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, TgsError>;
+pub type Result<T> = std::result::Result<T, SspryError>;
 
 #[derive(Debug, Error)]
-pub enum TgsError {
+pub enum SspryError {
     #[error("{0}")]
     Message(String),
     #[error(transparent)]
@@ -21,13 +21,13 @@ pub enum TgsError {
     Hex(#[from] hex::FromHexError),
 }
 
-impl From<&str> for TgsError {
+impl From<&str> for SspryError {
     fn from(value: &str) -> Self {
         Self::Message(value.to_owned())
     }
 }
 
-impl From<String> for TgsError {
+impl From<String> for SspryError {
     fn from(value: String) -> Self {
         Self::Message(value)
     }

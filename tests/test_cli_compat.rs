@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::tempdir;
 
 fn bin_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_yaya"))
+    PathBuf::from(env!("CARGO_BIN_EXE_sspry"))
 }
 
 fn run_ok(args: &[&str]) -> String {
@@ -25,6 +25,24 @@ fn run_ok(args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+fn run_ok_capture(args: &[&str]) -> (String, String) {
+    let output = Command::new(bin_path())
+        .args(args)
+        .output()
+        .expect("run command");
+    assert!(
+        output.status.success(),
+        "command failed: {:?}\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        String::from_utf8(output.stdout).expect("utf8 stdout"),
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+    )
 }
 
 fn run_fail(args: &[&str]) -> String {
@@ -113,6 +131,40 @@ fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
     panic!("search did not reach {expected} candidates on {addr}");
 }
 
+fn wait_for_verified_matches(
+    addr: &str,
+    rule: &Path,
+    expected_checked: usize,
+    expected_matched: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let output = Command::new(bin_path())
+            .args([
+                "search",
+                "--addr",
+                addr,
+                "--rule",
+                rule.to_str().expect("rule path"),
+                "--verify",
+            ])
+            .output()
+            .expect("run verified search");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains(&format!("verified_checked: {expected_checked}"))
+                && stdout.contains(&format!("verified_matched: {expected_matched}"))
+            {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "verified search did not reach checked={expected_checked} matched={expected_matched} on {addr}"
+    );
+}
+
 fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
     let addr = tcp_addr(port);
     let mut command = Command::new(bin_path());
@@ -126,6 +178,64 @@ fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Chi
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command.spawn().expect("spawn serve")
+}
+
+fn write_minimal_pe64_dotnet(path: &Path, anchor: &[u8]) {
+    let mut pe = vec![0u8; 512];
+    pe[0..2].copy_from_slice(b"MZ");
+    pe[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+    pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+    pe[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+    pe[0x88..0x8c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    pe[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+    pe[0x96..0x98].copy_from_slice(&0x2000u16.to_le_bytes());
+    pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+    pe[0x98 + 68..0x98 + 70].copy_from_slice(&3u16.to_le_bytes());
+    pe[0x98 + 112 + 32..0x98 + 112 + 40].copy_from_slice(&[1, 0, 0, 0, 8, 0, 0, 0]);
+    pe[0x98 + 112 + 112..0x98 + 112 + 120].copy_from_slice(&[1, 0, 0, 0, 8, 0, 0, 0]);
+    pe.extend_from_slice(anchor);
+    fs::write(path, pe).expect("write pe");
+}
+
+fn write_minimal_elf64(path: &Path, anchor: &[u8]) {
+    let mut elf = vec![0u8; 64];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[7] = 3;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+    elf.extend_from_slice(anchor);
+    fs::write(path, elf).expect("write elf");
+}
+
+fn write_minimal_dex(path: &Path, version: &str, anchor: &[u8]) {
+    let mut dex = format!("dex\n{version}\0").into_bytes();
+    dex.resize(64, 0);
+    dex.extend_from_slice(anchor);
+    fs::write(path, dex).expect("write dex");
+}
+
+fn unix_to_filetime(unix_seconds: u64) -> u64 {
+    (unix_seconds + 11_644_473_600) * 10_000_000
+}
+
+fn write_minimal_lnk(
+    path: &Path,
+    creation_unix: u64,
+    access_unix: u64,
+    write_unix: u64,
+    anchor: &[u8],
+) {
+    let mut lnk = vec![0u8; 128];
+    lnk[0..4].copy_from_slice(&0x4cu32.to_le_bytes());
+    lnk[4..12].copy_from_slice(&0x0000_0000_0002_1401u64.to_le_bytes());
+    lnk[12..20].copy_from_slice(&0x4600_0000_0000_00c0u64.to_le_bytes());
+    lnk[28..36].copy_from_slice(&unix_to_filetime(creation_unix).to_le_bytes());
+    lnk[36..44].copy_from_slice(&unix_to_filetime(access_unix).to_le_bytes());
+    lnk[44..52].copy_from_slice(&unix_to_filetime(write_unix).to_le_bytes());
+    lnk[96..96 + anchor.len()].copy_from_slice(anchor);
+    fs::write(path, lnk).expect("write lnk");
 }
 
 #[test]
@@ -210,6 +320,7 @@ rule q {
 #[test]
 fn help_surface_has_only_public_commands() {
     let out = run_ok(&["--help"]);
+    assert!(out.contains("Scalable Screening and Prefiltering of Rules for YARA"));
     assert!(out.contains("serve"));
     assert!(out.contains("index"));
     assert!(out.contains("delete"));
@@ -226,7 +337,7 @@ fn help_surface_has_only_public_commands() {
 }
 
 #[test]
-fn info_uses_tgsdb_addr_env() {
+fn info_uses_sspry_addr_env() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("candidate_db");
     let port = reserve_tcp_port();
@@ -235,12 +346,512 @@ fn info_uses_tgsdb_addr_env() {
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     wait_for_info(&addr);
 
-    let info = run_ok_env(&["info"], &[("YAYA_ADDR", &addr)]);
+    let info = run_ok_env(&["info"], &[("SSPRY_ADDR", &addr)]);
     let parsed: Value = serde_json::from_str(&info).expect("info json");
     assert_eq!(
         parsed.get("candidate_shards").and_then(Value::as_u64),
         Some(256)
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_help_uses_sspry_env_and_removed_publish_flag_stays_gone() {
+    let out = run_ok(&["serve", "--help"]);
+    assert!(out.contains("SSPRY_ADDR"));
+    assert!(!out.contains("YAYA_ADDR"));
+    assert!(!out.contains("auto-publish-idle-ms"));
+
+    let err = run_fail(&["serve", "--auto-publish-idle-ms", "1"]);
+    assert!(err.contains("unexpected argument"));
+}
+
+#[test]
+fn info_light_exposes_adaptive_publish_status() {
+    let tmp = tempdir().expect("tmp");
+    let candidate_root = tmp.path().join("candidate_db");
+    let port = reserve_tcp_port();
+    let addr = tcp_addr(port);
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    wait_for_info(&addr);
+
+    let info = run_ok(&["info", "--addr", &addr, "--light"]);
+    let parsed: Value = serde_json::from_str(&info).expect("info json");
+    let adaptive_publish = parsed
+        .get("adaptive_publish")
+        .and_then(Value::as_object)
+        .expect("adaptive publish object");
+    assert!(adaptive_publish.contains_key("current_idle_ms"));
+    assert!(adaptive_publish.contains_key("mode"));
+    assert!(adaptive_publish.contains_key("reason"));
+    assert!(adaptive_publish.contains_key("storage_class"));
+    assert!(
+        parsed
+            .get("published_df_snapshot_seal")
+            .and_then(Value::as_object)
+            .is_some()
+    );
+    assert!(
+        parsed
+            .get("published_tier2_snapshot_seal")
+            .and_then(Value::as_object)
+            .is_some()
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_verify_uses_stored_paths_when_available() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    let hit = sample_dir.join("hit.bin");
+    let miss = sample_dir.join("miss.bin");
+    fs::write(&hit, b"prefix NEEDLE suffix").expect("write hit");
+    fs::write(&miss, b"prefix nothing suffix").expect("write miss");
+    fs::write(
+        &rule,
+        r#"
+rule q {
+  strings:
+    $a = "NEEDLE"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 2"));
+
+    wait_for_search_candidates(&addr, &rule, 1);
+    wait_for_verified_matches(&addr, &rule, 1, 1);
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(search.contains("candidates: 1"));
+    assert!(search.contains("verified_checked: 1"));
+    assert!(search.contains("verified_matched: 1"));
+    assert!(search.contains("verified_skipped: 0"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_verify_skips_candidates_without_stored_paths() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    let hit = sample_dir.join("hit.bin");
+    fs::write(&hit, b"prefix NEEDLE suffix").expect("write hit");
+    fs::write(
+        &rule,
+        r#"
+rule q {
+  strings:
+    $a = "NEEDLE"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 1"));
+
+    wait_for_search_candidates(&addr, &rule, 1);
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(search.contains("candidates: 1"));
+    assert!(search.contains("verified_checked: 0"));
+    assert!(search.contains("verified_matched: 0"));
+    assert!(search.contains("verified_skipped: 1"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_supports_filesize_equality_conditions() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    let small = sample_dir.join("small.bin");
+    let large = sample_dir.join("large.bin");
+    fs::write(&small, b"ABCD1234").expect("write small");
+    fs::write(&large, b"ABCD12345").expect("write large");
+    fs::write(
+        &rule,
+        r#"
+rule q {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and filesize == 8
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 2"));
+
+    wait_for_search_candidates(&addr, &rule, 1);
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+    ]);
+    assert!(search.contains("candidates: 1"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_supports_module_metadata_conditions() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let pe_rule = base.join("pe_rule.yar");
+    let elf_rule = base.join("elf_rule.yar");
+    let dex_rule = base.join("dex_rule.yar");
+    let lnk_rule = base.join("lnk_rule.yar");
+    let port = reserve_tcp_port();
+    let anchor = b"ANCHOR";
+    let creation_time = 1_700_000_000u64;
+    let access_time = creation_time + 1;
+    let write_time = creation_time + 2;
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    write_minimal_pe64_dotnet(&sample_dir.join("dotnet_pe.bin"), anchor);
+    write_minimal_elf64(&sample_dir.join("linux.elf"), anchor);
+    write_minimal_dex(&sample_dir.join("classes.dex"), "035", anchor);
+    write_minimal_lnk(
+        &sample_dir.join("shortcut.lnk"),
+        creation_time,
+        access_time,
+        write_time,
+        anchor,
+    );
+    fs::write(
+        sample_dir.join("decoy.bin"),
+        [anchor.as_slice(), b"-not-a-module"].concat(),
+    )
+    .expect("write decoy");
+
+    fs::write(
+        &pe_rule,
+        r#"
+rule ModulePe {
+  strings:
+    $a = "ANCHOR"
+  condition:
+    $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true and dotnet.is_dotnet == true
+}
+"#,
+    )
+    .expect("write pe rule");
+    fs::write(
+        &elf_rule,
+        r#"
+rule ModuleElf {
+  strings:
+    $a = "ANCHOR"
+  condition:
+    $a and elf.machine == 62 and elf.type == 2 and ELF.OSABI == 3
+}
+"#,
+    )
+    .expect("write elf rule");
+    fs::write(
+        &dex_rule,
+        r#"
+rule ModuleDex {
+  strings:
+    $a = "ANCHOR"
+  condition:
+    $a and dex.is_dex and dex.version == 35
+}
+"#,
+    )
+    .expect("write dex rule");
+    fs::write(
+        &lnk_rule,
+        format!(
+            r#"
+rule ModuleLnk {{
+  strings:
+    $a = "ANCHOR"
+  condition:
+    $a and lnk.is_lnk and lnk.creation_time == {creation_time} and lnk.access_time == {access_time} and lnk.write_time == {write_time}
+}}
+"#
+        ),
+    )
+    .expect("write lnk rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 5"));
+
+    for rule in [&pe_rule, &elf_rule, &dex_rule, &lnk_rule] {
+        wait_for_search_candidates(&addr, rule, 1);
+        let search = run_ok(&[
+            "search",
+            "--addr",
+            &addr,
+            "--rule",
+            rule.to_str().expect("rule"),
+        ]);
+        assert!(search.contains("candidates: 1"), "{rule:?}: {search}");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn index_verbose_emits_server_telemetry() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+    fs::write(sample_dir.join("a.bin"), b"alpha NEEDLE").expect("write a");
+    fs::write(sample_dir.join("b.bin"), b"beta NEEDLE").expect("write b");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let (stdout, stderr) = run_ok_capture(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+        "--verbose",
+    ]);
+    assert!(stdout.contains("submitted_documents: 2"));
+    assert!(stdout.contains("processed_documents: 2"));
+    assert!(stderr.contains("verbose.index.total_ms:"));
+    assert!(stderr.contains("verbose.index.submit_ms:"));
+    assert!(stderr.contains("verbose.index.server_disk_usage_bytes:"));
+    assert!(stderr.contains("verbose.index.server_publish_adaptive_idle_ms:"));
+    assert!(stderr.contains("verbose.index.server_published_df_snapshot_seal_pending_shards:"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_verbose_verify_emits_telemetry() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("hit.bin"), b"prefix NEEDLE suffix").expect("write hit");
+    fs::write(sample_dir.join("miss.bin"), b"prefix nothing suffix").expect("write miss");
+    fs::write(
+        &rule,
+        r#"
+rule q {
+  strings:
+    $a = "NEEDLE"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 2"));
+    wait_for_search_candidates(&addr, &rule, 1);
+
+    let (stdout, stderr) = run_ok_capture(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+        "--verify",
+        "--verbose",
+    ]);
+    assert!(stdout.contains("candidates: 1"));
+    assert!(stdout.contains("verified_checked: 1"));
+    assert!(stdout.contains("verified_matched: 1"));
+    assert!(stderr.contains("verbose.search.total_ms:"));
+    assert!(stderr.contains("verbose.search.df_lookup_ms:"));
+    assert!(stderr.contains("verbose.search.query_ms:"));
+    assert!(stderr.contains("verbose.search.verify_ms:"));
+    assert!(stderr.contains("verbose.search.verify_enabled: true"));
+    assert!(stderr.contains("verbose.search.verified_checked: 1"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_verify_supports_numeric_read_equality_conditions() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("numeric_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    let mut hit = b"ANCHOR".to_vec();
+    hit.extend_from_slice(&0x0000_4000u32.to_le_bytes());
+    fs::write(sample_dir.join("hit.bin"), hit).expect("write hit");
+
+    let mut miss = b"ANCHOR".to_vec();
+    miss.extend_from_slice(&0x0000_4001u32.to_le_bytes());
+    fs::write(sample_dir.join("miss.bin"), miss).expect("write miss");
+
+    fs::write(
+        &rule,
+        r#"
+rule NumericSearch {
+  strings:
+    $a = "ANCHOR"
+  condition:
+    $a and uint32(6) == 0x4000
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 2"));
+
+    wait_for_search_candidates(&addr, &rule, 2);
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(search.contains("candidates: 2"));
+    assert!(search.contains("verified_checked: 2"));
+    assert!(search.contains("verified_matched: 1"));
+    assert!(search.contains("verified_skipped: 0"));
 
     let _ = child.kill();
     let _ = child.wait();

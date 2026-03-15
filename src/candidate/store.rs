@@ -20,11 +20,12 @@ use crate::candidate::filter_policy::{
     choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
 use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
+use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::perf::{record_counter, record_max, scope};
-use crate::{Result, TgsError};
+use crate::{Result, SspryError};
 
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 const TIER2_SUPERBLOCKS_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_FILTER_BYTES: usize = 2048;
 const DEFAULT_BLOOM_HASHES: usize = 7;
@@ -59,7 +60,7 @@ impl DfCountsState {
             let len = file.metadata()?.len() as usize;
             let row_bytes = gram_bytes + 4;
             if len % row_bytes != 0 {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "Invalid df_counts snapshot at {}",
                     snapshot_path.display()
                 )));
@@ -68,7 +69,7 @@ impl DfCountsState {
                 None
             } else {
                 Some(unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-                    TgsError::from(format!("Failed to mmap {}: {err}", snapshot_path.display()))
+                    SspryError::from(format!("Failed to mmap {}: {err}", snapshot_path.display()))
                 })?)
             }
         } else {
@@ -94,7 +95,7 @@ impl DfCountsState {
             let bytes = fs::read(&delta_path)?;
             let row_bytes = self.gram_bytes + 4;
             if bytes.len() % row_bytes != 0 {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "Invalid df_counts delta at {}",
                     delta_path.display()
                 )));
@@ -113,7 +114,7 @@ impl DfCountsState {
         if unit_delta_path.exists() {
             let bytes = fs::read(&unit_delta_path)?;
             if self.gram_bytes == 0 || bytes.len() % self.gram_bytes != 0 {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "Invalid df_counts unit delta at {}",
                     unit_delta_path.display()
                 )));
@@ -455,6 +456,7 @@ pub struct ImportedCandidateDocument {
     pub grams_indexed_bytes: Vec<u8>,
     pub grams_indexed_count: usize,
     pub grams_complete: bool,
+    pub metadata_bytes: Vec<u8>,
     pub external_id: Option<String>,
 }
 
@@ -589,7 +591,7 @@ struct LegacyCandidateDoc {
     external_id: Option<String>,
 }
 
-const DOC_META_ROW_BYTES: usize = 64;
+const DOC_META_ROW_BYTES: usize = 80;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 const MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024;
@@ -614,6 +616,8 @@ struct DocMetaRow {
     grams_indexed_count: u32,
     external_id_offset: u64,
     external_id_len: u32,
+    metadata_offset: u64,
+    metadata_len: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -636,7 +640,9 @@ impl Tier2DocMetaRow {
 
     fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != TIER2_DOC_META_ROW_BYTES {
-            return Err(TgsError::from("Invalid candidate doc meta5 row size"));
+            return Err(SspryError::from(
+                "Invalid candidate tier2 doc meta row size",
+            ));
         }
         Ok(Self {
             filter_bytes: u32::from_le_bytes(bytes[0..4].try_into().expect("tier2_filter_bytes")),
@@ -662,12 +668,14 @@ impl DocMetaRow {
         out[48..52].copy_from_slice(&self.grams_indexed_count.to_le_bytes());
         out[52..60].copy_from_slice(&self.external_id_offset.to_le_bytes());
         out[60..64].copy_from_slice(&self.external_id_len.to_le_bytes());
+        out[64..72].copy_from_slice(&self.metadata_offset.to_le_bytes());
+        out[72..76].copy_from_slice(&self.metadata_len.to_le_bytes());
         out
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != DOC_META_ROW_BYTES {
-            return Err(TgsError::from("Invalid candidate doc meta row size"));
+            return Err(SspryError::from("Invalid candidate doc meta row size"));
         }
         Ok(Self {
             file_size: u64::from_le_bytes(bytes[0..8].try_into().expect("file_size")),
@@ -692,6 +700,8 @@ impl DocMetaRow {
                 bytes[52..60].try_into().expect("external_id_offset"),
             ),
             external_id_len: u32::from_le_bytes(bytes[60..64].try_into().expect("external_id_len")),
+            metadata_offset: u64::from_le_bytes(bytes[64..72].try_into().expect("metadata_offset")),
+            metadata_len: u32::from_le_bytes(bytes[72..76].try_into().expect("metadata_len")),
         })
     }
 }
@@ -725,7 +735,7 @@ impl BlobSidecar {
             return Ok(());
         }
         let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-            TgsError::from(format!("Failed to mmap {}: {err}", self.path.display()))
+            SspryError::from(format!("Failed to mmap {}: {err}", self.path.display()))
         })?;
         self.mmap = Some(mmap);
         Ok(())
@@ -753,7 +763,7 @@ impl BlobSidecar {
             let start = offset as usize;
             let end = start.saturating_add(len);
             if end > mmap.len() {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "Invalid {label} payload stored for doc_id {doc_id}"
                 )));
             }
@@ -774,6 +784,7 @@ struct StoreSidecars {
     tier2_blooms: BlobSidecar,
     grams_received: BlobSidecar,
     grams_indexed: BlobSidecar,
+    metadata: BlobSidecar,
     external_ids: BlobSidecar,
 }
 
@@ -784,6 +795,7 @@ impl StoreSidecars {
             tier2_blooms: BlobSidecar::new(tier2_blooms_path(root)),
             grams_received: BlobSidecar::new(grams_received_path(root)),
             grams_indexed: BlobSidecar::new(grams_indexed_path(root)),
+            metadata: BlobSidecar::new(doc_metadata_path(root)),
             external_ids: BlobSidecar::new(external_ids_path(root)),
         }
     }
@@ -799,6 +811,7 @@ impl StoreSidecars {
         self.tier2_blooms.map_if_exists()?;
         self.grams_received.map_if_exists()?;
         self.grams_indexed.map_if_exists()?;
+        self.metadata.map_if_exists()?;
         self.external_ids.map_if_exists()?;
         Ok(())
     }
@@ -808,6 +821,7 @@ impl StoreSidecars {
         self.tier2_blooms.invalidate();
         self.grams_received.invalidate();
         self.grams_indexed.invalidate();
+        self.metadata.invalidate();
         self.external_ids.invalidate();
     }
 
@@ -816,6 +830,7 @@ impl StoreSidecars {
         self.tier2_blooms.retarget(tier2_blooms_path(root));
         self.grams_received.retarget(grams_received_path(root));
         self.grams_indexed.retarget(grams_indexed_path(root));
+        self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
     }
 }
@@ -858,7 +873,7 @@ impl AppendFile {
         let handle = self
             .handle
             .as_mut()
-            .ok_or_else(|| TgsError::from("append handle unexpectedly unavailable"))?;
+            .ok_or_else(|| SspryError::from("append handle unexpectedly unavailable"))?;
         handle.write_all(bytes)?;
         self.offset = self.offset.saturating_add(bytes.len() as u64);
         Ok(offset)
@@ -875,6 +890,7 @@ struct StoreAppendWriters {
     tier2_blooms: AppendFile,
     grams_received: AppendFile,
     grams_indexed: AppendFile,
+    metadata: AppendFile,
     external_ids: AppendFile,
     sha_by_docid: AppendFile,
     doc_meta: AppendFile,
@@ -890,6 +906,7 @@ impl StoreAppendWriters {
             tier2_blooms: AppendFile::new(tier2_blooms_path(root))?,
             grams_received: AppendFile::new(grams_received_path(root))?,
             grams_indexed: AppendFile::new(grams_indexed_path(root))?,
+            metadata: AppendFile::new(doc_metadata_path(root))?,
             external_ids: AppendFile::new(external_ids_path(root))?,
             sha_by_docid: AppendFile::new(sha_by_docid_path(root))?,
             doc_meta: AppendFile::new(doc_meta_path(root))?,
@@ -904,6 +921,7 @@ impl StoreAppendWriters {
         self.tier2_blooms.retarget(tier2_blooms_path(root));
         self.grams_received.retarget(grams_received_path(root));
         self.grams_indexed.retarget(grams_indexed_path(root));
+        self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
         self.sha_by_docid.retarget(sha_by_docid_path(root));
         self.doc_meta.retarget(doc_meta_path(root));
@@ -1275,6 +1293,7 @@ impl CandidateStore {
         let sha_path = sha_by_docid_path(&config.root);
         let doc_meta_path = doc_meta_path(&config.root);
         let tier2_doc_meta_path = tier2_doc_meta_path(&config.root);
+        let doc_metadata_path = doc_metadata_path(&config.root);
         let blooms_path = blooms_path(&config.root);
         let tier2_blooms_path = tier2_blooms_path(&config.root);
         let grams_received_path = grams_received_path(&config.root);
@@ -1290,6 +1309,7 @@ impl CandidateStore {
                 || sha_path.exists()
                 || doc_meta_path.exists()
                 || tier2_doc_meta_path.exists()
+                || doc_metadata_path.exists()
                 || blooms_path.exists()
                 || tier2_blooms_path.exists()
                 || grams_received_path.exists()
@@ -1299,7 +1319,7 @@ impl CandidateStore {
                 || df_delta_path.exists()
                 || df_unit_delta_path.exists())
         {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Candidate store already exists at {}. Use --force to overwrite.",
                 config.root.display()
             )));
@@ -1322,6 +1342,7 @@ impl CandidateStore {
             let _ = fs::remove_file(&sha_path);
             let _ = fs::remove_file(&doc_meta_path);
             let _ = fs::remove_file(&tier2_doc_meta_path);
+            let _ = fs::remove_file(&doc_metadata_path);
             let _ = fs::remove_file(&blooms_path);
             let _ = fs::remove_file(&tier2_blooms_path);
             let _ = fs::remove_file(&grams_received_path);
@@ -1395,7 +1416,7 @@ impl CandidateStore {
         let meta_started = Instant::now();
         let meta: StoreMeta =
             serde_json::from_slice(&fs::read(meta_path(&root))?).map_err(|_| {
-                TgsError::from(format!("Invalid candidate metadata at {}", root.display()))
+                SspryError::from(format!("Invalid candidate metadata at {}", root.display()))
             })?;
         let meta_ms = meta_started
             .elapsed()
@@ -1403,7 +1424,7 @@ impl CandidateStore {
             .try_into()
             .unwrap_or(u64::MAX);
         if meta.version != STORE_VERSION {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "Unsupported candidate store version: {}",
                 meta.version
             )));
@@ -1556,6 +1577,7 @@ impl CandidateStore {
                 .saturating_add(tier2_row.bloom_len as u64)
                 .saturating_add(row.grams_received_count as u64 * gram_bytes)
                 .saturating_add(row.grams_indexed_count as u64 * gram_bytes)
+                .saturating_add(row.metadata_len as u64)
                 .saturating_add(row.external_id_len as u64);
         }
         total
@@ -1903,10 +1925,49 @@ impl CandidateStore {
         external_id: Option<String>,
         grams_sorted_unique: bool,
     ) -> Result<CandidateInsertResult> {
+        self.insert_document_with_metadata(
+            sha256,
+            file_size,
+            gram_count_estimate,
+            bloom_hashes,
+            tier2_gram_count_estimate,
+            tier2_bloom_hashes,
+            filter_bytes,
+            bloom_filter,
+            tier2_filter_bytes,
+            tier2_bloom_filter,
+            grams_received,
+            grams_complete,
+            effective_diversity,
+            &[],
+            external_id,
+            grams_sorted_unique,
+        )
+    }
+
+    pub fn insert_document_with_metadata(
+        &mut self,
+        sha256: [u8; 32],
+        file_size: u64,
+        gram_count_estimate: Option<usize>,
+        bloom_hashes: Option<usize>,
+        tier2_gram_count_estimate: Option<usize>,
+        tier2_bloom_hashes: Option<usize>,
+        filter_bytes: usize,
+        bloom_filter: &[u8],
+        tier2_filter_bytes: usize,
+        tier2_bloom_filter: &[u8],
+        grams_received: &[u64],
+        grams_complete: bool,
+        effective_diversity: Option<f64>,
+        metadata: &[u8],
+        external_id: Option<String>,
+        grams_sorted_unique: bool,
+    ) -> Result<CandidateInsertResult> {
         let mut total_scope = scope("candidate.insert_document");
         total_scope.add_bytes(file_size);
         if filter_bytes == 0 {
-            return Err(TgsError::from("filter_bytes must be > 0"));
+            return Err(SspryError::from("filter_bytes must be > 0"));
         }
         let expected_filter_bytes =
             self.resolve_filter_bytes_for_file_size(file_size, gram_count_estimate)?;
@@ -1916,12 +1977,12 @@ impl CandidateStore {
             bloom_hashes,
         );
         if filter_bytes != expected_filter_bytes {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "filter_bytes must equal expected filter size ({expected_filter_bytes})"
             )));
         }
         if bloom_filter.len() != expected_filter_bytes {
-            return Err(TgsError::from(format!(
+            return Err(SspryError::from(format!(
                 "bloom_filter length must equal filter_bytes ({expected_filter_bytes})"
             )));
         }
@@ -1934,12 +1995,12 @@ impl CandidateStore {
         );
         if !tier2_bloom_filter.is_empty() {
             if tier2_filter_bytes != expected_tier2_filter_bytes {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "tier2_filter_bytes must equal expected filter size ({expected_tier2_filter_bytes})"
                 )));
             }
             if tier2_bloom_filter.len() != expected_tier2_filter_bytes {
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "tier2_bloom_filter length must equal tier2_filter_bytes ({expected_tier2_filter_bytes})"
                 )));
             }
@@ -2030,12 +2091,13 @@ impl CandidateStore {
                 snapshot.bloom_hashes,
                 snapshot.grams_complete,
                 snapshot.deleted,
+                metadata,
                 external_id.as_deref(),
                 bloom_filter,
                 &dedup_received,
                 &indexed,
             )?;
-            let tier2_row = self.build_doc_row5(
+            let tier2_row = self.build_tier2_doc_row(
                 snapshot.tier2_filter_bytes,
                 snapshot.tier2_bloom_hashes,
                 tier2_bloom_filter,
@@ -2047,7 +2109,7 @@ impl CandidateStore {
                 self.doc_rows[existing_pos] = row;
                 self.tier2_doc_rows[existing_pos] = tier2_row;
                 self.write_doc_row(snapshot.doc_id, row)?;
-                self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
             }
             self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
             self.maybe_rebalance_tier2_superblocks()?;
@@ -2078,12 +2140,13 @@ impl CandidateStore {
                     doc.bloom_hashes,
                     doc.grams_complete,
                     doc.deleted,
+                    metadata,
                     external_id.as_deref(),
                     bloom_filter,
                     &dedup_received,
                     &indexed,
                 )?;
-                let tier2_row = self.build_doc_row5(
+                let tier2_row = self.build_tier2_doc_row(
                     doc.tier2_filter_bytes,
                     doc.tier2_bloom_hashes,
                     tier2_bloom_filter,
@@ -2152,6 +2215,7 @@ impl CandidateStore {
             Vec<u64>,
             bool,
             Option<f64>,
+            Vec<u8>,
             Option<String>,
             bool,
         )],
@@ -2164,6 +2228,7 @@ impl CandidateStore {
             sha256: [u8; 32],
             sha256_hex: String,
             doc: CandidateDoc,
+            metadata: &'a [u8],
             external_id: Option<&'a str>,
             bloom_filter: &'a [u8],
             tier2_bloom_filter: &'a [u8],
@@ -2200,12 +2265,13 @@ impl CandidateStore {
                 grams_received,
                 grams_complete,
                 effective_diversity,
+                metadata,
                 external_id,
                 grams_sorted_unique,
             ) = document;
             total_scope.add_bytes(*file_size);
             if *filter_bytes == 0 {
-                return Err(TgsError::from("filter_bytes must be > 0"));
+                return Err(SspryError::from("filter_bytes must be > 0"));
             }
             let expected_filter_bytes =
                 self.resolve_filter_bytes_for_file_size(*file_size, *gram_count_estimate)?;
@@ -2216,13 +2282,13 @@ impl CandidateStore {
             );
             if *filter_bytes != expected_filter_bytes {
                 self.last_insert_batch_profile = insert_profile;
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "filter_bytes must equal expected filter size ({expected_filter_bytes})"
                 )));
             }
             if bloom_filter.len() != expected_filter_bytes {
                 self.last_insert_batch_profile = insert_profile;
-                return Err(TgsError::from(format!(
+                return Err(SspryError::from(format!(
                     "bloom_filter length must equal filter_bytes ({expected_filter_bytes})"
                 )));
             }
@@ -2236,13 +2302,13 @@ impl CandidateStore {
             if !tier2_bloom_filter.is_empty() {
                 if *tier2_filter_bytes != expected_tier2_filter_bytes {
                     self.last_insert_batch_profile = insert_profile;
-                    return Err(TgsError::from(format!(
+                    return Err(SspryError::from(format!(
                         "tier2_filter_bytes must equal expected filter size ({expected_tier2_filter_bytes})"
                     )));
                 }
                 if tier2_bloom_filter.len() != expected_tier2_filter_bytes {
                     self.last_insert_batch_profile = insert_profile;
-                    return Err(TgsError::from(format!(
+                    return Err(SspryError::from(format!(
                         "tier2_bloom_filter length must equal tier2_filter_bytes ({expected_tier2_filter_bytes})"
                     )));
                 }
@@ -2353,12 +2419,13 @@ impl CandidateStore {
                     snapshot.bloom_hashes,
                     snapshot.grams_complete,
                     snapshot.deleted,
+                    metadata,
                     external_id.as_deref(),
                     bloom_filter,
                     &dedup_received,
                     &indexed,
                 )?;
-                let tier2_row = self.build_doc_row5(
+                let tier2_row = self.build_tier2_doc_row(
                     snapshot.tier2_filter_bytes,
                     snapshot.tier2_bloom_hashes,
                     tier2_bloom_filter,
@@ -2366,7 +2433,7 @@ impl CandidateStore {
                 self.doc_rows[existing_pos] = row;
                 self.tier2_doc_rows[existing_pos] = tier2_row;
                 self.write_doc_row(snapshot.doc_id, row)?;
-                self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
                 insert_profile.write_existing_us = insert_profile
                     .write_existing_us
                     .saturating_add(elapsed_us(write_existing_started));
@@ -2428,6 +2495,7 @@ impl CandidateStore {
                 sha256: *sha256,
                 sha256_hex: doc.sha256.clone(),
                 doc,
+                metadata,
                 external_id: external_id.as_deref(),
                 bloom_filter,
                 tier2_bloom_filter,
@@ -2485,6 +2553,7 @@ impl CandidateStore {
                     pending.doc.bloom_hashes,
                     pending.doc.grams_complete,
                     pending.doc.deleted,
+                    pending.metadata,
                     pending.external_id,
                     bloom_offset,
                     pending.bloom_filter.len(),
@@ -2679,6 +2748,7 @@ impl CandidateStore {
                 grams_indexed_bytes: self.doc_indexed_bytes(pos)?.into_owned(),
                 grams_indexed_count: self.doc_rows[pos].grams_indexed_count as usize,
                 grams_complete: doc.grams_complete,
+                metadata_bytes: self.doc_metadata_bytes(pos)?.into_owned(),
                 external_id: self.doc_external_id(pos)?,
             });
         }
@@ -2795,12 +2865,13 @@ impl CandidateStore {
                         snapshot.bloom_hashes,
                         snapshot.grams_complete,
                         snapshot.deleted,
+                        &document.metadata_bytes,
                         document.external_id.as_deref(),
                         &document.bloom_filter,
                         &decode_exact_gram_vec(&document.grams_received_bytes, gram_bytes)?,
                         &decode_exact_gram_vec(&document.grams_indexed_bytes, gram_bytes)?,
                     )?;
-                    let tier2_row = self.build_doc_row5(
+                    let tier2_row = self.build_tier2_doc_row(
                         snapshot.tier2_filter_bytes,
                         snapshot.tier2_bloom_hashes,
                         &document.tier2_bloom_filter,
@@ -2808,7 +2879,7 @@ impl CandidateStore {
                     self.doc_rows[existing_pos] = row;
                     self.tier2_doc_rows[existing_pos] = tier2_row;
                     self.write_doc_row(snapshot.doc_id, row)?;
-                    self.write_doc_row5(snapshot.doc_id, tier2_row)?;
+                    self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
                     self.update_tier2_superblocks_for_doc_bytes_inner(
                         existing_pos,
                         &document.bloom_filter,
@@ -2849,11 +2920,13 @@ impl CandidateStore {
             let grams_received_base = self.append_writers.grams_received.offset;
             let grams_indexed_base = self.append_writers.grams_indexed.offset;
             let external_ids_base = self.append_writers.external_ids.offset;
+            let metadata_base = self.append_writers.metadata.offset;
             let tier2_blooms_base = self.append_writers.tier2_blooms.offset;
             let mut blooms_payload = Vec::<u8>::new();
             let mut grams_received_payload = Vec::<u8>::new();
             let mut grams_indexed_payload = Vec::<u8>::new();
             let mut external_ids_payload = Vec::<u8>::new();
+            let mut metadata_payload = Vec::<u8>::new();
             let mut tier2_blooms_payload = Vec::<u8>::new();
             let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_inserts.len() * 32);
             let mut doc_meta_payload =
@@ -2895,6 +2968,13 @@ impl CandidateStore {
                     } else {
                         (0, 0)
                     };
+                let (metadata_offset, metadata_len) = if document.metadata_bytes.is_empty() {
+                    (0, 0)
+                } else {
+                    let offset = metadata_base + metadata_payload.len() as u64;
+                    metadata_payload.extend_from_slice(&document.metadata_bytes);
+                    (offset, document.metadata_bytes.len() as u32)
+                };
 
                 let tier2_row = if document.tier2_bloom_filter.is_empty() {
                     Tier2DocMetaRow::default()
@@ -2922,6 +3002,8 @@ impl CandidateStore {
                     grams_indexed_count: document.grams_indexed_count as u32,
                     external_id_offset,
                     external_id_len,
+                    metadata_offset,
+                    metadata_len,
                 };
 
                 let doc = CandidateDoc {
@@ -2969,6 +3051,7 @@ impl CandidateStore {
             self.append_writers
                 .external_ids
                 .append(&external_ids_payload)?;
+            self.append_writers.metadata.append(&metadata_payload)?;
             self.append_writers
                 .tier2_blooms
                 .append(&tier2_blooms_payload)?;
@@ -3195,6 +3278,10 @@ impl CandidateStore {
         let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
         let block_count = self.tier2_superblocks.keys_per_block.len();
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
+        let query_now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         for block_idx in 0..block_count {
             if allow_block_skip
@@ -3216,6 +3303,7 @@ impl CandidateStore {
                     continue;
                 }
                 docs_scanned += 1;
+                let metadata_bytes = self.doc_metadata_bytes(pos)?;
                 let indexed_bytes = self.doc_indexed_bytes(pos)?;
                 let tier1_bloom_bytes = self.doc_bloom_bytes(pos)?;
                 let tier2_bloom_bytes = self.doc_tier2_bloom_bytes(pos)?;
@@ -3223,12 +3311,14 @@ impl CandidateStore {
                 let outcome = evaluate_node(
                     &plan.root,
                     doc,
+                    metadata_bytes.as_ref(),
                     indexed_bytes.as_ref(),
                     tier1_bloom_bytes.as_ref(),
                     tier2_bloom_bytes.as_ref(),
                     &prepared.patterns,
                     &prepared.mask_cache,
                     plan,
+                    query_now_unix,
                     &mut eval_cache,
                 )?;
                 if outcome.matched {
@@ -3305,7 +3395,7 @@ impl CandidateStore {
             .collect()
     }
 
-    pub(crate) fn tier2_filter_keys(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn tier1_superblock_filter_keys(&self) -> Vec<(usize, usize)> {
         self.tier2_superblocks
             .bucket_for_key
             .keys()
@@ -3313,7 +3403,7 @@ impl CandidateStore {
             .collect::<Vec<_>>()
     }
 
-    pub(crate) fn secondary_filter_keys(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn tier2_doc_filter_keys(&self) -> Vec<(usize, usize)> {
         let mut keys = self
             .docs
             .iter()
@@ -3407,12 +3497,23 @@ impl CandidateStore {
         )?;
         Ok(Some(String::from_utf8(bytes.into_owned()).map_err(
             |_| {
-                TgsError::from(format!(
+                SspryError::from(format!(
                     "Invalid external_id payload stored for doc_id {}",
                     doc.doc_id
                 ))
             },
         )?))
+    }
+
+    fn doc_metadata_bytes<'a>(&'a self, pos: usize) -> Result<Cow<'a, [u8]>> {
+        let doc = &self.docs[pos];
+        let row = self.doc_rows[pos];
+        self.sidecars.metadata.read_bytes(
+            row.metadata_offset,
+            row.metadata_len as usize,
+            "metadata",
+            doc.doc_id,
+        )
     }
 
     fn persist_meta(&mut self) -> Result<()> {
@@ -3472,6 +3573,7 @@ impl CandidateStore {
         bloom_hashes: usize,
         grams_complete: bool,
         deleted: bool,
+        metadata: &[u8],
         external_id: Option<&str>,
         bloom_filter: &[u8],
         grams_received: &[u64],
@@ -3484,6 +3586,7 @@ impl CandidateStore {
                 bloom_hashes,
                 grams_complete,
                 deleted,
+                metadata,
                 external_id,
                 bloom_filter,
                 grams_received,
@@ -3499,6 +3602,7 @@ impl CandidateStore {
         bloom_hashes: usize,
         grams_complete: bool,
         deleted: bool,
+        metadata: &[u8],
         external_id: Option<&str>,
         bloom_offset: u64,
         bloom_len: usize,
@@ -3527,6 +3631,14 @@ impl CandidateStore {
         )?;
         profile.grams_indexed_us = elapsed_us(grams_indexed_started);
         profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+        let (metadata_offset, metadata_len) = if metadata.is_empty() {
+            (0, 0)
+        } else {
+            (
+                self.append_writers.metadata.append(metadata)?,
+                metadata.len() as u32,
+            )
+        };
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
             let external_id_started = Instant::now();
@@ -3555,6 +3667,8 @@ impl CandidateStore {
                 grams_indexed_count: grams_indexed.len() as u32,
                 external_id_offset,
                 external_id_len,
+                metadata_offset,
+                metadata_len,
             },
             profile,
         ))
@@ -3567,6 +3681,7 @@ impl CandidateStore {
         bloom_hashes: usize,
         grams_complete: bool,
         deleted: bool,
+        metadata: &[u8],
         external_id: Option<&str>,
         bloom_filter: &[u8],
         grams_received: &[u64],
@@ -3598,6 +3713,14 @@ impl CandidateStore {
         )?;
         profile.grams_indexed_us = elapsed_us(grams_indexed_started);
         profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+        let (metadata_offset, metadata_len) = if metadata.is_empty() {
+            (0, 0)
+        } else {
+            (
+                self.append_writers.metadata.append(metadata)?,
+                metadata.len() as u32,
+            )
+        };
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
             let external_id_started = Instant::now();
@@ -3625,22 +3748,28 @@ impl CandidateStore {
             grams_indexed_count: grams_indexed.len() as u32,
             external_id_offset,
             external_id_len,
+            metadata_offset,
+            metadata_len,
         };
         Ok((row, profile))
     }
 
-    fn build_doc_row5(
+    fn build_tier2_doc_row(
         &mut self,
         tier2_filter_bytes: usize,
         tier2_bloom_hashes: usize,
         tier2_bloom_filter: &[u8],
     ) -> Result<Tier2DocMetaRow> {
         Ok(self
-            .build_doc_row5_profile(tier2_filter_bytes, tier2_bloom_hashes, tier2_bloom_filter)?
+            .build_tier2_doc_row_profile(
+                tier2_filter_bytes,
+                tier2_bloom_hashes,
+                tier2_bloom_filter,
+            )?
             .0)
     }
 
-    fn build_doc_row5_profile(
+    fn build_tier2_doc_row_profile(
         &mut self,
         tier2_filter_bytes: usize,
         tier2_bloom_hashes: usize,
@@ -3691,7 +3820,7 @@ impl CandidateStore {
 
     fn write_doc_row(&self, doc_id: u64, row: DocMetaRow) -> Result<()> {
         if doc_id == 0 {
-            return Err(TgsError::from("doc_id must be positive"));
+            return Err(SspryError::from("doc_id must be positive"));
         }
         write_at(
             doc_meta_path(&self.root),
@@ -3700,9 +3829,9 @@ impl CandidateStore {
         )
     }
 
-    fn write_doc_row5(&self, doc_id: u64, row: Tier2DocMetaRow) -> Result<()> {
+    fn write_tier2_doc_row(&self, doc_id: u64, row: Tier2DocMetaRow) -> Result<()> {
         if doc_id == 0 {
-            return Err(TgsError::from("doc_id must be positive"));
+            return Err(SspryError::from("doc_id must be positive"));
         }
         write_at(
             tier2_doc_meta_path(&self.root),
@@ -4137,7 +4266,7 @@ impl CandidateStore {
     }
 
     fn prepared_query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
-        serde_json::to_string(plan).map_err(TgsError::from)
+        serde_json::to_string(plan).map_err(SspryError::from)
     }
 
     fn prepare_query_artifacts(
@@ -4152,8 +4281,8 @@ impl CandidateStore {
         record_counter("candidate.query_prepared_cache_misses_total", 1);
         let entry = build_prepared_query_artifacts(
             plan,
-            &self.tier2_filter_keys(),
-            &self.secondary_filter_keys(),
+            &self.tier1_superblock_filter_keys(),
+            &self.tier2_doc_filter_keys(),
         )?;
         self.prepared_query_cache.insert(key, entry.clone());
         Ok(entry)
@@ -4173,6 +4302,7 @@ pub(crate) fn write_compacted_snapshot(
         sha_by_docid_path(compacted_root),
         doc_meta_path(compacted_root),
         tier2_doc_meta_path(compacted_root),
+        doc_metadata_path(compacted_root),
         blooms_path(compacted_root),
         tier2_blooms_path(compacted_root),
         grams_received_path(compacted_root),
@@ -4230,8 +4360,19 @@ pub(crate) fn write_compacted_snapshot(
                 0,
             )?;
             Some(String::from_utf8(bytes).map_err(|_| {
-                TgsError::from("Invalid UTF-8 external_id payload during compaction.")
+                SspryError::from("Invalid UTF-8 external_id payload during compaction.")
             })?)
+        };
+        let metadata = if doc.row.metadata_len == 0 {
+            Vec::new()
+        } else {
+            read_blob_from_path(
+                &doc_metadata_path(&snapshot.root),
+                doc.row.metadata_offset,
+                doc.row.metadata_len as usize,
+                "metadata",
+                0,
+            )?
         };
 
         for gram in &grams_received {
@@ -4266,6 +4407,12 @@ pub(crate) fn write_compacted_snapshot(
                 .as_ref()
                 .map(|value| value.len() as u32)
                 .unwrap_or(0),
+            metadata_offset: if metadata.is_empty() {
+                0
+            } else {
+                append_blob(doc_metadata_path(compacted_root), &metadata)?
+            },
+            metadata_len: metadata.len() as u32,
         };
         let tier2_row = if tier2_bloom_bytes.is_empty() {
             Tier2DocMetaRow::default()
@@ -4310,7 +4457,11 @@ fn doc_meta_path(root: &Path) -> PathBuf {
 }
 
 fn tier2_doc_meta_path(root: &Path) -> PathBuf {
-    root.join("doc_meta5.bin")
+    root.join("tier2_doc_meta.bin")
+}
+
+fn doc_metadata_path(root: &Path) -> PathBuf {
+    root.join("doc_metadata.bin")
 }
 
 fn blooms_path(root: &Path) -> PathBuf {
@@ -4368,7 +4519,7 @@ fn read_shard_compaction_manifest(root: &Path) -> Result<ShardCompactionManifest
         return Ok(ShardCompactionManifest::default());
     }
     serde_json::from_slice(&fs::read(&path)?).map_err(|_| {
-        TgsError::from(format!(
+        SspryError::from(format!(
             "Invalid candidate compaction manifest at {}",
             path.display()
         ))
@@ -4415,7 +4566,7 @@ pub fn read_candidate_shard_count(root: &Path) -> Result<Option<usize>> {
         return Ok(None);
     }
     let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path)?).map_err(|_| {
-        TgsError::from(format!(
+        SspryError::from(format!(
             "Invalid candidate shard manifest at {}",
             path.display()
         ))
@@ -4424,7 +4575,7 @@ pub fn read_candidate_shard_count(root: &Path) -> Result<Option<usize>> {
         .get("candidate_shards")
         .and_then(|value| value.as_u64())
         .ok_or_else(|| {
-            TgsError::from(format!(
+            SspryError::from(format!(
                 "Invalid candidate shard manifest at {}",
                 path.display()
             ))
@@ -4472,7 +4623,7 @@ fn read_blob_from_path(
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0u8; len];
     file.read_exact(&mut bytes).map_err(|err| {
-        TgsError::from(format!(
+        SspryError::from(format!(
             "Failed to read {label} payload for doc_id {doc_id} from {}: {err}",
             path.display()
         ))
@@ -4627,7 +4778,7 @@ fn append_u64(payload: &mut Vec<u8>, value: u64) {
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
     let end = cursor.saturating_add(4);
     if end > bytes.len() {
-        return Err(TgsError::from("Invalid tier2 superblocks snapshot"));
+        return Err(SspryError::from("Invalid tier2 superblocks snapshot"));
     }
     let value = u32::from_le_bytes(bytes[*cursor..end].try_into().expect("u32 slice"));
     *cursor = end;
@@ -4637,7 +4788,7 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
 fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
     let end = cursor.saturating_add(8);
     if end > bytes.len() {
-        return Err(TgsError::from("Invalid tier2 superblocks snapshot"));
+        return Err(SspryError::from("Invalid tier2 superblocks snapshot"));
     }
     let value = u64::from_le_bytes(bytes[*cursor..end].try_into().expect("u64 slice"));
     *cursor = end;
@@ -4686,7 +4837,7 @@ fn extend_unit_df_payload_from_packed(
     gram_bytes: usize,
 ) -> Result<()> {
     if gram_bytes == 0 || packed_grams.len() % gram_bytes != 0 {
-        return Err(TgsError::from("Invalid packed exact gram payload."));
+        return Err(SspryError::from("Invalid packed exact gram payload."));
     }
     payload.reserve(packed_grams.len());
     payload.extend_from_slice(packed_grams);
@@ -4730,7 +4881,7 @@ fn load_candidate_store_state(
     }
     let docs = serde_json::from_slice::<Vec<LegacyCandidateDoc>>(&fs::read(&legacy_path)?)
         .map_err(|_| {
-            TgsError::from(format!(
+            SspryError::from(format!(
                 "Invalid candidate document state at {}",
                 root.display()
             ))
@@ -4750,7 +4901,7 @@ fn load_candidate_docs_log(path: &Path) -> Result<Vec<LegacyCandidateDoc>> {
             continue;
         }
         let doc = serde_json::from_str::<LegacyCandidateDoc>(&line).map_err(|_| {
-            TgsError::from(format!(
+            SspryError::from(format!(
                 "Invalid candidate document log at {}:{}",
                 path.display(),
                 line_no + 1
@@ -4765,6 +4916,7 @@ fn binary_store_exists(root: &Path) -> bool {
     sha_by_docid_path(root).exists()
         || doc_meta_path(root).exists()
         || tier2_doc_meta_path(root).exists()
+        || doc_metadata_path(root).exists()
 }
 
 fn persist_docs_as_binary(
@@ -4777,6 +4929,7 @@ fn persist_docs_as_binary(
         sha_by_docid_path(root),
         doc_meta_path(root),
         tier2_doc_meta_path(root),
+        doc_metadata_path(root),
         blooms_path(root),
         tier2_blooms_path(root),
         grams_received_path(root),
@@ -4792,13 +4945,13 @@ fn persist_docs_as_binary(
     ordered_docs.sort_by_key(|doc| doc.doc_id);
     for doc in &ordered_docs {
         let bloom_bytes = hex::decode(&doc.bloom_hex).map_err(|_| {
-            TgsError::from(format!("Invalid bloom payload stored for {}", doc.sha256))
+            SspryError::from(format!("Invalid bloom payload stored for {}", doc.sha256))
         })?;
         let tier2_bloom_bytes = if doc.tier2_bloom_hex.is_empty() {
             Vec::new()
         } else {
             hex::decode(&doc.tier2_bloom_hex).map_err(|_| {
-                TgsError::from(format!(
+                SspryError::from(format!(
                     "Invalid tier2_bloom payload stored for {}",
                     doc.sha256
                 ))
@@ -4840,6 +4993,8 @@ fn persist_docs_as_binary(
                 .as_ref()
                 .map(|value| value.len() as u32)
                 .unwrap_or(0),
+            metadata_offset: 0,
+            metadata_len: 0,
         };
         let tier2_row = if tier2_bloom_bytes.is_empty() {
             Tier2DocMetaRow::default()
@@ -4867,16 +5022,16 @@ fn load_candidate_binary_store(
 ) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
     let sha_bytes = fs::read(sha_by_docid_path(root))?;
     let row_bytes = fs::read(doc_meta_path(root))?;
-    let row5_bytes = fs::read(tier2_doc_meta_path(root)).unwrap_or_default();
+    let tier2_row_bytes = fs::read(tier2_doc_meta_path(root)).unwrap_or_default();
     if sha_bytes.len() % 32 != 0 || row_bytes.len() % DOC_META_ROW_BYTES != 0 {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Invalid candidate binary document state at {}",
             root.display()
         )));
     }
     let doc_count = sha_bytes.len() / 32;
     if doc_count != row_bytes.len() / DOC_META_ROW_BYTES {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Mismatched candidate binary document state at {}",
             root.display()
         )));
@@ -4890,9 +5045,9 @@ fn load_candidate_binary_store(
         let row = DocMetaRow::decode(
             &row_bytes[index * DOC_META_ROW_BYTES..(index + 1) * DOC_META_ROW_BYTES],
         )?;
-        let tier2_row = if row5_bytes.len() >= (index + 1) * TIER2_DOC_META_ROW_BYTES {
+        let tier2_row = if tier2_row_bytes.len() >= (index + 1) * TIER2_DOC_META_ROW_BYTES {
             Tier2DocMetaRow::decode(
-                &row5_bytes
+                &tier2_row_bytes
                     [index * TIER2_DOC_META_ROW_BYTES..(index + 1) * TIER2_DOC_META_ROW_BYTES],
             )?
         } else {
@@ -4926,7 +5081,7 @@ fn read_blob<'a>(
     let offset = offset as usize;
     let end = offset.saturating_add(len);
     if end > bytes.len() {
-        return Err(TgsError::from(format!(
+        return Err(SspryError::from(format!(
             "Invalid {label} payload stored for doc_id {doc_id}"
         )));
     }
@@ -4983,7 +5138,7 @@ fn read_exact_gram_vec_from_path(
 
 fn decode_exact_gram_vec(bytes: &[u8], gram_bytes: usize) -> Result<Vec<u64>> {
     if gram_bytes == 0 || bytes.len() % gram_bytes != 0 {
-        return Err(TgsError::from("Invalid packed exact gram payload."));
+        return Err(SspryError::from("Invalid packed exact gram payload."));
     }
     let mut out = Vec::with_capacity(bytes.len() / gram_bytes);
     for chunk in bytes.chunks_exact(gram_bytes) {
@@ -5030,29 +5185,29 @@ fn exact_gram_bytes_contains_all(bytes: &[u8], required: &[u64], gram_bytes: usi
 
 fn validate_config(config: &CandidateConfig) -> Result<()> {
     if config.df_min == 0 {
-        return Err(TgsError::from("candidate config values must be positive"));
+        return Err(SspryError::from("candidate config values must be positive"));
     }
     if config.df_max != 0 && config.df_max < config.df_min {
-        return Err(TgsError::from("df_max must be >= df_min"));
+        return Err(SspryError::from("df_max must be >= df_min"));
     }
     if !matches!(
         config.id_source.as_str(),
         "sha256" | "md5" | "sha1" | "sha512"
     ) {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "id_source must be one of sha256, md5, sha1, sha512",
         ));
     }
     GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)
-        .map_err(|err| TgsError::from(format!("invalid gram size pair: {err}")))?;
+        .map_err(|err| SspryError::from(format!("invalid gram size pair: {err}")))?;
     if !config.compaction_idle_cooldown_s.is_finite() || config.compaction_idle_cooldown_s < 0.0 {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "compaction_idle_cooldown_s must be finite and >= 0",
         ));
     }
     if let Some(value) = config.filter_target_fp {
         if !(0.0 < value && value < 1.0) {
-            return Err(TgsError::from("filter_target_fp must be in range (0, 1)"));
+            return Err(SspryError::from("filter_target_fp must be in range (0, 1)"));
         }
     }
     Ok(())
@@ -5061,7 +5216,7 @@ fn validate_config(config: &CandidateConfig) -> Result<()> {
 fn normalize_sha256_hex(value: &str) -> Result<String> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(TgsError::from(
+        return Err(SspryError::from(
             "sha256 must be exactly 64 hexadecimal characters.",
         ));
     }
@@ -5103,6 +5258,10 @@ fn merge_cached_bloom_masks(
 fn node_structurally_impossible(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "pattern" => false,
+        "verifier_only_eq" => false,
+        "filesize_eq" => false,
+        "metadata_eq" => false,
+        "time_now_eq" => false,
         "and" => node.children.iter().any(node_structurally_impossible),
         "or" => !node.children.is_empty() && node.children.iter().all(node_structurally_impossible),
         "n_of" => {
@@ -5247,7 +5406,7 @@ fn block_maybe_matches_node(
             let pattern_id = node
                 .pattern_id
                 .as_ref()
-                .ok_or_else(|| TgsError::from("pattern node requires pattern_id"))?;
+                .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
             Ok(block_matches_pattern(
                 block_idx,
                 pattern_id,
@@ -5255,6 +5414,10 @@ fn block_maybe_matches_node(
                 superblocks,
             ))
         }
+        "verifier_only_eq" => Ok(true),
+        "filesize_eq" => Ok(true),
+        "metadata_eq" => Ok(true),
+        "time_now_eq" => Ok(true),
         "and" => {
             for child in &node.children {
                 if !block_maybe_matches_node(block_idx, child, mask_cache, superblocks)? {
@@ -5274,7 +5437,7 @@ fn block_maybe_matches_node(
         "n_of" => {
             let threshold = node
                 .threshold
-                .ok_or_else(|| TgsError::from("n_of node requires threshold"))?;
+                .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
             let mut matched = 0usize;
             for child in &node.children {
                 if block_maybe_matches_node(block_idx, child, mask_cache, superblocks)? {
@@ -5286,7 +5449,7 @@ fn block_maybe_matches_node(
             }
             Ok(false)
         }
-        other => Err(TgsError::from(format!(
+        other => Err(SspryError::from(format!(
             "Unsupported ast node kind: {other}"
         ))),
     }
@@ -5387,12 +5550,14 @@ fn evaluate_pattern(
 fn evaluate_node(
     node: &QueryNode,
     doc: &CandidateDoc,
+    metadata_bytes: &[u8],
     indexed_bytes: &[u8],
     bloom_bytes: &[u8],
     tier2_bloom_bytes: &[u8],
     patterns: &HashMap<String, PatternPlan>,
     mask_cache: &PatternMaskCache,
     plan: &CompiledQueryPlan,
+    query_now_unix: u64,
     eval_cache: &mut QueryEvalCache,
 ) -> Result<MatchOutcome> {
     match node.kind.as_str() {
@@ -5400,16 +5565,16 @@ fn evaluate_node(
             let pattern_id = node
                 .pattern_id
                 .as_ref()
-                .ok_or_else(|| TgsError::from("pattern node requires pattern_id"))?;
+                .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
             if let Some(outcome) = eval_cache.pattern_outcomes.get(pattern_id).copied() {
                 return Ok(outcome);
             }
             let pattern = patterns
                 .get(pattern_id)
-                .ok_or_else(|| TgsError::from(format!("Unknown pattern id: {pattern_id}")))?;
+                .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
             let pattern_masks = mask_cache
                 .get(pattern_id)
-                .ok_or_else(|| TgsError::from(format!("Unknown pattern id: {pattern_id}")))?;
+                .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
             let outcome = evaluate_pattern(
                 pattern,
                 pattern_masks,
@@ -5424,6 +5589,50 @@ fn evaluate_node(
                 .insert(pattern_id.clone(), outcome);
             Ok(outcome)
         }
+        "verifier_only_eq" => Ok(MatchOutcome {
+            matched: true,
+            tiers: TierFlags::default(),
+            score: 0,
+        }),
+        "filesize_eq" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from("filesize_eq node requires threshold"))?
+                as u64;
+            Ok(MatchOutcome {
+                matched: doc.file_size == expected_size,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
+        "metadata_eq" => {
+            let field = node
+                .pattern_id
+                .as_deref()
+                .ok_or_else(|| SspryError::from("metadata_eq node requires pattern_id"))?;
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from("metadata_eq node requires threshold"))?
+                as u64;
+            let matched =
+                metadata_field_matches_eq(metadata_bytes, field, expected)?.unwrap_or(true);
+            Ok(MatchOutcome {
+                matched,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
+        "time_now_eq" => {
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from("time_now_eq node requires threshold"))?
+                as u64;
+            Ok(MatchOutcome {
+                matched: query_now_unix == expected,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
         "and" => {
             let mut merged = TierFlags::default();
             let mut score = 0u32;
@@ -5431,12 +5640,14 @@ fn evaluate_node(
                 let outcome = evaluate_node(
                     child,
                     doc,
+                    metadata_bytes,
                     indexed_bytes,
                     bloom_bytes,
                     tier2_bloom_bytes,
                     patterns,
                     mask_cache,
                     plan,
+                    query_now_unix,
                     eval_cache,
                 )?;
                 if !outcome.matched {
@@ -5456,12 +5667,14 @@ fn evaluate_node(
                 let outcome = evaluate_node(
                     child,
                     doc,
+                    metadata_bytes,
                     indexed_bytes,
                     bloom_bytes,
                     tier2_bloom_bytes,
                     patterns,
                     mask_cache,
                     plan,
+                    query_now_unix,
                     eval_cache,
                 )?;
                 if outcome.matched {
@@ -5473,7 +5686,7 @@ fn evaluate_node(
         "n_of" => {
             let threshold = node
                 .threshold
-                .ok_or_else(|| TgsError::from("n_of node requires threshold"))?;
+                .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
             let mut matched_count = 0usize;
             let mut merged = TierFlags::default();
             let mut score = 0u32;
@@ -5481,12 +5694,14 @@ fn evaluate_node(
                 let outcome = evaluate_node(
                     child,
                     doc,
+                    metadata_bytes,
                     indexed_bytes,
                     bloom_bytes,
                     tier2_bloom_bytes,
                     patterns,
                     mask_cache,
                     plan,
+                    query_now_unix,
                     eval_cache,
                 )?;
                 if outcome.matched {
@@ -5512,7 +5727,7 @@ fn evaluate_node(
                 score: if matched_count >= threshold { score } else { 0 },
             })
         }
-        other => Err(TgsError::from(format!(
+        other => Err(SspryError::from(format!(
             "Unsupported ast node kind: {other}"
         ))),
     }
@@ -5524,8 +5739,8 @@ mod tests {
 
     use crate::candidate::BloomFilter;
     use crate::candidate::{
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, pack_exact_gram,
-        query_plan::compile_query_plan,
+        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, extract_compact_document_metadata,
+        pack_exact_gram, query_plan::compile_query_plan,
     };
 
     use super::*;
@@ -6600,6 +6815,8 @@ rule q {
             grams_indexed_count: 1,
             external_id_offset: 21,
             external_id_len: 4,
+            metadata_offset: 25,
+            metadata_len: 3,
         };
         let encoded = row.encode();
         let decoded = DocMetaRow::decode(&encoded).expect("decode row");
@@ -7067,12 +7284,14 @@ rule q {
                 ],
             },
             &doc,
+            &[],
             &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &patterns,
             &mask_cache,
             &eval_plan,
+            0,
             &mut QueryEvalCache::default(),
         )
         .expect("and");
@@ -7101,12 +7320,14 @@ rule q {
                 ],
             },
             &doc,
+            &[],
             &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &patterns,
             &mask_cache,
             &eval_plan,
+            0,
             &mut QueryEvalCache::default(),
         )
         .expect("or");
@@ -7135,12 +7356,14 @@ rule q {
                 ],
             },
             &doc,
+            &[],
             &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &patterns,
             &mask_cache,
             &eval_plan,
+            0,
             &mut QueryEvalCache::default(),
         )
         .expect("n_of");
@@ -7157,12 +7380,14 @@ rule q {
                     children: Vec::new(),
                 },
                 &doc,
+                &[],
                 &indexed,
                 &bloom_bytes,
                 tier2_bloom_bytes,
                 &patterns,
                 &mask_cache,
                 &eval_plan,
+                0,
                 &mut QueryEvalCache::default(),
             )
             .expect_err("missing threshold")
@@ -7178,18 +7403,145 @@ rule q {
                     children: Vec::new(),
                 },
                 &doc,
+                &[],
                 &indexed,
                 &bloom_bytes,
                 tier2_bloom_bytes,
                 &patterns,
                 &mask_cache,
                 &eval_plan,
+                0,
                 &mut QueryEvalCache::default(),
             )
             .expect_err("unsupported kind")
             .to_string()
             .contains("Unsupported ast node kind")
         );
+    }
+
+    #[test]
+    fn evaluate_node_supports_metadata_and_time_conditions() {
+        let tmp = tempdir().expect("tmp");
+        let pe_path = tmp.path().join("sample.exe");
+        let mut pe = vec![0u8; 512];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        pe[0x88..0x8c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+        pe[0x96..0x98].copy_from_slice(&0x2000u16.to_le_bytes());
+        pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[0x98 + 68..0x98 + 70].copy_from_slice(&3u16.to_le_bytes());
+        fs::write(&pe_path, pe).expect("write pe");
+        let metadata_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
+
+        let doc = CandidateDoc {
+            doc_id: 1,
+            sha256: hex::encode([0x11; 32]),
+            file_size: 512,
+            filter_bytes: 8,
+            bloom_hashes: 2,
+            tier2_filter_bytes: 8,
+            tier2_bloom_hashes: 2,
+            grams_complete: true,
+            deleted: false,
+        };
+        let patterns = HashMap::<String, PatternPlan>::new();
+        let mask_cache = PatternMaskCache::new();
+        let eval_plan = CompiledQueryPlan {
+            patterns: Vec::new(),
+            root: QueryNode {
+                kind: "metadata_eq".to_owned(),
+                pattern_id: Some("pe.machine".to_owned()),
+                threshold: Some(0x14c),
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 32,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+
+        let metadata_outcome = evaluate_node(
+            &eval_plan.root,
+            &doc,
+            &metadata_bytes,
+            &[],
+            &[],
+            &[],
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("metadata eq");
+        assert!(metadata_outcome.matched);
+
+        let unknown_outcome = evaluate_node(
+            &QueryNode {
+                kind: "metadata_eq".to_owned(),
+                pattern_id: Some("elf.machine".to_owned()),
+                threshold: Some(62),
+                children: Vec::new(),
+            },
+            &doc,
+            &[],
+            &[],
+            &[],
+            &[],
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("unknown metadata eq");
+        assert!(unknown_outcome.matched);
+
+        let time_outcome = evaluate_node(
+            &QueryNode {
+                kind: "time_now_eq".to_owned(),
+                pattern_id: Some("time.now".to_owned()),
+                threshold: Some(1234),
+                children: Vec::new(),
+            },
+            &doc,
+            &metadata_bytes,
+            &[],
+            &[],
+            &[],
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            1234,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("time now eq");
+        assert!(time_outcome.matched);
+
+        let verifier_outcome = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_eq".to_owned(),
+                pattern_id: Some("uint32(0)==332".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &doc,
+            &metadata_bytes,
+            &[],
+            &[],
+            &[],
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("verifier only eq");
+        assert!(verifier_outcome.matched);
     }
 
     #[test]
@@ -7219,14 +7571,14 @@ rule q {
             .expect("add primary gram");
         let tier2_filter_bytes = store
             .resolve_filter_bytes_for_file_size(4, Some(2))
-            .expect("secondary filter bytes");
+            .expect("tier2 filter bytes");
         let tier2_bloom_hashes =
             store.resolve_bloom_hashes_for_document(tier2_filter_bytes, Some(2), None);
-        let mut secondary_bloom =
-            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("secondary bloom");
-        secondary_bloom
+        let mut tier2_bloom =
+            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("tier2 bloom");
+        tier2_bloom
             .add(pack_exact_gram(&[1, 2, 3, 4]))
-            .expect("add secondary gram");
+            .expect("add tier2 gram");
         store
             .insert_document(
                 sha256,
@@ -7238,14 +7590,14 @@ rule q {
                 filter_bytes,
                 &primary_bloom.into_bytes(),
                 tier2_filter_bytes,
-                &secondary_bloom.into_bytes(),
+                &tier2_bloom.into_bytes(),
                 &[pack_exact_gram(&[1, 2, 3, 4])],
                 false,
                 None,
                 None,
                 true,
             )
-            .expect("write secondary sidecars");
+            .expect("write tier2 sidecars");
 
         let plan = CompiledQueryPlan {
             patterns: vec![PatternPlan {
@@ -7326,14 +7678,14 @@ rule q {
             .expect("add primary gram");
         let tier2_filter_bytes = store
             .resolve_filter_bytes_for_file_size(file_size, Some(2))
-            .expect("secondary filter bytes");
+            .expect("tier2 filter bytes");
         let tier2_bloom_hashes =
             store.resolve_bloom_hashes_for_document(tier2_filter_bytes, Some(2), None);
-        let mut secondary_bloom =
-            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("secondary bloom");
-        secondary_bloom
+        let mut tier2_bloom =
+            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("tier2 bloom");
+        tier2_bloom
             .add(pack_exact_gram(&[1, 2, 3, 4]))
-            .expect("add secondary gram");
+            .expect("add tier2 gram");
         store
             .insert_document(
                 sha256,
@@ -7345,7 +7697,7 @@ rule q {
                 filter_bytes,
                 &primary_bloom.into_bytes(),
                 tier2_filter_bytes,
-                &secondary_bloom.into_bytes(),
+                &tier2_bloom.into_bytes(),
                 &[pack_exact_gram(&[1, 2, 3, 4])],
                 false,
                 None,

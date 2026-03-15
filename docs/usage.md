@@ -2,7 +2,7 @@
 
 ## Overview
 
-`yaya` has one public workflow:
+`sspry` has one public workflow:
 
 1. `serve` starts the TCP server and initializes the store if needed.
 2. `index` scans files and submits batched inserts.
@@ -22,14 +22,14 @@ Top-level:
 ## serve
 
 ```bash
-./target/release/yaya serve [options]
+./target/release/sspry serve [options]
 ```
 
 Options:
 
 - `--addr <host:port>`
   - TCP bind address
-  - env: `YAYA_ADDR`
+  - env: `SSPRY_ADDR`
 - `--max-request-bytes <bytes>`
   - hard request-size cap
 - `--search-workers <n>`
@@ -50,7 +50,7 @@ Options:
 Example:
 
 ```bash
-./target/release/yaya serve \
+./target/release/sspry serve \
   --addr 127.0.0.1:17653 \
   --root ./candidate_db \
   --shards 256 \
@@ -63,7 +63,7 @@ Example:
 ## index
 
 ```bash
-./target/release/yaya index [options] <paths>...
+./target/release/sspry index [options] <paths>...
 ```
 
 Options:
@@ -84,7 +84,7 @@ Notes:
 ## delete
 
 ```bash
-./target/release/yaya delete [options] <values>...
+./target/release/sspry delete [options] <values>...
 ```
 
 Options:
@@ -102,7 +102,7 @@ If a provided value does not match the server identity format, `delete` returns 
 ## search
 
 ```bash
-./target/release/yaya search [options] --rule <rule.yar>
+./target/release/sspry search [options] --rule <rule.yar>
 ```
 
 Options:
@@ -119,12 +119,33 @@ Behavior:
 - default search is unverified
 - `--verify` reopens candidate file paths and runs local YARA verification
 - verified search requires stored file paths to still exist on disk
+- indexed search currently supports:
+  - literal and hex-string anchors
+  - `filesize == <const>`
+  - exact equality on stored module metadata such as:
+    - `pe.*`
+    - `elf.*`
+    - `dex.*`
+    - `lnk.*`
+    - `dotnet.is_dotnet`
+  - `time.now == <const>`
+- numeric read equality such as `uint32(0) == 0x4000` is accepted in indexed search only when the rule also has at least one string/hex anchor
+  - the numeric equality is verifier-only in this first phase
+  - without `--verify`, candidate results may still include extra false positives
 
 ## info
 
 ```bash
-./target/release/yaya info [options]
+./target/release/sspry info [options]
 ```
+
+Options:
+
+- `--addr <host:port>`
+- `--timeout <seconds>`
+- `--light`
+  - return lightweight server status without walking shard stats
+  - includes adaptive publish state and background seal queue state
 
 Returns JSON describing:
 
@@ -134,6 +155,7 @@ Returns JSON describing:
 - search worker count
 - drain state and active connections
 - bloom policy
+- adaptive publish state
 - document counts and filter-bucket counts
 - startup cleanup counts for abandoned compaction roots
 - compaction generation / retired generation counts
@@ -142,7 +164,7 @@ Returns JSON describing:
 ## shutdown
 
 ```bash
-./target/release/yaya shutdown [options]
+./target/release/sspry shutdown [options]
 ```
 
 Options:
@@ -161,14 +183,14 @@ Behavior:
 ## yara
 
 ```bash
-./target/release/yaya yara --rule ./rule.yar <file>
+./target/release/sspry yara --rule ./rule.yar <file>
 ```
 
 This bypasses the database and scans one file directly.
 
 ## Environment
 
-- `YAYA_ADDR`
+- `SSPRY_ADDR`
   - default server/client address for `serve`, `index`, `delete`, `search`, and `info`
 
 ## Operational Guidance

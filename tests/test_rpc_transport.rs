@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use tempfile::tempdir;
 
-use yaya::candidate::{compile_query_plan_from_file, encode_grams_delta_u64, scan_file_features};
-use yaya::rpc::{CandidateDocumentWire, ClientConfig, TgsdbClient};
+use sspry::candidate::{compile_query_plan_from_file, encode_grams_delta_u64, scan_file_features};
+use sspry::rpc::{CandidateDocumentWire, ClientConfig, SspryClient};
 
 fn bin_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_yaya"))
+    PathBuf::from(env!("CARGO_BIN_EXE_sspry"))
 }
 
 struct ChildGuard {
@@ -52,8 +52,8 @@ fn spawn_tcp_serve(port: u16, candidate_root: &Path) -> ChildGuard {
     ChildGuard { child }
 }
 
-fn wait_for_server(port: u16) -> TgsdbClient {
-    let client = TgsdbClient::new(ClientConfig::new(
+fn wait_for_server(port: u16) -> SspryClient {
+    let client = SspryClient::new(ClientConfig::new(
         "127.0.0.1".to_owned(),
         port,
         Duration::from_secs(1),
@@ -147,6 +147,7 @@ rule q {
             grams: Vec::new(),
             grams_complete: !features_a.unique_grams_truncated,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: Some("cand-a".to_owned()),
         },
         CandidateDocumentWire {
@@ -163,6 +164,7 @@ rule q {
             grams: features_b.unique_grams,
             grams_complete: !features_b.unique_grams_truncated,
             effective_diversity: None,
+            metadata_b64: None,
             external_id: Some("cand-b".to_owned()),
         },
     ];

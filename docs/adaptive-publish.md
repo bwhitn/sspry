@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace the temporary fixed `--auto-publish-idle-ms` knob with a server-owned policy that:
+The fixed `--auto-publish-idle-ms` knob has been removed. The current server-owned policy should:
 
 - publishes quickly on fast, lightly loaded systems
 - backs off on slow or saturated systems
@@ -118,15 +118,13 @@ Then adjust from runtime signals:
 - grow the window quickly when backlog or publish duration spikes
 - on storage that is detected as rotational or unknown, do not enter the `0-100ms` band until observed publish/seal behavior is healthy for several cycles
 
-## Removal Of The Fixed Knob
+## Debug Surface
 
-After the adaptive policy is validated:
+The public fixed knob is already gone. Keep only internal stats/debug output for:
 
-- remove public `--auto-publish-idle-ms`
-- keep only internal stats/debug output for:
-  - current adaptive idle window
-  - recent publish p50/p95
-  - current seal backlog
+- current adaptive idle window
+- recent publish p50/p95
+- current seal backlog
 
 ## Next Implementation Step
 

@@ -1,6 +1,6 @@
 # Implementation
 
-`yaya` is a mutable file-search engine built around exact gram postings, per-document bloom filters, and optional local YARA verification.
+`sspry` is a mutable file-search engine built around exact gram postings, per-document bloom filters, and optional local YARA verification.
 
 ## Architecture
 
@@ -44,7 +44,7 @@ Per shard, the implementation persists binary sidecars for:
 - document metadata
 - normalized document ids
 - primary bloom blobs
-- secondary bloom blobs
+- tier2 bloom blobs
 - retained exact gram lists
 - deleted state
 - DF state
@@ -137,7 +137,7 @@ For each file, the client computes:
 
 - normalized document id
 - primary bloom grams
-- secondary bloom grams
+- tier2 bloom grams
 - retained Tier1 exact grams
 - file size
 - optional stored path
