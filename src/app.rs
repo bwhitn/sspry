@@ -17,17 +17,17 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
 use crate::candidate::query_plan::{
-    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
+    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
 };
 #[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, GramSizes, HLL_DEFAULT_PRECISION,
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
     encode_grams_delta_u64, estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
     extract_compact_document_metadata, read_candidate_shard_count,
-    scan_file_features_with_gram_sizes,
+    scan_file_features_with_gram_sizes, BoundedCache, CandidateConfig, CandidateStore, GramSizes,
+    HLL_DEFAULT_PRECISION,
 };
 use crate::perf;
 use crate::rpc::{
@@ -1400,7 +1400,11 @@ fn legacy_query_from_plan(plan: &crate::candidate::CompiledQueryPlan) -> Option<
                     .get(node.pattern_id.as_ref()?)
                     .cloned()
                     .unwrap_or_default();
-                if expr.is_empty() { None } else { Some(expr) }
+                if expr.is_empty() {
+                    None
+                } else {
+                    Some(expr)
+                }
             }
             "and" | "or" => {
                 let parts = node
@@ -2586,6 +2590,26 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             (
                                 "store_compact_df_counts_us",
                                 "verbose.index.server_index_insert_batch_store_compact_df_counts_us",
+                            ),
+                            (
+                                "store_compact_df_counts_check_us",
+                                "verbose.index.server_index_insert_batch_store_compact_df_counts_check_us",
+                            ),
+                            (
+                                "store_compact_df_counts_checked_delta_bytes",
+                                "verbose.index.server_index_insert_batch_store_compact_df_counts_checked_delta_bytes",
+                            ),
+                            (
+                                "store_compact_df_counts_persist_snapshot_us",
+                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_us",
+                            ),
+                            (
+                                "store_compact_df_counts_refresh_snapshot_us",
+                                "verbose.index.server_index_insert_batch_store_compact_df_counts_refresh_snapshot_us",
+                            ),
+                            (
+                                "store_compact_df_counts_reopen_writers_us",
+                                "verbose.index.server_index_insert_batch_store_compact_df_counts_reopen_writers_us",
                             ),
                             (
                                 "store_rebalance_tier2_us",
@@ -3814,12 +3838,10 @@ mod tests {
             file_digest,
             path_identity_sha256(&sample).expect("path digest")
         );
-        assert!(
-            sha256_file(&sample, 0)
-                .expect_err("zero chunk size")
-                .to_string()
-                .contains("positive integer")
-        );
+        assert!(sha256_file(&sample, 0)
+            .expect_err("zero chunk size")
+            .to_string()
+            .contains("positive integer"));
 
         let mut files = Vec::new();
         collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -4804,24 +4826,18 @@ rule remote_q {
         let sample = tmp.path().join("sample.bin");
         fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-        assert!(
-            md5_file(&sample, 0)
-                .expect_err("md5 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha1_file(&sample, 0)
-                .expect_err("sha1 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha512_file(&sample, 0)
-                .expect_err("sha512 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
+        assert!(md5_file(&sample, 0)
+            .expect_err("md5 zero chunk")
+            .to_string()
+            .contains("positive integer"));
+        assert!(sha1_file(&sample, 0)
+            .expect_err("sha1 zero chunk")
+            .to_string()
+            .contains("positive integer"));
+        assert!(sha512_file(&sample, 0)
+            .expect_err("sha512 zero chunk")
+            .to_string()
+            .contains("positive integer"));
 
         assert_eq!(
             detect_digest_identity_source(&"aa".repeat(16)),

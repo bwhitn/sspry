@@ -19,7 +19,7 @@ use crate::candidate::features::scale_tier1_gram_budget;
 use crate::candidate::filter_policy::{
     choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
-use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
+use crate::candidate::grams::{GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
 use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::perf::{record_counter, record_max, scope};
@@ -374,6 +374,11 @@ pub struct CandidateInsertBatchProfile {
     pub persist_meta_us: u64,
     pub append_df_delta_us: u64,
     pub compact_df_counts_us: u64,
+    pub compact_df_counts_check_us: u64,
+    pub compact_df_counts_checked_delta_bytes: u64,
+    pub compact_df_counts_persist_snapshot_us: u64,
+    pub compact_df_counts_refresh_snapshot_us: u64,
+    pub compact_df_counts_reopen_writers_us: u64,
     pub rebalance_tier2_us: u64,
 }
 
@@ -405,6 +410,15 @@ struct CandidateDocRowPayloadProfile {
     grams_indexed_bytes: u64,
     external_id_bytes: u64,
     tier2_bloom_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DfCountsCompactionProfile {
+    check_us: u64,
+    checked_delta_bytes: u64,
+    persist_snapshot_us: u64,
+    refresh_snapshot_us: u64,
+    reopen_writers_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -552,7 +566,11 @@ impl Default for StoreMeta {
 
 impl StoreMeta {
     fn exact_gram_bytes(&self) -> usize {
-        if self.tier1_gram_size <= 4 { 4 } else { 8 }
+        if self.tier1_gram_size <= 4 {
+            4
+        } else {
+            8
+        }
     }
 }
 
@@ -1512,7 +1530,7 @@ impl CandidateStore {
         );
         self.df_counts_delta_compact_threshold_bytes =
             df_counts_delta_compact_threshold_bytes(memory_budget_bytes, self.total_shards);
-        self.maybe_compact_df_counts()?;
+        let _ = self.maybe_compact_df_counts()?;
         self.maybe_rebalance_tier2_superblocks()
     }
 
@@ -2168,7 +2186,7 @@ impl CandidateStore {
             &mut self.append_writers.df_counts_unit_delta,
             &df_unit_delta_payload,
         )?;
-        self.maybe_compact_df_counts()?;
+        let _ = self.maybe_compact_df_counts()?;
         self.sidecars.invalidate_all();
 
         self.mark_write_activity();
@@ -2641,10 +2659,25 @@ impl CandidateStore {
                 .append_df_delta_us
                 .saturating_add(elapsed_us(append_df_delta_started));
             let compact_df_counts_started = Instant::now();
-            self.maybe_compact_df_counts()?;
+            let compact_df_counts_profile = self.maybe_compact_df_counts()?;
             insert_profile.compact_df_counts_us = insert_profile
                 .compact_df_counts_us
                 .saturating_add(elapsed_us(compact_df_counts_started));
+            insert_profile.compact_df_counts_check_us = insert_profile
+                .compact_df_counts_check_us
+                .saturating_add(compact_df_counts_profile.check_us);
+            insert_profile.compact_df_counts_checked_delta_bytes = insert_profile
+                .compact_df_counts_checked_delta_bytes
+                .max(compact_df_counts_profile.checked_delta_bytes);
+            insert_profile.compact_df_counts_persist_snapshot_us = insert_profile
+                .compact_df_counts_persist_snapshot_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_us);
+            insert_profile.compact_df_counts_refresh_snapshot_us = insert_profile
+                .compact_df_counts_refresh_snapshot_us
+                .saturating_add(compact_df_counts_profile.refresh_snapshot_us);
+            insert_profile.compact_df_counts_reopen_writers_us = insert_profile
+                .compact_df_counts_reopen_writers_us
+                .saturating_add(compact_df_counts_profile.reopen_writers_us);
             let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
             insert_profile.rebalance_tier2_us = insert_profile
@@ -2711,7 +2744,7 @@ impl CandidateStore {
                 self.meta.exact_gram_bytes(),
                 &df_deltas,
             )?;
-            self.maybe_compact_df_counts()?;
+            let _ = self.maybe_compact_df_counts()?;
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
             return Ok(result);
@@ -3553,17 +3586,31 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn maybe_compact_df_counts(&mut self) -> Result<()> {
+    fn maybe_compact_df_counts(&mut self) -> Result<DfCountsCompactionProfile> {
+        fn elapsed_us(started: Instant) -> u64 {
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+        }
+
+        let mut profile = DfCountsCompactionProfile::default();
+        let check_started = Instant::now();
         let len = current_df_counts_delta_bytes(&self.root);
+        profile.check_us = elapsed_us(check_started);
+        profile.checked_delta_bytes = len;
         if len >= self.df_counts_delta_compact_threshold_bytes {
+            let persist_snapshot_started = Instant::now();
             self.persist_df_counts_snapshot()?;
+            profile.persist_snapshot_us = elapsed_us(persist_snapshot_started);
+            let refresh_snapshot_started = Instant::now();
             self.df_counts.refresh_snapshot(&self.root)?;
+            profile.refresh_snapshot_us = elapsed_us(refresh_snapshot_started);
+            let reopen_writers_started = Instant::now();
             self.append_writers.df_counts_delta =
                 AppendFile::new(df_counts_delta_path(&self.root))?;
             self.append_writers.df_counts_unit_delta =
                 AppendFile::new(df_counts_unit_delta_path(&self.root))?;
+            profile.reopen_writers_us = elapsed_us(reopen_writers_started);
         }
-        Ok(())
+        Ok(profile)
     }
 
     fn build_doc_row(
@@ -5739,8 +5786,8 @@ mod tests {
 
     use crate::candidate::BloomFilter;
     use crate::candidate::{
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, extract_compact_document_metadata,
-        pack_exact_gram, query_plan::compile_query_plan,
+        extract_compact_document_metadata, pack_exact_gram, query_plan::compile_query_plan,
+        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
     };
 
     use super::*;
@@ -6152,13 +6199,11 @@ rule q {
 
         let manifest = ShardCompactionManifest {
             current_generation: 7,
-            retired_roots: vec![
-                retired_root
-                    .file_name()
-                    .expect("retired file name")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
+            retired_roots: vec![retired_root
+                .file_name()
+                .expect("retired file name")
+                .to_string_lossy()
+                .into_owned()],
         };
         fs::create_dir_all(&retired_root).expect("create retired root");
         write_shard_compaction_manifest(&root, &manifest).expect("write manifest");
@@ -6270,12 +6315,10 @@ rule q {
         )
         .expect("insert third");
 
-        assert!(
-            store
-                .apply_compaction_snapshot(&snapshot, &compacted_root)
-                .expect("apply compaction")
-                .is_none()
-        );
+        assert!(store
+            .apply_compaction_snapshot(&snapshot, &compacted_root)
+            .expect("apply compaction")
+            .is_none());
         assert_eq!(store.stats().doc_count, 2);
         assert_eq!(store.stats().deleted_doc_count, 1);
         let _ = fs::remove_dir_all(compacted_root);
@@ -6301,12 +6344,10 @@ rule q {
         bloom.add(0x4443_4241).expect("add gram");
         let bloom_bytes = bloom.into_bytes();
 
-        assert!(
-            store
-                .prepare_compaction_snapshot(false)
-                .expect("snapshot without deletes")
-                .is_none()
-        );
+        assert!(store
+            .prepare_compaction_snapshot(false)
+            .expect("snapshot without deletes")
+            .is_none());
 
         insert_primary(
             &mut store,
@@ -6326,18 +6367,14 @@ rule q {
             .delete_document(&hex::encode([0x11; 32]))
             .expect("delete");
 
-        assert!(
-            store
-                .prepare_compaction_snapshot(false)
-                .expect("cooldown snapshot")
-                .is_none()
-        );
-        assert!(
-            store
-                .prepare_compaction_snapshot(true)
-                .expect("forced snapshot")
-                .is_some()
-        );
+        assert!(store
+            .prepare_compaction_snapshot(false)
+            .expect("cooldown snapshot")
+            .is_none());
+        assert!(store
+            .prepare_compaction_snapshot(true)
+            .expect("forced snapshot")
+            .is_some());
     }
 
     #[test]
@@ -6519,80 +6556,66 @@ rule q {
             true,
         )
         .expect("init");
-        assert!(
-            CandidateStore::init(
-                CandidateConfig {
-                    root: root.clone(),
-                    ..CandidateConfig::default()
-                },
-                false
-            )
-            .expect_err("existing store")
-            .to_string()
-            .contains("already exists")
-        );
+        assert!(CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            false
+        )
+        .expect_err("existing store")
+        .to_string()
+        .contains("already exists"));
 
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                df_min: 0,
-                ..CandidateConfig::default()
-            })
-            .expect_err("positive config")
-            .to_string()
-            .contains("must be positive")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                df_min: 2,
-                df_max: 1,
-                ..CandidateConfig::default()
-            })
-            .expect_err("df order")
-            .to_string()
-            .contains("df_max")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                id_source: "filepath".to_owned(),
-                ..CandidateConfig::default()
-            })
-            .expect_err("id source")
-            .to_string()
-            .contains("id_source")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                filter_target_fp: Some(1.0),
-                ..CandidateConfig::default()
-            })
-            .expect_err("target fp")
-            .to_string()
-            .contains("filter_target_fp")
-        );
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            df_min: 0,
+            ..CandidateConfig::default()
+        })
+        .expect_err("positive config")
+        .to_string()
+        .contains("must be positive"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            df_min: 2,
+            df_max: 1,
+            ..CandidateConfig::default()
+        })
+        .expect_err("df order")
+        .to_string()
+        .contains("df_max"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            id_source: "filepath".to_owned(),
+            ..CandidateConfig::default()
+        })
+        .expect_err("id source")
+        .to_string()
+        .contains("id_source"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            filter_target_fp: Some(1.0),
+            ..CandidateConfig::default()
+        })
+        .expect_err("target fp")
+        .to_string()
+        .contains("filter_target_fp"));
         assert_eq!(
             normalize_sha256_hex(&format!("  {}  ", "AB".repeat(32))).expect("normalize"),
             "ab".repeat(32)
         );
-        assert!(
-            normalize_sha256_hex("not-a-sha")
-                .expect_err("invalid sha")
-                .to_string()
-                .contains("64 hexadecimal")
-        );
+        assert!(normalize_sha256_hex("not-a-sha")
+            .expect_err("invalid sha")
+            .to_string()
+            .contains("64 hexadecimal"));
 
         let open_root = tmp.path().join("open_checks");
         fs::create_dir_all(&open_root).expect("open root");
         fs::write(meta_path(&open_root), b"{").expect("bad meta");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("invalid meta")
-                .to_string()
-                .contains("Invalid candidate metadata")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("invalid meta")
+            .to_string()
+            .contains("Invalid candidate metadata"));
 
         let bad_version = StoreMeta {
             version: STORE_VERSION + 1,
@@ -6603,12 +6626,10 @@ rule q {
             serde_json::to_vec_pretty(&bad_version).expect("version json"),
         )
         .expect("write version");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("unsupported version")
-                .to_string()
-                .contains("Unsupported candidate store version")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("unsupported version")
+            .to_string()
+            .contains("Unsupported candidate store version"));
 
         fs::write(
             meta_path(&open_root),
@@ -6619,12 +6640,10 @@ rule q {
         assert_eq!(opened.stats().doc_count, 0);
 
         fs::write(docs_path(&open_root), b"{").expect("bad docs");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("invalid docs")
-                .to_string()
-                .contains("Invalid candidate document state")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("invalid docs")
+            .to_string()
+            .contains("Invalid candidate document state"));
     }
 
     #[test]
@@ -6720,12 +6739,10 @@ rule q {
 
         let invalid_log = tmp.path().join("invalid_log.jsonl");
         fs::write(&invalid_log, b"{\n").expect("write invalid log");
-        assert!(
-            load_candidate_docs_log(&invalid_log)
-                .expect_err("invalid log")
-                .to_string()
-                .contains("Invalid candidate document log")
-        );
+        assert!(load_candidate_docs_log(&invalid_log)
+            .expect_err("invalid log")
+            .to_string()
+            .contains("Invalid candidate document log"));
     }
 
     #[test]
@@ -6746,22 +6763,18 @@ rule q {
         let invalid_len_root = tmp.path().join("invalid_len_root");
         persist_docs_as_binary(&invalid_len_root, &docs, 4).expect("persist invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
-        assert!(
-            load_candidate_binary_store(&invalid_len_root)
-                .expect_err("invalid binary len")
-                .to_string()
-                .contains("Invalid candidate binary document state")
-        );
+        assert!(load_candidate_binary_store(&invalid_len_root)
+            .expect_err("invalid binary len")
+            .to_string()
+            .contains("Invalid candidate binary document state"));
 
         let mismatch_root = tmp.path().join("mismatch_root");
         persist_docs_as_binary(&mismatch_root, &docs, 4).expect("persist mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
-        assert!(
-            load_candidate_binary_store(&mismatch_root)
-                .expect_err("mismatch state")
-                .to_string()
-                .contains("Mismatched candidate binary document state")
-        );
+        assert!(load_candidate_binary_store(&mismatch_root)
+            .expect_err("mismatch state")
+            .to_string()
+            .contains("Mismatched candidate binary document state"));
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
         persist_docs_as_binary(&invalid_bloom_root, &docs, 4).expect("persist invalid bloom root");
@@ -6775,12 +6788,10 @@ rule q {
             serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
-        assert!(
-            CandidateStore::open(&invalid_bloom_root)
-                .expect_err("invalid bloom offset")
-                .to_string()
-                .contains("Invalid bloom payload stored")
-        );
+        assert!(CandidateStore::open(&invalid_bloom_root)
+            .expect_err("invalid bloom offset")
+            .to_string()
+            .contains("Invalid bloom payload stored"));
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
         persist_docs_as_binary(&invalid_utf8_root, &docs, 4).expect("persist invalid utf8 root");
@@ -6790,14 +6801,12 @@ rule q {
             serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad utf8 meta"),
         )
         .expect("write bad utf8 meta");
-        assert!(
-            CandidateStore::open(&invalid_utf8_root)
-                .expect("open utf8 root")
-                .doc_external_id(0)
-                .expect_err("invalid external id utf8")
-                .to_string()
-                .contains("Invalid external_id payload stored")
-        );
+        assert!(CandidateStore::open(&invalid_utf8_root)
+            .expect("open utf8 root")
+            .doc_external_id(0)
+            .expect_err("invalid external id utf8")
+            .to_string()
+            .contains("Invalid external_id payload stored"));
     }
 
     #[test]
@@ -6831,12 +6840,10 @@ rule q {
         assert_eq!(decoded.grams_indexed_count, row.grams_indexed_count);
         assert_eq!(decoded.external_id_offset, row.external_id_offset);
         assert_eq!(decoded.external_id_len, row.external_id_len);
-        assert!(
-            DocMetaRow::decode(&encoded[..encoded.len() - 1])
-                .expect_err("short row")
-                .to_string()
-                .contains("Invalid candidate doc meta row size")
-        );
+        assert!(DocMetaRow::decode(&encoded[..encoded.len() - 1])
+            .expect_err("short row")
+            .to_string()
+            .contains("Invalid candidate doc meta row size"));
 
         let tmp = tempdir().expect("tmp");
         let blob_path = tmp.path().join("blob.bin");
@@ -6852,12 +6859,10 @@ rule q {
         write_at(blob_path.clone(), 1, b"Z").expect("write at");
         bytes = fs::read(&blob_path).expect("re-read blob file");
         assert_eq!(&bytes, b"aZcde");
-        assert!(
-            read_blob(&bytes, 99, 1, "blob", 1)
-                .expect_err("invalid blob range")
-                .to_string()
-                .contains("Invalid blob payload stored")
-        );
+        assert!(read_blob(&bytes, 99, 1, "blob", 1)
+            .expect_err("invalid blob range")
+            .to_string()
+            .contains("Invalid blob payload stored"));
 
         let u32_path = tmp.path().join("u32.bin");
         let offset = append_u32_slice(u32_path.clone(), &[7, 8, 9]).expect("append u32");
@@ -6866,12 +6871,10 @@ rule q {
             read_u32_vec(&u32_bytes, offset, 3, "grams", 9).expect("read u32 vec"),
             vec![7, 8, 9]
         );
-        assert!(
-            read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
-                .expect_err("invalid u32 range")
-                .to_string()
-                .contains("Invalid grams payload stored")
-        );
+        assert!(read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
+            .expect_err("invalid u32 range")
+            .to_string()
+            .contains("Invalid grams payload stored"));
     }
 
     #[test]
@@ -6958,19 +6961,23 @@ rule q {
         let mut sidecar = BlobSidecar::new(grams_received_path(&root));
         sidecar.map_if_exists().expect("map sidecar");
         assert_eq!(
-            sidecar.read_bytes(1, 3, "grams", 7).expect("mmap read").as_ref(),
+            sidecar
+                .read_bytes(1, 3, "grams", 7)
+                .expect("mmap read")
+                .as_ref(),
             b"bcd"
         );
-        assert!(
-            sidecar
-                .read_bytes(99, 1, "grams", 7)
-                .expect_err("invalid range")
-                .to_string()
-                .contains("Invalid grams payload stored")
-        );
+        assert!(sidecar
+            .read_bytes(99, 1, "grams", 7)
+            .expect_err("invalid range")
+            .to_string()
+            .contains("Invalid grams payload stored"));
         sidecar.invalidate();
         assert_eq!(
-            sidecar.read_bytes(0, 2, "grams", 7).expect("file read").as_ref(),
+            sidecar
+                .read_bytes(0, 2, "grams", 7)
+                .expect("file read")
+                .as_ref(),
             b"ab"
         );
 
@@ -6980,7 +6987,10 @@ rule q {
         sidecar.retarget(grams_received_path(&other_root));
         sidecar.map_if_exists().expect("remap sidecar");
         assert_eq!(
-            sidecar.read_bytes(0, 3, "grams", 8).expect("retarget read").as_ref(),
+            sidecar
+                .read_bytes(0, 3, "grams", 8)
+                .expect("retarget read")
+                .as_ref(),
             b"xyz"
         );
 
@@ -7010,18 +7020,27 @@ rule q {
         assert_eq!(append.append(b"abc").expect("append first"), 0);
         assert_eq!(append.append(b"").expect("append empty"), 3);
         assert_eq!(append.append(b"de").expect("append second"), 3);
-        assert_eq!(fs::read(&append_path).expect("read append payload"), b"abcde");
+        assert_eq!(
+            fs::read(&append_path).expect("read append payload"),
+            b"abcde"
+        );
 
         let retarget_path = tmp.path().join("retarget").join("payload.bin");
         append.retarget(retarget_path.clone());
         append.handle = None;
         assert_eq!(append.append(b"zz").expect("append retarget"), 5);
-        assert_eq!(fs::read(&retarget_path).expect("read retarget payload"), b"zz");
+        assert_eq!(
+            fs::read(&retarget_path).expect("read retarget payload"),
+            b"zz"
+        );
 
         let mut writers = StoreAppendWriters::new(&root).expect("append writers");
         writers.retarget_root(&other_root);
         assert_eq!(writers.metadata.path, doc_metadata_path(&other_root));
-        assert_eq!(writers.df_counts_unit_delta.path, df_counts_unit_delta_path(&other_root));
+        assert_eq!(
+            writers.df_counts_unit_delta.path,
+            df_counts_unit_delta_path(&other_root)
+        );
     }
 
     #[test]
@@ -7030,30 +7049,24 @@ rule q {
         let root = tmp.path();
 
         fs::write(df_counts_path(root), [1u8, 2, 3]).expect("write invalid snapshot");
-        assert!(
-            DfCountsState::load(root, 4)
-                .expect_err("invalid snapshot size")
-                .to_string()
-                .contains("Invalid df_counts snapshot")
-        );
+        assert!(DfCountsState::load(root, 4)
+            .expect_err("invalid snapshot size")
+            .to_string()
+            .contains("Invalid df_counts snapshot"));
 
         fs::write(df_counts_path(root), Vec::<u8>::new()).expect("clear snapshot");
         fs::write(df_counts_delta_path(root), [1u8, 2, 3]).expect("write invalid delta");
-        assert!(
-            DfCountsState::load(root, 4)
-                .expect_err("invalid delta size")
-                .to_string()
-                .contains("Invalid df_counts delta")
-        );
+        assert!(DfCountsState::load(root, 4)
+            .expect_err("invalid delta size")
+            .to_string()
+            .contains("Invalid df_counts delta"));
 
         fs::write(df_counts_delta_path(root), Vec::<u8>::new()).expect("clear delta");
         fs::write(df_counts_unit_delta_path(root), [1u8, 2, 3]).expect("write invalid unit");
-        assert!(
-            DfCountsState::load(root, 4)
-                .expect_err("invalid unit delta size")
-                .to_string()
-                .contains("Invalid df_counts unit delta")
-        );
+        assert!(DfCountsState::load(root, 4)
+            .expect_err("invalid unit delta size")
+            .to_string()
+            .contains("Invalid df_counts unit delta"));
     }
 
     #[test]
@@ -7070,52 +7083,48 @@ rule q {
         )
         .expect("init");
 
-        assert!(
-            store
-                .insert_document(
-                    [0x10; 32],
-                    8,
-                    None,
-                    None,
-                    None,
-                    None,
-                    0,
-                    &[],
-                    0,
-                    &[],
-                    &[],
-                    true,
-                    None,
-                    None,
-                    true,
-                )
-                .expect_err("zero filter bytes")
-                .to_string()
-                .contains("filter_bytes must be > 0")
-        );
-        assert!(
-            store
-                .insert_document(
-                    [0x10; 32],
-                    8,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1024,
-                    &vec![0u8; 32],
-                    0,
-                    &[],
-                    &[],
-                    true,
-                    None,
-                    None,
-                    true,
-                )
-                .expect_err("length mismatch")
-                .to_string()
-                .contains("bloom_filter length")
-        );
+        assert!(store
+            .insert_document(
+                [0x10; 32],
+                8,
+                None,
+                None,
+                None,
+                None,
+                0,
+                &[],
+                0,
+                &[],
+                &[],
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect_err("zero filter bytes")
+            .to_string()
+            .contains("filter_bytes must be > 0"));
+        assert!(store
+            .insert_document(
+                [0x10; 32],
+                8,
+                None,
+                None,
+                None,
+                None,
+                1024,
+                &vec![0u8; 32],
+                0,
+                &[],
+                &[],
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect_err("length mismatch")
+            .to_string()
+            .contains("bloom_filter length"));
 
         let inserted = insert_primary(
             &mut store,
@@ -7553,52 +7562,48 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1+tier2");
         assert!(outcome.score > 0);
 
-        assert!(
-            evaluate_node(
-                &QueryNode {
-                    kind: "n_of".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &doc,
-                &[],
-                &indexed,
-                &bloom_bytes,
-                tier2_bloom_bytes,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                0,
-                &mut QueryEvalCache::default(),
-            )
-            .expect_err("missing threshold")
-            .to_string()
-            .contains("requires threshold")
-        );
-        assert!(
-            evaluate_node(
-                &QueryNode {
-                    kind: "bogus".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &doc,
-                &[],
-                &indexed,
-                &bloom_bytes,
-                tier2_bloom_bytes,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                0,
-                &mut QueryEvalCache::default(),
-            )
-            .expect_err("unsupported kind")
-            .to_string()
-            .contains("Unsupported ast node kind")
-        );
+        assert!(evaluate_node(
+            &QueryNode {
+                kind: "n_of".to_owned(),
+                pattern_id: None,
+                threshold: None,
+                children: Vec::new(),
+            },
+            &doc,
+            &[],
+            &indexed,
+            &bloom_bytes,
+            tier2_bloom_bytes,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect_err("missing threshold")
+        .to_string()
+        .contains("requires threshold"));
+        assert!(evaluate_node(
+            &QueryNode {
+                kind: "bogus".to_owned(),
+                pattern_id: None,
+                threshold: None,
+                children: Vec::new(),
+            },
+            &doc,
+            &[],
+            &indexed,
+            &bloom_bytes,
+            tier2_bloom_bytes,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect_err("unsupported kind")
+        .to_string()
+        .contains("Unsupported ast node kind"));
     }
 
     #[test]
@@ -7743,8 +7748,7 @@ rule q {
             .resolve_filter_bytes_for_file_size(4, Some(1))
             .expect("primary filter bytes");
         let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, Some(1), None);
-        let mut primary_bloom =
-            BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
+        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
         primary_bloom
             .add(pack_exact_gram(&[1, 2, 3]))
             .expect("add primary gram");
@@ -7853,8 +7857,7 @@ rule q {
         assert!(filter_bytes > MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
-        let mut primary_bloom =
-            BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
+        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
         primary_bloom
             .add(pack_exact_gram(&[1, 2, 3]))
             .expect("add primary gram");
@@ -7990,6 +7993,82 @@ rule q {
         );
         assert_eq!(stats.tier2_superblock_memory_budget_bytes, 16 * 1024 * 1024);
         assert_eq!(stats.tier2_superblock_summary_bytes, 0);
+    }
+
+    #[test]
+    fn maybe_compact_df_counts_reports_checked_bytes_and_clears_delta_files() {
+        fn make_doc(
+            store: &CandidateStore,
+            file_size: u64,
+            sha_byte: u8,
+            gram: u64,
+        ) -> ([u8; 32], Vec<u64>, usize, usize, Vec<u8>) {
+            let grams = vec![gram];
+            let filter_bytes = store
+                .resolve_filter_bytes_for_file_size(file_size, Some(grams.len()))
+                .expect("filter bytes");
+            let bloom_hashes =
+                store.resolve_bloom_hashes_for_document(filter_bytes, Some(grams.len()), None);
+            let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
+            for value in &grams {
+                bloom.add(*value).expect("add gram");
+            }
+            (
+                [sha_byte; 32],
+                grams,
+                filter_bytes,
+                bloom_hashes,
+                bloom.into_bytes(),
+            )
+        }
+
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let file_size = 4096u64;
+        let (sha256, grams, filter_bytes, bloom_hashes, bloom_bytes) =
+            make_doc(&store, file_size, 0x41, pack_exact_gram(&[1, 2, 3, 4]));
+        store
+            .insert_document(
+                sha256,
+                file_size,
+                Some(grams.len()),
+                Some(bloom_hashes),
+                Some(grams.len()),
+                Some(bloom_hashes),
+                filter_bytes,
+                &bloom_bytes,
+                filter_bytes,
+                &bloom_bytes,
+                &grams,
+                true,
+                None,
+                None,
+                true,
+            )
+            .expect("insert");
+
+        let bytes_before = current_df_counts_delta_bytes(&root);
+        assert!(bytes_before > 0);
+
+        store.df_counts_delta_compact_threshold_bytes = 1;
+        let profile = store.maybe_compact_df_counts().expect("compact df counts");
+        assert_eq!(profile.checked_delta_bytes, bytes_before);
+        assert_eq!(current_df_counts_delta_bytes(&root), 0);
+        assert!(
+            fs::metadata(df_counts_path(&root))
+                .expect("df counts snapshot")
+                .len()
+                > 0
+        );
     }
 
     #[test]

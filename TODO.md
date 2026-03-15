@@ -2,7 +2,7 @@
 
 Current baseline:
 - Repo: `/root/pertest/repos/yaya`
-- Current `HEAD`: `ce4d203` `Make auto publish adaptive`
+- Current pushed baseline: `62910e5` `Expand search coverage and refresh deps`
 - Repo-local git auto maintenance is disabled during benchmark work:
   - `gc.auto = 0`
   - `maintenance.auto = false`
@@ -42,6 +42,28 @@ Interpretation:
 - Inside store work, the two biggest remaining hotspots are:
   1. `compact_df_counts`
   2. `classify`
+
+Current-tree DF compaction rerun, late-run snapshot:
+- Artifact root: `/root/pertest/results/sspry_dfcompact_profile_26000_current_20260315_140702`
+- The run was intentionally stopped after a late-run live snapshot once the compaction diagnosis was clear.
+- Snapshot at `23,359` active docs:
+  - `work_df_counts_delta_bytes = 728,515,384`
+  - `work_df_counts_delta_compact_threshold_bytes = 1,073,741,824`
+  - `store_compact_df_counts_us = 87,330,505`
+  - `store_classify_us = 93,892,615`
+  - `store_append_sidecars_us = 88,334,406`
+  - `store_apply_df_counts_us = 50,140,201`
+  - `store_compact_df_counts_check_us = 0`
+  - `store_compact_df_counts_persist_snapshot_us = 0`
+  - `store_compact_df_counts_refresh_snapshot_us = 0`
+  - `store_compact_df_counts_reopen_writers_us = 0`
+
+Read:
+- `compact_df_counts` is still a real large-ingest hotspot on the current tree.
+- The new split is incomplete: the expensive subphase is not captured by the current
+  `check/persist/refresh/reopen` fields.
+- The next step is a second instrumentation pass inside `maybe_compact_df_counts()` /
+  `persist_df_counts_snapshot_to_root()` before attempting another optimization.
 
 Useful current comparison run:
 - Artifact root: `/root/pertest/results/yaya_incremental_large_auto_20260315`
@@ -93,20 +115,22 @@ Important kept changes already in `master`:
 Why:
 - On the `26k` ingest it was the single biggest store-side bucket:
   - `187,097,904 us`
+- On the current-tree late-run rerun it is still first-tier:
+  - `87,330,505 us` by `23,359` docs
 
 Next step:
-- Add a deeper breakdown inside `maybe_compact_df_counts()`:
-  - snapshot persist time
-  - snapshot refresh time
-  - append-writer reopen time
-  - any extra file-size checks / metadata work
+- Add a second, tighter breakdown inside `maybe_compact_df_counts()` and
+  `persist_df_counts_snapshot_to_root()`:
+  - snapshot payload materialization time
+  - sort/order time before snapshot write
+  - snapshot write/rename time
+  - delta-file clear time
+  - any hidden file-size / metadata / fsync work not captured by the first split
 
 Goal:
-- Determine whether the cost is mostly:
-  - snapshot write IO
-  - snapshot reload IO
-  - writer lifecycle churn
-  - or compaction frequency
+- Determine which real subphase explains the large outer
+  `store_compact_df_counts_us` number, because the first split showed zeros even
+  while the outer bucket spiked.
 
 Important note:
 - A naive attempt to defer work-root DF compaction was benchmarked and rejected.
@@ -258,3 +282,45 @@ Useful reminder:
 - do not let Git auto-maintenance kick back in during benchmark work
 - keep benchmark artifacts in `/root/pertest/results/`
 - keep only the main repo worktree unless an A/B run is actively using another one
+
+## Search Shortcuts
+
+Goal:
+- add a deliberate shorthand layer for common search cases without weakening correctness
+- keep false negatives impossible
+- allow false positives only when the verifier/search pipeline already tolerates them
+
+Scope ideas:
+- aliases for the most common metadata fields and module expressions
+- shorthand for common equality checks that already map cleanly to indexed search
+- canonical expansion of shortcuts before planning so profiling/debugging still sees the real query shape
+
+Constraints:
+- shortcuts must expand to the existing restricted rule/search model
+- no hidden semantics changes
+- no shortcut should bypass verifier-only handling for numeric/module cases that still need it
+
+## Search Optimization
+
+Goal:
+- reduce search latency and candidate counts without increasing false negatives
+
+Current likely directions:
+- planner-side shortcut expansion and normalization should happen before DF ordering and branch-budget decisions
+- keep improving selectivity ordering for mixed:
+  - string anchors
+  - numeric-read anchors
+  - metadata equality filters
+- watch for unnecessary metadata/sidecar reads in candidate evaluation
+- profile query-time costs separately for:
+  - plan compile
+  - DF lookup
+  - candidate query
+  - verification
+
+Important constraints:
+- HDD behavior matters; avoid optimizations that trade a small CPU win for materially more random IO
+- keep memory pressure bounded during long-running searches and large candidate pages
+- preserve the current bar:
+  - false positives are acceptable
+  - false negatives are not
