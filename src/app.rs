@@ -46,7 +46,6 @@ pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
 pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
-pub const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = rpc::DEFAULT_AUTO_PUBLISH_IDLE_MS;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
 pub const DEFAULT_INCREMENTAL_SHARDS: usize = 64;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
@@ -206,6 +205,14 @@ fn detect_storage_class_for_paths(paths: &[PathBuf]) -> IngestStorageClass {
         IngestStorageClass::SolidState
     } else {
         IngestStorageClass::Unknown
+    }
+}
+
+fn adaptive_publish_prior_for_root(root: &Path) -> (String, u64) {
+    match detect_storage_class_for_path(root) {
+        IngestStorageClass::SolidState => ("solid-state".to_owned(), 0),
+        IngestStorageClass::Rotational => ("rotational".to_owned(), 1_500),
+        IngestStorageClass::Unknown => ("unknown".to_owned(), 500),
     }
 }
 
@@ -1604,6 +1611,8 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
     match (|| -> Result<i32> {
         let (host, port) = parse_host_port(&args.addr)?;
         let candidate_shards = serve_candidate_shard_count(args);
+        let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
+            adaptive_publish_prior_for_root(Path::new(&args.root));
         let signals = serve_signal_flags()?;
         rpc::serve_with_signal_flags(
             &host,
@@ -1616,7 +1625,8 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
                 tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
-                auto_publish_idle_ms: args.auto_publish_idle_ms,
+                auto_publish_initial_idle_ms,
+                auto_publish_storage_class,
                 workspace_mode: true,
             },
             signals.shutdown.clone(),
@@ -2210,8 +2220,40 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_publish_idle_elapsed_ms",
                         ),
                         (
+                            "adaptive_idle_ms",
+                            "verbose.index.server_publish_adaptive_idle_ms",
+                        ),
+                        (
                             "idle_remaining_ms",
                             "verbose.index.server_publish_idle_remaining_ms",
+                        ),
+                        (
+                            "adaptive_recent_publish_p95_ms",
+                            "verbose.index.server_publish_adaptive_recent_publish_p95_ms",
+                        ),
+                        (
+                            "adaptive_recent_submit_p95_ms",
+                            "verbose.index.server_publish_adaptive_recent_submit_p95_ms",
+                        ),
+                        (
+                            "adaptive_recent_store_p95_ms",
+                            "verbose.index.server_publish_adaptive_recent_store_p95_ms",
+                        ),
+                        (
+                            "adaptive_recent_publishes_in_window",
+                            "verbose.index.server_publish_adaptive_recent_publishes_in_window",
+                        ),
+                        (
+                            "adaptive_df_pending_shards",
+                            "verbose.index.server_publish_adaptive_df_pending_shards",
+                        ),
+                        (
+                            "adaptive_tier2_pending_shards",
+                            "verbose.index.server_publish_adaptive_tier2_pending_shards",
+                        ),
+                        (
+                            "adaptive_healthy_cycles",
+                            "verbose.index.server_publish_adaptive_healthy_cycles",
                         ),
                         (
                             "published_doc_count",
@@ -2344,6 +2386,24 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         } else if let Some(value) =
                             publish.get(key).and_then(|value| value.as_u64())
                         {
+                            eprintln!("{label}: {value}");
+                        }
+                    }
+                    for (key, label) in [
+                        (
+                            "adaptive_mode",
+                            "verbose.index.server_publish_adaptive_mode",
+                        ),
+                        (
+                            "adaptive_reason",
+                            "verbose.index.server_publish_adaptive_reason",
+                        ),
+                        (
+                            "adaptive_storage_class",
+                            "verbose.index.server_publish_adaptive_storage_class",
+                        ),
+                    ] {
+                        if let Some(value) = publish.get(key).and_then(|value| value.as_str()) {
                             eprintln!("{label}: {value}");
                         }
                     }
@@ -3325,12 +3385,6 @@ struct ServeArgs {
     )]
     tier2_superblock_budget_divisor: u64,
     #[arg(
-        long = "auto-publish-idle-ms",
-        default_value_t = DEFAULT_AUTO_PUBLISH_IDLE_MS,
-        help = "Temporary fixed idle window before auto-publish. 0 publishes immediately once active index sessions and mutations are drained."
-    )]
-    auto_publish_idle_ms: u64,
-    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. YAYA will manage current/, work/, and retired/ under this path."
@@ -3583,7 +3637,8 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+            auto_publish_initial_idle_ms: 500,
+            auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: true,
         })
     }
@@ -3668,7 +3723,6 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
@@ -4664,7 +4718,8 @@ rule remote_q {
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+            auto_publish_initial_idle_ms: 500,
+            auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: true,
         });
 

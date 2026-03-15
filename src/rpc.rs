@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
@@ -125,7 +125,8 @@ pub struct ServerConfig {
     pub search_workers: usize,
     pub memory_budget_bytes: u64,
     pub tier2_superblock_budget_divisor: u64,
-    pub auto_publish_idle_ms: u64,
+    pub auto_publish_initial_idle_ms: u64,
+    pub auto_publish_storage_class: String,
     pub workspace_mode: bool,
 }
 
@@ -429,6 +430,7 @@ struct ServerState {
     last_published_tier2_snapshot_seal_persisted_shards: AtomicU64,
     last_published_tier2_snapshot_seal_failures: AtomicU64,
     last_published_tier2_snapshot_seal_completed_unix_ms: AtomicU64,
+    adaptive_publish: Mutex<AdaptivePublishState>,
     df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
@@ -492,7 +494,274 @@ struct PublishReadiness {
     eligible: bool,
     blocked_reason: &'static str,
     idle_elapsed_ms: u64,
+    idle_threshold_ms: u64,
     idle_remaining_ms: u64,
+}
+
+const ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW: usize = 16;
+const ADAPTIVE_PUBLISH_RECENT_PRESSURE_WINDOW: usize = 16;
+const ADAPTIVE_PUBLISH_RATE_WINDOW_MS: u64 = 10_000;
+const ADAPTIVE_PUBLISH_FAST_P95_MS: u64 = 500;
+const ADAPTIVE_PUBLISH_BACKOFF_P95_MS: u64 = 2_000;
+const ADAPTIVE_PUBLISH_FAST_SUBMIT_MS: u64 = 2_000;
+const ADAPTIVE_PUBLISH_BACKOFF_SUBMIT_MS: u64 = 5_000;
+const ADAPTIVE_PUBLISH_FAST_STORE_MS: u64 = 1_500;
+const ADAPTIVE_PUBLISH_BACKOFF_STORE_MS: u64 = 4_000;
+const ADAPTIVE_PUBLISH_GROW_STEP_MS: u64 = 500;
+const ADAPTIVE_PUBLISH_SHRINK_STEP_MS: u64 = 100;
+const ADAPTIVE_PUBLISH_HEALTHY_CYCLES_TO_SHRINK: u64 = 3;
+
+#[derive(Clone, Debug)]
+struct AdaptivePublishSnapshot {
+    storage_class: String,
+    current_idle_ms: u64,
+    mode: &'static str,
+    reason: &'static str,
+    recent_publish_p95_ms: u64,
+    recent_submit_p95_ms: u64,
+    recent_store_p95_ms: u64,
+    recent_publishes_in_window: u64,
+    df_pending_shards: u64,
+    tier2_pending_shards: u64,
+    healthy_cycles: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AdaptivePublishState {
+    storage_class: String,
+    candidate_shards: usize,
+    current_idle_ms: u64,
+    recent_publish_ms: VecDeque<u64>,
+    recent_submit_ms: VecDeque<u64>,
+    recent_store_ms: VecDeque<u64>,
+    recent_publish_completed_unix_ms: VecDeque<u64>,
+    last_df_pending_shards: usize,
+    last_tier2_pending_shards: usize,
+    healthy_cycles: u64,
+    mode: &'static str,
+    reason: &'static str,
+}
+
+impl AdaptivePublishState {
+    fn new(storage_class: String, initial_idle_ms: u64, candidate_shards: usize) -> Self {
+        Self {
+            storage_class,
+            candidate_shards: candidate_shards.max(1),
+            current_idle_ms: initial_idle_ms.min(DEFAULT_AUTO_PUBLISH_IDLE_MS),
+            recent_publish_ms: VecDeque::with_capacity(ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW),
+            recent_submit_ms: VecDeque::with_capacity(ADAPTIVE_PUBLISH_RECENT_PRESSURE_WINDOW),
+            recent_store_ms: VecDeque::with_capacity(ADAPTIVE_PUBLISH_RECENT_PRESSURE_WINDOW),
+            recent_publish_completed_unix_ms: VecDeque::with_capacity(
+                ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW,
+            ),
+            last_df_pending_shards: 0,
+            last_tier2_pending_shards: 0,
+            healthy_cycles: 0,
+            mode: "moderate",
+            reason: "startup_bias",
+        }
+    }
+
+    fn push_recent(window: &mut VecDeque<u64>, value: u64, limit: usize) {
+        if window.len() >= limit {
+            window.pop_front();
+        }
+        window.push_back(value);
+    }
+
+    fn p95(window: &VecDeque<u64>) -> u64 {
+        if window.is_empty() {
+            return 0;
+        }
+        let mut values = window.iter().copied().collect::<Vec<_>>();
+        values.sort_unstable();
+        let idx = ((values.len() - 1) * 95) / 100;
+        values[idx]
+    }
+
+    fn recent_publishes_in_window(&self, now_unix_ms: u64) -> u64 {
+        self.recent_publish_completed_unix_ms
+            .iter()
+            .filter(|completed| now_unix_ms.saturating_sub(**completed) <= ADAPTIVE_PUBLISH_RATE_WINDOW_MS)
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn update_completed_index_session(&mut self, submit_ms: u64, store_ms: u64) {
+        if submit_ms > 0 {
+            Self::push_recent(
+                &mut self.recent_submit_ms,
+                submit_ms,
+                ADAPTIVE_PUBLISH_RECENT_PRESSURE_WINDOW,
+            );
+        }
+        if store_ms > 0 {
+            Self::push_recent(
+                &mut self.recent_store_ms,
+                store_ms,
+                ADAPTIVE_PUBLISH_RECENT_PRESSURE_WINDOW,
+            );
+        }
+    }
+
+    fn update_completed_publish(
+        &mut self,
+        now_unix_ms: u64,
+        visible_publish_ms: u64,
+        df_pending_shards: usize,
+        tier2_pending_shards: usize,
+    ) {
+        Self::push_recent(
+            &mut self.recent_publish_ms,
+            visible_publish_ms,
+            ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW,
+        );
+        Self::push_recent(
+            &mut self.recent_publish_completed_unix_ms,
+            now_unix_ms,
+            ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW,
+        );
+        self.recompute(now_unix_ms, df_pending_shards, tier2_pending_shards);
+    }
+
+    fn update_seal_backlog(
+        &mut self,
+        now_unix_ms: u64,
+        df_pending_shards: usize,
+        tier2_pending_shards: usize,
+    ) {
+        self.recompute(now_unix_ms, df_pending_shards, tier2_pending_shards);
+    }
+
+    fn recompute(
+        &mut self,
+        now_unix_ms: u64,
+        df_pending_shards: usize,
+        tier2_pending_shards: usize,
+    ) {
+        let publish_p95_ms = Self::p95(&self.recent_publish_ms);
+        let submit_p95_ms = Self::p95(&self.recent_submit_ms);
+        let store_p95_ms = Self::p95(&self.recent_store_ms);
+        let publish_rate = self.recent_publishes_in_window(now_unix_ms);
+        let backlog_rising = df_pending_shards > self.last_df_pending_shards
+            || tier2_pending_shards > self.last_tier2_pending_shards;
+        let backlog_present = df_pending_shards > 0 || tier2_pending_shards > 0;
+        let backlog_drained = !backlog_present
+            && (self.last_df_pending_shards > 0 || self.last_tier2_pending_shards > 0);
+        let one_shard_set = self.candidate_shards.max(1);
+        let backlog_high = df_pending_shards >= one_shard_set || tier2_pending_shards >= one_shard_set;
+
+        let (target_idle_ms, mode, reason) = if publish_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_P95_MS
+            || backlog_high
+            || backlog_rising
+            || publish_rate >= 4
+            || submit_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_SUBMIT_MS
+            || store_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_STORE_MS
+        {
+            self.healthy_cycles = 0;
+            (
+                match self.storage_class.as_str() {
+                    "rotational" => 3_000,
+                    "solid-state" => 2_000,
+                    _ => 2_500,
+                },
+                "backoff",
+                if backlog_rising {
+                    "seal_backlog_rising"
+                } else if backlog_high {
+                    "seal_backlog_high"
+                } else if publish_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_P95_MS {
+                    "publish_latency_high"
+                } else if publish_rate >= 4 {
+                    "publish_rate_high"
+                } else if submit_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_SUBMIT_MS {
+                    "submit_pressure_high"
+                } else {
+                    "store_pressure_high"
+                },
+            )
+        } else if publish_p95_ms >= ADAPTIVE_PUBLISH_FAST_P95_MS
+            || backlog_present
+            || publish_rate >= 2
+            || submit_p95_ms > ADAPTIVE_PUBLISH_FAST_SUBMIT_MS
+            || store_p95_ms > ADAPTIVE_PUBLISH_FAST_STORE_MS
+        {
+            self.healthy_cycles = 0;
+            (
+                match self.storage_class.as_str() {
+                    "rotational" => 1_000,
+                    "solid-state" => 250,
+                    _ => 500,
+                },
+                "moderate",
+                if backlog_present {
+                    "seal_backlog_present"
+                } else if publish_p95_ms >= ADAPTIVE_PUBLISH_FAST_P95_MS {
+                    "publish_latency_moderate"
+                } else if publish_rate >= 2 {
+                    "publish_rate_moderate"
+                } else if submit_p95_ms > ADAPTIVE_PUBLISH_FAST_SUBMIT_MS {
+                    "submit_pressure_moderate"
+                } else {
+                    "store_pressure_moderate"
+                },
+            )
+        } else {
+            self.healthy_cycles = self.healthy_cycles.saturating_add(1);
+            (
+                match self.storage_class.as_str() {
+                    "rotational" => 250,
+                    "solid-state" => 0,
+                    _ => 100,
+                },
+                "fast",
+                "healthy",
+            )
+        };
+
+        let new_idle_ms = if backlog_drained && mode == "fast" {
+            target_idle_ms
+        } else if target_idle_ms > self.current_idle_ms {
+            self.current_idle_ms
+                .saturating_add(ADAPTIVE_PUBLISH_GROW_STEP_MS)
+                .max(target_idle_ms)
+                .min(DEFAULT_AUTO_PUBLISH_IDLE_MS)
+        } else if self.healthy_cycles >= ADAPTIVE_PUBLISH_HEALTHY_CYCLES_TO_SHRINK {
+            self.current_idle_ms
+                .saturating_sub(ADAPTIVE_PUBLISH_SHRINK_STEP_MS)
+                .max(target_idle_ms)
+        } else {
+            self.current_idle_ms.max(target_idle_ms)
+        };
+
+        self.current_idle_ms = new_idle_ms.min(DEFAULT_AUTO_PUBLISH_IDLE_MS);
+        self.mode = mode;
+        self.reason = reason;
+        self.last_df_pending_shards = df_pending_shards;
+        self.last_tier2_pending_shards = tier2_pending_shards;
+    }
+
+    fn snapshot(
+        &self,
+        now_unix_ms: u64,
+        df_pending_shards: usize,
+        tier2_pending_shards: usize,
+    ) -> AdaptivePublishSnapshot {
+        AdaptivePublishSnapshot {
+            storage_class: self.storage_class.clone(),
+            current_idle_ms: self.current_idle_ms,
+            mode: self.mode,
+            reason: self.reason,
+            recent_publish_p95_ms: Self::p95(&self.recent_publish_ms),
+            recent_submit_p95_ms: Self::p95(&self.recent_submit_ms),
+            recent_store_p95_ms: Self::p95(&self.recent_store_ms),
+            recent_publishes_in_window: self.recent_publishes_in_window(now_unix_ms),
+            df_pending_shards: df_pending_shards.try_into().unwrap_or(u64::MAX),
+            tier2_pending_shards: tier2_pending_shards.try_into().unwrap_or(u64::MAX),
+            healthy_cycles: self.healthy_cycles,
+        }
+    }
 }
 
 impl Drop for ActiveMutationGuard<'_> {
@@ -1325,6 +1594,9 @@ impl ServerState {
         let (store_mode, startup_cleanup_removed_roots, mut startup_profile) =
             ensure_candidate_stores(&config)?;
         startup_profile.total_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let auto_publish_storage_class = config.auto_publish_storage_class.clone();
+        let auto_publish_initial_idle_ms = config.auto_publish_initial_idle_ms;
+        let candidate_shards = config.candidate_shards;
         Ok(Self {
             config,
             shutdown,
@@ -1426,6 +1698,11 @@ impl ServerState {
             last_published_tier2_snapshot_seal_persisted_shards: AtomicU64::new(0),
             last_published_tier2_snapshot_seal_failures: AtomicU64::new(0),
             last_published_tier2_snapshot_seal_completed_unix_ms: AtomicU64::new(0),
+            adaptive_publish: Mutex::new(AdaptivePublishState::new(
+                auto_publish_storage_class,
+                auto_publish_initial_idle_ms,
+                candidate_shards,
+            )),
             df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -1594,6 +1871,78 @@ impl ServerState {
         Ok(pending.len())
     }
 
+    fn adaptive_publish_snapshot(&self, now_unix_ms: u64) -> Result<AdaptivePublishSnapshot> {
+        let df_pending_shards = self.pending_published_df_snapshot_shard_count()?;
+        let tier2_pending_shards = self.pending_published_tier2_snapshot_shard_count()?;
+        let adaptive = self
+            .adaptive_publish
+            .lock()
+            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+        Ok(adaptive.snapshot(now_unix_ms, df_pending_shards, tier2_pending_shards))
+    }
+
+    fn adaptive_publish_snapshot_or_default(&self, now_unix_ms: u64) -> AdaptivePublishSnapshot {
+        self.adaptive_publish_snapshot(now_unix_ms)
+            .unwrap_or(AdaptivePublishSnapshot {
+                storage_class: self.config.auto_publish_storage_class.clone(),
+                current_idle_ms: self.config.auto_publish_initial_idle_ms,
+                mode: "moderate",
+                reason: "adaptive_snapshot_unavailable",
+                recent_publish_p95_ms: 0,
+                recent_submit_p95_ms: 0,
+                recent_store_p95_ms: 0,
+                recent_publishes_in_window: 0,
+                df_pending_shards: 0,
+                tier2_pending_shards: 0,
+                healthy_cycles: 0,
+            })
+    }
+
+    fn update_adaptive_publish_from_index_session(&self) -> Result<()> {
+        let submit_ms = self
+            .index_session_server_insert_batch_total_us
+            .load(Ordering::Acquire)
+            / 1_000;
+        let store_ms = self
+            .index_session_server_insert_batch_store_us
+            .load(Ordering::Acquire)
+            / 1_000;
+        let mut adaptive = self
+            .adaptive_publish
+            .lock()
+            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+        adaptive.update_completed_index_session(submit_ms, store_ms);
+        Ok(())
+    }
+
+    fn update_adaptive_publish_from_publish(&self, now_unix_ms: u64) -> Result<()> {
+        let df_pending_shards = self.pending_published_df_snapshot_shard_count()?;
+        let tier2_pending_shards = self.pending_published_tier2_snapshot_shard_count()?;
+        let visible_publish_ms = self.last_publish_duration_ms.load(Ordering::Acquire);
+        let mut adaptive = self
+            .adaptive_publish
+            .lock()
+            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+        adaptive.update_completed_publish(
+            now_unix_ms,
+            visible_publish_ms,
+            df_pending_shards,
+            tier2_pending_shards,
+        );
+        Ok(())
+    }
+
+    fn update_adaptive_publish_from_seal_backlog(&self, now_unix_ms: u64) -> Result<()> {
+        let df_pending_shards = self.pending_published_df_snapshot_shard_count()?;
+        let tier2_pending_shards = self.pending_published_tier2_snapshot_shard_count()?;
+        let mut adaptive = self
+            .adaptive_publish
+            .lock()
+            .map_err(|_| TgsError::from("Adaptive publish state lock poisoned."))?;
+        adaptive.update_seal_backlog(now_unix_ms, df_pending_shards, tier2_pending_shards);
+        Ok(())
+    }
+
     fn run_published_df_snapshot_seal_cycle(&self) -> Result<()> {
         if self.publish_in_progress.load(Ordering::Acquire) {
             return Ok(());
@@ -1659,6 +2008,7 @@ impl ServerState {
             self.last_published_df_snapshot_seal_completed_unix_ms
                 .store(current_unix_ms(), Ordering::SeqCst);
         }
+        let _ = self.update_adaptive_publish_from_seal_backlog(current_unix_ms());
         Ok(())
     }
 
@@ -1724,6 +2074,7 @@ impl ServerState {
             self.last_published_tier2_snapshot_seal_completed_unix_ms
                 .store(current_unix_ms(), Ordering::SeqCst);
         }
+        let _ = self.update_adaptive_publish_from_seal_backlog(current_unix_ms());
         Ok(())
     }
 
@@ -1985,6 +2336,7 @@ impl ServerState {
         }
         self.index_session_last_update_unix_ms
             .store(current_unix_ms(), Ordering::SeqCst);
+        let _ = self.update_adaptive_publish_from_index_session();
         Ok(CandidateIndexSessionResponse {
             message: "index session finished".to_owned(),
         })
@@ -2002,7 +2354,8 @@ impl ServerState {
         } else {
             now_unix_ms.saturating_sub(last_mutation)
         };
-        let idle_threshold_ms = self.config.auto_publish_idle_ms;
+        let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
+        let idle_threshold_ms = adaptive.current_idle_ms;
         let idle_remaining_ms = idle_threshold_ms.saturating_sub(idle_elapsed_ms);
         let eligible = self.config.workspace_mode
             && work_dirty
@@ -2035,6 +2388,7 @@ impl ServerState {
             eligible,
             blocked_reason,
             idle_elapsed_ms,
+            idle_threshold_ms,
             idle_remaining_ms,
         }
     }
@@ -2108,6 +2462,8 @@ impl ServerState {
 
     fn current_stats_json(&self) -> Result<Map<String, Value>> {
         let started_total = Instant::now();
+        let now_unix_ms = current_unix_ms();
+        let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
         let _op = self
             .operation_gate
             .read()
@@ -2147,8 +2503,20 @@ impl ServerState {
             json!(self.last_work_mutation_unix_ms.load(Ordering::Acquire)),
         );
         stats.insert(
-            "auto_publish_idle_ms".to_owned(),
-            json!(self.config.auto_publish_idle_ms),
+            "adaptive_publish".to_owned(),
+            json!({
+                "storage_class": adaptive.storage_class,
+                "current_idle_ms": adaptive.current_idle_ms,
+                "mode": adaptive.mode,
+                "reason": adaptive.reason,
+                "recent_publish_p95_ms": adaptive.recent_publish_p95_ms,
+                "recent_submit_p95_ms": adaptive.recent_submit_p95_ms,
+                "recent_store_p95_ms": adaptive.recent_store_p95_ms,
+                "recent_publishes_in_window": adaptive.recent_publishes_in_window,
+                "df_pending_shards": adaptive.df_pending_shards,
+                "tier2_pending_shards": adaptive.tier2_pending_shards,
+                "healthy_cycles": adaptive.healthy_cycles,
+            }),
         );
         stats.insert(
             "search_workers".to_owned(),
@@ -2357,6 +2725,7 @@ impl ServerState {
             );
             let now_unix_ms = current_unix_ms();
             let readiness = self.publish_readiness(now_unix_ms);
+            let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
             let published_doc_count = stats.get("doc_count").and_then(Value::as_u64).unwrap_or(0);
             let published_active_doc_count = stats
                 .get("active_doc_count")
@@ -2395,6 +2764,47 @@ impl ServerState {
             publish.insert(
                 "idle_remaining_ms".to_owned(),
                 json!(readiness.idle_remaining_ms),
+            );
+            publish.insert("adaptive_idle_ms".to_owned(), json!(readiness.idle_threshold_ms));
+            publish.insert(
+                "adaptive_mode".to_owned(),
+                Value::String(adaptive.mode.to_owned()),
+            );
+            publish.insert(
+                "adaptive_reason".to_owned(),
+                Value::String(adaptive.reason.to_owned()),
+            );
+            publish.insert(
+                "adaptive_storage_class".to_owned(),
+                Value::String(adaptive.storage_class),
+            );
+            publish.insert(
+                "adaptive_recent_publish_p95_ms".to_owned(),
+                json!(adaptive.recent_publish_p95_ms),
+            );
+            publish.insert(
+                "adaptive_recent_submit_p95_ms".to_owned(),
+                json!(adaptive.recent_submit_p95_ms),
+            );
+            publish.insert(
+                "adaptive_recent_store_p95_ms".to_owned(),
+                json!(adaptive.recent_store_p95_ms),
+            );
+            publish.insert(
+                "adaptive_recent_publishes_in_window".to_owned(),
+                json!(adaptive.recent_publishes_in_window),
+            );
+            publish.insert(
+                "adaptive_df_pending_shards".to_owned(),
+                json!(adaptive.df_pending_shards),
+            );
+            publish.insert(
+                "adaptive_tier2_pending_shards".to_owned(),
+                json!(adaptive.tier2_pending_shards),
+            );
+            publish.insert(
+                "adaptive_healthy_cycles".to_owned(),
+                json!(adaptive.healthy_cycles),
             );
             publish.insert("published_doc_count".to_owned(), json!(published_doc_count));
             publish.insert(
@@ -2674,6 +3084,8 @@ impl ServerState {
     }
 
     fn status_json(&self) -> Result<Map<String, Value>> {
+        let now_unix_ms = current_unix_ms();
+        let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
         let mut stats = Map::new();
         stats.insert("draining".to_owned(), json!(self.is_shutting_down()));
         stats.insert(
@@ -2705,8 +3117,20 @@ impl ServerState {
             json!(self.last_work_mutation_unix_ms.load(Ordering::Acquire)),
         );
         stats.insert(
-            "auto_publish_idle_ms".to_owned(),
-            json!(self.config.auto_publish_idle_ms),
+            "adaptive_publish".to_owned(),
+            json!({
+                "storage_class": adaptive.storage_class,
+                "current_idle_ms": adaptive.current_idle_ms,
+                "mode": adaptive.mode,
+                "reason": adaptive.reason,
+                "recent_publish_p95_ms": adaptive.recent_publish_p95_ms,
+                "recent_submit_p95_ms": adaptive.recent_submit_p95_ms,
+                "recent_store_p95_ms": adaptive.recent_store_p95_ms,
+                "recent_publishes_in_window": adaptive.recent_publishes_in_window,
+                "df_pending_shards": adaptive.df_pending_shards,
+                "tier2_pending_shards": adaptive.tier2_pending_shards,
+                "healthy_cycles": adaptive.healthy_cycles,
+            }),
         );
         stats.insert(
             "search_workers".to_owned(),
@@ -4345,6 +4769,7 @@ impl ServerState {
                 Ordering::SeqCst,
             );
             self.publish_runs_total.fetch_add(1, Ordering::SeqCst);
+            let _ = self.update_adaptive_publish_from_publish(publish_completed_unix_ms);
             self.invalidate_search_caches();
             Ok(CandidatePublishResponse {
                 message: format!(
@@ -5101,7 +5526,8 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -5123,7 +5549,8 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -5145,7 +5572,8 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: true,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -5506,7 +5934,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_readiness_allows_zero_idle_window() {
+    fn publish_readiness_respects_adaptive_initial_idle() {
         let tmp = tempdir().expect("tmp");
         let mut config = ServerConfig {
             candidate_config: CandidateConfig {
@@ -5517,7 +5945,8 @@ mod tests {
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            auto_publish_idle_ms: 0,
+            auto_publish_initial_idle_ms: 0,
+            auto_publish_storage_class: "solid-state".to_owned(),
             workspace_mode: true,
         };
         let state = Arc::new(
@@ -5528,12 +5957,14 @@ mod tests {
         assert!(readiness.eligible);
         assert_eq!(readiness.idle_remaining_ms, 0);
 
-        config.auto_publish_idle_ms = 1;
+        config.auto_publish_initial_idle_ms = 500;
+        config.auto_publish_storage_class = "unknown".to_owned();
         let state =
             Arc::new(ServerState::new(config, Arc::new(AtomicBool::new(false))).expect("state"));
         state.mark_work_mutation();
         let readiness = state.publish_readiness(current_unix_ms());
         assert!(!readiness.eligible);
+        assert_eq!(readiness.idle_threshold_ms, 500);
     }
 
     #[test]
@@ -5962,7 +6393,8 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
             );
@@ -6022,7 +6454,8 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
             );
@@ -6069,7 +6502,8 @@ mod tests {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
                 server_shutdown,
@@ -7083,7 +7517,8 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             },
             Arc::new(AtomicBool::new(true)),
@@ -7392,7 +7827,8 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             })
             .expect_err("single-shard mismatch")
@@ -7420,7 +7856,8 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             })
             .expect_err("sharded mismatch")
@@ -7438,7 +7875,8 @@ rule q {
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+            auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
         })
         .expect("create sharded stores");
@@ -7460,7 +7898,8 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             })
             .expect_err("manifest mismatch")
@@ -7571,7 +8010,8 @@ rule q {
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                 tier2_superblock_budget_divisor:
                     crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
             },
             Arc::new(AtomicBool::new(false)),
@@ -7674,7 +8114,8 @@ rule q {
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
             tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+            auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
         })
         .expect("ensure stores");
@@ -7706,7 +8147,8 @@ rule q {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -7801,7 +8243,8 @@ rule q {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
@@ -7887,7 +8330,8 @@ rule q {
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                    auto_publish_idle_ms: DEFAULT_AUTO_PUBLISH_IDLE_MS,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
                 },
                 Arc::new(AtomicBool::new(false)),
