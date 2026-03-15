@@ -351,6 +351,8 @@ pub struct CandidateInsertBatchProfile {
     pub classify_us: u64,
     pub apply_df_counts_us: u64,
     pub append_sidecars_us: u64,
+    pub append_sidecar_payloads_us: u64,
+    pub append_doc_records_us: u64,
     pub write_existing_us: u64,
     pub install_docs_us: u64,
     pub tier2_update_us: u64,
@@ -366,6 +368,8 @@ pub struct CandidateImportBatchProfile {
     pub apply_df_counts_ms: u64,
     pub build_payloads_ms: u64,
     pub append_sidecars_ms: u64,
+    pub append_sidecar_payloads_ms: u64,
+    pub append_doc_records_ms: u64,
     pub install_docs_ms: u64,
     pub tier2_update_ms: u64,
     pub persist_meta_ms: u64,
@@ -2377,6 +2381,7 @@ impl CandidateStore {
                 .apply_df_counts_us
                 .saturating_add(elapsed_us(apply_df_counts_started));
             let append_sidecars_started = Instant::now();
+            let append_sidecar_payloads_started = Instant::now();
             let row = self.build_doc_row(
                 doc.file_size,
                 doc.filter_bytes,
@@ -2393,7 +2398,14 @@ impl CandidateStore {
                 doc.tier2_bloom_hashes,
                 tier2_bloom_filter,
             )?;
+            insert_profile.append_sidecar_payloads_us = insert_profile
+                .append_sidecar_payloads_us
+                .saturating_add(elapsed_us(append_sidecar_payloads_started));
+            let append_doc_records_started = Instant::now();
             self.append_new_doc(sha256, row, tier2_row)?;
+            insert_profile.append_doc_records_us = insert_profile
+                .append_doc_records_us
+                .saturating_add(elapsed_us(append_doc_records_started));
             insert_profile.append_sidecars_us = insert_profile
                 .append_sidecars_us
                 .saturating_add(elapsed_us(append_sidecars_started));

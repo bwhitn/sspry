@@ -2445,6 +2445,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_store_append_sidecars_us",
                             ),
                             (
+                                "store_append_sidecar_payloads_us",
+                                "verbose.index.server_index_insert_batch_store_append_sidecar_payloads_us",
+                            ),
+                            (
+                                "store_append_doc_records_us",
+                                "verbose.index.server_index_insert_batch_store_append_doc_records_us",
+                            ),
+                            (
                                 "store_write_existing_us",
                                 "verbose.index.server_index_insert_batch_store_write_existing_us",
                             ),

@@ -367,6 +367,8 @@ struct ServerState {
     index_session_server_insert_batch_store_classify_us: AtomicU64,
     index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
+    index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64,
+    index_session_server_insert_batch_store_append_doc_records_us: AtomicU64,
     index_session_server_insert_batch_store_write_existing_us: AtomicU64,
     index_session_server_insert_batch_store_install_docs_us: AtomicU64,
     index_session_server_insert_batch_store_tier2_update_us: AtomicU64,
@@ -1341,6 +1343,8 @@ impl ServerState {
             index_session_server_insert_batch_store_classify_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_doc_records_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_write_existing_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_install_docs_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_tier2_update_us: AtomicU64::new(0),
@@ -1740,6 +1744,10 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecars_us
                     .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_sidecar_payloads_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_doc_records_us
+                    .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_write_existing_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_install_docs_us
@@ -1853,6 +1861,10 @@ impl ServerState {
             .fetch_add(store_profile.apply_df_counts_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecars_us
             .fetch_add(store_profile.append_sidecars_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_append_sidecar_payloads_us
+            .fetch_add(store_profile.append_sidecar_payloads_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_append_doc_records_us
+            .fetch_add(store_profile.append_doc_records_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_write_existing_us
             .fetch_add(store_profile.write_existing_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_install_docs_us
@@ -2089,6 +2101,8 @@ impl ServerState {
             "store_classify_us": self.index_session_server_insert_batch_store_classify_us.load(Ordering::Acquire),
             "store_apply_df_counts_us": self.index_session_server_insert_batch_store_apply_df_counts_us.load(Ordering::Acquire),
             "store_append_sidecars_us": self.index_session_server_insert_batch_store_append_sidecars_us.load(Ordering::Acquire),
+            "store_append_sidecar_payloads_us": self.index_session_server_insert_batch_store_append_sidecar_payloads_us.load(Ordering::Acquire),
+            "store_append_doc_records_us": self.index_session_server_insert_batch_store_append_doc_records_us.load(Ordering::Acquire),
             "store_write_existing_us": self.index_session_server_insert_batch_store_write_existing_us.load(Ordering::Acquire),
             "store_install_docs_us": self.index_session_server_insert_batch_store_install_docs_us.load(Ordering::Acquire),
             "store_tier2_update_us": self.index_session_server_insert_batch_store_tier2_update_us.load(Ordering::Acquire),
@@ -2636,6 +2650,8 @@ impl ServerState {
             "store_classify_us": self.index_session_server_insert_batch_store_classify_us.load(Ordering::Acquire),
             "store_apply_df_counts_us": self.index_session_server_insert_batch_store_apply_df_counts_us.load(Ordering::Acquire),
             "store_append_sidecars_us": self.index_session_server_insert_batch_store_append_sidecars_us.load(Ordering::Acquire),
+            "store_append_sidecar_payloads_us": self.index_session_server_insert_batch_store_append_sidecar_payloads_us.load(Ordering::Acquire),
+            "store_append_doc_records_us": self.index_session_server_insert_batch_store_append_doc_records_us.load(Ordering::Acquire),
             "store_write_existing_us": self.index_session_server_insert_batch_store_write_existing_us.load(Ordering::Acquire),
             "store_install_docs_us": self.index_session_server_insert_batch_store_install_docs_us.load(Ordering::Acquire),
             "store_tier2_update_us": self.index_session_server_insert_batch_store_tier2_update_us.load(Ordering::Acquire),
@@ -3431,6 +3447,12 @@ impl ServerState {
             store_profile_total.append_sidecars_us = store_profile_total
                 .append_sidecars_us
                 .saturating_add(store_profile.append_sidecars_us);
+            store_profile_total.append_sidecar_payloads_us = store_profile_total
+                .append_sidecar_payloads_us
+                .saturating_add(store_profile.append_sidecar_payloads_us);
+            store_profile_total.append_doc_records_us = store_profile_total
+                .append_doc_records_us
+                .saturating_add(store_profile.append_doc_records_us);
             store_profile_total.write_existing_us = store_profile_total
                 .write_existing_us
                 .saturating_add(store_profile.write_existing_us);
@@ -3509,6 +3531,12 @@ impl ServerState {
                 store_profile_total.append_sidecars_us = store_profile_total
                     .append_sidecars_us
                     .saturating_add(store_profile.append_sidecars_us);
+                store_profile_total.append_sidecar_payloads_us = store_profile_total
+                    .append_sidecar_payloads_us
+                    .saturating_add(store_profile.append_sidecar_payloads_us);
+                store_profile_total.append_doc_records_us = store_profile_total
+                    .append_doc_records_us
+                    .saturating_add(store_profile.append_doc_records_us);
                 store_profile_total.write_existing_us = store_profile_total
                     .write_existing_us
                     .saturating_add(store_profile.write_existing_us);
