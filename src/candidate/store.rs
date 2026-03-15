@@ -1014,6 +1014,15 @@ fn tier2_superblock_summary_bytes(filter_bytes: usize) -> usize {
     filter_bytes.max(1).min(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
 }
 
+fn fold_bloom_bytes_into_summary(summary: &mut [u8], bloom_bytes: &[u8]) {
+    let summary_bytes = summary.len().max(1);
+    for chunk in bloom_bytes.chunks(summary_bytes) {
+        for (dst, src) in summary.iter_mut().zip(chunk.iter()) {
+            *dst |= *src;
+        }
+    }
+}
+
 const TIER2_SUPERBLOCK_FILTER_BUCKETS: &[usize] = &[
     1 << 10,
     2 << 10,
@@ -3757,11 +3766,7 @@ impl CandidateStore {
         let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
         if let Some(blocks) = self.tier2_superblocks.masks_by_bucket.get_mut(&bucket_key) {
             if let Some(block) = blocks.get_mut(block_idx) {
-                let summary_bytes = block.len().max(1);
-                for (source_idx, src) in bloom_bytes.iter().copied().enumerate() {
-                    let folded_idx = source_idx % summary_bytes;
-                    block[folded_idx] |= src;
-                }
+                fold_bloom_bytes_into_summary(block, bloom_bytes);
             }
         }
         Ok(())
@@ -3794,10 +3799,7 @@ impl CandidateStore {
             let folded = aggregated
                 .entry((block_idx, filter_key))
                 .or_insert_with(|| vec![0u8; summary_bytes]);
-            for (source_idx, src) in bloom_bytes.iter().copied().enumerate() {
-                let folded_idx = source_idx % summary_bytes;
-                folded[folded_idx] |= src;
-            }
+            fold_bloom_bytes_into_summary(folded, bloom_bytes);
         }
 
         if self.tier2_superblocks.keys_per_block.len() < max_needed_blocks {
