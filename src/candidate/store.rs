@@ -352,6 +352,11 @@ pub struct CandidateInsertBatchProfile {
     pub apply_df_counts_us: u64,
     pub append_sidecars_us: u64,
     pub append_sidecar_payloads_us: u64,
+    pub append_bloom_payload_us: u64,
+    pub append_grams_received_payload_us: u64,
+    pub append_grams_indexed_payload_us: u64,
+    pub append_external_id_payload_us: u64,
+    pub append_tier2_bloom_payload_us: u64,
     pub append_doc_records_us: u64,
     pub write_existing_us: u64,
     pub install_docs_us: u64,
@@ -376,6 +381,15 @@ pub struct CandidateImportBatchProfile {
     pub append_df_delta_ms: u64,
     pub compact_df_counts_ms: u64,
     pub rebalance_tier2_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CandidateDocRowPayloadProfile {
+    bloom_us: u64,
+    grams_received_us: u64,
+    grams_indexed_us: u64,
+    external_id_us: u64,
+    tier2_bloom_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2382,7 +2396,7 @@ impl CandidateStore {
                 .saturating_add(elapsed_us(apply_df_counts_started));
             let append_sidecars_started = Instant::now();
             let append_sidecar_payloads_started = Instant::now();
-            let row = self.build_doc_row(
+            let (row, row_profile) = self.build_doc_row_profile(
                 doc.file_size,
                 doc.filter_bytes,
                 doc.bloom_hashes,
@@ -2393,7 +2407,7 @@ impl CandidateStore {
                 &dedup_received,
                 &indexed,
             )?;
-            let tier2_row = self.build_doc_row5(
+            let (tier2_row, tier2_profile) = self.build_doc_row5_profile(
                 doc.tier2_filter_bytes,
                 doc.tier2_bloom_hashes,
                 tier2_bloom_filter,
@@ -2401,6 +2415,21 @@ impl CandidateStore {
             insert_profile.append_sidecar_payloads_us = insert_profile
                 .append_sidecar_payloads_us
                 .saturating_add(elapsed_us(append_sidecar_payloads_started));
+            insert_profile.append_bloom_payload_us = insert_profile
+                .append_bloom_payload_us
+                .saturating_add(row_profile.bloom_us);
+            insert_profile.append_grams_received_payload_us = insert_profile
+                .append_grams_received_payload_us
+                .saturating_add(row_profile.grams_received_us);
+            insert_profile.append_grams_indexed_payload_us = insert_profile
+                .append_grams_indexed_payload_us
+                .saturating_add(row_profile.grams_indexed_us);
+            insert_profile.append_external_id_payload_us = insert_profile
+                .append_external_id_payload_us
+                .saturating_add(row_profile.external_id_us);
+            insert_profile.append_tier2_bloom_payload_us = insert_profile
+                .append_tier2_bloom_payload_us
+                .saturating_add(tier2_profile.tier2_bloom_us);
             let append_doc_records_started = Instant::now();
             self.append_new_doc(sha256, row, tier2_row)?;
             insert_profile.append_doc_records_us = insert_profile
@@ -3360,28 +3389,69 @@ impl CandidateStore {
         grams_received: &[u64],
         grams_indexed: &[u64],
     ) -> Result<DocMetaRow> {
+        Ok(self
+            .build_doc_row_profile(
+                file_size,
+                filter_bytes,
+                bloom_hashes,
+                grams_complete,
+                deleted,
+                external_id,
+                bloom_filter,
+                grams_received,
+                grams_indexed,
+            )?
+            .0)
+    }
+
+    fn build_doc_row_profile(
+        &mut self,
+        file_size: u64,
+        filter_bytes: usize,
+        bloom_hashes: usize,
+        grams_complete: bool,
+        deleted: bool,
+        external_id: Option<&str>,
+        bloom_filter: &[u8],
+        grams_received: &[u64],
+        grams_indexed: &[u64],
+    ) -> Result<(DocMetaRow, CandidateDocRowPayloadProfile)> {
+        fn elapsed_us(started: Instant) -> u64 {
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+        }
+
         let gram_bytes = self.meta.exact_gram_bytes();
+        let mut profile = CandidateDocRowPayloadProfile::default();
+        let bloom_started = Instant::now();
         let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
+        profile.bloom_us = elapsed_us(bloom_started);
+        let grams_received_started = Instant::now();
         let grams_received_offset = append_exact_gram_slice_with_writer(
             &mut self.append_writers.grams_received,
             grams_received,
             gram_bytes,
         )?;
+        profile.grams_received_us = elapsed_us(grams_received_started);
+        let grams_indexed_started = Instant::now();
         let grams_indexed_offset = append_exact_gram_slice_with_writer(
             &mut self.append_writers.grams_indexed,
             grams_indexed,
             gram_bytes,
         )?;
+        profile.grams_indexed_us = elapsed_us(grams_indexed_started);
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
-            (
+            let external_id_started = Instant::now();
+            let result = (
                 self.append_writers.external_ids.append(bytes)?,
                 bytes.len() as u32,
-            )
+            );
+            profile.external_id_us = elapsed_us(external_id_started);
+            result
         } else {
             (0, 0)
         };
-        Ok(DocMetaRow {
+        let row = DocMetaRow {
             file_size,
             filter_bytes: filter_bytes as u32,
             flags: (u8::from(grams_complete) * DOC_FLAG_GRAMS_COMPLETE)
@@ -3395,7 +3465,8 @@ impl CandidateStore {
             grams_indexed_count: grams_indexed.len() as u32,
             external_id_offset,
             external_id_len,
-        })
+        };
+        Ok((row, profile))
     }
 
     fn build_doc_row5(
@@ -3404,19 +3475,43 @@ impl CandidateStore {
         tier2_bloom_hashes: usize,
         tier2_bloom_filter: &[u8],
     ) -> Result<Tier2DocMetaRow> {
-        if tier2_bloom_filter.is_empty() {
-            return Ok(Tier2DocMetaRow::default());
+        Ok(self
+            .build_doc_row5_profile(tier2_filter_bytes, tier2_bloom_hashes, tier2_bloom_filter)?
+            .0)
+    }
+
+    fn build_doc_row5_profile(
+        &mut self,
+        tier2_filter_bytes: usize,
+        tier2_bloom_hashes: usize,
+        tier2_bloom_filter: &[u8],
+    ) -> Result<(Tier2DocMetaRow, CandidateDocRowPayloadProfile)> {
+        fn elapsed_us(started: Instant) -> u64 {
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
         }
+
+        if tier2_bloom_filter.is_empty() {
+            return Ok((
+                Tier2DocMetaRow::default(),
+                CandidateDocRowPayloadProfile::default(),
+            ));
+        }
+        let mut profile = CandidateDocRowPayloadProfile::default();
+        let bloom_started = Instant::now();
         let bloom_offset = self
             .append_writers
             .tier2_blooms
             .append(tier2_bloom_filter)?;
-        Ok(Tier2DocMetaRow {
-            filter_bytes: tier2_filter_bytes as u32,
-            bloom_hashes: tier2_bloom_hashes.min(u8::MAX as usize) as u8,
-            bloom_offset,
-            bloom_len: tier2_bloom_filter.len() as u32,
-        })
+        profile.tier2_bloom_us = elapsed_us(bloom_started);
+        Ok((
+            Tier2DocMetaRow {
+                filter_bytes: tier2_filter_bytes as u32,
+                bloom_hashes: tier2_bloom_hashes.min(u8::MAX as usize) as u8,
+                bloom_offset,
+                bloom_len: tier2_bloom_filter.len() as u32,
+            },
+            profile,
+        ))
     }
 
     fn append_new_doc(
