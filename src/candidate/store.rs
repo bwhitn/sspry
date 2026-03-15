@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use hashbrown::{HashMap as FastHashMap, hash_map::Entry as FastEntry};
+use hashbrown::HashMap as HbHashMap;
 use memmap2::{Mmap, MmapOptions};
+use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::bloom::{bloom_byte_masks, raw_filter_matches_masks};
@@ -38,6 +39,9 @@ const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 128;
 const MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
+
+type FastHashMap<K, V> = HbHashMap<K, V, FxBuildHasher>;
+type FastEntry<'a, K, V> = hashbrown::hash_map::Entry<'a, K, V, FxBuildHasher>;
 
 #[derive(Debug, Default)]
 struct DfCountsState {
@@ -78,7 +82,7 @@ impl DfCountsState {
                 .map(|mmap| mmap.len() / (gram_bytes + 4))
                 .unwrap_or(0),
             snapshot,
-            delta: FastHashMap::new(),
+            delta: FastHashMap::with_hasher(FxBuildHasher),
         };
         state.load_delta(root)?;
         Ok(state)
