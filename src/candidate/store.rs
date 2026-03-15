@@ -357,6 +357,11 @@ pub struct CandidateInsertBatchProfile {
     pub append_grams_indexed_payload_us: u64,
     pub append_external_id_payload_us: u64,
     pub append_tier2_bloom_payload_us: u64,
+    pub append_bloom_payload_bytes: u64,
+    pub append_grams_received_payload_bytes: u64,
+    pub append_grams_indexed_payload_bytes: u64,
+    pub append_external_id_payload_bytes: u64,
+    pub append_tier2_bloom_payload_bytes: u64,
     pub append_doc_records_us: u64,
     pub write_existing_us: u64,
     pub install_docs_us: u64,
@@ -390,6 +395,11 @@ struct CandidateDocRowPayloadProfile {
     grams_indexed_us: u64,
     external_id_us: u64,
     tier2_bloom_us: u64,
+    bloom_bytes: u64,
+    grams_received_bytes: u64,
+    grams_indexed_bytes: u64,
+    external_id_bytes: u64,
+    tier2_bloom_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2430,6 +2440,21 @@ impl CandidateStore {
             insert_profile.append_tier2_bloom_payload_us = insert_profile
                 .append_tier2_bloom_payload_us
                 .saturating_add(tier2_profile.tier2_bloom_us);
+            insert_profile.append_bloom_payload_bytes = insert_profile
+                .append_bloom_payload_bytes
+                .saturating_add(row_profile.bloom_bytes);
+            insert_profile.append_grams_received_payload_bytes = insert_profile
+                .append_grams_received_payload_bytes
+                .saturating_add(row_profile.grams_received_bytes);
+            insert_profile.append_grams_indexed_payload_bytes = insert_profile
+                .append_grams_indexed_payload_bytes
+                .saturating_add(row_profile.grams_indexed_bytes);
+            insert_profile.append_external_id_payload_bytes = insert_profile
+                .append_external_id_payload_bytes
+                .saturating_add(row_profile.external_id_bytes);
+            insert_profile.append_tier2_bloom_payload_bytes = insert_profile
+                .append_tier2_bloom_payload_bytes
+                .saturating_add(tier2_profile.tier2_bloom_bytes);
             let append_doc_records_started = Instant::now();
             self.append_new_doc(sha256, row, tier2_row)?;
             insert_profile.append_doc_records_us = insert_profile
@@ -3425,6 +3450,7 @@ impl CandidateStore {
         let bloom_started = Instant::now();
         let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
         profile.bloom_us = elapsed_us(bloom_started);
+        profile.bloom_bytes = bloom_filter.len() as u64;
         let grams_received_started = Instant::now();
         let grams_received_offset = append_exact_gram_slice_with_writer(
             &mut self.append_writers.grams_received,
@@ -3432,6 +3458,7 @@ impl CandidateStore {
             gram_bytes,
         )?;
         profile.grams_received_us = elapsed_us(grams_received_started);
+        profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
         let grams_indexed_started = Instant::now();
         let grams_indexed_offset = append_exact_gram_slice_with_writer(
             &mut self.append_writers.grams_indexed,
@@ -3439,6 +3466,7 @@ impl CandidateStore {
             gram_bytes,
         )?;
         profile.grams_indexed_us = elapsed_us(grams_indexed_started);
+        profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
             let external_id_started = Instant::now();
@@ -3447,6 +3475,7 @@ impl CandidateStore {
                 bytes.len() as u32,
             );
             profile.external_id_us = elapsed_us(external_id_started);
+            profile.external_id_bytes = bytes.len() as u64;
             result
         } else {
             (0, 0)
@@ -3503,6 +3532,7 @@ impl CandidateStore {
             .tier2_blooms
             .append(tier2_bloom_filter)?;
         profile.tier2_bloom_us = elapsed_us(bloom_started);
+        profile.tier2_bloom_bytes = tier2_bloom_filter.len() as u64;
         Ok((
             Tier2DocMetaRow {
                 filter_bytes: tier2_filter_bytes as u32,
