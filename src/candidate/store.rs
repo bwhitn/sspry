@@ -1006,15 +1006,6 @@ fn split_weighted_quota(total: usize, weights: &[usize]) -> Vec<usize> {
     quotas
 }
 
-fn normalized_log_df(projected_df: usize, doc_count: usize) -> f64 {
-    if projected_df == 0 || doc_count == 0 {
-        return 0.0;
-    }
-    let numerator = ((projected_df as f64) + 1.0).ln();
-    let denominator = ((doc_count as f64) + 1.0).ln().max(1.0);
-    (numerator / denominator).clamp(0.0, 1.0)
-}
-
 fn tier2_superblock_summary_bytes(filter_bytes: usize) -> usize {
     filter_bytes.max(1).min(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
 }
@@ -1741,30 +1732,6 @@ impl CandidateStore {
         )
     }
 
-    fn projected_tier1_df_entries_with_active_docs(
-        &self,
-        grams: &[u64],
-        active_docs: usize,
-    ) -> Vec<Tier1DfEntry> {
-        let active_docs = active_docs.max(1);
-        let projected = if is_strictly_sorted_unique(grams) {
-            self.df_counts.get_many_sorted_counts(grams)
-        } else {
-            grams.iter().map(|gram| self.df_counts.get(*gram)).collect()
-        };
-        let mut entries = Vec::with_capacity(grams.len());
-        for (gram, current_df) in grams.iter().zip(projected.into_iter()) {
-            let projected_df = current_df + 1;
-            entries.push(Tier1DfEntry {
-                gram: *gram,
-                projected_df,
-                commonness: normalized_log_df(projected_df, active_docs),
-                tie_breaker: stable_tier1_tie_breaker(*gram, DEFAULT_TIER1_GRAM_HASH_SEED),
-            });
-        }
-        entries
-    }
-
     fn select_indexed_grams(
         &self,
         dedup_received: &[u64],
@@ -1799,15 +1766,33 @@ impl CandidateStore {
         let mut eligible = Vec::<Tier1DfEntry>::new();
         let mut commonness_values = Vec::<f64>::new();
         let mut complete = true;
-        for entry in self.projected_tier1_df_entries_with_active_docs(dedup_received, active_docs) {
-            if entry.projected_df < self.meta.df_min
-                || (self.meta.df_max != 0 && entry.projected_df > self.meta.df_max)
+        let active_docs = active_docs.max(1);
+        let projected = if is_strictly_sorted_unique(dedup_received) {
+            self.df_counts.get_many_sorted_counts(dedup_received)
+        } else {
+            dedup_received
+                .iter()
+                .map(|gram| self.df_counts.get(*gram))
+                .collect()
+        };
+        let df_log_denominator = ((active_docs as f64) + 1.0).ln().max(1.0);
+        for (gram, current_df) in dedup_received.iter().zip(projected.into_iter()) {
+            let projected_df = current_df + 1;
+            if projected_df < self.meta.df_min
+                || (self.meta.df_max != 0 && projected_df > self.meta.df_max)
             {
                 complete = false;
                 continue;
             }
-            commonness_values.push(entry.commonness);
-            eligible.push(entry);
+            let commonness =
+                ((((projected_df as f64) + 1.0).ln()) / df_log_denominator).clamp(0.0, 1.0);
+            commonness_values.push(commonness);
+            eligible.push(Tier1DfEntry {
+                gram: *gram,
+                projected_df,
+                commonness,
+                tie_breaker: stable_tier1_tie_breaker(*gram, DEFAULT_TIER1_GRAM_HASH_SEED),
+            });
         }
         if eligible.len() == dedup_received.len() && DEFAULT_TIER1_GRAM_BUDGET == 0 {
             let mut grams = eligible
