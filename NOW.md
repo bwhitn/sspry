@@ -119,9 +119,9 @@ Exit criteria:
 ### 2. Close the current test / coverage gaps
 
 Current measured repo coverage:
-- `src/` line coverage: `93.33%`
-- `src/` function coverage: `87.98%`
-- `src/` region coverage: `91.91%`
+- `src/` line coverage: `93.41%`
+- `src/` function coverage: `88.05%`
+- `src/` region coverage: `92.02%`
 
 Current weakest files:
 - [src/app.rs](/root/pertest/repos/yaya/src/app.rs)
@@ -144,7 +144,7 @@ Work:
   - `95%+` line coverage
 
 Exit criteria:
-- raise `app.rs` materially from the current `76.96%` line coverage
+- raise `app.rs` materially from the current `92.03%` line coverage
 - keep full `cargo test --workspace --all-targets` green
 
 ### 3. Strengthen correctness coverage around recent performance work
@@ -216,7 +216,7 @@ Current baseline references:
 - large ingest baseline:
   - `/root/pertest/results/yaya_ingest_26000_20260315`
 - current repo state when this file was created:
-  - `HEAD=0c5af11`
+  - `HEAD=07874ce`
 
 ## Recorded Decisions
 
@@ -239,12 +239,17 @@ Current baseline references:
 - public/internal rename is complete for the public product surface; remaining old-name hits are limited to negative tests and historical notes in planning docs
 - indexed search now supports `filesize == <const>` when combined with the currently supported restricted rule format
 - indexed search now supports compact stored metadata equality for:
+  - `crx`
   - `pe`
   - `elf`
+  - `macho`
   - `dex`
   - `lnk`
   - `dotnet.is_dotnet`
   - `time.now` runtime equality
+- indexed search now supports explicit string modifiers for:
+  - `ascii`
+  - `wide`
 - indexed search now accepts first-phase numeric read equality for:
   - `int32()`
   - `uint32()`
@@ -271,6 +276,6 @@ Current baseline references:
   - `float64be()`
 - coverage workflow now uses an isolated target dir and repo-only filtering
 - latest repo-only coverage:
-  - lines: `93.33%`
-  - functions: `87.98%`
+  - lines: `93.41%`
+  - functions: `88.05%`
   - `app.rs` lines: `92.03%`

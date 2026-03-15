@@ -8,9 +8,9 @@ description = "Scalable Screening and Prefiltering of Rules for YARA"
 [dependencies]
 hashbrown = "0.15.5"
 base64 = "0.22.1"
-clap = { version = "4.5.60", features = ["derive", "env"] }
+clap = { version = "4.6.0", features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
-ctrlc = "3.5.1"
+ctrlc = "3.5.2"
 hex = "0.4.3"
 memmap2 = "0.9.10"
 md-5 = "0.10.6"

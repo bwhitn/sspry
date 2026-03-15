@@ -120,19 +120,48 @@ Behavior:
 - `--verify` reopens candidate file paths and runs local YARA verification
 - verified search requires stored file paths to still exist on disk
 - indexed search currently supports:
-  - literal and hex-string anchors
+  - literal string anchors with:
+    - `ascii`
+    - `wide`
+  - hex-string anchors
   - `filesize == <const>`
-  - exact equality on stored module metadata such as:
-    - `pe.*`
-    - `elf.*`
-    - `dex.*`
-    - `lnk.*`
+  - exact equality on stored module/runtime metadata:
+    - `crx.is_crx`
+    - `pe.is_pe`
+    - `pe.is_32bit`
+    - `pe.is_64bit`
+    - `pe.is_dll`
+    - `pe.is_signed`
+    - `pe.machine`
+    - `pe.subsystem`
+    - `pe.timestamp`
+    - `elf.type`
+    - `elf.os_abi`
+    - `elf.machine`
+    - `macho.cpu_type`
+    - `macho.device_type`
     - `dotnet.is_dotnet`
-  - `time.now == <const>`
-- numeric read equality such as `uint32(0) == 0x4000` is accepted in indexed search for literal `==` comparisons
-  - the numeric equality is verifier-only in this first phase
+    - `dex.is_dex`
+    - `dex.version`
+    - `lnk.is_lnk`
+    - `lnk.creation_time`
+    - `lnk.access_time`
+    - `lnk.write_time`
+    - `time.now == <const>`
+- numeric read equality is accepted in indexed search for literal `==` comparisons:
+  - `int32(<offset>)`
+  - `uint32(<offset>)`
+  - `int32be(<offset>)`
+  - `uint32be(<offset>)`
+  - `float32(<offset>)`
+  - `float64(<offset>)`
+  - `float32be(<offset>)`
+  - `float64be(<offset>)`
+- numeric-read caveats:
+  - the numeric predicate is verifier-only in this first phase
   - its literal bytes can contribute anchors when the current gram sizes can represent them
   - if the current gram sizes are larger than the literal width, the rule still needs another string/hex anchor
+  - numeric equality only supports literal constants, not expressions such as `uint32(0) == filesize`
   - without `--verify`, candidate results may still include extra false positives
 
 ## info

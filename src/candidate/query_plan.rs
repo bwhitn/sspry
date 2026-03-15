@@ -905,11 +905,9 @@ fn parse_numeric_read_expression(expr: &str) -> Result<(&str, usize, &str)> {
             "Invalid numeric read expression: {expr}"
         )));
     };
-    let offset = offset_text.parse::<usize>().map_err(|_| {
-        SspryError::from(format!(
-            "Invalid numeric read expression offset: {expr}"
-        ))
-    })?;
+    let offset = offset_text
+        .parse::<usize>()
+        .map_err(|_| SspryError::from(format!("Invalid numeric read expression offset: {expr}")))?;
     Ok((name, offset, literal_text))
 }
 
@@ -933,33 +931,25 @@ fn numeric_read_anchor_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> 
         }
         "float32" => {
             let value = literal_text.parse::<f32>().map_err(|_| {
-                SspryError::from(format!(
-                    "Invalid float literal for {name}: {literal_text}"
-                ))
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
             })?;
             Ok(value.to_bits().to_le_bytes().to_vec())
         }
         "float32be" => {
             let value = literal_text.parse::<f32>().map_err(|_| {
-                SspryError::from(format!(
-                    "Invalid float literal for {name}: {literal_text}"
-                ))
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
             })?;
             Ok(value.to_bits().to_be_bytes().to_vec())
         }
         "float64" => {
             let value = literal_text.parse::<f64>().map_err(|_| {
-                SspryError::from(format!(
-                    "Invalid float literal for {name}: {literal_text}"
-                ))
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
             })?;
             Ok(value.to_bits().to_le_bytes().to_vec())
         }
         "float64be" => {
             let value = literal_text.parse::<f64>().map_err(|_| {
-                SspryError::from(format!(
-                    "Invalid float literal for {name}: {literal_text}"
-                ))
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
             })?;
             Ok(value.to_bits().to_be_bytes().to_vec())
         }
@@ -1499,7 +1489,10 @@ rule numeric_reads {
         assert_eq!(plan.root.kind, "and");
         assert!(plan.patterns.iter().any(|pattern| {
             pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
-                && pattern.fixed_literals.iter().any(|literal| literal == &0x14cu32.to_le_bytes())
+                && pattern
+                    .fixed_literals
+                    .iter()
+                    .any(|literal| literal == &0x14cu32.to_le_bytes())
         }));
         assert!(plan.patterns.iter().any(|pattern| {
             pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
@@ -1527,6 +1520,70 @@ rule numeric_reads {
             }
         }
         assert_eq!(verifier_children, 2);
+    }
+
+    #[test]
+    fn compile_rule_with_numeric_only_condition_uses_injected_anchor() {
+        let rule = r#"
+rule numeric_only {
+  strings:
+    $unused = "UNUSED"
+  condition:
+    uint32(0) == 0x4000
+}
+"#;
+        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.patterns.len(), 2);
+        assert_eq!(plan.root.kind, "and");
+        assert!(plan.patterns.iter().any(|pattern| {
+            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
+                && pattern
+                    .fixed_literals
+                    .iter()
+                    .any(|literal| literal == &0x0000_4000u32.to_le_bytes())
+        }));
+        assert!(
+            plan.patterns
+                .iter()
+                .any(|pattern| pattern.pattern_id.as_str() == "$unused")
+        );
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "pattern"
+                && child
+                    .pattern_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(NUMERIC_READ_ANCHOR_PREFIX))
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "verifier_only_eq"
+                && child.pattern_id.as_deref() == Some("uint32(0)==16384")
+        }));
+    }
+
+    #[test]
+    fn numeric_only_condition_rejects_unanchorable_literal_without_other_anchor() {
+        let rule = r#"
+rule numeric_only_unanchorable {
+  strings:
+    $unused = "UNUSED"
+  condition:
+    uint32(0) == 0x4000
+}
+"#;
+        let err = compile_query_plan_with_gram_sizes(
+            rule,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, 5).expect("gram sizes"),
+            None,
+            8,
+            false,
+            true,
+            100_000,
+        )
+        .expect_err("unanchorable numeric-only condition should fail");
+        assert!(
+            err.to_string()
+                .contains("requires an anchorable literal for the current gram sizes")
+        );
     }
 
     #[test]
@@ -1848,11 +1905,12 @@ rule numeric_only {
         )
         .expect("numeric-only search should use numeric anchors");
         assert_eq!(numeric_only.patterns.len(), 2);
-        assert!(numeric_only.patterns.iter().any(|pattern| {
-            pattern
-                .pattern_id
-                .starts_with(NUMERIC_READ_ANCHOR_PREFIX)
-        }));
+        assert!(
+            numeric_only
+                .patterns
+                .iter()
+                .any(|pattern| { pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX) })
+        );
 
         assert!(
             compile_query_plan_with_gram_sizes(
