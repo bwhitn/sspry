@@ -2162,6 +2162,17 @@ impl CandidateStore {
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
         }
 
+        struct PendingNewInsert<'a> {
+            sha256: [u8; 32],
+            sha256_hex: String,
+            doc: CandidateDoc,
+            external_id: Option<&'a str>,
+            bloom_filter: &'a [u8],
+            tier2_bloom_filter: &'a [u8],
+            dedup_received: Vec<u64>,
+            indexed: Vec<u64>,
+        }
+
         let mut total_scope = scope("candidate.insert_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
         let mut aggregate_df_unit_delta_payload = Vec::<u8>::new();
@@ -2174,6 +2185,7 @@ impl CandidateStore {
         let mut max_indexed_grams = 0u64;
         let mut active_docs = self.docs.iter().filter(|doc| !doc.deleted).count();
         let mut tier2_updates = Vec::<(usize, usize, usize, &[u8])>::with_capacity(documents.len());
+        let mut pending_new_inserts = Vec::<PendingNewInsert<'_>>::new();
 
         for document in documents {
             let (
@@ -2404,80 +2416,6 @@ impl CandidateStore {
             insert_profile.apply_df_counts_us = insert_profile
                 .apply_df_counts_us
                 .saturating_add(elapsed_us(apply_df_counts_started));
-            let append_sidecars_started = Instant::now();
-            let append_sidecar_payloads_started = Instant::now();
-            let (row, row_profile) = self.build_doc_row_profile(
-                doc.file_size,
-                doc.filter_bytes,
-                doc.bloom_hashes,
-                doc.grams_complete,
-                doc.deleted,
-                external_id.as_deref(),
-                bloom_filter,
-                &dedup_received,
-                &indexed,
-            )?;
-            let (tier2_row, tier2_profile) = self.build_doc_row5_profile(
-                doc.tier2_filter_bytes,
-                doc.tier2_bloom_hashes,
-                tier2_bloom_filter,
-            )?;
-            insert_profile.append_sidecar_payloads_us = insert_profile
-                .append_sidecar_payloads_us
-                .saturating_add(elapsed_us(append_sidecar_payloads_started));
-            insert_profile.append_bloom_payload_us = insert_profile
-                .append_bloom_payload_us
-                .saturating_add(row_profile.bloom_us);
-            insert_profile.append_grams_received_payload_us = insert_profile
-                .append_grams_received_payload_us
-                .saturating_add(row_profile.grams_received_us);
-            insert_profile.append_grams_indexed_payload_us = insert_profile
-                .append_grams_indexed_payload_us
-                .saturating_add(row_profile.grams_indexed_us);
-            insert_profile.append_external_id_payload_us = insert_profile
-                .append_external_id_payload_us
-                .saturating_add(row_profile.external_id_us);
-            insert_profile.append_tier2_bloom_payload_us = insert_profile
-                .append_tier2_bloom_payload_us
-                .saturating_add(tier2_profile.tier2_bloom_us);
-            insert_profile.append_bloom_payload_bytes = insert_profile
-                .append_bloom_payload_bytes
-                .saturating_add(row_profile.bloom_bytes);
-            insert_profile.append_grams_received_payload_bytes = insert_profile
-                .append_grams_received_payload_bytes
-                .saturating_add(row_profile.grams_received_bytes);
-            insert_profile.append_grams_indexed_payload_bytes = insert_profile
-                .append_grams_indexed_payload_bytes
-                .saturating_add(row_profile.grams_indexed_bytes);
-            insert_profile.append_external_id_payload_bytes = insert_profile
-                .append_external_id_payload_bytes
-                .saturating_add(row_profile.external_id_bytes);
-            insert_profile.append_tier2_bloom_payload_bytes = insert_profile
-                .append_tier2_bloom_payload_bytes
-                .saturating_add(tier2_profile.tier2_bloom_bytes);
-            let append_doc_records_started = Instant::now();
-            self.append_new_doc(sha256, row, tier2_row)?;
-            insert_profile.append_doc_records_us = insert_profile
-                .append_doc_records_us
-                .saturating_add(elapsed_us(append_doc_records_started));
-            insert_profile.append_sidecars_us = insert_profile
-                .append_sidecars_us
-                .saturating_add(elapsed_us(append_sidecars_started));
-            let install_docs_started = Instant::now();
-            self.doc_rows.push(row);
-            self.tier2_doc_rows.push(tier2_row);
-            self.docs.push(doc.clone());
-            self.sha_to_pos
-                .insert(sha256_hex.clone(), self.docs.len() - 1);
-            insert_profile.install_docs_us = insert_profile
-                .install_docs_us
-                .saturating_add(elapsed_us(install_docs_started));
-            tier2_updates.push((
-                self.docs.len() - 1,
-                *filter_bytes,
-                expected_bloom_hashes,
-                bloom_filter,
-            ));
             modified = true;
             meta_dirty = true;
             results.push(CandidateInsertResult {
@@ -2488,7 +2426,134 @@ impl CandidateStore {
                 grams_indexed: indexed.len(),
                 grams_complete: complete,
             });
+            pending_new_inserts.push(PendingNewInsert {
+                sha256: *sha256,
+                sha256_hex: doc.sha256.clone(),
+                doc,
+                external_id: external_id.as_deref(),
+                bloom_filter,
+                tier2_bloom_filter,
+                dedup_received,
+                indexed,
+            });
             active_docs = active_docs.saturating_add(1);
+        }
+
+        if !pending_new_inserts.is_empty() {
+            let append_sidecars_started = Instant::now();
+            let bloom_base = self.append_writers.blooms.offset;
+            let tier2_bloom_base = self.append_writers.tier2_blooms.offset;
+            let mut blooms_payload = Vec::<u8>::new();
+            let mut tier2_blooms_payload = Vec::<u8>::new();
+            let mut bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
+            let mut tier2_bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
+            for pending in &pending_new_inserts {
+                bloom_offsets.push(bloom_base + blooms_payload.len() as u64);
+                blooms_payload.extend_from_slice(pending.bloom_filter);
+                if pending.tier2_bloom_filter.is_empty() {
+                    tier2_bloom_offsets.push(0);
+                } else {
+                    tier2_bloom_offsets.push(tier2_bloom_base + tier2_blooms_payload.len() as u64);
+                    tier2_blooms_payload.extend_from_slice(pending.tier2_bloom_filter);
+                }
+            }
+            let append_bloom_started = Instant::now();
+            self.append_writers.blooms.append(&blooms_payload)?;
+            insert_profile.append_bloom_payload_us = insert_profile
+                .append_bloom_payload_us
+                .saturating_add(elapsed_us(append_bloom_started));
+            insert_profile.append_bloom_payload_bytes = insert_profile
+                .append_bloom_payload_bytes
+                .saturating_add(blooms_payload.len() as u64);
+            let append_tier2_bloom_started = Instant::now();
+            self.append_writers
+                .tier2_blooms
+                .append(&tier2_blooms_payload)?;
+            insert_profile.append_tier2_bloom_payload_us = insert_profile
+                .append_tier2_bloom_payload_us
+                .saturating_add(elapsed_us(append_tier2_bloom_started));
+            insert_profile.append_tier2_bloom_payload_bytes = insert_profile
+                .append_tier2_bloom_payload_bytes
+                .saturating_add(tier2_blooms_payload.len() as u64);
+
+            for ((pending, bloom_offset), tier2_bloom_offset) in pending_new_inserts
+                .into_iter()
+                .zip(bloom_offsets.into_iter())
+                .zip(tier2_bloom_offsets.into_iter())
+            {
+                let (row, row_profile) = self.build_doc_row_with_bloom_offset_profile(
+                    pending.doc.file_size,
+                    pending.doc.filter_bytes,
+                    pending.doc.bloom_hashes,
+                    pending.doc.grams_complete,
+                    pending.doc.deleted,
+                    pending.external_id,
+                    bloom_offset,
+                    pending.bloom_filter.len(),
+                    &pending.dedup_received,
+                    &pending.indexed,
+                )?;
+                let tier2_row = if pending.tier2_bloom_filter.is_empty() {
+                    Tier2DocMetaRow::default()
+                } else {
+                    Tier2DocMetaRow {
+                        filter_bytes: pending.doc.tier2_filter_bytes as u32,
+                        bloom_hashes: pending.doc.tier2_bloom_hashes.min(u8::MAX as usize) as u8,
+                        bloom_offset: tier2_bloom_offset,
+                        bloom_len: pending.tier2_bloom_filter.len() as u32,
+                    }
+                };
+                insert_profile.append_grams_received_payload_us = insert_profile
+                    .append_grams_received_payload_us
+                    .saturating_add(row_profile.grams_received_us);
+                insert_profile.append_grams_received_payload_bytes = insert_profile
+                    .append_grams_received_payload_bytes
+                    .saturating_add(row_profile.grams_received_bytes);
+                insert_profile.append_grams_indexed_payload_us = insert_profile
+                    .append_grams_indexed_payload_us
+                    .saturating_add(row_profile.grams_indexed_us);
+                insert_profile.append_grams_indexed_payload_bytes = insert_profile
+                    .append_grams_indexed_payload_bytes
+                    .saturating_add(row_profile.grams_indexed_bytes);
+                insert_profile.append_external_id_payload_us = insert_profile
+                    .append_external_id_payload_us
+                    .saturating_add(row_profile.external_id_us);
+                insert_profile.append_external_id_payload_bytes = insert_profile
+                    .append_external_id_payload_bytes
+                    .saturating_add(row_profile.external_id_bytes);
+                let append_doc_records_started = Instant::now();
+                self.append_new_doc(&pending.sha256, row, tier2_row)?;
+                insert_profile.append_doc_records_us = insert_profile
+                    .append_doc_records_us
+                    .saturating_add(elapsed_us(append_doc_records_started));
+                let install_docs_started = Instant::now();
+                let pos = self.docs.len();
+                self.doc_rows.push(row);
+                self.tier2_doc_rows.push(tier2_row);
+                self.docs.push(pending.doc.clone());
+                self.sha_to_pos.insert(pending.sha256_hex, pos);
+                insert_profile.install_docs_us = insert_profile
+                    .install_docs_us
+                    .saturating_add(elapsed_us(install_docs_started));
+                tier2_updates.push((
+                    pos,
+                    pending.doc.filter_bytes,
+                    pending.doc.bloom_hashes,
+                    pending.bloom_filter,
+                ));
+            }
+            insert_profile.append_sidecar_payloads_us =
+                insert_profile.append_sidecar_payloads_us.saturating_add(
+                    insert_profile
+                        .append_bloom_payload_us
+                        .saturating_add(insert_profile.append_grams_received_payload_us)
+                        .saturating_add(insert_profile.append_grams_indexed_payload_us)
+                        .saturating_add(insert_profile.append_external_id_payload_us)
+                        .saturating_add(insert_profile.append_tier2_bloom_payload_us),
+                );
+            insert_profile.append_sidecars_us = insert_profile
+                .append_sidecars_us
+                .saturating_add(elapsed_us(append_sidecars_started));
         }
 
         if modified {
@@ -3427,6 +3492,74 @@ impl CandidateStore {
                 grams_indexed,
             )?
             .0)
+    }
+
+    fn build_doc_row_with_bloom_offset_profile(
+        &mut self,
+        file_size: u64,
+        filter_bytes: usize,
+        bloom_hashes: usize,
+        grams_complete: bool,
+        deleted: bool,
+        external_id: Option<&str>,
+        bloom_offset: u64,
+        bloom_len: usize,
+        grams_received: &[u64],
+        grams_indexed: &[u64],
+    ) -> Result<(DocMetaRow, CandidateDocRowPayloadProfile)> {
+        fn elapsed_us(started: Instant) -> u64 {
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+        }
+
+        let gram_bytes = self.meta.exact_gram_bytes();
+        let mut profile = CandidateDocRowPayloadProfile::default();
+        let grams_received_started = Instant::now();
+        let grams_received_offset = append_exact_gram_slice_with_writer(
+            &mut self.append_writers.grams_received,
+            grams_received,
+            gram_bytes,
+        )?;
+        profile.grams_received_us = elapsed_us(grams_received_started);
+        profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
+        let grams_indexed_started = Instant::now();
+        let grams_indexed_offset = append_exact_gram_slice_with_writer(
+            &mut self.append_writers.grams_indexed,
+            grams_indexed,
+            gram_bytes,
+        )?;
+        profile.grams_indexed_us = elapsed_us(grams_indexed_started);
+        profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+        let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
+            let bytes = external_id.as_bytes();
+            let external_id_started = Instant::now();
+            let result = (
+                self.append_writers.external_ids.append(bytes)?,
+                bytes.len() as u32,
+            );
+            profile.external_id_us = elapsed_us(external_id_started);
+            profile.external_id_bytes = bytes.len() as u64;
+            result
+        } else {
+            (0, 0)
+        };
+        Ok((
+            DocMetaRow {
+                file_size,
+                filter_bytes: filter_bytes as u32,
+                flags: (u8::from(grams_complete) * DOC_FLAG_GRAMS_COMPLETE)
+                    | (u8::from(deleted) * DOC_FLAG_DELETED),
+                bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
+                bloom_offset,
+                bloom_len: bloom_len as u32,
+                grams_received_offset,
+                grams_received_count: grams_received.len() as u32,
+                grams_indexed_offset,
+                grams_indexed_count: grams_indexed.len() as u32,
+                external_id_offset,
+                external_id_len,
+            },
+            profile,
+        ))
     }
 
     fn build_doc_row_profile(
