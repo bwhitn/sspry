@@ -6875,6 +6875,188 @@ rule q {
     }
 
     #[test]
+    fn df_counts_state_loads_snapshot_and_delta_variants() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        let gram_bytes = 4usize;
+        let gram_a = pack_exact_gram(&[1, 2, 3, 4]);
+        let gram_b = pack_exact_gram(&[5, 6, 7, 8]);
+        let gram_c = pack_exact_gram(&[9, 10, 11, 12]);
+
+        let packed = |gram: u64| gram.to_le_bytes()[..gram_bytes].to_vec();
+        let mut snapshot = Vec::new();
+        for (gram, count) in [(gram_a, 5u32), (gram_b, 2u32)] {
+            snapshot.extend_from_slice(&packed(gram));
+            snapshot.extend_from_slice(&count.to_le_bytes());
+        }
+        fs::write(df_counts_path(root), snapshot).expect("write snapshot");
+
+        let mut counted_delta = Vec::new();
+        for (gram, delta) in [(gram_a, -2i32), (gram_b, 4i32)] {
+            counted_delta.extend_from_slice(&packed(gram));
+            counted_delta.extend_from_slice(&delta.to_le_bytes());
+        }
+        fs::write(df_counts_delta_path(root), counted_delta).expect("write counted delta");
+
+        let mut unit_delta = Vec::new();
+        unit_delta.extend_from_slice(&packed(gram_b));
+        unit_delta.extend_from_slice(&packed(gram_c));
+        fs::write(df_counts_unit_delta_path(root), unit_delta).expect("write unit delta");
+
+        let mut state = DfCountsState::load(root, gram_bytes).expect("load state");
+        assert_eq!(state.snapshot_count(gram_a), 5);
+        assert_eq!(state.snapshot_count(gram_c), 0);
+        assert_eq!(state.get(gram_a), 3);
+        assert_eq!(state.get(gram_b), 7);
+        assert_eq!(state.get(gram_c), 1);
+        assert_eq!(
+            state.get_many(&[gram_a, gram_b, gram_c]),
+            HashMap::from([(gram_a, 3usize), (gram_b, 7usize), (gram_c, 1usize)])
+        );
+        assert_eq!(
+            state.get_many_sorted_counts(&[gram_a, gram_b, gram_c]),
+            vec![3, 7, 1]
+        );
+        assert_eq!(
+            state.materialize(),
+            HashMap::from([(gram_a, 3usize), (gram_b, 7usize), (gram_c, 1usize)])
+        );
+        assert_eq!(state.unique_count_hint(), 5);
+
+        state.apply_deltas(&[(gram_a, -3), (gram_c, -1), (gram_b, 0)]);
+        state.apply_unit_deltas(&[gram_b, gram_b]);
+        assert_eq!(state.get(gram_a), 0);
+        assert_eq!(state.get(gram_b), 9);
+        assert_eq!(state.get(gram_c), 0);
+        assert_eq!(state.materialize(), HashMap::from([(gram_b, 9usize)]));
+        assert!(is_strictly_sorted_unique(&[gram_a, gram_b, gram_c]));
+        assert!(!is_strictly_sorted_unique(&[gram_a, gram_a]));
+        assert!(!is_strictly_sorted_unique(&[gram_b, gram_a]));
+
+        let mut refreshed_snapshot = Vec::new();
+        refreshed_snapshot.extend_from_slice(&packed(gram_c));
+        refreshed_snapshot.extend_from_slice(&11u32.to_le_bytes());
+        fs::write(df_counts_path(root), refreshed_snapshot).expect("rewrite snapshot");
+        fs::write(df_counts_delta_path(root), Vec::new()).expect("clear counted delta");
+        fs::write(df_counts_unit_delta_path(root), Vec::new()).expect("clear unit delta");
+        state.refresh_snapshot(root).expect("refresh snapshot");
+        assert_eq!(state.get(gram_a), 0);
+        assert_eq!(state.get(gram_b), 0);
+        assert_eq!(state.get(gram_c), 11);
+        assert_eq!(state.unique_count_hint(), 1);
+    }
+
+    #[test]
+    fn sidecar_and_append_helper_paths_work() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).expect("create root");
+
+        fs::write(grams_received_path(&root), b"abcdef").expect("write grams_received");
+        fs::write(doc_metadata_path(&root), b"meta").expect("write metadata");
+
+        let mut sidecar = BlobSidecar::new(grams_received_path(&root));
+        sidecar.map_if_exists().expect("map sidecar");
+        assert_eq!(
+            sidecar.read_bytes(1, 3, "grams", 7).expect("mmap read").as_ref(),
+            b"bcd"
+        );
+        assert!(
+            sidecar
+                .read_bytes(99, 1, "grams", 7)
+                .expect_err("invalid range")
+                .to_string()
+                .contains("Invalid grams payload stored")
+        );
+        sidecar.invalidate();
+        assert_eq!(
+            sidecar.read_bytes(0, 2, "grams", 7).expect("file read").as_ref(),
+            b"ab"
+        );
+
+        let other_root = tmp.path().join("other");
+        fs::create_dir_all(&other_root).expect("create other root");
+        fs::write(grams_received_path(&other_root), b"xyz").expect("write retarget grams");
+        sidecar.retarget(grams_received_path(&other_root));
+        sidecar.map_if_exists().expect("remap sidecar");
+        assert_eq!(
+            sidecar.read_bytes(0, 3, "grams", 8).expect("retarget read").as_ref(),
+            b"xyz"
+        );
+
+        let mut sidecars = StoreSidecars::map_existing(&root).expect("map store sidecars");
+        assert_eq!(
+            sidecars
+                .metadata
+                .read_bytes(0, 4, "metadata", 9)
+                .expect("metadata read")
+                .as_ref(),
+            b"meta"
+        );
+        sidecars.invalidate_all();
+        sidecars.retarget_root(&other_root);
+        sidecars.refresh_maps().expect("refresh retargeted maps");
+        assert_eq!(
+            sidecars
+                .grams_received
+                .read_bytes(0, 3, "grams", 10)
+                .expect("retargeted store sidecar")
+                .as_ref(),
+            b"xyz"
+        );
+
+        let append_path = tmp.path().join("append").join("payload.bin");
+        let mut append = AppendFile::new(append_path.clone()).expect("new append file");
+        assert_eq!(append.append(b"abc").expect("append first"), 0);
+        assert_eq!(append.append(b"").expect("append empty"), 3);
+        assert_eq!(append.append(b"de").expect("append second"), 3);
+        assert_eq!(fs::read(&append_path).expect("read append payload"), b"abcde");
+
+        let retarget_path = tmp.path().join("retarget").join("payload.bin");
+        append.retarget(retarget_path.clone());
+        append.handle = None;
+        assert_eq!(append.append(b"zz").expect("append retarget"), 5);
+        assert_eq!(fs::read(&retarget_path).expect("read retarget payload"), b"zz");
+
+        let mut writers = StoreAppendWriters::new(&root).expect("append writers");
+        writers.retarget_root(&other_root);
+        assert_eq!(writers.metadata.path, doc_metadata_path(&other_root));
+        assert_eq!(writers.df_counts_unit_delta.path, df_counts_unit_delta_path(&other_root));
+    }
+
+    #[test]
+    fn df_counts_state_rejects_invalid_snapshot_and_delta_shapes() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+
+        fs::write(df_counts_path(root), [1u8, 2, 3]).expect("write invalid snapshot");
+        assert!(
+            DfCountsState::load(root, 4)
+                .expect_err("invalid snapshot size")
+                .to_string()
+                .contains("Invalid df_counts snapshot")
+        );
+
+        fs::write(df_counts_path(root), Vec::<u8>::new()).expect("clear snapshot");
+        fs::write(df_counts_delta_path(root), [1u8, 2, 3]).expect("write invalid delta");
+        assert!(
+            DfCountsState::load(root, 4)
+                .expect_err("invalid delta size")
+                .to_string()
+                .contains("Invalid df_counts delta")
+        );
+
+        fs::write(df_counts_delta_path(root), Vec::<u8>::new()).expect("clear delta");
+        fs::write(df_counts_unit_delta_path(root), [1u8, 2, 3]).expect("write invalid unit");
+        assert!(
+            DfCountsState::load(root, 4)
+                .expect_err("invalid unit delta size")
+                .to_string()
+                .contains("Invalid df_counts unit delta")
+        );
+    }
+
+    #[test]
     fn insert_restore_delete_and_stats_edge_paths_work() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("candidate_db");
@@ -7562,7 +7744,7 @@ rule q {
             .expect("primary filter bytes");
         let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, Some(1), None);
         let mut primary_bloom =
-            BloomFilter::new(filter_bytes, bloom_hashes).expect("primary bloom");
+            BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
         primary_bloom
             .add(pack_exact_gram(&[1, 2, 3]))
             .expect("add primary gram");
@@ -7672,7 +7854,7 @@ rule q {
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
         let mut primary_bloom =
-            BloomFilter::new(filter_bytes, bloom_hashes).expect("primary bloom");
+            BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
         primary_bloom
             .add(pack_exact_gram(&[1, 2, 3]))
             .expect("add primary gram");

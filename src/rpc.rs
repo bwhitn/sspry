@@ -5708,6 +5708,38 @@ mod tests {
     }
 
     #[test]
+    fn store_set_cache_helpers_work() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("candidate_db");
+        let store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init store");
+        let store_set = StoreSet::new(root, vec![store]);
+        assert!(store_set.cached_stats().expect("empty cache").is_none());
+        store_set
+            .set_cached_stats(
+                Map::from_iter([("docs".to_owned(), Value::from(1u64))]),
+                42,
+            )
+            .expect("set cache");
+        let cached = store_set
+            .cached_stats()
+            .expect("cached stats")
+            .expect("cache entry");
+        assert_eq!(cached.0.get("docs").and_then(Value::as_u64), Some(1));
+        assert_eq!(cached.1, 42);
+        store_set.invalidate_stats_cache().expect("invalidate cache");
+        assert!(store_set.cached_stats().expect("cache cleared").is_none());
+        let stores = store_set.into_stores().expect("into stores");
+        assert_eq!(stores.len(), 1);
+    }
+
+    #[test]
     fn status_json_does_not_require_shard_locks() {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state(tmp.path());
@@ -7612,6 +7644,145 @@ rule q {
                 .expect_err("default server error")
                 .to_string()
                 .contains("Server returned an error")
+        );
+    }
+
+    #[test]
+    fn client_control_methods_cover_remaining_public_calls() {
+        let status_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, _) = read_frame(&mut stream).expect("read status frame");
+            assert_eq!(action, ACTION_CANDIDATE_STATUS);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&json!({
+                    "workspace_mode": true,
+                    "publish": {"mode": "fast"},
+                }))
+                .expect("status payload"),
+            )
+            .expect("write status frame");
+        }));
+        let status = status_client.candidate_status().expect("candidate status");
+        assert_eq!(status.get("workspace_mode").and_then(Value::as_bool), Some(true));
+
+        let publish_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, _) = read_frame(&mut stream).expect("read publish frame");
+            assert_eq!(action, ACTION_PUBLISH);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidatePublishResponse {
+                    message: "published work root".to_owned(),
+                })
+                .expect("publish payload"),
+            )
+            .expect("write publish frame");
+        }));
+        assert_eq!(
+            publish_client.publish().expect("publish"),
+            "published work root"
+        );
+
+        let begin_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, _) = read_frame(&mut stream).expect("read begin frame");
+            assert_eq!(action, ACTION_INDEX_SESSION_BEGIN);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidateIndexSessionResponse {
+                    message: "index session started".to_owned(),
+                })
+                .expect("begin payload"),
+            )
+            .expect("write begin frame");
+        }));
+        assert_eq!(
+            begin_client.begin_index_session().expect("begin session"),
+            "index session started"
+        );
+
+        let progress_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, payload) = read_frame(&mut stream).expect("read progress frame");
+            assert_eq!(action, ACTION_INDEX_SESSION_PROGRESS);
+            let parsed: CandidateIndexSessionProgressRequest =
+                serde_json::from_slice(&payload).expect("progress payload");
+            assert_eq!(parsed.total_documents, Some(12));
+            assert_eq!(parsed.submitted_documents, 7);
+            assert_eq!(parsed.processed_documents, 5);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidateIndexSessionResponse {
+                    message: "progress updated".to_owned(),
+                })
+                .expect("progress response"),
+            )
+            .expect("write progress frame");
+        }));
+        progress_client
+            .update_index_session_progress(Some(12), 7, 5)
+            .expect("update progress");
+
+        let end_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, _) = read_frame(&mut stream).expect("read end frame");
+            assert_eq!(action, ACTION_INDEX_SESSION_END);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidateIndexSessionResponse {
+                    message: "index session finished".to_owned(),
+                })
+                .expect("end payload"),
+            )
+            .expect("write end frame");
+        }));
+        assert_eq!(
+            end_client.end_index_session().expect("end session"),
+            "index session finished"
+        );
+
+        let shutdown_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, _) = read_frame(&mut stream).expect("read shutdown frame");
+            assert_eq!(action, ACTION_SHUTDOWN);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&json!({ "message": "shutdown requested" }))
+                    .expect("shutdown payload"),
+            )
+            .expect("write shutdown frame");
+        }));
+        assert_eq!(
+            shutdown_client.shutdown().expect("shutdown"),
+            "shutdown requested"
+        );
+
+        assert!(
+            SspryClient::candidate_insert_batch_payload_size(&[CandidateDocumentWire {
+                sha256: "33".repeat(32),
+                file_size: 4,
+                bloom_filter_b64: "AQID".to_owned(),
+                gram_count_estimate: None,
+                bloom_hashes: None,
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: vec![1, 2, 3],
+                grams_complete: true,
+                effective_diversity: None,
+                metadata_b64: None,
+                external_id: Some("doc".to_owned()),
+            }])
+            .expect("payload size")
+                > 0
         );
     }
 

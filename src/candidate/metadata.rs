@@ -892,5 +892,51 @@ mod tests {
                 .expect("macho device"),
             Some(true)
         );
+        assert_eq!(
+            normalize_query_metadata_field("macho.cputype"),
+            Some("macho.cpu_type")
+        );
+        assert_eq!(
+            normalize_query_metadata_field("macho.devicetype"),
+            Some("macho.device_type")
+        );
+    }
+
+    #[test]
+    fn extracts_fat_macho_and_field_aliases() {
+        let tmp = tempdir().expect("tmp");
+        let macho_path = tmp.path().join("sample-fat.macho");
+        let mut macho = vec![0u8; 0x140];
+        macho[0..4].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+        macho[4..8].copy_from_slice(&1u32.to_be_bytes());
+        macho[8..12].copy_from_slice(&7u32.to_be_bytes());
+        macho[16..20].copy_from_slice(&0x100u32.to_be_bytes());
+        macho[20..24].copy_from_slice(&40u32.to_be_bytes());
+        macho[0x100..0x104].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        macho[0x104..0x108].copy_from_slice(&0x0100_000cu32.to_le_bytes());
+        macho[0x110..0x114].copy_from_slice(&1u32.to_le_bytes());
+        macho[0x114..0x118].copy_from_slice(&8u32.to_le_bytes());
+        macho[0x120..0x124].copy_from_slice(&0x25u32.to_le_bytes());
+        macho[0x124..0x128].copy_from_slice(&8u32.to_le_bytes());
+        fs::write(&macho_path, &macho).expect("write fat macho");
+        let macho_bytes = extract_compact_document_metadata(&macho_path).expect("metadata");
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "macho.cputype", 7).expect("fat cpu type"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "macho.cpu_type", 0x0100_000c)
+                .expect("thin cpu type"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "macho.devicetype", 0x25)
+                .expect("device type"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "elf.machine", 62).expect("other module"),
+            Some(false)
+        );
     }
 }

@@ -188,7 +188,7 @@ pub fn decode_grams_delta_u64(payload: &[u8]) -> Result<Vec<u64>> {
 mod tests {
     use super::{
         decode_grams_delta_u32, decode_grams_delta_u64, encode_grams_delta_u32,
-        encode_grams_delta_u64,
+        encode_grams_delta_u64, encode_u32, encode_u64,
     };
 
     #[test]
@@ -249,6 +249,16 @@ mod tests {
                 .to_string()
                 .contains("truncated")
         );
+        let mut overflow64 = Vec::new();
+        encode_u32(2, &mut overflow64);
+        encode_u64(u64::MAX, &mut overflow64);
+        encode_u64(1, &mut overflow64);
+        assert!(
+            decode_grams_delta_u64(&overflow64)
+                .expect_err("u64 overflow")
+                .to_string()
+                .contains("exceeds u64 range")
+        );
         let overlong_u32 = [0x81, 0x81, 0x81, 0x81, 0x81, 0x00];
         assert!(
             decode_grams_delta_u32(&overlong_u32)
@@ -264,6 +274,14 @@ mod tests {
                 .expect_err("u64 varint too large")
                 .to_string()
                 .contains("too large")
+        );
+        let mut trailing64 = encode_grams_delta_u64([1u64, 9u64]);
+        trailing64.push(0);
+        assert!(
+            decode_grams_delta_u64(&trailing64)
+                .expect_err("u64 trailing bytes")
+                .to_string()
+                .contains("trailing bytes")
         );
     }
 }

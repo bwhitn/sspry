@@ -81,6 +81,8 @@ enum NumericReadKind {
     Float,
 }
 
+const NUMERIC_READ_ANCHOR_PREFIX: &str = "__numeric_eq_anchor_";
+
 struct ConditionParser {
     tokens: Vec<Token>,
     index: usize,
@@ -892,6 +894,141 @@ fn numeric_read_kind(name: &str) -> Option<NumericReadKind> {
     }
 }
 
+fn parse_numeric_read_expression(expr: &str) -> Result<(&str, usize, &str)> {
+    let Some((name, rest)) = expr.split_once('(') else {
+        return Err(SspryError::from(format!(
+            "Invalid numeric read expression: {expr}"
+        )));
+    };
+    let Some((offset_text, literal_text)) = rest.split_once(")==") else {
+        return Err(SspryError::from(format!(
+            "Invalid numeric read expression: {expr}"
+        )));
+    };
+    let offset = offset_text.parse::<usize>().map_err(|_| {
+        SspryError::from(format!(
+            "Invalid numeric read expression offset: {expr}"
+        ))
+    })?;
+    Ok((name, offset, literal_text))
+}
+
+fn numeric_read_anchor_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> {
+    match name {
+        "int32" | "uint32" => {
+            let value = literal_text.parse::<u32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        "int32be" | "uint32be" => {
+            let value = literal_text.parse::<u32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        "float32" => {
+            let value = literal_text.parse::<f32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Invalid float literal for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_bits().to_le_bytes().to_vec())
+        }
+        "float32be" => {
+            let value = literal_text.parse::<f32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Invalid float literal for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_bits().to_be_bytes().to_vec())
+        }
+        "float64" => {
+            let value = literal_text.parse::<f64>().map_err(|_| {
+                SspryError::from(format!(
+                    "Invalid float literal for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_bits().to_le_bytes().to_vec())
+        }
+        "float64be" => {
+            let value = literal_text.parse::<f64>().map_err(|_| {
+                SspryError::from(format!(
+                    "Invalid float literal for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_bits().to_be_bytes().to_vec())
+        }
+        _ => Err(SspryError::from(format!(
+            "Unsupported numeric read anchor function: {name}"
+        ))),
+    }
+}
+
+fn inject_numeric_read_anchor_patterns(
+    node: &mut QueryNode,
+    pattern_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
+    pattern_tier2_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
+    pattern_fixed_literals: &mut BTreeMap<String, Vec<Vec<u8>>>,
+    gram_sizes: GramSizes,
+    next_anchor_id: &mut usize,
+) -> Result<()> {
+    for child in &mut node.children {
+        inject_numeric_read_anchor_patterns(
+            child,
+            pattern_alternatives,
+            pattern_tier2_alternatives,
+            pattern_fixed_literals,
+            gram_sizes,
+            next_anchor_id,
+        )?;
+    }
+    if node.kind != "verifier_only_eq" {
+        return Ok(());
+    }
+    let expr = node
+        .pattern_id
+        .as_ref()
+        .ok_or_else(|| SspryError::from("verifier_only_eq node requires pattern_id"))?
+        .clone();
+    let (name, _offset, literal_text) = parse_numeric_read_expression(&expr)?;
+    let anchor_bytes = numeric_read_anchor_bytes(name, literal_text)?;
+    if anchor_bytes.len() < gram_sizes.tier1 {
+        return Ok(());
+    }
+    let synthetic_pattern_id = format!("{NUMERIC_READ_ANCHOR_PREFIX}{next_anchor_id}");
+    *next_anchor_id += 1;
+    pattern_alternatives.insert(
+        synthetic_pattern_id.clone(),
+        vec![grams_tier1_from_bytes(&anchor_bytes, gram_sizes.tier1)],
+    );
+    pattern_tier2_alternatives.insert(
+        synthetic_pattern_id.clone(),
+        vec![grams_tier2_from_bytes(&anchor_bytes, gram_sizes.tier2)],
+    );
+    pattern_fixed_literals.insert(synthetic_pattern_id.clone(), vec![anchor_bytes]);
+    let verifier_node = node.clone();
+    *node = QueryNode {
+        kind: "and".to_owned(),
+        pattern_id: None,
+        threshold: None,
+        children: vec![
+            QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some(synthetic_pattern_id),
+                threshold: None,
+                children: Vec::new(),
+            },
+            verifier_node,
+        ],
+    };
+    Ok(())
+}
+
 fn contains_verifier_only_eq(node: &QueryNode) -> bool {
     node.kind == "verifier_only_eq" || node.children.iter().any(contains_verifier_only_eq)
 }
@@ -1089,9 +1226,18 @@ pub fn compile_query_plan_with_gram_sizes(
         pattern_alternatives.keys().cloned().collect(),
     )?;
     let mut root = parser.parse()?;
+    let mut next_numeric_anchor_id = 0usize;
+    inject_numeric_read_anchor_patterns(
+        &mut root,
+        &mut pattern_alternatives,
+        &mut pattern_tier2_alternatives,
+        &mut pattern_fixed_literals,
+        gram_sizes,
+        &mut next_numeric_anchor_id,
+    )?;
     if !contains_pattern_node(&root) && contains_verifier_only_eq(&root) {
         return Err(SspryError::from(
-            "Numeric read equality in indexed search currently requires at least one string or hex anchor.",
+            "Numeric read equality in indexed search requires an anchorable literal for the current gram sizes or another string/hex anchor.",
         ));
     }
     reorder_or_nodes_for_selectivity(&mut root, &pattern_alternatives, df_counts);
@@ -1349,16 +1495,38 @@ rule numeric_reads {
 }
 "#;
         let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.patterns.len(), 1);
+        assert_eq!(plan.patterns.len(), 3);
         assert_eq!(plan.root.kind, "and");
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "verifier_only_eq"
-                && child.pattern_id.as_deref() == Some("uint32(0)==332")
+        assert!(plan.patterns.iter().any(|pattern| {
+            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
+                && pattern.fixed_literals.iter().any(|literal| literal == &0x14cu32.to_le_bytes())
         }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "verifier_only_eq"
-                && child.pattern_id.as_deref() == Some("float32be(4)==2.5")
+        assert!(plan.patterns.iter().any(|pattern| {
+            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
+                && pattern
+                    .fixed_literals
+                    .iter()
+                    .any(|literal| literal == &2.5f32.to_bits().to_be_bytes())
         }));
+        let mut verifier_children = 0usize;
+        for child in &plan.root.children {
+            if child.kind == "and" {
+                assert_eq!(child.children.len(), 2);
+                assert!(child.children.iter().any(|grandchild| {
+                    grandchild.kind == "pattern"
+                        && grandchild
+                            .pattern_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with(NUMERIC_READ_ANCHOR_PREFIX))
+                }));
+                assert!(child.children.iter().any(|grandchild| {
+                    grandchild.kind == "verifier_only_eq"
+                        && grandchild.pattern_id.as_deref().is_some()
+                }));
+                verifier_children += 1;
+            }
+        }
+        assert_eq!(verifier_children, 2);
     }
 
     #[test]
@@ -1663,9 +1831,8 @@ rule bad {
             .contains("unknown string id")
         );
 
-        assert!(
-            compile_query_plan(
-                r#"
+        let numeric_only = compile_query_plan(
+            r#"
 rule numeric_only {
   strings:
     $a = "ABCD"
@@ -1673,15 +1840,40 @@ rule numeric_only {
     uint32(0) == 1
 }
 "#,
+            None,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("numeric-only search should use numeric anchors");
+        assert_eq!(numeric_only.patterns.len(), 2);
+        assert!(numeric_only.patterns.iter().any(|pattern| {
+            pattern
+                .pattern_id
+                .starts_with(NUMERIC_READ_ANCHOR_PREFIX)
+        }));
+
+        assert!(
+            compile_query_plan_with_gram_sizes(
+                r#"
+rule numeric_too_short_for_gram_sizes {
+  strings:
+    $a = "ABCD"
+  condition:
+    uint32(0) == 1
+}
+"#,
+                GramSizes::new(5, 6).expect("gram sizes"),
                 None,
                 8,
                 false,
                 true,
                 100,
             )
-            .expect_err("numeric-only indexed search")
+            .expect_err("numeric-only indexed search without anchorable grams")
             .to_string()
-            .contains("requires at least one string or hex anchor")
+            .contains("requires an anchorable literal")
         );
 
         assert!(

@@ -129,8 +129,10 @@ Behavior:
     - `lnk.*`
     - `dotnet.is_dotnet`
   - `time.now == <const>`
-- numeric read equality such as `uint32(0) == 0x4000` is accepted in indexed search only when the rule also has at least one string/hex anchor
+- numeric read equality such as `uint32(0) == 0x4000` is accepted in indexed search for literal `==` comparisons
   - the numeric equality is verifier-only in this first phase
+  - its literal bytes can contribute anchors when the current gram sizes can represent them
+  - if the current gram sizes are larger than the literal width, the rule still needs another string/hex anchor
   - without `--verify`, candidate results may still include extra false positives
 
 ## info

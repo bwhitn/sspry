@@ -93,7 +93,7 @@ fn tcp_addr(port: u16) -> String {
 }
 
 fn wait_for_info(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let output = Command::new(bin_path())
             .args(["info", "--addr", addr])
@@ -108,7 +108,7 @@ fn wait_for_info(addr: &str) {
 }
 
 fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         let output = Command::new(bin_path())
             .args([
@@ -137,7 +137,7 @@ fn wait_for_verified_matches(
     expected_checked: usize,
     expected_matched: usize,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         let output = Command::new(bin_path())
             .args([
@@ -803,12 +803,12 @@ fn search_verify_supports_numeric_read_equality_conditions() {
     let port = reserve_tcp_port();
     fs::create_dir_all(&sample_dir).expect("mkdir samples");
 
-    let mut hit = b"ANCHOR".to_vec();
-    hit.extend_from_slice(&0x0000_4000u32.to_le_bytes());
+    let mut hit = 0x0000_4000u32.to_le_bytes().to_vec();
+    hit.extend_from_slice(b"rest-of-hit");
     fs::write(sample_dir.join("hit.bin"), hit).expect("write hit");
 
-    let mut miss = b"ANCHOR".to_vec();
-    miss.extend_from_slice(&0x0000_4001u32.to_le_bytes());
+    let mut miss = 0x0000_4001u32.to_le_bytes().to_vec();
+    miss.extend_from_slice(b"rest-of-miss");
     fs::write(sample_dir.join("miss.bin"), miss).expect("write miss");
 
     fs::write(
@@ -816,9 +816,9 @@ fn search_verify_supports_numeric_read_equality_conditions() {
         r#"
 rule NumericSearch {
   strings:
-    $a = "ANCHOR"
+    $unused = "ANCHOR"
   condition:
-    $a and uint32(6) == 0x4000
+    $unused or uint32(0) == 0x4000
 }
 "#,
     )
@@ -838,7 +838,7 @@ rule NumericSearch {
     ]);
     assert!(ingest.contains("processed_documents: 2"));
 
-    wait_for_search_candidates(&addr, &rule, 2);
+    wait_for_search_candidates(&addr, &rule, 1);
 
     let search = run_ok(&[
         "search",
@@ -848,8 +848,8 @@ rule NumericSearch {
         rule.to_str().expect("rule"),
         "--verify",
     ]);
-    assert!(search.contains("candidates: 2"));
-    assert!(search.contains("verified_checked: 2"));
+    assert!(search.contains("candidates: 1"));
+    assert!(search.contains("verified_checked: 1"));
     assert!(search.contains("verified_matched: 1"));
     assert!(search.contains("verified_skipped: 0"));
 

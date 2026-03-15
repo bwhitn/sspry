@@ -119,20 +119,20 @@ Exit criteria:
 ### 2. Close the current test / coverage gaps
 
 Current measured repo coverage:
-- `src/` line coverage: `90.45%`
-- `src/` function coverage: `86.93%`
-- `src/` region coverage: `90.49%`
+- `src/` line coverage: `93.33%`
+- `src/` function coverage: `87.98%`
+- `src/` region coverage: `91.91%`
 
 Current weakest files:
 - [src/app.rs](/root/pertest/repos/yaya/src/app.rs)
-  - lines: `76.96%`
-  - functions: `83.55%`
+  - lines: `92.03%`
+  - functions: `88.74%`
 - [src/candidate/store.rs](/root/pertest/repos/yaya/src/candidate/store.rs)
-  - lines: `89.52%`
-  - functions: `87.38%`
+  - lines: `90.55%`
+  - functions: `86.90%`
 - [src/rpc.rs](/root/pertest/repos/yaya/src/rpc.rs)
-  - lines: `94.67%`
-  - functions: `82.25%`
+  - lines: `94.88%`
+  - functions: `83.33%`
 
 Work:
 - identify the lowest-covered functions in `app.rs` first
@@ -236,7 +236,7 @@ Current baseline references:
 
 ## Current State
 
-- public/internal rename is in progress and largely complete
+- public/internal rename is complete for the public product surface; remaining old-name hits are limited to negative tests and historical notes in planning docs
 - indexed search now supports `filesize == <const>` when combined with the currently supported restricted rule format
 - indexed search now supports compact stored metadata equality for:
   - `pe`
@@ -254,7 +254,9 @@ Current baseline references:
   - `float64()`
   - `float32be()`
   - `float64be()`
-  - current behavior is anchor-required and verifier-only for the numeric predicate itself
+  - current behavior is verifier-only for the numeric predicate itself
+  - the literal bytes now contribute indexed anchors when the current gram sizes can represent them
+  - if the current gram sizes are larger than the literal width, another string/hex anchor is still required
 - per-document compact metadata is now stored in `doc_metadata.bin`
 - the old `doc_meta5.bin` path has already been replaced by `tier2_doc_meta.bin`
 - direct `yara` verification is covered for:
@@ -269,6 +271,6 @@ Current baseline references:
   - `float64be()`
 - coverage workflow now uses an isolated target dir and repo-only filtering
 - latest repo-only coverage:
-  - lines: `93.05%`
-  - functions: `87.93%`
-  - `app.rs` lines: `92.11%`
+  - lines: `93.33%`
+  - functions: `87.98%`
+  - `app.rs` lines: `92.03%`

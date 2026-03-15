@@ -43,7 +43,7 @@ Per shard, the implementation persists binary sidecars for:
 
 - document metadata
 - normalized document ids
-- primary bloom blobs
+- tier1 bloom blobs
 - tier2 bloom blobs
 - retained exact gram lists
 - deleted state
@@ -136,7 +136,7 @@ Client-side indexing does the expensive file scan and feature extraction before 
 For each file, the client computes:
 
 - normalized document id
-- primary bloom grams
+- tier1 bloom grams
 - tier2 bloom grams
 - retained Tier1 exact grams
 - file size
