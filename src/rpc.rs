@@ -406,6 +406,12 @@ struct ServerState {
     index_session_server_insert_batch_store_us: AtomicU64,
     index_session_server_insert_batch_finalize_us: AtomicU64,
     index_session_server_insert_batch_store_classify_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_dedup_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_eligibility_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_budget_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_binning_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_finalize_us: AtomicU64,
     index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64,
@@ -1744,6 +1750,12 @@ impl ServerState {
             index_session_server_insert_batch_store_us: AtomicU64::new(0),
             index_session_server_insert_batch_finalize_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_dedup_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_eligibility_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_budget_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_binning_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_finalize_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64::new(0),
@@ -2421,6 +2433,18 @@ impl ServerState {
             );
         self.index_session_server_insert_batch_store_classify_us
             .fetch_add(store_profile.classify_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_dedup_us
+            .fetch_add(store_profile.classify_dedup_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_df_lookup_us
+            .fetch_add(store_profile.classify_df_lookup_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_eligibility_us
+            .fetch_add(store_profile.classify_eligibility_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_budget_us
+            .fetch_add(store_profile.classify_budget_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_binning_us
+            .fetch_add(store_profile.classify_binning_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_finalize_us
+            .fetch_add(store_profile.classify_finalize_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_apply_df_counts_us
             .fetch_add(store_profile.apply_df_counts_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecars_us
@@ -2590,6 +2614,30 @@ impl ServerState {
             (
                 "store_classify_us",
                 self.index_session_server_insert_batch_store_classify_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_dedup_us",
+                self.index_session_server_insert_batch_store_classify_dedup_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_us",
+                self.index_session_server_insert_batch_store_classify_df_lookup_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_eligibility_us",
+                self.index_session_server_insert_batch_store_classify_eligibility_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_budget_us",
+                self.index_session_server_insert_batch_store_classify_budget_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_binning_us",
+                self.index_session_server_insert_batch_store_classify_binning_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_finalize_us",
+                self.index_session_server_insert_batch_store_classify_finalize_us.load(Ordering::Acquire),
             ),
             (
                 "store_apply_df_counts_us",
@@ -4368,6 +4416,24 @@ impl ServerState {
             store_profile_total.classify_us = store_profile_total
                 .classify_us
                 .saturating_add(store_profile.classify_us);
+            store_profile_total.classify_dedup_us = store_profile_total
+                .classify_dedup_us
+                .saturating_add(store_profile.classify_dedup_us);
+            store_profile_total.classify_df_lookup_us = store_profile_total
+                .classify_df_lookup_us
+                .saturating_add(store_profile.classify_df_lookup_us);
+            store_profile_total.classify_eligibility_us = store_profile_total
+                .classify_eligibility_us
+                .saturating_add(store_profile.classify_eligibility_us);
+            store_profile_total.classify_budget_us = store_profile_total
+                .classify_budget_us
+                .saturating_add(store_profile.classify_budget_us);
+            store_profile_total.classify_binning_us = store_profile_total
+                .classify_binning_us
+                .saturating_add(store_profile.classify_binning_us);
+            store_profile_total.classify_finalize_us = store_profile_total
+                .classify_finalize_us
+                .saturating_add(store_profile.classify_finalize_us);
             store_profile_total.apply_df_counts_us = store_profile_total
                 .apply_df_counts_us
                 .saturating_add(store_profile.apply_df_counts_us);
@@ -4533,6 +4599,24 @@ impl ServerState {
                 store_profile_total.classify_us = store_profile_total
                     .classify_us
                     .saturating_add(store_profile.classify_us);
+                store_profile_total.classify_dedup_us = store_profile_total
+                    .classify_dedup_us
+                    .saturating_add(store_profile.classify_dedup_us);
+                store_profile_total.classify_df_lookup_us = store_profile_total
+                    .classify_df_lookup_us
+                    .saturating_add(store_profile.classify_df_lookup_us);
+                store_profile_total.classify_eligibility_us = store_profile_total
+                    .classify_eligibility_us
+                    .saturating_add(store_profile.classify_eligibility_us);
+                store_profile_total.classify_budget_us = store_profile_total
+                    .classify_budget_us
+                    .saturating_add(store_profile.classify_budget_us);
+                store_profile_total.classify_binning_us = store_profile_total
+                    .classify_binning_us
+                    .saturating_add(store_profile.classify_binning_us);
+                store_profile_total.classify_finalize_us = store_profile_total
+                    .classify_finalize_us
+                    .saturating_add(store_profile.classify_finalize_us);
                 store_profile_total.apply_df_counts_us = store_profile_total
                     .apply_df_counts_us
                     .saturating_add(store_profile.apply_df_counts_us);

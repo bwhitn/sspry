@@ -500,6 +500,12 @@ pub struct CandidateInsertResult {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateInsertBatchProfile {
     pub classify_us: u64,
+    pub classify_dedup_us: u64,
+    pub classify_df_lookup_us: u64,
+    pub classify_eligibility_us: u64,
+    pub classify_budget_us: u64,
+    pub classify_binning_us: u64,
+    pub classify_finalize_us: u64,
     pub apply_df_counts_us: u64,
     pub append_sidecars_us: u64,
     pub append_sidecar_payloads_us: u64,
@@ -1192,6 +1198,19 @@ struct Tier1DfEntry {
     projected_df: usize,
     commonness: f64,
     tie_breaker: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Tier1SelectionProfile {
+    df_lookup_us: u64,
+    eligibility_us: u64,
+    budget_us: u64,
+    binning_us: u64,
+    finalize_us: u64,
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn stable_tier1_tie_breaker(gram: u64, hash_seed: u64) -> u64 {
@@ -1969,25 +1988,58 @@ impl CandidateStore {
         gram_count_estimate: Option<usize>,
         effective_diversity: Option<f64>,
     ) -> (Vec<u64>, bool) {
-        self.select_indexed_grams_with_active_docs(
+        let (grams, complete, _) = self.select_indexed_grams_with_active_docs_profiled(
             dedup_received,
             gram_count_estimate,
             effective_diversity,
             self.docs.iter().filter(|doc| !doc.deleted).count(),
-        )
+        );
+        (grams, complete)
     }
 
-    fn select_indexed_grams_with_active_docs(
+    fn select_indexed_grams_with_active_docs_profiled(
         &self,
         dedup_received: &[u64],
         gram_count_estimate: Option<usize>,
         effective_diversity: Option<f64>,
         active_docs: usize,
-    ) -> (Vec<u64>, bool) {
+    ) -> (Vec<u64>, bool, Tier1SelectionProfile) {
+        let mut profile = Tier1SelectionProfile::default();
         if dedup_received.is_empty() {
-            return (Vec::new(), false);
+            return (Vec::new(), false, profile);
         }
 
+        let active_docs = active_docs.max(1);
+        let df_lookup_started = Instant::now();
+        let projected = if is_strictly_sorted_unique(dedup_received) {
+            self.df_counts.get_many_sorted_counts(dedup_received)
+        } else {
+            dedup_received
+                .iter()
+                .map(|gram| self.df_counts.get(*gram))
+                .collect()
+        };
+        profile.df_lookup_us = elapsed_us(df_lookup_started);
+        let (grams, complete) = self.select_indexed_grams_from_projected_counts_profiled(
+            dedup_received,
+            &projected,
+            gram_count_estimate,
+            effective_diversity,
+            active_docs,
+            &mut profile,
+        );
+        (grams, complete, profile)
+    }
+
+    fn select_indexed_grams_from_projected_counts_profiled(
+        &self,
+        dedup_received: &[u64],
+        projected: &[usize],
+        gram_count_estimate: Option<usize>,
+        effective_diversity: Option<f64>,
+        active_docs: usize,
+        profile: &mut Tier1SelectionProfile,
+    ) -> (Vec<u64>, bool) {
         let base_budget = match gram_count_estimate {
             Some(estimate) if DEFAULT_TIER1_GRAM_BUDGET > 0 => {
                 scale_tier1_gram_budget(DEFAULT_TIER1_GRAM_BUDGET, estimate)
@@ -1997,17 +2049,9 @@ impl CandidateStore {
         let mut eligible = Vec::<Tier1DfEntry>::new();
         let mut commonness_values = Vec::<f64>::new();
         let mut complete = true;
-        let active_docs = active_docs.max(1);
-        let projected = if is_strictly_sorted_unique(dedup_received) {
-            self.df_counts.get_many_sorted_counts(dedup_received)
-        } else {
-            dedup_received
-                .iter()
-                .map(|gram| self.df_counts.get(*gram))
-                .collect()
-        };
         let df_log_denominator = ((active_docs as f64) + 1.0).ln().max(1.0);
-        for (gram, current_df) in dedup_received.iter().zip(projected.into_iter()) {
+        let eligibility_started = Instant::now();
+        for (gram, current_df) in dedup_received.iter().zip(projected.iter().copied()) {
             let projected_df = current_df + 1;
             if projected_df < self.meta.df_min
                 || (self.meta.df_max != 0 && projected_df > self.meta.df_max)
@@ -2025,6 +2069,9 @@ impl CandidateStore {
                 tie_breaker: stable_tier1_tie_breaker(*gram, DEFAULT_TIER1_GRAM_HASH_SEED),
             });
         }
+        profile.eligibility_us = profile
+            .eligibility_us
+            .saturating_add(elapsed_us(eligibility_started));
         if eligible.len() == dedup_received.len() && DEFAULT_TIER1_GRAM_BUDGET == 0 {
             let mut grams = eligible
                 .into_iter()
@@ -2037,6 +2084,7 @@ impl CandidateStore {
             return (Vec::new(), false);
         }
 
+        let budget_started = Instant::now();
         let doc_diversity = effective_diversity.unwrap_or(0.5).clamp(0.0, 1.0);
         let min_adjusted_budget = if base_budget == 0 {
             eligible.len()
@@ -2044,6 +2092,7 @@ impl CandidateStore {
             ((base_budget as f64) * 0.80).floor() as usize
         };
         if min_adjusted_budget >= eligible.len() {
+            profile.budget_us = profile.budget_us.saturating_add(elapsed_us(budget_started));
             let mut grams = eligible
                 .into_iter()
                 .map(|entry| entry.gram)
@@ -2060,6 +2109,7 @@ impl CandidateStore {
                 .max(1.0) as usize
         };
         if adjusted_budget >= eligible.len() {
+            profile.budget_us = profile.budget_us.saturating_add(elapsed_us(budget_started));
             let mut grams = eligible
                 .into_iter()
                 .map(|entry| entry.gram)
@@ -2070,19 +2120,25 @@ impl CandidateStore {
 
         let weights = tier1_df_bin_weights(doc_diversity, doc_commonness);
         let quotas = split_weighted_quota(adjusted_budget, &weights);
+        profile.budget_us = profile.budget_us.saturating_add(elapsed_us(budget_started));
         let mut bins = [
             Vec::<Tier1DfEntry>::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
         ];
+        let binning_started = Instant::now();
         for entry in eligible {
             bins[tier1_df_bin(entry.commonness)].push(entry);
         }
         for bin in &mut bins {
             bin.sort_unstable_by_key(|entry| (entry.projected_df, entry.tie_breaker, entry.gram));
         }
+        profile.binning_us = profile
+            .binning_us
+            .saturating_add(elapsed_us(binning_started));
 
+        let finalize_started = Instant::now();
         let mut selected = Vec::<u64>::new();
         let mut leftovers = Vec::<Tier1DfEntry>::new();
         for (bin, quota) in bins.iter_mut().zip(quotas.into_iter()) {
@@ -2100,6 +2156,9 @@ impl CandidateStore {
             }
         }
         selected.sort_unstable();
+        profile.finalize_us = profile
+            .finalize_us
+            .saturating_add(elapsed_us(finalize_started));
         (selected, false)
     }
 
@@ -2512,6 +2571,7 @@ impl CandidateStore {
 
             let classify_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
+            let dedup_started = Instant::now();
             let dedup_received = if *grams_sorted_unique {
                 let mut ordered = Vec::with_capacity(grams_received.len());
                 let mut prev = None;
@@ -2546,13 +2606,32 @@ impl CandidateStore {
                 dedup.sort_unstable();
                 dedup
             };
+            insert_profile.classify_dedup_us = insert_profile
+                .classify_dedup_us
+                .saturating_add(elapsed_us(dedup_started));
 
-            let (indexed, selection_complete) = self.select_indexed_grams_with_active_docs(
-                &dedup_received,
-                *gram_count_estimate,
-                *effective_diversity,
-                active_docs,
-            );
+            let (indexed, selection_complete, selection_profile) = self
+                .select_indexed_grams_with_active_docs_profiled(
+                    &dedup_received,
+                    *gram_count_estimate,
+                    *effective_diversity,
+                    active_docs,
+                );
+            insert_profile.classify_df_lookup_us = insert_profile
+                .classify_df_lookup_us
+                .saturating_add(selection_profile.df_lookup_us);
+            insert_profile.classify_eligibility_us = insert_profile
+                .classify_eligibility_us
+                .saturating_add(selection_profile.eligibility_us);
+            insert_profile.classify_budget_us = insert_profile
+                .classify_budget_us
+                .saturating_add(selection_profile.budget_us);
+            insert_profile.classify_binning_us = insert_profile
+                .classify_binning_us
+                .saturating_add(selection_profile.binning_us);
+            insert_profile.classify_finalize_us = insert_profile
+                .classify_finalize_us
+                .saturating_add(selection_profile.finalize_us);
             let complete =
                 *grams_complete && selection_complete && indexed.len() == dedup_received.len();
             let received_len = dedup_received.len() as u64;

@@ -127,6 +127,30 @@ Immediate next work:
   - final gram materialization
 - only then attempt another structural optimize pass
 
+Latest live `26k` classify profile:
+- artifact:
+  - `/root/pertest/results/sspry_ingest_26000_20260316_classify_profile_r2/live.info.light.3.json`
+- at `8,465 / 26,000` docs:
+  - `store_classify_us = 26,819,278`
+  - `store_classify_df_lookup_us = 13,111,118`
+  - `store_classify_binning_us = 6,276,715`
+  - `store_classify_eligibility_us = 3,752,417`
+  - `store_classify_finalize_us = 2,410,269`
+  - `store_classify_dedup_us = 309,739`
+  - `store_classify_budget_us = 158,650`
+- read:
+  - classify is not dominated by dedup or budget math
+  - the growing classify cost is exact DF lookup first, binning/sorting second
+  - any next pass should target those two areas first
+
+Rejected follow-up:
+- batch-local exact DF cache across a single insert batch
+  - artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_classify_cache_r1/live.info.light.1.json`
+  - read:
+    - early `15.8%` sample regressed `store_classify_df_lookup_us` enough to reject quickly
+    - do not keep this approach
+
 ### 2. `append_sidecars` on large ingests
 
 Why:
