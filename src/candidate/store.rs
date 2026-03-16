@@ -380,7 +380,15 @@ pub struct CandidateInsertBatchProfile {
     pub compact_df_counts_us: u64,
     pub compact_df_counts_check_us: u64,
     pub compact_df_counts_checked_delta_bytes: u64,
+    pub compact_df_counts_checked_delta_estimated_memory_bytes: u64,
     pub compact_df_counts_persist_snapshot_us: u64,
+    pub compact_df_counts_persist_snapshot_collect_delta_us: u64,
+    pub compact_df_counts_persist_snapshot_sort_delta_us: u64,
+    pub compact_df_counts_persist_snapshot_merge_write_us: u64,
+    pub compact_df_counts_persist_snapshot_flush_us: u64,
+    pub compact_df_counts_persist_snapshot_rename_us: u64,
+    pub compact_df_counts_persist_snapshot_close_us: u64,
+    pub compact_df_counts_persist_snapshot_clear_delta_files_us: u64,
     pub compact_df_counts_refresh_snapshot_us: u64,
     pub compact_df_counts_reopen_writers_us: u64,
     pub rebalance_tier2_us: u64,
@@ -422,8 +430,26 @@ struct DfCountsCompactionProfile {
     checked_delta_bytes: u64,
     checked_delta_estimated_memory_bytes: u64,
     persist_snapshot_us: u64,
+    persist_snapshot_collect_delta_us: u64,
+    persist_snapshot_sort_delta_us: u64,
+    persist_snapshot_merge_write_us: u64,
+    persist_snapshot_flush_us: u64,
+    persist_snapshot_rename_us: u64,
+    persist_snapshot_close_us: u64,
+    persist_snapshot_clear_delta_files_us: u64,
     refresh_snapshot_us: u64,
     reopen_writers_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DfCountsSnapshotPersistProfile {
+    collect_delta_us: u64,
+    sort_delta_us: u64,
+    merge_write_us: u64,
+    flush_us: u64,
+    close_us: u64,
+    rename_us: u64,
+    clear_delta_files_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2673,9 +2699,33 @@ impl CandidateStore {
             insert_profile.compact_df_counts_checked_delta_bytes = insert_profile
                 .compact_df_counts_checked_delta_bytes
                 .max(compact_df_counts_profile.checked_delta_bytes);
+            insert_profile.compact_df_counts_checked_delta_estimated_memory_bytes = insert_profile
+                .compact_df_counts_checked_delta_estimated_memory_bytes
+                .max(compact_df_counts_profile.checked_delta_estimated_memory_bytes);
             insert_profile.compact_df_counts_persist_snapshot_us = insert_profile
                 .compact_df_counts_persist_snapshot_us
                 .saturating_add(compact_df_counts_profile.persist_snapshot_us);
+            insert_profile.compact_df_counts_persist_snapshot_collect_delta_us = insert_profile
+                .compact_df_counts_persist_snapshot_collect_delta_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_collect_delta_us);
+            insert_profile.compact_df_counts_persist_snapshot_sort_delta_us = insert_profile
+                .compact_df_counts_persist_snapshot_sort_delta_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_sort_delta_us);
+            insert_profile.compact_df_counts_persist_snapshot_merge_write_us = insert_profile
+                .compact_df_counts_persist_snapshot_merge_write_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_merge_write_us);
+            insert_profile.compact_df_counts_persist_snapshot_flush_us = insert_profile
+                .compact_df_counts_persist_snapshot_flush_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_flush_us);
+            insert_profile.compact_df_counts_persist_snapshot_rename_us = insert_profile
+                .compact_df_counts_persist_snapshot_rename_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_rename_us);
+            insert_profile.compact_df_counts_persist_snapshot_close_us = insert_profile
+                .compact_df_counts_persist_snapshot_close_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_close_us);
+            insert_profile.compact_df_counts_persist_snapshot_clear_delta_files_us = insert_profile
+                .compact_df_counts_persist_snapshot_clear_delta_files_us
+                .saturating_add(compact_df_counts_profile.persist_snapshot_clear_delta_files_us);
             insert_profile.compact_df_counts_refresh_snapshot_us = insert_profile
                 .compact_df_counts_refresh_snapshot_us
                 .saturating_add(compact_df_counts_profile.refresh_snapshot_us);
@@ -3606,8 +3656,16 @@ impl CandidateStore {
                     .saturating_mul(DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER)
         {
             let persist_snapshot_started = Instant::now();
-            self.persist_df_counts_snapshot()?;
+            let persist_profile =
+                persist_df_counts_state_snapshot_to_root_profiled(&self.root, &self.df_counts)?;
             profile.persist_snapshot_us = elapsed_us(persist_snapshot_started);
+            profile.persist_snapshot_collect_delta_us = persist_profile.collect_delta_us;
+            profile.persist_snapshot_sort_delta_us = persist_profile.sort_delta_us;
+            profile.persist_snapshot_merge_write_us = persist_profile.merge_write_us;
+            profile.persist_snapshot_flush_us = persist_profile.flush_us;
+            profile.persist_snapshot_close_us = persist_profile.close_us;
+            profile.persist_snapshot_rename_us = persist_profile.rename_us;
+            profile.persist_snapshot_clear_delta_files_us = persist_profile.clear_delta_files_us;
             let refresh_snapshot_started = Instant::now();
             self.df_counts.refresh_snapshot(&self.root)?;
             profile.refresh_snapshot_us = elapsed_us(refresh_snapshot_started);
@@ -4823,45 +4881,86 @@ fn persist_df_counts_snapshot_to_root(
 }
 
 fn persist_df_counts_state_snapshot_to_root(root: &Path, state: &DfCountsState) -> Result<()> {
+    persist_df_counts_state_snapshot_to_root_profiled(root, state).map(|_| ())
+}
+
+fn persist_df_counts_state_snapshot_to_root_profiled(
+    root: &Path,
+    state: &DfCountsState,
+) -> Result<DfCountsSnapshotPersistProfile> {
+    fn elapsed_us(started: Instant) -> u64 {
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
     fs::create_dir_all(root)?;
+    let mut profile = DfCountsSnapshotPersistProfile::default();
+    let collect_delta_started = Instant::now();
     let mut delta = state
         .delta
         .iter()
         .filter_map(|(gram, change)| (*change != 0).then_some((*gram, *change)))
         .collect::<Vec<_>>();
+    profile.collect_delta_us = elapsed_us(collect_delta_started);
+    let sort_delta_started = Instant::now();
     delta.sort_unstable_by_key(|(gram, _)| *gram);
+    profile.sort_delta_us = elapsed_us(sort_delta_started);
 
     let snapshot_path = df_counts_path(root);
     let tmp_path = PathBuf::from(format!("{}.tmp", snapshot_path.display()));
-    let file = fs::File::create(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
-    let snapshot = state.snapshot.as_deref().unwrap_or(&[]);
-    let row_bytes = state.gram_bytes + 4;
-    let mut snapshot_idx = 0usize;
-    let mut delta_idx = 0usize;
+    {
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        let snapshot = state.snapshot.as_deref().unwrap_or(&[]);
+        let row_bytes = state.gram_bytes + 4;
+        let mut snapshot_idx = 0usize;
+        let mut delta_idx = 0usize;
 
-    while snapshot_idx < state.snapshot_rows || delta_idx < delta.len() {
-        let next_snapshot = if snapshot_idx < state.snapshot_rows {
-            Some(read_df_count_snapshot_row(
-                snapshot,
-                snapshot_idx,
-                state.gram_bytes,
-                row_bytes,
-            ))
-        } else {
-            None
-        };
-        let next_delta = delta.get(delta_idx).copied();
-        match (next_snapshot, next_delta) {
-            (Some((snapshot_gram, snapshot_count)), Some((delta_gram, delta_count))) => {
-                if snapshot_gram == delta_gram {
-                    let merged = (snapshot_count as i64 + delta_count).max(0) as usize;
-                    if merged > 0 {
-                        write_df_count_row(&mut writer, snapshot_gram, merged, state.gram_bytes)?;
+        let merge_write_started = Instant::now();
+        while snapshot_idx < state.snapshot_rows || delta_idx < delta.len() {
+            let next_snapshot = if snapshot_idx < state.snapshot_rows {
+                Some(read_df_count_snapshot_row(
+                    snapshot,
+                    snapshot_idx,
+                    state.gram_bytes,
+                    row_bytes,
+                ))
+            } else {
+                None
+            };
+            let next_delta = delta.get(delta_idx).copied();
+            match (next_snapshot, next_delta) {
+                (Some((snapshot_gram, snapshot_count)), Some((delta_gram, delta_count))) => {
+                    if snapshot_gram == delta_gram {
+                        let merged = (snapshot_count as i64 + delta_count).max(0) as usize;
+                        if merged > 0 {
+                            write_df_count_row(
+                                &mut writer,
+                                snapshot_gram,
+                                merged,
+                                state.gram_bytes,
+                            )?;
+                        }
+                        snapshot_idx += 1;
+                        delta_idx += 1;
+                    } else if snapshot_gram < delta_gram {
+                        if snapshot_count > 0 {
+                            write_df_count_row(
+                                &mut writer,
+                                snapshot_gram,
+                                snapshot_count,
+                                state.gram_bytes,
+                            )?;
+                        }
+                        snapshot_idx += 1;
+                    } else {
+                        let merged = delta_count.max(0) as usize;
+                        if merged > 0 {
+                            write_df_count_row(&mut writer, delta_gram, merged, state.gram_bytes)?;
+                        }
+                        delta_idx += 1;
                     }
-                    snapshot_idx += 1;
-                    delta_idx += 1;
-                } else if snapshot_gram < delta_gram {
+                }
+                (Some((snapshot_gram, snapshot_count)), None) => {
                     if snapshot_count > 0 {
                         write_df_count_row(
                             &mut writer,
@@ -4871,41 +4970,37 @@ fn persist_df_counts_state_snapshot_to_root(root: &Path, state: &DfCountsState) 
                         )?;
                     }
                     snapshot_idx += 1;
-                } else {
+                }
+                (None, Some((delta_gram, delta_count))) => {
                     let merged = delta_count.max(0) as usize;
                     if merged > 0 {
                         write_df_count_row(&mut writer, delta_gram, merged, state.gram_bytes)?;
                     }
                     delta_idx += 1;
                 }
+                (None, None) => break,
             }
-            (Some((snapshot_gram, snapshot_count)), None) => {
-                if snapshot_count > 0 {
-                    write_df_count_row(
-                        &mut writer,
-                        snapshot_gram,
-                        snapshot_count,
-                        state.gram_bytes,
-                    )?;
-                }
-                snapshot_idx += 1;
-            }
-            (None, Some((delta_gram, delta_count))) => {
-                let merged = delta_count.max(0) as usize;
-                if merged > 0 {
-                    write_df_count_row(&mut writer, delta_gram, merged, state.gram_bytes)?;
-                }
-                delta_idx += 1;
-            }
-            (None, None) => break,
         }
-    }
+        profile.merge_write_us = elapsed_us(merge_write_started);
 
-    writer.flush()?;
-    fs::rename(tmp_path, snapshot_path)?;
+        let flush_started = Instant::now();
+        writer.flush()?;
+        profile.flush_us = elapsed_us(flush_started);
+        let close_started = Instant::now();
+        let file = writer.into_inner().map_err(|err| {
+            SspryError::from(format!("Failed to finalize df_counts snapshot: {err}"))
+        })?;
+        drop(file);
+        profile.close_us = elapsed_us(close_started);
+    }
+    let rename_started = Instant::now();
+    fs::rename(&tmp_path, &snapshot_path)?;
+    profile.rename_us = elapsed_us(rename_started);
+    let clear_delta_files_started = Instant::now();
     fs::write(df_counts_delta_path(root), [])?;
     fs::write(df_counts_unit_delta_path(root), [])?;
-    Ok(())
+    profile.clear_delta_files_us = elapsed_us(clear_delta_files_started);
+    Ok(profile)
 }
 
 fn read_df_count_snapshot_row(
@@ -8281,11 +8376,10 @@ rule q {
         let bytes_before = current_df_counts_delta_bytes(&root);
         assert!(bytes_before < DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES);
 
-        store.df_counts_delta_compact_threshold_bytes =
-            (DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES
-                / DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER)
-                .max(1)
-                - 1;
+        store.df_counts_delta_compact_threshold_bytes = (DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES
+            / DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER)
+            .max(1)
+            - 1;
         let profile = store.maybe_compact_df_counts().expect("compact by memory");
         assert_eq!(profile.checked_delta_bytes, bytes_before);
         assert_eq!(

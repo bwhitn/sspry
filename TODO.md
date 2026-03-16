@@ -251,19 +251,57 @@ Why:
 - On the current-tree late-run rerun it is still first-tier:
   - `87,330,505 us` by `23,359` docs
 
-Next step:
-- Add a second, tighter breakdown inside `maybe_compact_df_counts()` and
-  `persist_df_counts_snapshot_to_root()`:
-  - snapshot payload materialization time
-  - sort/order time before snapshot write
-  - snapshot write/rename time
-  - delta-file clear time
-  - any hidden file-size / metadata / fsync work not captured by the first split
+Status:
+- second-pass subphase instrumentation is now in place locally and should be kept
+- first profiled rerun artifact:
+  - `/root/pertest/results/sspry_ingest_26000_20260316_memcap2_profiled_rerun`
+- later accepted-layout rerun with explicit close timing:
+  - `/root/pertest/results/sspry_ingest_26000_20260316_memcap2_profiled_v2`
 
-Goal:
-- Determine which real subphase explains the large outer
-  `store_compact_df_counts_us` number, because the first split showed zeros even
-  while the outer bucket spiked.
+What it showed:
+- the original zeroed subfields were an aggregation bug in `rpc.rs`, now fixed
+- once fixed, the outer compaction bucket is no longer opaque
+- on the accepted bounded-memory path, the dominant subphase is still the first
+  syscall after the large snapshot rewrite:
+  - at `4,770` docs:
+    - `store_compact_df_counts_us = 51,310,625`
+    - `persist_snapshot_collect_delta_us = 518,710`
+    - `persist_snapshot_sort_delta_us = 1,641,037`
+    - `persist_snapshot_merge_write_us = 1,022,996`
+    - `persist_snapshot_flush_us = 1,311`
+    - `persist_snapshot_close_us = 1,174`
+    - `persist_snapshot_rename_us = 47,718,244`
+- read:
+  - the real cost is the full DF snapshot rewrite and the dirty-page writeback it triggers
+  - it is not primarily sort cost
+  - it is not primarily merge-loop CPU
+  - it is not primarily file-close cost
+  - `rename` is just where the kernel currently charges that writeback stall
+
+Rejected follow-up from this finding:
+- versioned snapshot files plus a small current-pointer file
+  - artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_versioned`
+  - result:
+    - replacing the live snapshot path in place stopped being expensive
+    - but the cost simply moved to the next tiny pointer-file write
+    - by `4,356` docs:
+      - `store_compact_df_counts_us = 62,338,905`
+      - `persist_snapshot_rename_us = 9,199`
+      - `persist_snapshot_publish_pointer_us = 59,220,051`
+    - worse overall than the accepted path
+  - conclusion:
+    - the issue is not rename semantics alone
+    - it is the full snapshot rewrite / writeback itself
+
+Next step:
+- stop trying to micro-fix rename
+- reduce or eliminate full DF snapshot rewrites during compaction
+- likely path:
+  - move DF state toward an exact segment/LSM-style representation
+  - bound memory by active batch/shard work
+  - keep IO mostly sequential
+  - avoid new resident indexes unless measurements prove they are cheap enough
 
 Important note:
 - A naive attempt to defer work-root DF compaction was benchmarked and rejected.
