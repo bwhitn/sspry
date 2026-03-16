@@ -44,11 +44,108 @@ const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
 type FastHashMap<K, V> = HbHashMap<K, V, FxBuildHasher>;
 type FastEntry<'a, K, V> = hashbrown::hash_map::Entry<'a, K, V, FxBuildHasher>;
 
+#[derive(Debug)]
+struct DfCountsSegment {
+    path: PathBuf,
+    mmap: Mmap,
+    rows: usize,
+}
+
+impl DfCountsSegment {
+    fn load(path: PathBuf, gram_bytes: usize) -> Result<Self> {
+        let file = fs::File::open(&path)?;
+        let len = file.metadata()?.len() as usize;
+        let row_bytes = gram_bytes + 8;
+        if len % row_bytes != 0 {
+            return Err(SspryError::from(format!(
+                "Invalid df_counts segment at {}",
+                path.display()
+            )));
+        }
+        let mmap = if len == 0 {
+            return Err(SspryError::from(format!(
+                "Empty df_counts segment at {}",
+                path.display()
+            )));
+        } else {
+            unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
+                SspryError::from(format!("Failed to mmap {}: {err}", path.display()))
+            })?
+        };
+        Ok(Self {
+            path,
+            mmap,
+            rows: len / row_bytes,
+        })
+    }
+
+    fn bytes(&self) -> u64 {
+        self.mmap.len() as u64
+    }
+
+    fn get_delta(&self, gram: u64, gram_bytes: usize) -> i64 {
+        let row_bytes = gram_bytes + 8;
+        let mut left = 0usize;
+        let mut right = self.rows;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let start = mid * row_bytes;
+            let candidate = decode_packed_exact_gram(&self.mmap[start..start + gram_bytes]);
+            if candidate == gram {
+                return i64::from_le_bytes(
+                    self.mmap[start + gram_bytes..start + row_bytes]
+                        .try_into()
+                        .expect("df segment delta"),
+                );
+            }
+            if candidate < gram {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        0
+    }
+
+    fn add_many_sorted_counts(&self, grams: &[u64], counts: &mut [i64], gram_bytes: usize) {
+        if grams.is_empty() || counts.is_empty() {
+            return;
+        }
+        let row_bytes = gram_bytes + 8;
+        if self.rows <= grams.len().saturating_mul(32).max(1) {
+            let mut segment_idx = 0usize;
+            for (idx, gram) in grams.iter().enumerate() {
+                while segment_idx < self.rows {
+                    let start = segment_idx * row_bytes;
+                    let candidate = decode_packed_exact_gram(&self.mmap[start..start + gram_bytes]);
+                    if candidate < *gram {
+                        segment_idx += 1;
+                        continue;
+                    }
+                    if candidate == *gram {
+                        counts[idx] += i64::from_le_bytes(
+                            self.mmap[start + gram_bytes..start + row_bytes]
+                                .try_into()
+                                .expect("df segment delta"),
+                        );
+                    }
+                    break;
+                }
+            }
+            return;
+        }
+        for (idx, gram) in grams.iter().enumerate() {
+            counts[idx] += self.get_delta(*gram, gram_bytes);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct DfCountsState {
     gram_bytes: usize,
     snapshot: Option<Mmap>,
     snapshot_rows: usize,
+    segments: Vec<DfCountsSegment>,
     delta: FastHashMap<u64, i64>,
 }
 
@@ -83,6 +180,7 @@ impl DfCountsState {
                 .map(|mmap| mmap.len() / (gram_bytes + 4))
                 .unwrap_or(0),
             snapshot,
+            segments: load_df_counts_segments(root, gram_bytes)?,
             delta: FastHashMap::with_hasher(FxBuildHasher),
         };
         state.load_delta(root)?;
@@ -169,8 +267,13 @@ impl DfCountsState {
 
     fn get(&self, gram: u64) -> usize {
         let base = self.snapshot_count(gram) as i64;
+        let segment_delta = self
+            .segments
+            .iter()
+            .map(|segment| segment.get_delta(gram, self.gram_bytes))
+            .sum::<i64>();
         let delta = self.delta.get(&gram).copied().unwrap_or(0);
-        (base + delta).max(0) as usize
+        (base + segment_delta + delta).max(0) as usize
     }
 
     fn get_many(&self, grams: &[u64]) -> HashMap<u64, usize> {
@@ -217,15 +320,24 @@ impl DfCountsState {
             } else {
                 0
             };
-            let delta = self.delta.get(gram).copied().unwrap_or(0);
-            counts.push((base as i64 + delta).max(0) as usize);
+            counts.push(base as i64);
+        }
+        for segment in &self.segments {
+            segment.add_many_sorted_counts(grams, &mut counts, self.gram_bytes);
+        }
+        for (idx, gram) in grams.iter().enumerate() {
+            counts[idx] += self.delta.get(gram).copied().unwrap_or(0);
         }
         counts
+            .into_iter()
+            .map(|count| count.max(0) as usize)
+            .collect()
     }
 
     fn materialize(&self) -> HashMap<u64, usize> {
-        let mut counts =
-            HashMap::<u64, usize>::with_capacity(self.snapshot_rows + self.delta.len());
+        let mut counts = HashMap::<u64, usize>::with_capacity(
+            self.snapshot_rows + self.segment_rows() + self.delta.len(),
+        );
         if let Some(snapshot) = &self.snapshot {
             let row_bytes = self.gram_bytes + 4;
             for chunk in snapshot.chunks_exact(row_bytes) {
@@ -237,6 +349,23 @@ impl DfCountsState {
                 ) as usize;
                 if count > 0 {
                     counts.insert(gram, count);
+                }
+            }
+        }
+        for segment in &self.segments {
+            let row_bytes = self.gram_bytes + 8;
+            for chunk in segment.mmap.chunks_exact(row_bytes) {
+                let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
+                let change = i64::from_le_bytes(
+                    chunk[self.gram_bytes..row_bytes]
+                        .try_into()
+                        .expect("df segment delta"),
+                );
+                let next = counts.get(&gram).copied().unwrap_or(0) as i64 + change;
+                if next > 0 {
+                    counts.insert(gram, next as usize);
+                } else {
+                    counts.remove(&gram);
                 }
             }
         }
@@ -292,12 +421,25 @@ impl DfCountsState {
         let fresh = Self::load(root, self.gram_bytes)?;
         self.snapshot = fresh.snapshot;
         self.snapshot_rows = fresh.snapshot_rows;
+        self.segments = fresh.segments;
         self.delta = fresh.delta;
         Ok(())
     }
 
     fn unique_count_hint(&self) -> usize {
-        self.snapshot_rows + self.delta.len()
+        self.snapshot_rows + self.segment_rows() + self.delta.len()
+    }
+
+    fn segment_rows(&self) -> usize {
+        self.segments.iter().map(|segment| segment.rows).sum()
+    }
+
+    fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn segment_bytes(&self) -> u64 {
+        self.segments.iter().map(DfCountsSegment::bytes).sum()
     }
 
     fn estimated_delta_memory_bytes(&self) -> u64 {
@@ -544,6 +686,8 @@ pub struct CandidateStats {
     pub tier2_superblock_memory_budget_bytes: u64,
     pub df_counts_delta_bytes: u64,
     pub df_counts_delta_entries: usize,
+    pub df_counts_segment_count: usize,
+    pub df_counts_segment_bytes: u64,
     pub df_counts_delta_estimated_memory_bytes: u64,
     pub df_counts_delta_compact_threshold_bytes: u64,
 }
@@ -645,6 +789,7 @@ const MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const DF_COUNTS_DELTA_MEMORY_BUDGET_DIVISOR: u64 = 16;
 const DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES: u64 = 64;
 const DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER: u64 = 2;
+const DF_COUNTS_SEGMENT_MAX_FILES_PER_SHARD: usize = 2;
 const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_GRAMS_COMPLETE: u8 = 0x01;
@@ -1348,6 +1493,7 @@ impl CandidateStore {
         let grams_indexed_path = grams_indexed_path(&config.root);
         let external_ids_path = external_ids_path(&config.root);
         let df_counts_path = df_counts_path(&config.root);
+        let df_segments_path = df_counts_segments_dir(&config.root);
         let df_delta_path = df_counts_delta_path(&config.root);
         let df_unit_delta_path = df_counts_unit_delta_path(&config.root);
         if !force
@@ -1364,6 +1510,7 @@ impl CandidateStore {
                 || grams_indexed_path.exists()
                 || external_ids_path.exists()
                 || df_counts_path.exists()
+                || df_segments_path.exists()
                 || df_delta_path.exists()
                 || df_unit_delta_path.exists())
         {
@@ -1397,6 +1544,7 @@ impl CandidateStore {
             let _ = fs::remove_file(&grams_indexed_path);
             let _ = fs::remove_file(&external_ids_path);
             let _ = fs::remove_file(&df_counts_path);
+            let _ = fs::remove_dir_all(&df_segments_path);
             let _ = fs::remove_file(&df_delta_path);
             let _ = fs::remove_file(&df_unit_delta_path);
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
@@ -3460,6 +3608,8 @@ impl CandidateStore {
             tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
             df_counts_delta_bytes: current_df_counts_delta_bytes(&self.root),
             df_counts_delta_entries: self.df_counts.delta.len(),
+            df_counts_segment_count: self.df_counts.segment_count(),
+            df_counts_segment_bytes: self.df_counts.segment_bytes(),
             df_counts_delta_estimated_memory_bytes: self.df_counts.estimated_delta_memory_bytes(),
             df_counts_delta_compact_threshold_bytes: self.df_counts_delta_compact_threshold_bytes,
         }
@@ -3656,8 +3806,8 @@ impl CandidateStore {
                     .saturating_mul(DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER)
         {
             let persist_snapshot_started = Instant::now();
-            let persist_profile =
-                persist_df_counts_state_snapshot_to_root_profiled(&self.root, &self.df_counts)?;
+            let (segment, persist_profile) =
+                flush_df_counts_delta_to_segment_profiled(&self.root, &self.df_counts)?;
             profile.persist_snapshot_us = elapsed_us(persist_snapshot_started);
             profile.persist_snapshot_collect_delta_us = persist_profile.collect_delta_us;
             profile.persist_snapshot_sort_delta_us = persist_profile.sort_delta_us;
@@ -3666,9 +3816,44 @@ impl CandidateStore {
             profile.persist_snapshot_close_us = persist_profile.close_us;
             profile.persist_snapshot_rename_us = persist_profile.rename_us;
             profile.persist_snapshot_clear_delta_files_us = persist_profile.clear_delta_files_us;
-            let refresh_snapshot_started = Instant::now();
-            self.df_counts.refresh_snapshot(&self.root)?;
-            profile.refresh_snapshot_us = elapsed_us(refresh_snapshot_started);
+            self.df_counts.delta.clear();
+            self.df_counts.segments.push(segment);
+            while self.df_counts.segments.len() > DF_COUNTS_SEGMENT_MAX_FILES_PER_SHARD {
+                let mut indices = (0..self.df_counts.segments.len()).collect::<Vec<_>>();
+                indices.sort_unstable_by_key(|index| self.df_counts.segments[*index].bytes());
+                let left_idx = indices[0];
+                let right_idx = indices[1];
+                let merge_started = Instant::now();
+                let merged_profile = merge_df_counts_segments_profiled(
+                    &self.root,
+                    self.meta.exact_gram_bytes(),
+                    &self.df_counts.segments[left_idx],
+                    &self.df_counts.segments[right_idx],
+                )?;
+                profile.persist_snapshot_us = profile
+                    .persist_snapshot_us
+                    .saturating_add(elapsed_us(merge_started));
+                profile.persist_snapshot_merge_write_us = profile
+                    .persist_snapshot_merge_write_us
+                    .saturating_add(merged_profile.1.merge_write_us);
+                profile.persist_snapshot_flush_us = profile
+                    .persist_snapshot_flush_us
+                    .saturating_add(merged_profile.1.flush_us);
+                profile.persist_snapshot_close_us = profile
+                    .persist_snapshot_close_us
+                    .saturating_add(merged_profile.1.close_us);
+                profile.persist_snapshot_rename_us = profile
+                    .persist_snapshot_rename_us
+                    .saturating_add(merged_profile.1.rename_us);
+                let (high_idx, low_idx) = if left_idx > right_idx {
+                    (left_idx, right_idx)
+                } else {
+                    (right_idx, left_idx)
+                };
+                self.df_counts.segments.swap_remove(high_idx);
+                self.df_counts.segments.swap_remove(low_idx);
+                self.df_counts.segments.push(merged_profile.0);
+            }
             let reopen_writers_started = Instant::now();
             self.append_writers.df_counts_delta =
                 AppendFile::new(df_counts_delta_path(&self.root))?;
@@ -4605,6 +4790,52 @@ fn df_counts_path(root: &Path) -> PathBuf {
     root.join("df_counts.bin")
 }
 
+fn df_counts_segments_dir(root: &Path) -> PathBuf {
+    root.join("df_counts_segments")
+}
+
+fn df_counts_segment_path(root: &Path, generation: u64) -> PathBuf {
+    df_counts_segments_dir(root).join(format!("{generation:016x}.bin"))
+}
+
+fn parse_df_counts_segment_generation(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".bin")?;
+    u64::from_str_radix(stem, 16).ok()
+}
+
+fn load_df_counts_segments(root: &Path, gram_bytes: usize) -> Result<Vec<DfCountsSegment>> {
+    let dir = df_counts_segments_dir(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "bin"))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    let mut segments = Vec::with_capacity(paths.len());
+    for path in paths {
+        segments.push(DfCountsSegment::load(path, gram_bytes)?);
+    }
+    Ok(segments)
+}
+
+fn next_df_counts_segment_generation(root: &Path) -> Result<u64> {
+    let dir = df_counts_segments_dir(root);
+    if !dir.exists() {
+        return Ok(1);
+    }
+    let mut next_generation = 1u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(generation) = parse_df_counts_segment_generation(&entry.path()) {
+            next_generation = next_generation.max(generation.saturating_add(1));
+        }
+    }
+    Ok(next_generation)
+}
+
 fn df_counts_delta_path(root: &Path) -> PathBuf {
     root.join("df_counts.delta.bin")
 }
@@ -4875,6 +5106,7 @@ fn persist_df_counts_snapshot_to_root(
     }
     writer.flush()?;
     fs::rename(tmp_path, snapshot_path)?;
+    let _ = fs::remove_dir_all(df_counts_segments_dir(root));
     fs::write(df_counts_delta_path(root), [])?;
     fs::write(df_counts_unit_delta_path(root), [])?;
     Ok(())
@@ -4895,14 +5127,15 @@ fn persist_df_counts_state_snapshot_to_root_profiled(
     fs::create_dir_all(root)?;
     let mut profile = DfCountsSnapshotPersistProfile::default();
     let collect_delta_started = Instant::now();
-    let mut delta = state
-        .delta
-        .iter()
-        .filter_map(|(gram, change)| (*change != 0).then_some((*gram, *change)))
-        .collect::<Vec<_>>();
+    let counts = state.materialize();
     profile.collect_delta_us = elapsed_us(collect_delta_started);
     let sort_delta_started = Instant::now();
-    delta.sort_unstable_by_key(|(gram, _)| *gram);
+    let mut ordered = counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(gram, count)| (*gram, *count))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(gram, _)| *gram);
     profile.sort_delta_us = elapsed_us(sort_delta_started);
 
     let snapshot_path = df_counts_path(root);
@@ -4910,76 +5143,10 @@ fn persist_df_counts_state_snapshot_to_root_profiled(
     {
         let file = fs::File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
-        let snapshot = state.snapshot.as_deref().unwrap_or(&[]);
-        let row_bytes = state.gram_bytes + 4;
-        let mut snapshot_idx = 0usize;
-        let mut delta_idx = 0usize;
 
         let merge_write_started = Instant::now();
-        while snapshot_idx < state.snapshot_rows || delta_idx < delta.len() {
-            let next_snapshot = if snapshot_idx < state.snapshot_rows {
-                Some(read_df_count_snapshot_row(
-                    snapshot,
-                    snapshot_idx,
-                    state.gram_bytes,
-                    row_bytes,
-                ))
-            } else {
-                None
-            };
-            let next_delta = delta.get(delta_idx).copied();
-            match (next_snapshot, next_delta) {
-                (Some((snapshot_gram, snapshot_count)), Some((delta_gram, delta_count))) => {
-                    if snapshot_gram == delta_gram {
-                        let merged = (snapshot_count as i64 + delta_count).max(0) as usize;
-                        if merged > 0 {
-                            write_df_count_row(
-                                &mut writer,
-                                snapshot_gram,
-                                merged,
-                                state.gram_bytes,
-                            )?;
-                        }
-                        snapshot_idx += 1;
-                        delta_idx += 1;
-                    } else if snapshot_gram < delta_gram {
-                        if snapshot_count > 0 {
-                            write_df_count_row(
-                                &mut writer,
-                                snapshot_gram,
-                                snapshot_count,
-                                state.gram_bytes,
-                            )?;
-                        }
-                        snapshot_idx += 1;
-                    } else {
-                        let merged = delta_count.max(0) as usize;
-                        if merged > 0 {
-                            write_df_count_row(&mut writer, delta_gram, merged, state.gram_bytes)?;
-                        }
-                        delta_idx += 1;
-                    }
-                }
-                (Some((snapshot_gram, snapshot_count)), None) => {
-                    if snapshot_count > 0 {
-                        write_df_count_row(
-                            &mut writer,
-                            snapshot_gram,
-                            snapshot_count,
-                            state.gram_bytes,
-                        )?;
-                    }
-                    snapshot_idx += 1;
-                }
-                (None, Some((delta_gram, delta_count))) => {
-                    let merged = delta_count.max(0) as usize;
-                    if merged > 0 {
-                        write_df_count_row(&mut writer, delta_gram, merged, state.gram_bytes)?;
-                    }
-                    delta_idx += 1;
-                }
-                (None, None) => break,
-            }
+        for (gram, count) in ordered {
+            write_df_count_row(&mut writer, gram, count, state.gram_bytes)?;
         }
         profile.merge_write_us = elapsed_us(merge_write_started);
 
@@ -4997,26 +5164,160 @@ fn persist_df_counts_state_snapshot_to_root_profiled(
     fs::rename(&tmp_path, &snapshot_path)?;
     profile.rename_us = elapsed_us(rename_started);
     let clear_delta_files_started = Instant::now();
+    let _ = fs::remove_dir_all(df_counts_segments_dir(root));
     fs::write(df_counts_delta_path(root), [])?;
     fs::write(df_counts_unit_delta_path(root), [])?;
     profile.clear_delta_files_us = elapsed_us(clear_delta_files_started);
     Ok(profile)
 }
 
-fn read_df_count_snapshot_row(
-    snapshot: &[u8],
-    row_idx: usize,
+fn flush_df_counts_delta_to_segment_profiled(
+    root: &Path,
+    state: &DfCountsState,
+) -> Result<(DfCountsSegment, DfCountsSnapshotPersistProfile)> {
+    fn elapsed_us(started: Instant) -> u64 {
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    fs::create_dir_all(df_counts_segments_dir(root))?;
+    let mut profile = DfCountsSnapshotPersistProfile::default();
+    let collect_delta_started = Instant::now();
+    let mut delta = state
+        .delta
+        .iter()
+        .filter_map(|(gram, change)| (*change != 0).then_some((*gram, *change)))
+        .collect::<Vec<_>>();
+    profile.collect_delta_us = elapsed_us(collect_delta_started);
+    let sort_delta_started = Instant::now();
+    delta.sort_unstable_by_key(|(gram, _)| *gram);
+    profile.sort_delta_us = elapsed_us(sort_delta_started);
+
+    let generation = next_df_counts_segment_generation(root)?;
+    let segment_path = df_counts_segment_path(root, generation);
+    let tmp_path = PathBuf::from(format!("{}.tmp", segment_path.display()));
+    {
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        let merge_write_started = Instant::now();
+        for (gram, change) in &delta {
+            write_df_count_delta_row(&mut writer, *gram, *change, state.gram_bytes)?;
+        }
+        profile.merge_write_us = elapsed_us(merge_write_started);
+        let flush_started = Instant::now();
+        writer.flush()?;
+        profile.flush_us = elapsed_us(flush_started);
+        let close_started = Instant::now();
+        let file = writer.into_inner().map_err(|err| {
+            SspryError::from(format!("Failed to finalize df_counts segment: {err}"))
+        })?;
+        drop(file);
+        profile.close_us = elapsed_us(close_started);
+    }
+    let rename_started = Instant::now();
+    fs::rename(&tmp_path, &segment_path)?;
+    profile.rename_us = elapsed_us(rename_started);
+    let clear_delta_files_started = Instant::now();
+    fs::write(df_counts_delta_path(root), [])?;
+    fs::write(df_counts_unit_delta_path(root), [])?;
+    profile.clear_delta_files_us = elapsed_us(clear_delta_files_started);
+    Ok((
+        DfCountsSegment::load(segment_path, state.gram_bytes)?,
+        profile,
+    ))
+}
+
+fn merge_df_counts_segments_profiled(
+    root: &Path,
     gram_bytes: usize,
-    row_bytes: usize,
-) -> (u64, usize) {
-    let start = row_idx * row_bytes;
-    let gram = decode_packed_exact_gram(&snapshot[start..start + gram_bytes]);
-    let count = u32::from_le_bytes(
-        snapshot[start + gram_bytes..start + row_bytes]
-            .try_into()
-            .expect("df count"),
-    ) as usize;
-    (gram, count)
+    left: &DfCountsSegment,
+    right: &DfCountsSegment,
+) -> Result<(DfCountsSegment, DfCountsSnapshotPersistProfile)> {
+    fn elapsed_us(started: Instant) -> u64 {
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    let generation = next_df_counts_segment_generation(root)?;
+    let segment_path = df_counts_segment_path(root, generation);
+    let tmp_path = PathBuf::from(format!("{}.tmp", segment_path.display()));
+    let mut profile = DfCountsSnapshotPersistProfile::default();
+    let left_row_bytes = gram_bytes + 8;
+    let right_row_bytes = gram_bytes + 8;
+    let mut left_idx = 0usize;
+    let mut right_idx = 0usize;
+
+    {
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        let merge_write_started = Instant::now();
+        while left_idx < left.rows || right_idx < right.rows {
+            let next_left = if left_idx < left.rows {
+                Some(read_df_count_delta_row(
+                    &left.mmap,
+                    left_idx,
+                    gram_bytes,
+                    left_row_bytes,
+                ))
+            } else {
+                None
+            };
+            let next_right = if right_idx < right.rows {
+                Some(read_df_count_delta_row(
+                    &right.mmap,
+                    right_idx,
+                    gram_bytes,
+                    right_row_bytes,
+                ))
+            } else {
+                None
+            };
+            match (next_left, next_right) {
+                (Some((left_gram, left_delta)), Some((right_gram, right_delta))) => {
+                    if left_gram == right_gram {
+                        let merged = left_delta + right_delta;
+                        if merged != 0 {
+                            write_df_count_delta_row(&mut writer, left_gram, merged, gram_bytes)?;
+                        }
+                        left_idx += 1;
+                        right_idx += 1;
+                    } else if left_gram < right_gram {
+                        write_df_count_delta_row(&mut writer, left_gram, left_delta, gram_bytes)?;
+                        left_idx += 1;
+                    } else {
+                        write_df_count_delta_row(&mut writer, right_gram, right_delta, gram_bytes)?;
+                        right_idx += 1;
+                    }
+                }
+                (Some((left_gram, left_delta)), None) => {
+                    write_df_count_delta_row(&mut writer, left_gram, left_delta, gram_bytes)?;
+                    left_idx += 1;
+                }
+                (None, Some((right_gram, right_delta))) => {
+                    write_df_count_delta_row(&mut writer, right_gram, right_delta, gram_bytes)?;
+                    right_idx += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        profile.merge_write_us = elapsed_us(merge_write_started);
+        let flush_started = Instant::now();
+        writer.flush()?;
+        profile.flush_us = elapsed_us(flush_started);
+        let close_started = Instant::now();
+        let file = writer.into_inner().map_err(|err| {
+            SspryError::from(format!(
+                "Failed to finalize merged df_counts segment: {err}"
+            ))
+        })?;
+        drop(file);
+        profile.close_us = elapsed_us(close_started);
+    }
+
+    let rename_started = Instant::now();
+    fs::rename(&tmp_path, &segment_path)?;
+    profile.rename_us = elapsed_us(rename_started);
+    fs::remove_file(&left.path)?;
+    fs::remove_file(&right.path)?;
+    Ok((DfCountsSegment::load(segment_path, gram_bytes)?, profile))
 }
 
 fn write_df_count_row(
@@ -5028,6 +5329,33 @@ fn write_df_count_row(
     writer.write_all(&gram.to_le_bytes()[..gram_bytes])?;
     writer.write_all(&(count.min(u32::MAX as usize) as u32).to_le_bytes())?;
     Ok(())
+}
+
+fn write_df_count_delta_row(
+    writer: &mut impl Write,
+    gram: u64,
+    change: i64,
+    gram_bytes: usize,
+) -> Result<()> {
+    writer.write_all(&gram.to_le_bytes()[..gram_bytes])?;
+    writer.write_all(&change.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_df_count_delta_row(
+    bytes: &[u8],
+    row_idx: usize,
+    gram_bytes: usize,
+    row_bytes: usize,
+) -> (u64, i64) {
+    let start = row_idx * row_bytes;
+    let gram = decode_packed_exact_gram(&bytes[start..start + gram_bytes]);
+    let delta = i64::from_le_bytes(
+        bytes[start + gram_bytes..start + row_bytes]
+            .try_into()
+            .expect("df segment delta"),
+    );
+    (gram, delta)
 }
 
 fn append_u32(payload: &mut Vec<u8>, value: u32) {
@@ -8271,6 +8599,8 @@ rule q {
         let stats = store.stats();
         assert_eq!(stats.df_counts_delta_entries, 0);
         assert_eq!(stats.df_counts_delta_bytes, 0);
+        assert_eq!(stats.df_counts_segment_count, 0);
+        assert_eq!(stats.df_counts_segment_bytes, 0);
         assert_eq!(stats.df_counts_delta_estimated_memory_bytes, 0);
         assert_eq!(
             stats.df_counts_delta_compact_threshold_bytes,
@@ -8348,12 +8678,9 @@ rule q {
         let profile = store.maybe_compact_df_counts().expect("compact df counts");
         assert_eq!(profile.checked_delta_bytes, bytes_before);
         assert_eq!(current_df_counts_delta_bytes(&root), 0);
-        assert!(
-            fs::metadata(df_counts_path(&root))
-                .expect("df counts snapshot")
-                .len()
-                > 0
-        );
+        assert_eq!(store.df_counts.segment_count(), 1);
+        assert!(store.df_counts.segment_bytes() > 0);
+        assert_eq!(store.df_counts.get(pack_exact_gram(&[1, 2, 3, 4])), 1);
     }
 
     #[test]
@@ -8388,7 +8715,46 @@ rule q {
         );
         assert_eq!(current_df_counts_delta_bytes(&root), 0);
         assert_eq!(store.df_counts.delta.len(), 0);
+        assert_eq!(store.df_counts.segment_count(), 1);
         assert_eq!(store.df_counts.get(gram), 1);
+    }
+
+    #[test]
+    fn persist_df_counts_snapshot_merges_segments_back_into_snapshot() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let gram = pack_exact_gram(&[1, 2, 3, 4]);
+        store.df_counts.apply_unit_deltas(&[gram, gram]);
+        let packed = [
+            gram.to_le_bytes()[..4].to_vec(),
+            gram.to_le_bytes()[..4].to_vec(),
+        ]
+        .concat();
+        fs::write(df_counts_unit_delta_path(&root), packed).expect("write unit delta");
+        store.df_counts_delta_compact_threshold_bytes = 1;
+        store.maybe_compact_df_counts().expect("flush to segment");
+        assert_eq!(store.df_counts.segment_count(), 1);
+        store
+            .persist_df_counts_snapshot()
+            .expect("persist merged snapshot");
+        store
+            .df_counts
+            .refresh_snapshot(&root)
+            .expect("refresh state");
+        assert_eq!(store.df_counts.segment_count(), 0);
+        assert_eq!(store.df_counts.delta.len(), 0);
+        assert_eq!(store.df_counts.get(gram), 2);
+        assert!(!df_counts_segments_dir(&root).exists());
+        assert!(df_counts_path(&root).exists());
     }
 
     #[test]

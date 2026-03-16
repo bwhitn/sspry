@@ -1315,6 +1315,14 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.df_counts_delta_entries)
         .sum::<usize>();
+    let df_counts_segment_count = stats_rows
+        .iter()
+        .map(|item| item.df_counts_segment_count)
+        .sum::<usize>();
+    let df_counts_segment_bytes = stats_rows
+        .iter()
+        .map(|item| item.df_counts_segment_bytes)
+        .sum::<u64>();
     let df_counts_delta_estimated_memory_bytes = stats_rows
         .iter()
         .map(|item| item.df_counts_delta_estimated_memory_bytes)
@@ -1360,6 +1368,14 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "df_counts_delta_entries".to_owned(),
         json!(df_counts_delta_entries),
+    );
+    out.insert(
+        "df_counts_segment_count".to_owned(),
+        json!(df_counts_segment_count),
+    );
+    out.insert(
+        "df_counts_segment_bytes".to_owned(),
+        json!(df_counts_segment_bytes),
     );
     out.insert(
         "df_counts_delta_estimated_memory_bytes".to_owned(),
@@ -1510,6 +1526,7 @@ fn start_auto_publish_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> 
                 break;
             }
             let _ = state.run_auto_publish_cycle();
+            let _ = state.run_retired_root_prune_cycle();
         }
     })
 }
@@ -2686,6 +2703,28 @@ impl ServerState {
             return Ok(());
         }
         let _ = self.handle_publish()?;
+        Ok(())
+    }
+
+    fn run_retired_root_prune_cycle(&self) -> Result<()> {
+        if self.publish_in_progress.load(Ordering::Acquire)
+            || self.active_index_sessions.load(Ordering::Acquire) > 0
+            || self.active_mutations.load(Ordering::Acquire) > 0
+        {
+            return Ok(());
+        }
+        let retired_root = {
+            let store_mode = self
+                .store_mode
+                .lock()
+                .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+            match &*store_mode {
+                StoreMode::Workspace { root, .. } => workspace_retired_root(root),
+                StoreMode::Direct { .. } => return Ok(()),
+            }
+        };
+        let _ =
+            prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
         Ok(())
     }
 
@@ -5072,10 +5111,7 @@ impl ServerState {
             self.last_publish_tier2_snapshot_persist_failures
                 .store(0, Ordering::SeqCst);
 
-            let removed_retired_roots = prune_workspace_retired_roots(
-                &retired_parent,
-                DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP,
-            )?;
+            let removed_retired_roots = 0usize;
             self.last_publish_reused_work_stores
                 .store(reuse_work_stores, Ordering::SeqCst);
 
@@ -6536,6 +6572,9 @@ mod tests {
             Ordering::SeqCst,
         );
         state.handle_publish().expect("second publish");
+        state
+            .run_retired_root_prune_cycle()
+            .expect("retired prune cycle");
 
         let retained = workspace_retired_roots(&retired_root);
         assert_eq!(retained.len(), DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP);
