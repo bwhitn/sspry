@@ -75,6 +75,65 @@ Useful current comparison run:
     - `total_ms = 8338.243`
     - `submit_ms = 5793.406`
 
+Latest rejected bounded-memory experiment:
+- Exact streaming classify + streaming DF snapshot persist was tested locally and rejected.
+- Fresh deterministic datasets used for the rerun:
+  - `26k` prefix:
+    - `/root/pertest/results/sspry_dataset_26000_sorted_20260316/dataset.json`
+    - files: `26,000`
+    - bytes: `65,094,641,220`
+    - GiB: `60.624108854681`
+  - `50k` prefix:
+    - `/root/pertest/results/sspry_dataset_50000_sorted_20260316/dataset.json`
+    - files: `50,000`
+    - bytes: `143,010,953,447`
+    - GiB: `133.189329362474`
+
+`26k` exact-streaming rerun:
+- Artifact root:
+  - `/root/pertest/results/sspry_ingest_26000_20260316_streaming_bounded`
+- Final index totals:
+  - `verbose.index.total_ms = 801,605.882`
+  - `verbose.index.submit_ms = 442,367.917`
+  - `verbose.index.server_current_rss_kb = 6,839,812`
+  - `verbose.index.server_peak_rss_kb = 6,893,572`
+- Dominant server store buckets:
+  - `store_append_sidecars_us = 120,491,599`
+  - `store_compact_df_counts_us = 101,856,962`
+  - `store_classify_us = 73,417,880`
+  - `store_classify_df_lookup_us = 34,003,536`
+  - `store_apply_df_counts_us = 33,895,899`
+- Read:
+  - faster than the old `26k` baseline on total time
+  - completely fails the memory bar
+  - late-run current RSS stayed close to peak instead of dropping to a safe level
+
+`50k` scaling confirmation:
+- Artifact root:
+  - `/root/pertest/results/sspry_ingest_50000_20260316_streaming_bounded`
+- The run was intentionally stopped early to avoid wasting more IO once the RSS slope was clear.
+- Last clean light-info sample:
+  - sample file:
+    - `/root/pertest/results/sspry_ingest_50000_20260316_streaming_bounded/monitor.0008.json`
+  - progress:
+    - `submitted_documents = 6,803`
+    - `progress_percent = 13.606`
+  - memory:
+    - `current_rss_kb = 2,755,732`
+    - `peak_rss_kb = 2,815,092`
+- Read:
+  - RSS slope is worse than the rejected `26k` run
+  - the path is not scaling safely enough to justify further IO on this approach
+
+Conclusion from the reruns:
+- exact streaming snapshot reads by themselves are not enough
+- even without the original mmap random-probe path, the current classify strategy still grows
+  resident memory too aggressively as corpus size increases
+- do not land this path
+- next attempt needs a different shape:
+  - memory bounded by active batch/shard work, not cumulative snapshot state
+  - likely locality-aware exact lookup rather than whole-snapshot rereads
+
 ## Landed Wins
 
 Important kept changes already in `master`:
