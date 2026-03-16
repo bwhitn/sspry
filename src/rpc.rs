@@ -351,6 +351,7 @@ struct ServerState {
     shutdown: Arc<AtomicBool>,
     operation_gate: RwLock<()>,
     store_mode: Mutex<StoreMode>,
+    publish_requested: AtomicBool,
     mutations_paused: AtomicBool,
     publish_in_progress: AtomicBool,
     active_mutations: AtomicUsize,
@@ -1688,6 +1689,7 @@ impl ServerState {
             shutdown,
             operation_gate: RwLock::new(()),
             store_mode: Mutex::new(store_mode),
+            publish_requested: AtomicBool::new(false),
             mutations_paused: AtomicBool::new(false),
             publish_in_progress: AtomicBool::new(false),
             active_mutations: AtomicUsize::new(0),
@@ -2190,7 +2192,8 @@ impl ServerState {
     }
 
     fn handle_begin_index_session(&self) -> Result<CandidateIndexSessionResponse> {
-        if self.publish_in_progress.load(Ordering::Acquire)
+        if self.publish_requested.load(Ordering::Acquire)
+            || self.publish_in_progress.load(Ordering::Acquire)
             || self.mutations_paused.load(Ordering::Acquire)
         {
             return Err(SspryError::from(
@@ -2684,6 +2687,7 @@ impl ServerState {
 
     fn publish_readiness(&self, now_unix_ms: u64) -> PublishReadiness {
         let work_dirty = self.work_dirty.load(Ordering::Acquire);
+        let publish_requested = self.publish_requested.load(Ordering::Acquire);
         let publish_in_progress = self.publish_in_progress.load(Ordering::Acquire);
         let mutations_paused = self.mutations_paused.load(Ordering::Acquire);
         let active_index_sessions = self.active_index_sessions.load(Ordering::Acquire);
@@ -2701,6 +2705,7 @@ impl ServerState {
             && work_dirty
             && active_index_sessions == 0
             && active_mutations == 0
+            && !publish_requested
             && !publish_in_progress
             && !mutations_paused
             && last_mutation != 0
@@ -2709,6 +2714,8 @@ impl ServerState {
             "workspace_disabled"
         } else if !work_dirty {
             "work_clean"
+        } else if publish_requested {
+            "publish_requested"
         } else if publish_in_progress {
             "publish_in_progress"
         } else if mutations_paused {
@@ -2843,6 +2850,10 @@ impl ServerState {
         stats.insert(
             "active_mutations".to_owned(),
             json!(self.active_mutations.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "publish_requested".to_owned(),
+            json!(self.publish_requested.load(Ordering::Acquire)),
         );
         stats.insert(
             "mutations_paused".to_owned(),
@@ -3428,6 +3439,10 @@ impl ServerState {
         stats.insert(
             "active_mutations".to_owned(),
             json!(self.active_mutations.load(Ordering::Acquire)),
+        );
+        stats.insert(
+            "publish_requested".to_owned(),
+            json!(self.publish_requested.load(Ordering::Acquire)),
         );
         stats.insert(
             "mutations_paused".to_owned(),
@@ -4803,44 +4818,54 @@ impl ServerState {
     }
 
     fn handle_publish(&self) -> Result<CandidatePublishResponse> {
-        self.mutations_paused.store(true, Ordering::SeqCst);
-        while self.active_index_sessions.load(Ordering::Acquire) > 0
-            || self.active_mutations.load(Ordering::Acquire) > 0
+        if self
+            .publish_requested
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
+            return Err(SspryError::from(
+                "server is already publishing; retry later",
+            ));
+        }
+        while self.active_index_sessions.load(Ordering::Acquire) > 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.mutations_paused.store(true, Ordering::SeqCst);
+        while self.active_mutations.load(Ordering::Acquire) > 0 {
             thread::sleep(Duration::from_millis(10));
         }
         self.publish_in_progress.store(true, Ordering::SeqCst);
-        let publish_started_unix_ms = current_unix_ms();
-        self.last_publish_started_unix_ms
-            .store(publish_started_unix_ms, Ordering::SeqCst);
-        self.last_publish_promote_work_ms.store(0, Ordering::SeqCst);
-        self.last_publish_promote_work_export_ms
-            .store(0, Ordering::SeqCst);
-        self.last_publish_promote_work_import_ms
-            .store(0, Ordering::SeqCst);
-        self.last_publish_promote_work_remove_work_root_ms
-            .store(0, Ordering::SeqCst);
-        self.last_publish_promote_work_other_ms
-            .store(0, Ordering::SeqCst);
-        self.last_publish_promote_work_imported_docs
-            .store(0, Ordering::SeqCst);
-        self.last_publish_promote_work_imported_shards
-            .store(0, Ordering::SeqCst);
-        self.last_publish_persist_df_counts_ms
-            .store(0, Ordering::SeqCst);
-        self.last_publish_df_snapshot_persist_failures
-            .store(0, Ordering::SeqCst);
-        self.last_publish_persist_tier2_superblocks_ms
-            .store(0, Ordering::SeqCst);
-        self.last_publish_tier2_snapshot_persist_failures
-            .store(0, Ordering::SeqCst);
-        self.last_publish_persisted_snapshot_shards
-            .store(0, Ordering::SeqCst);
-        let _op = self
-            .operation_gate
-            .write()
-            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let result = (|| -> Result<CandidatePublishResponse> {
+            let publish_started_unix_ms = current_unix_ms();
+            self.last_publish_started_unix_ms
+                .store(publish_started_unix_ms, Ordering::SeqCst);
+            self.last_publish_promote_work_ms.store(0, Ordering::SeqCst);
+            self.last_publish_promote_work_export_ms
+                .store(0, Ordering::SeqCst);
+            self.last_publish_promote_work_import_ms
+                .store(0, Ordering::SeqCst);
+            self.last_publish_promote_work_remove_work_root_ms
+                .store(0, Ordering::SeqCst);
+            self.last_publish_promote_work_other_ms
+                .store(0, Ordering::SeqCst);
+            self.last_publish_promote_work_imported_docs
+                .store(0, Ordering::SeqCst);
+            self.last_publish_promote_work_imported_shards
+                .store(0, Ordering::SeqCst);
+            self.last_publish_persist_df_counts_ms
+                .store(0, Ordering::SeqCst);
+            self.last_publish_df_snapshot_persist_failures
+                .store(0, Ordering::SeqCst);
+            self.last_publish_persist_tier2_superblocks_ms
+                .store(0, Ordering::SeqCst);
+            self.last_publish_tier2_snapshot_persist_failures
+                .store(0, Ordering::SeqCst);
+            self.last_publish_persisted_snapshot_shards
+                .store(0, Ordering::SeqCst);
+            let _op = self
+                .operation_gate
+                .write()
+                .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
             let mut store_mode = self
                 .store_mode
                 .lock()
@@ -5200,6 +5225,7 @@ impl ServerState {
         })();
         self.publish_in_progress.store(false, Ordering::SeqCst);
         self.mutations_paused.store(false, Ordering::SeqCst);
+        self.publish_requested.store(false, Ordering::SeqCst);
         result
     }
 }
@@ -6085,6 +6111,31 @@ mod tests {
         )
     }
 
+    fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
+        fs::write(path, bytes).expect("write sample");
+        let features = crate::candidate::scan_file_features(
+            path, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features");
+        CandidateDocumentWire {
+            sha256: hex::encode(features.sha256),
+            file_size: features.file_size,
+            bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                .encode(features.bloom_filter),
+            gram_count_estimate: None,
+            bloom_hashes: Some(7),
+            tier2_bloom_filter_b64: None,
+            tier2_gram_count_estimate: None,
+            tier2_bloom_hashes: None,
+            grams_delta_b64: None,
+            grams: features.unique_grams,
+            grams_complete: !features.unique_grams_truncated,
+            effective_diversity: None,
+            metadata_b64: None,
+            external_id: None,
+        }
+    }
+
     #[test]
     fn current_stats_json_returns_busy_error_when_shard_locked() {
         let tmp = tempdir().expect("tmp");
@@ -6584,6 +6635,39 @@ mod tests {
     }
 
     #[test]
+    fn publish_requested_blocks_new_index_sessions_while_waiting_for_active_session() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        let publish_state = state.clone();
+        let publish_thread = thread::spawn(move || publish_state.handle_publish());
+
+        let started = Instant::now();
+        while !state.publish_requested.load(Ordering::Acquire) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "publish request did not become visible"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let err = state
+            .handle_begin_index_session()
+            .expect_err("new session should be blocked while publish is pending");
+        assert!(
+            err.to_string()
+                .contains("server is publishing; index session unavailable; retry later")
+        );
+
+        state.active_index_sessions.store(0, Ordering::SeqCst);
+        let publish = publish_thread
+            .join()
+            .expect("join publish thread")
+            .expect("publish result");
+        assert!(publish.message.contains("published work root"));
+    }
+
+    #[test]
     fn publish_prunes_workspace_retired_roots_to_keep_last_one() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -7062,6 +7146,49 @@ mod tests {
         panic!("test tcp rpc server did not become ready");
     }
 
+    fn start_tcp_workspace_server(base: &Path, candidate_shards: usize) -> ClientConfig {
+        let probe = TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind probe");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let root = base.join(format!("tcp_workspace_{candidate_shards}"));
+        thread::spawn(move || {
+            let _ = serve(
+                DEFAULT_RPC_HOST,
+                port,
+                None,
+                DEFAULT_MAX_REQUEST_BYTES,
+                ServerConfig {
+                    candidate_config: CandidateConfig {
+                        root,
+                        ..CandidateConfig::default()
+                    },
+                    candidate_shards,
+                    search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    tier2_superblock_budget_divisor:
+                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
+                    workspace_mode: true,
+                },
+            );
+        });
+        let config = ClientConfig::new(
+            DEFAULT_RPC_HOST.to_owned(),
+            port,
+            Duration::from_millis(250),
+            None,
+        );
+        let client = SspryClient::new(config.clone());
+        for _ in 0..100 {
+            if client.ping().is_ok() {
+                return config;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("test tcp workspace rpc server did not become ready");
+    }
+
     #[test]
     fn serve_with_shutdown_flag_drains_and_exits() {
         let tmp = tempdir().expect("tmp");
@@ -7535,6 +7662,97 @@ mod tests {
             .expect("batch retry succeeds");
         assert_eq!(response.inserted_count, 1);
         assert_eq!(response.results.len(), 1);
+    }
+
+    #[test]
+    fn workspace_publish_waits_for_remote_index_session_without_failing_later_batches() {
+        let tmp = tempdir().expect("tmp");
+        let config = start_tcp_workspace_server(tmp.path(), 1);
+        let client = SspryClient::new(config.clone());
+        let mut persistent = client.connect_persistent().expect("connect persistent");
+        assert_eq!(
+            persistent
+                .begin_index_session()
+                .expect("begin index session"),
+            "index session started"
+        );
+
+        let doc_a =
+            candidate_document_wire_from_bytes(&tmp.path().join("overlap-a.bin"), b"xxABCDyy");
+        let doc_b =
+            candidate_document_wire_from_bytes(&tmp.path().join("overlap-b.bin"), b"zzWXYZqq");
+        let row_a = serde_json::to_vec(&doc_a).expect("serialize doc a");
+        let row_b = serde_json::to_vec(&doc_b).expect("serialize doc b");
+
+        let inserted_a = persistent
+            .candidate_insert_batch_serialized_rows(&[row_a])
+            .expect("insert first batch");
+        assert_eq!(inserted_a.inserted_count, 1);
+
+        let publish_config = config.clone();
+        let publish_thread =
+            thread::spawn(move || SspryClient::new(publish_config).publish().expect("publish"));
+
+        let status_client = SspryClient::new(config.clone());
+        let wait_started = Instant::now();
+        loop {
+            let status = status_client.candidate_status().expect("candidate status");
+            if status
+                .get("publish_requested")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                assert_eq!(
+                    status.get("publish_in_progress").and_then(Value::as_bool),
+                    Some(false)
+                );
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(5),
+                "publish request did not become visible"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let inserted_b = persistent
+            .candidate_insert_batch_serialized_rows(&[row_b])
+            .expect("insert second batch during pending publish");
+        assert_eq!(inserted_b.inserted_count, 1);
+        assert_eq!(
+            persistent.end_index_session().expect("end index session"),
+            "index session finished"
+        );
+
+        let publish_message = publish_thread.join().expect("join publish thread");
+        assert!(publish_message.contains("published work root"));
+
+        let gram = u64::from(u32::from_le_bytes(*b"WXYZ"));
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "$a".to_owned(),
+                alternatives: vec![vec![gram]],
+                tier2_alternatives: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+        let query = client
+            .candidate_query_plan(&plan, 0, None)
+            .expect("query published doc");
+        assert_eq!(query.total_candidates, 1);
+
+        assert_eq!(client.shutdown().expect("shutdown"), "shutdown requested");
     }
 
     #[test]
