@@ -266,7 +266,7 @@ type ParsedCandidateInsertDocument = (
 
 #[derive(Debug)]
 struct StoreSet {
-    root: PathBuf,
+    root: Mutex<PathBuf>,
     stores: Vec<Mutex<CandidateStore>>,
     stats_cache: Mutex<Option<CachedStoreSetStats>>,
 }
@@ -280,7 +280,7 @@ struct CachedStoreSetStats {
 impl StoreSet {
     fn new(root: PathBuf, stores: Vec<CandidateStore>) -> Self {
         Self {
-            root,
+            root: Mutex::new(root),
             stores: stores.into_iter().map(Mutex::new).collect(),
             stats_cache: Mutex::new(None),
         }
@@ -296,6 +296,37 @@ impl StoreSet {
                     .map_err(|_| SspryError::from("Candidate store lock poisoned."))
             })
             .collect()
+    }
+
+    fn root(&self) -> Result<PathBuf> {
+        self.root
+            .lock()
+            .map(|root| root.clone())
+            .map_err(|_| SspryError::from("Store set root lock poisoned."))
+    }
+
+    fn retarget_root(&self, root: &Path, shard_count: usize) -> Result<()> {
+        {
+            let mut current_root = self
+                .root
+                .lock()
+                .map_err(|_| SspryError::from("Store set root lock poisoned."))?;
+            *current_root = root.to_path_buf();
+        }
+        for (shard_idx, store_lock) in self.stores.iter().enumerate() {
+            let mut store = lock_candidate_store_with_timeout(
+                store_lock,
+                shard_idx,
+                "retarget published work root",
+            )?;
+            store.retarget_root(candidate_shard_root(root, shard_count, shard_idx));
+        }
+        let mut cache = self
+            .stats_cache
+            .lock()
+            .map_err(|_| SspryError::from("Store set stats cache lock poisoned."))?;
+        *cache = None;
+        Ok(())
     }
 
     fn cached_stats(&self) -> Result<Option<(Map<String, Value>, u64)>> {
@@ -1917,7 +1948,7 @@ impl ServerState {
                 published,
                 work_active,
                 ..
-            } => Some((published.root.clone(), work_active.root.clone())),
+            } => Some((published.root()?, work_active.root()?)),
         })
     }
 
@@ -2817,7 +2848,7 @@ impl ServerState {
             .try_into()
             .unwrap_or(u64::MAX);
         let started_disk_usage = Instant::now();
-        let disk_usage_bytes = disk_usage_under(&store_set.root);
+        let disk_usage_bytes = disk_usage_under(&store_set.root()?);
         let disk_usage_ms = started_disk_usage
             .elapsed()
             .as_millis()
@@ -3785,7 +3816,7 @@ impl ServerState {
 
         let work = self.work_store_set()?;
         let compacted_root = compaction_work_root(
-            &candidate_shard_root(&work.root, self.candidate_shard_count(), shard_idx),
+            &candidate_shard_root(&work.root()?, self.candidate_shard_count(), shard_idx),
             "compact",
         );
         let build_result = write_compacted_snapshot(&snapshot, &compacted_root);
@@ -4935,7 +4966,7 @@ impl ServerState {
                             )
                         })?;
                         let publish_work = std::mem::replace(work_active, next_active);
-                        let publish_work_root = publish_work.root.clone();
+                        let publish_work_root = publish_work.root()?;
                         (publish_work, publish_work_root)
                     }
                     StoreMode::Direct { .. } => unreachable!("workspace already checked"),
@@ -4954,8 +4985,8 @@ impl ServerState {
             self.last_work_mutation_unix_ms.store(0, Ordering::SeqCst);
             self.mutations_paused.store(false, Ordering::SeqCst);
             let publish_shard_count = self.candidate_shard_count();
-            let mut removed_current = 0usize;
-            let reuse_work_stores = false;
+            let removed_current = 0usize;
+            let mut reuse_work_stores = false;
             let mut changed_shards = vec![false; publish_shard_count];
             let published_store_set = if published_is_empty {
                 let swap_started = Instant::now();
@@ -5006,11 +5037,9 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_imported_shards
                     .store(0, Ordering::SeqCst);
-                let (published_stores, removed_existing_current, _) =
-                    ensure_candidate_stores_at_root(&self.config, &current_root)?;
-                let published_store_set =
-                    Arc::new(StoreSet::new(current_root.clone(), published_stores));
-                removed_current = removed_existing_current;
+                publish_work.retarget_root(&current_root, publish_shard_count)?;
+                reuse_work_stores = true;
+                let published_store_set = publish_work;
                 self.last_publish_promote_work_ms.store(
                     promote_started
                         .elapsed()
@@ -6560,7 +6589,7 @@ mod tests {
             publish_after
                 .get("last_publish_reused_work_stores")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true)
         );
         assert!(
             publish_after
@@ -6808,7 +6837,10 @@ mod tests {
 
         let state = sample_workspace_server_state(tmp.path(), 1);
         let work = state.work_store_set().expect("active work");
-        assert_eq!(work.root, workspace_work_root_a(&workspace_root));
+        assert_eq!(
+            work.root().expect("work root"),
+            workspace_work_root_a(&workspace_root)
+        );
         assert!(workspace_work_root_a(&workspace_root).exists());
         assert!(workspace_work_root_b(&workspace_root).exists());
         assert!(!legacy_work_root.exists());
@@ -6816,7 +6848,10 @@ mod tests {
         match &*mode {
             StoreMode::Workspace { work_idle, .. } => {
                 let idle = work_idle.as_ref().expect("idle work root");
-                assert_eq!(idle.root, workspace_work_root_b(&workspace_root));
+                assert_eq!(
+                    idle.root().expect("idle root"),
+                    workspace_work_root_b(&workspace_root)
+                );
             }
             StoreMode::Direct { .. } => panic!("expected workspace mode"),
         }
@@ -6921,6 +6956,22 @@ mod tests {
                 .and_then(|work| work.get("doc_count"))
                 .and_then(Value::as_u64),
             Some(0)
+        );
+        assert_eq!(
+            stats_after
+                .get("publish")
+                .and_then(Value::as_object)
+                .and_then(|publish| publish.get("last_publish_reused_work_stores"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            stats_after
+                .get("publish")
+                .and_then(Value::as_object)
+                .and_then(|publish| publish.get("publish_runs_total"))
+                .and_then(Value::as_u64),
+            Some(1)
         );
     }
 
