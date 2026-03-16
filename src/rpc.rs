@@ -286,6 +286,7 @@ impl StoreSet {
         }
     }
 
+    #[cfg(test)]
     fn into_stores(self) -> Result<Vec<CandidateStore>> {
         self.stores
             .into_iter()
@@ -341,7 +342,8 @@ enum StoreMode {
     Workspace {
         root: PathBuf,
         published: Arc<StoreSet>,
-        work: Arc<StoreSet>,
+        work_active: Arc<StoreSet>,
+        work_idle: Option<Arc<StoreSet>>,
     },
 }
 
@@ -1850,7 +1852,7 @@ impl ServerState {
             .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
             StoreMode::Direct { stores } => stores.clone(),
-            StoreMode::Workspace { work, .. } => work.clone(),
+            StoreMode::Workspace { work_active, .. } => work_active.clone(),
         })
     }
 
@@ -1868,7 +1870,10 @@ impl ServerState {
                 }
             }
             StoreMode::Workspace {
-                published, work, ..
+                published,
+                work_active,
+                work_idle,
+                ..
             } => {
                 for (shard_idx, store_lock) in published.stores.iter().enumerate() {
                     let mut store = lock_candidate_store_with_timeout(
@@ -1878,13 +1883,23 @@ impl ServerState {
                     )?;
                     let _ = store.persist_meta_if_dirty()?;
                 }
-                for (shard_idx, store_lock) in work.stores.iter().enumerate() {
+                for (shard_idx, store_lock) in work_active.stores.iter().enumerate() {
                     let mut store = lock_candidate_store_with_timeout(
                         store_lock,
                         shard_idx,
-                        "flush work meta",
+                        "flush active work meta",
                     )?;
                     let _ = store.persist_meta_if_dirty()?;
+                }
+                if let Some(work_idle) = work_idle {
+                    for (shard_idx, store_lock) in work_idle.stores.iter().enumerate() {
+                        let mut store = lock_candidate_store_with_timeout(
+                            store_lock,
+                            shard_idx,
+                            "flush idle work meta",
+                        )?;
+                        let _ = store.persist_meta_if_dirty()?;
+                    }
                 }
             }
         }
@@ -1899,8 +1914,10 @@ impl ServerState {
         Ok(match &*mode {
             StoreMode::Direct { .. } => None,
             StoreMode::Workspace {
-                published, work, ..
-            } => Some((published.root.clone(), work.root.clone())),
+                published,
+                work_active,
+                ..
+            } => Some((published.root.clone(), work_active.root.clone())),
         })
     }
 
@@ -4206,10 +4223,15 @@ impl ServerState {
     ) -> Result<CandidateInsertResponse> {
         let _scope = scope("rpc.handle_candidate_insert");
         let _mutation = self.begin_mutation("insert")?;
-        let _op = self
-            .operation_gate
-            .read()
-            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
+        let _op = if self.mutation_affects_published_queries()? {
+            Some(
+                self.operation_gate
+                    .read()
+                    .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?,
+            )
+        } else {
+            None
+        };
         let parsed = self.parse_candidate_insert_document(document, "request.payload")?;
         let shard_idx = self.candidate_store_index_for_sha256(&parsed.0);
         let work = self.work_store_set()?;
@@ -4248,10 +4270,15 @@ impl ServerState {
     ) -> Result<CandidateInsertBatchResponse> {
         let _scope = scope("rpc.handle_candidate_insert_batch");
         let _mutation = self.begin_mutation("insert batch")?;
-        let _op = self
-            .operation_gate
-            .read()
-            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
+        let _op = if self.mutation_affects_published_queries()? {
+            Some(
+                self.operation_gate
+                    .read()
+                    .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?,
+            )
+        } else {
+            None
+        };
         let started_total = Instant::now();
         let started_parse = Instant::now();
         let mut parsed_documents = Vec::with_capacity(documents.len());
@@ -4827,9 +4854,6 @@ impl ServerState {
                 "server is already publishing; retry later",
             ));
         }
-        while self.active_index_sessions.load(Ordering::Acquire) > 0 {
-            thread::sleep(Duration::from_millis(10));
-        }
         self.mutations_paused.store(true, Ordering::SeqCst);
         while self.active_mutations.load(Ordering::Acquire) > 0 {
             thread::sleep(Duration::from_millis(10));
@@ -4866,43 +4890,72 @@ impl ServerState {
                 .operation_gate
                 .write()
                 .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
-            let mut store_mode = self
-                .store_mode
-                .lock()
-                .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
-            let workspace_root = match &*store_mode {
-                StoreMode::Direct { .. } => {
-                    return Err(SspryError::from(
-                        "publish is only available for workspace stores",
-                    ));
-                }
-                StoreMode::Workspace { root, .. } => root.clone(),
-            };
-
-            let current_root = workspace_current_root(&workspace_root);
-            let work_root = workspace_work_root(&workspace_root);
-            let retired_parent = workspace_retired_root(&workspace_root);
-            let published_store_set = match &*store_mode {
-                StoreMode::Workspace { published, .. } => published.clone(),
-                StoreMode::Direct { .. } => unreachable!("workspace already checked"),
-            };
-            let published_is_empty = published_store_set.stores.iter().all(|store_lock| {
-                store_lock
+            let (
+                workspace_root,
+                current_root,
+                retired_parent,
+                publish_work,
+                publish_work_root,
+                published_store_set,
+                published_is_empty,
+            ) = {
+                let mut store_mode = self
+                    .store_mode
                     .lock()
-                    .map(|store| store.stats().doc_count == 0)
-                    .unwrap_or(false)
-            });
-
-            let prior_work = match &mut *store_mode {
-                StoreMode::Workspace { work, .. } => {
-                    std::mem::replace(work, Arc::new(StoreSet::new(work_root.clone(), Vec::new())))
-                }
-                StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                    .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+                let workspace_root = match &*store_mode {
+                    StoreMode::Direct { .. } => {
+                        return Err(SspryError::from(
+                            "publish is only available for workspace stores",
+                        ));
+                    }
+                    StoreMode::Workspace { root, .. } => root.clone(),
+                };
+                let current_root = workspace_current_root(&workspace_root);
+                let retired_parent = workspace_retired_root(&workspace_root);
+                let published_store_set = match &*store_mode {
+                    StoreMode::Workspace { published, .. } => published.clone(),
+                    StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                };
+                let published_is_empty = published_store_set.stores.iter().all(|store_lock| {
+                    store_lock
+                        .lock()
+                        .map(|store| store.stats().doc_count == 0)
+                        .unwrap_or(false)
+                });
+                let (publish_work, publish_work_root) = match &mut *store_mode {
+                    StoreMode::Workspace {
+                        work_active,
+                        work_idle,
+                        ..
+                    } => {
+                        let next_active = work_idle.take().ok_or_else(|| {
+                            SspryError::from(
+                                "idle work buffer is unavailable during publish; retry later",
+                            )
+                        })?;
+                        let publish_work = std::mem::replace(work_active, next_active);
+                        let publish_work_root = publish_work.root.clone();
+                        (publish_work, publish_work_root)
+                    }
+                    StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                };
+                (
+                    workspace_root,
+                    current_root,
+                    retired_parent,
+                    publish_work,
+                    publish_work_root,
+                    published_store_set,
+                    published_is_empty,
+                )
             };
-
+            self.work_dirty.store(false, Ordering::SeqCst);
+            self.last_work_mutation_unix_ms.store(0, Ordering::SeqCst);
+            self.mutations_paused.store(false, Ordering::SeqCst);
             let publish_shard_count = self.candidate_shard_count();
             let mut removed_current = 0usize;
-            let reuse_work_stores;
+            let reuse_work_stores = false;
             let mut changed_shards = vec![false; publish_shard_count];
             let published_store_set = if published_is_empty {
                 let swap_started = Instant::now();
@@ -4911,7 +4964,7 @@ impl ServerState {
                     let retired_root = next_workspace_retired_root_path(&retired_parent);
                     fs::rename(&current_root, &retired_root)?;
                 }
-                fs::rename(&work_root, &current_root)?;
+                fs::rename(&publish_work_root, &current_root)?;
                 self.last_publish_swap_ms.store(
                     swap_started
                         .elapsed()
@@ -4953,41 +5006,10 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_imported_shards
                     .store(0, Ordering::SeqCst);
-                let (published_store_set, removed_existing_current, reused_work_stores) =
-                    match Arc::try_unwrap(prior_work) {
-                        Ok(work_store_set) => {
-                            let mut stores = work_store_set.into_stores()?;
-                            for (shard_idx, store) in stores.iter_mut().enumerate() {
-                                store.retarget_root(candidate_shard_root(
-                                    &current_root,
-                                    publish_shard_count,
-                                    shard_idx,
-                                ));
-                            }
-                            (
-                                Arc::new(StoreSet::new(current_root.clone(), stores)),
-                                0usize,
-                                true,
-                            )
-                        }
-                        Err(work_store_set) => {
-                            let _ = match &mut *store_mode {
-                                StoreMode::Workspace { work, .. } => {
-                                    std::mem::replace(work, work_store_set)
-                                }
-                                StoreMode::Direct { .. } => {
-                                    unreachable!("workspace already checked")
-                                }
-                            };
-                            let (published_stores, removed_existing_current, _) =
-                                ensure_candidate_stores_at_root(&self.config, &current_root)?;
-                            (
-                                Arc::new(StoreSet::new(current_root.clone(), published_stores)),
-                                removed_existing_current,
-                                false,
-                            )
-                        }
-                    };
+                let (published_stores, removed_existing_current, _) =
+                    ensure_candidate_stores_at_root(&self.config, &current_root)?;
+                let published_store_set =
+                    Arc::new(StoreSet::new(current_root.clone(), published_stores));
                 removed_current = removed_existing_current;
                 self.last_publish_promote_work_ms.store(
                     promote_started
@@ -4997,7 +5019,6 @@ impl ServerState {
                         .unwrap_or(u64::MAX),
                     Ordering::SeqCst,
                 );
-                reuse_work_stores = reused_work_stores;
                 for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
                     let store = store_lock
                         .lock()
@@ -5010,16 +5031,17 @@ impl ServerState {
             } else {
                 self.last_publish_swap_ms.store(0, Ordering::SeqCst);
                 let promote_started = Instant::now();
-                let work_store_set = Arc::try_unwrap(prior_work).map_err(|_| {
-                    SspryError::from("work stores are still busy during publish; retry later")
-                })?;
-                let work_stores = work_store_set.into_stores()?;
                 let mut export_ms_total = 0u128;
                 let mut import_ms_total = 0u128;
                 let mut import_profile_total = CandidateImportBatchProfile::default();
                 let mut imported_docs_total = 0u64;
                 let mut imported_shards_total = 0u64;
-                for (shard_idx, mut work_store) in work_stores.into_iter().enumerate() {
+                for (shard_idx, store_lock) in publish_work.stores.iter().enumerate() {
+                    let mut work_store = lock_candidate_store_with_timeout(
+                        store_lock,
+                        shard_idx,
+                        "publish export work",
+                    )?;
                     let export_started = Instant::now();
                     let imported = work_store.export_live_documents()?;
                     export_ms_total =
@@ -5077,8 +5099,8 @@ impl ServerState {
                         import_ms_total.saturating_add(import_started.elapsed().as_millis());
                 }
                 let remove_started = Instant::now();
-                if work_root.exists() {
-                    fs::remove_dir_all(&work_root)?;
+                if publish_work_root.exists() {
+                    fs::remove_dir_all(&publish_work_root)?;
                 }
                 let remove_ms = remove_started.elapsed().as_millis();
                 let promote_ms = promote_started.elapsed().as_millis();
@@ -5127,7 +5149,6 @@ impl ServerState {
                     .store(imported_docs_total, Ordering::SeqCst);
                 self.last_publish_promote_work_imported_shards
                     .store(imported_shards_total, Ordering::SeqCst);
-                reuse_work_stores = false;
                 published_store_set
             };
             let persist_df_started = Instant::now();
@@ -5177,8 +5198,8 @@ impl ServerState {
                 .store(reuse_work_stores, Ordering::SeqCst);
 
             let init_work_started = Instant::now();
-            let (work_stores, removed_work, _) =
-                ensure_candidate_stores_at_root(&self.config, &work_root)?;
+            let (idle_work_stores, removed_work, _) =
+                ensure_candidate_stores_at_root(&self.config, &publish_work_root)?;
             self.last_publish_init_work_ms.store(
                 init_work_started
                     .elapsed()
@@ -5187,23 +5208,40 @@ impl ServerState {
                     .unwrap_or(u64::MAX),
                 Ordering::SeqCst,
             );
-            *store_mode = StoreMode::Workspace {
-                root: workspace_root.clone(),
-                published: published_store_set,
-                work: Arc::new(StoreSet::new(work_root.clone(), work_stores)),
-            };
-            self.work_dirty.store(false, Ordering::SeqCst);
-            self.last_work_mutation_unix_ms.store(0, Ordering::SeqCst);
-            self.index_session_total_documents
-                .store(0, Ordering::SeqCst);
-            self.index_session_submitted_documents
-                .store(0, Ordering::SeqCst);
-            self.index_session_processed_documents
-                .store(0, Ordering::SeqCst);
-            self.index_session_started_unix_ms
-                .store(0, Ordering::SeqCst);
-            self.index_session_last_update_unix_ms
-                .store(0, Ordering::SeqCst);
+            {
+                let mut store_mode = self
+                    .store_mode
+                    .lock()
+                    .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+                match &mut *store_mode {
+                    StoreMode::Workspace {
+                        root,
+                        published,
+                        work_idle,
+                        ..
+                    } => {
+                        *root = workspace_root.clone();
+                        *published = published_store_set;
+                        *work_idle = Some(Arc::new(StoreSet::new(
+                            publish_work_root.clone(),
+                            idle_work_stores,
+                        )));
+                    }
+                    StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                }
+            }
+            if self.active_index_sessions.load(Ordering::Acquire) == 0 {
+                self.index_session_total_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_submitted_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_processed_documents
+                    .store(0, Ordering::SeqCst);
+                self.index_session_started_unix_ms
+                    .store(0, Ordering::SeqCst);
+                self.index_session_last_update_unix_ms
+                    .store(0, Ordering::SeqCst);
+            }
             let publish_completed_unix_ms = current_unix_ms();
             self.last_publish_completed_unix_ms
                 .store(publish_completed_unix_ms, Ordering::SeqCst);
@@ -5801,8 +5839,16 @@ fn workspace_current_root(root: &Path) -> PathBuf {
     root.join("current")
 }
 
-fn workspace_work_root(root: &Path) -> PathBuf {
+fn workspace_legacy_work_root(root: &Path) -> PathBuf {
     root.join("work")
+}
+
+fn workspace_work_root_a(root: &Path) -> PathBuf {
+    root.join("work_a")
+}
+
+fn workspace_work_root_b(root: &Path) -> PathBuf {
+    root.join("work_b")
 }
 
 fn workspace_retired_root(root: &Path) -> PathBuf {
@@ -5959,21 +6005,36 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     }
 
     let current_root = workspace_current_root(root);
-    let work_root = workspace_work_root(root);
+    let legacy_work_root = workspace_legacy_work_root(root);
+    let work_root_a = workspace_work_root_a(root);
+    let work_root_b = workspace_work_root_b(root);
+    if legacy_work_root.exists() {
+        if work_root_a.exists() || work_root_b.exists() {
+            return Err(SspryError::from(format!(
+                "{} still contains a legacy work root alongside work_a/work_b; clean the workspace root before restarting.",
+                root.display()
+            )));
+        }
+        fs::rename(&legacy_work_root, &work_root_a)?;
+    }
     let retired_root = workspace_retired_root(root);
     let removed_retired =
         prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
     let (published, removed_current, current_profile) =
         ensure_candidate_stores_at_root(config, &current_root)?;
-    let (work, removed_work, work_profile) = ensure_candidate_stores_at_root(config, &work_root)?;
+    let (work_active, removed_work_active, work_profile) =
+        ensure_candidate_stores_at_root(config, &work_root_a)?;
+    let (work_idle, removed_work_idle, _) = ensure_candidate_stores_at_root(config, &work_root_b)?;
     Ok((
         StoreMode::Workspace {
             root: root.clone(),
             published: Arc::new(StoreSet::new(current_root, published)),
-            work: Arc::new(StoreSet::new(work_root, work)),
+            work_active: Arc::new(StoreSet::new(work_root_a, work_active)),
+            work_idle: Some(Arc::new(StoreSet::new(work_root_b, work_idle))),
         },
         removed_current
-            .saturating_add(removed_work)
+            .saturating_add(removed_work_active)
+            .saturating_add(removed_work_idle)
             .saturating_add(removed_retired),
         StartupProfile {
             current: current_profile,
@@ -6499,7 +6560,7 @@ mod tests {
             publish_after
                 .get("last_publish_reused_work_stores")
                 .and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert!(
             publish_after
@@ -6616,21 +6677,16 @@ mod tests {
     }
 
     #[test]
-    fn publish_waits_for_active_index_sessions_to_drain() {
+    fn publish_does_not_wait_for_active_index_sessions_once_mutations_are_quiescent() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         state.active_index_sessions.store(1, Ordering::SeqCst);
-        let release = state.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(120));
-            release.active_index_sessions.store(0, Ordering::SeqCst);
-        });
         let started = Instant::now();
         let publish = state.handle_publish().expect("publish");
         assert!(publish.message.contains("published work root"));
         assert!(
-            started.elapsed() >= Duration::from_millis(100),
-            "publish did not wait for active index session"
+            started.elapsed() < Duration::from_millis(100),
+            "publish should not wait for the index session to end once mutations are drained"
         );
     }
 
@@ -6639,6 +6695,7 @@ mod tests {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         state.active_index_sessions.store(1, Ordering::SeqCst);
+        state.active_mutations.store(1, Ordering::SeqCst);
         let publish_state = state.clone();
         let publish_thread = thread::spawn(move || publish_state.handle_publish());
 
@@ -6659,7 +6716,7 @@ mod tests {
                 .contains("server is publishing; index session unavailable; retry later")
         );
 
-        state.active_index_sessions.store(0, Ordering::SeqCst);
+        state.active_mutations.store(0, Ordering::SeqCst);
         let publish = publish_thread
             .join()
             .expect("join publish thread")
@@ -6719,6 +6776,50 @@ mod tests {
         assert_eq!(retained[0], newer);
         assert!(!older.exists());
         assert!(state.startup_cleanup_removed_roots >= 1);
+    }
+
+    #[test]
+    fn workspace_startup_migrates_legacy_single_work_root_to_dual_work_roots() {
+        let tmp = tempdir().expect("tmp");
+        let workspace_root = tmp.path().join("candidate_workspace_1");
+        let legacy_work_root = workspace_legacy_work_root(&workspace_root);
+        let (legacy_stores, _, _) = ensure_candidate_stores_at_root(
+            &ServerConfig {
+                candidate_config: CandidateConfig {
+                    root: workspace_root.clone(),
+                    ..CandidateConfig::default()
+                },
+                candidate_shards: 1,
+                search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                tier2_superblock_budget_divisor:
+                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_initial_idle_ms: 500,
+                auto_publish_storage_class: "unknown".to_owned(),
+                workspace_mode: true,
+            },
+            &legacy_work_root,
+        )
+        .expect("init legacy work root");
+        assert_eq!(legacy_stores.len(), 1);
+        assert!(legacy_work_root.exists());
+        assert!(!workspace_work_root_a(&workspace_root).exists());
+        assert!(!workspace_work_root_b(&workspace_root).exists());
+
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let work = state.work_store_set().expect("active work");
+        assert_eq!(work.root, workspace_work_root_a(&workspace_root));
+        assert!(workspace_work_root_a(&workspace_root).exists());
+        assert!(workspace_work_root_b(&workspace_root).exists());
+        assert!(!legacy_work_root.exists());
+        let mode = state.store_mode.lock().expect("store mode");
+        match &*mode {
+            StoreMode::Workspace { work_idle, .. } => {
+                let idle = work_idle.as_ref().expect("idle work root");
+                assert_eq!(idle.root, workspace_work_root_b(&workspace_root));
+            }
+            StoreMode::Direct { .. } => panic!("expected workspace mode"),
+        }
     }
 
     #[test]
@@ -7665,7 +7766,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_publish_waits_for_remote_index_session_without_failing_later_batches() {
+    fn workspace_publish_rotates_work_buffers_while_remote_index_session_stays_active() {
         let tmp = tempdir().expect("tmp");
         let config = start_tcp_workspace_server(tmp.path(), 1);
         let client = SspryClient::new(config.clone());
@@ -7681,8 +7782,11 @@ mod tests {
             candidate_document_wire_from_bytes(&tmp.path().join("overlap-a.bin"), b"xxABCDyy");
         let doc_b =
             candidate_document_wire_from_bytes(&tmp.path().join("overlap-b.bin"), b"zzWXYZqq");
+        let doc_c =
+            candidate_document_wire_from_bytes(&tmp.path().join("overlap-c.bin"), b"aaLMNObb");
         let row_a = serde_json::to_vec(&doc_a).expect("serialize doc a");
         let row_b = serde_json::to_vec(&doc_b).expect("serialize doc b");
+        let row_c = serde_json::to_vec(&doc_c).expect("serialize doc c");
 
         let inserted_a = persistent
             .candidate_insert_batch_serialized_rows(&[row_a])
@@ -7694,23 +7798,23 @@ mod tests {
             thread::spawn(move || SspryClient::new(publish_config).publish().expect("publish"));
 
         let status_client = SspryClient::new(config.clone());
+        let expected_active_root = workspace_work_root_b(&tmp.path().join("tcp_workspace_1"))
+            .display()
+            .to_string();
         let wait_started = Instant::now();
         loop {
             let status = status_client.candidate_status().expect("candidate status");
             if status
-                .get("publish_requested")
-                .and_then(Value::as_bool)
+                .get("work_root")
+                .and_then(Value::as_str)
+                .map(|value| value == expected_active_root)
                 .unwrap_or(false)
             {
-                assert_eq!(
-                    status.get("publish_in_progress").and_then(Value::as_bool),
-                    Some(false)
-                );
                 break;
             }
             assert!(
                 wait_started.elapsed() < Duration::from_secs(5),
-                "publish request did not become visible"
+                "active work root did not rotate"
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -7719,16 +7823,10 @@ mod tests {
             .candidate_insert_batch_serialized_rows(&[row_b])
             .expect("insert second batch during pending publish");
         assert_eq!(inserted_b.inserted_count, 1);
-        assert_eq!(
-            persistent.end_index_session().expect("end index session"),
-            "index session finished"
-        );
-
         let publish_message = publish_thread.join().expect("join publish thread");
         assert!(publish_message.contains("published work root"));
 
-        let gram = u64::from(u32::from_le_bytes(*b"WXYZ"));
-        let plan = CompiledQueryPlan {
+        let plan_for = |gram: u64| CompiledQueryPlan {
             patterns: vec![PatternPlan {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
@@ -7747,10 +7845,35 @@ mod tests {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
-        let query = client
-            .candidate_query_plan(&plan, 0, None)
-            .expect("query published doc");
-        assert_eq!(query.total_candidates, 1);
+        let query_a = client
+            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"ABCD"))), 0, None)
+            .expect("query published doc a");
+        assert_eq!(query_a.total_candidates, 1);
+        let query_b_before = client
+            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"WXYZ"))), 0, None)
+            .expect("query unpublished doc b");
+        assert_eq!(query_b_before.total_candidates, 0);
+
+        let inserted_c = persistent
+            .candidate_insert_batch_serialized_rows(&[row_c])
+            .expect("insert third batch after publish");
+        assert_eq!(inserted_c.inserted_count, 1);
+        assert_eq!(
+            persistent.end_index_session().expect("end index session"),
+            "index session finished"
+        );
+
+        let second_publish = client.publish().expect("publish second buffer");
+        assert!(second_publish.contains("published work root to"));
+
+        let query_b_after = client
+            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"WXYZ"))), 0, None)
+            .expect("query published doc b");
+        assert_eq!(query_b_after.total_candidates, 1);
+        let query_c_after = client
+            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"LMNO"))), 0, None)
+            .expect("query published doc c");
+        assert_eq!(query_c_after.total_candidates, 1);
 
         assert_eq!(client.shutdown().expect("shutdown"), "shutdown requested");
     }

@@ -534,3 +534,29 @@ Important constraints:
 - preserve the current bar:
   - false positives are acceptable
   - false negatives are not
+
+## Workspace Double Buffering
+
+Current state:
+- landed dual work roots for workspace mode:
+  - `work_a`
+  - `work_b`
+- startup migrates a legacy single `work/` root to `work_a/`
+- publish now swaps the active work root first, then publishes the old root
+- workspace inserts are no longer blocked on the global publish gate
+- search still reads only the published root and remains isolated from in-flight work
+
+What this enables now:
+- an active remote index session can keep inserting across a manual publish
+- the first publish only exposes the pre-swap work buffer
+- later inserts stay in the new active work buffer until the next publish
+
+What is still not done:
+- new index sessions are still blocked while a publish is in progress
+- search is still blocked by the publish operation gate while published roots are being mutated
+- stats/info only surface the active work root; they do not expose the idle root yet
+
+Next likely steps:
+- decide whether to allow new index sessions during publish or keep only the active-session overlap
+- narrow the publish gate further if we want search to stay live through more of publish
+- add targeted perf runs to measure whether double-buffering changes publish latency or long-ingest throughput

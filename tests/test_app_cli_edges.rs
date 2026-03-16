@@ -162,13 +162,25 @@ fn serve_persists_candidate_shards() {
             .exists()
     );
     assert!(
-        root.join("work")
+        root.join("work_a")
             .join("shard_000")
             .join("meta.json")
             .exists()
     );
     assert!(
-        root.join("work")
+        root.join("work_a")
+            .join("shard_001")
+            .join("meta.json")
+            .exists()
+    );
+    assert!(
+        root.join("work_b")
+            .join("shard_000")
+            .join("meta.json")
+            .exists()
+    );
+    assert!(
+        root.join("work_b")
             .join("shard_001")
             .join("meta.json")
             .exists()
