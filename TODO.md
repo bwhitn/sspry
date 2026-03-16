@@ -134,6 +134,80 @@ Conclusion from the reruns:
   - memory bounded by active batch/shard work, not cumulative snapshot state
   - likely locality-aware exact lookup rather than whole-snapshot rereads
 
+Current best bounded-memory path:
+- stream DF snapshot compaction instead of materializing a full output payload
+- trigger DF compaction from estimated in-memory delta-map size as well as on-disk delta bytes
+- artifacts:
+  - conservative `1x` memory-trigger run:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_memcap`
+  - accepted `2x` memory-trigger runs:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_memcap2`
+    - `/root/pertest/results/sspry_ingest_50000_20260316_memcap2`
+  - rejected `4x` memory-trigger run:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_memcap4`
+
+`1x` memory-trigger result, `26k`:
+- `verbose.index.total_ms = 1,400,599.627`
+- `verbose.index.submit_ms = 1,306,711.645`
+- `server_current_rss_kb = 1,822,480`
+- `server_peak_rss_kb = 1,929,764`
+- `server_df_counts_delta_estimated_memory_bytes = 415,499,392`
+- read:
+  - memory is excellent
+  - compaction is too aggressive:
+    - `store_compact_df_counts_us = 987,872,127`
+  - total time regressed too far to keep as the default
+
+Rejected `4x` memory-trigger result, early `26k` sample:
+- artifact:
+  - `/root/pertest/results/sspry_ingest_26000_20260316_memcap4/manual.info.full.2.json`
+- at `5,362` active docs:
+  - `current_rss_kb = 1,938,396`
+  - `peak_rss_kb = 1,970,844`
+  - `df_counts_delta_estimated_memory_bytes = 2,740,836,736`
+- read:
+  - too loose
+  - already worse than the conservative run at the same stage
+  - do not keep
+
+Accepted `2x` memory-trigger result, `26k`:
+- artifact:
+  - `/root/pertest/results/sspry_ingest_26000_20260316_memcap2`
+- final:
+  - `verbose.index.total_ms = 1,211,234.179`
+  - `verbose.index.submit_ms = 1,083,195.963`
+  - `server_current_rss_kb = 2,197,996`
+  - `server_peak_rss_kb = 2,321,064`
+  - `server_df_counts_delta_estimated_memory_bytes = 955,866,816`
+  - `store_us = 979,982,970`
+  - `store_classify_us = 162,271,287`
+  - `store_compact_df_counts_us = 749,467,991`
+- read:
+  - about `+6.2%` slower than the old `26k` baseline on wall time
+  - but peak RSS is about `-53.1%` lower than the old baseline
+  - this is the first tradeoff that actually bounds memory without destroying throughput
+
+Accepted `2x` memory-trigger result, `50k`:
+- artifact:
+  - `/root/pertest/results/sspry_ingest_50000_20260316_memcap2`
+- dataset:
+  - files: `50,000`
+  - bytes: `143,010,953,447`
+  - GiB: `133.189329362474`
+- final:
+  - `verbose.index.total_ms = 3,559,505.755`
+  - `verbose.index.submit_ms = 3,363,931.737`
+  - `server_current_rss_kb = 3,459,408`
+  - `server_peak_rss_kb = 3,702,620`
+  - `server_df_counts_delta_estimated_memory_bytes = 0`
+  - `store_us = 3,162,904,426`
+  - `store_classify_us = 470,394,772`
+  - `store_compact_df_counts_us = 2,279,577,581`
+- read:
+  - memory stays bounded into a much larger run
+  - compaction dominates store time even more strongly than before
+  - this should shift the next optimization pass from memory safety to compaction cost
+
 ## Landed Wins
 
 Important kept changes already in `master`:

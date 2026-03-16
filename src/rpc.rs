@@ -1302,6 +1302,10 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.df_counts_delta_entries)
         .sum::<usize>();
+    let df_counts_delta_estimated_memory_bytes = stats_rows
+        .iter()
+        .map(|item| item.df_counts_delta_estimated_memory_bytes)
+        .sum::<u64>();
     let df_counts_delta_compact_threshold_bytes = stats_rows
         .iter()
         .map(|item| item.df_counts_delta_compact_threshold_bytes)
@@ -1343,6 +1347,10 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "df_counts_delta_entries".to_owned(),
         json!(df_counts_delta_entries),
+    );
+    out.insert(
+        "df_counts_delta_estimated_memory_bytes".to_owned(),
+        json!(df_counts_delta_estimated_memory_bytes),
     );
     out.insert(
         "df_counts_delta_compact_threshold_bytes".to_owned(),

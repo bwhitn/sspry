@@ -2206,6 +2206,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         "verbose.index.server_df_counts_delta_entries",
                     ),
                     (
+                        "df_counts_delta_estimated_memory_bytes",
+                        "verbose.index.server_df_counts_delta_estimated_memory_bytes",
+                    ),
+                    (
                         "df_counts_delta_compact_threshold_bytes",
                         "verbose.index.server_df_counts_delta_compact_threshold_bytes",
                     ),
