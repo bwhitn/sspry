@@ -55,6 +55,8 @@ const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
 const ACTION_INDEX_SESSION_END: u8 = 11;
 const ACTION_INDEX_SESSION_PROGRESS: u8 = 12;
 const ACTION_CANDIDATE_STATUS: u8 = 13;
+const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
+const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const DF_CACHE_CAPACITY: usize = 128;
@@ -1071,7 +1073,7 @@ impl SspryClient {
 impl PersistentSspryClient {
     pub(crate) fn begin_index_session(&mut self) -> Result<String> {
         let response: CandidateIndexSessionResponse =
-            self.request_typed_json(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
+            self.request_typed_json_with_publish_retry(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
         Ok(response.message)
     }
 
@@ -1109,7 +1111,7 @@ impl PersistentSspryClient {
             });
         }
         let payload = serialized_candidate_insert_batch_payload(rows);
-        match self.request_typed_bytes(ACTION_CANDIDATE_INSERT_BATCH, &payload) {
+        match self.request_typed_bytes_with_publish_retry(ACTION_CANDIDATE_INSERT_BATCH, &payload) {
             Ok(response) => Ok(response),
             Err(err) if rows.len() > 1 && is_payload_too_large_error(&err) => {
                 let mid = rows.len() / 2;
@@ -1135,12 +1137,41 @@ impl PersistentSspryClient {
         self.request_typed_bytes(action, &bytes)
     }
 
+    fn request_typed_json_with_publish_retry<T, U>(&mut self, action: u8, payload: &U) -> Result<T>
+    where
+        T: DeserializeOwned,
+        U: Serialize,
+    {
+        let bytes = serde_json::to_vec(payload)?;
+        self.request_typed_bytes_with_publish_retry(action, &bytes)
+    }
+
     fn request_typed_bytes<T>(&mut self, action: u8, payload: &[u8]) -> Result<T>
     where
         T: DeserializeOwned,
     {
         let bytes = self.request_bytes(action, payload)?;
         serde_json::from_slice(&bytes).map_err(SspryError::from)
+    }
+
+    fn request_typed_bytes_with_publish_retry<T>(&mut self, action: u8, payload: &[u8]) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut retries = 0usize;
+        loop {
+            match self.request_typed_bytes(action, payload) {
+                Ok(response) => return Ok(response),
+                Err(err)
+                    if is_temporary_publish_retry_error(&err)
+                        && retries < TEMPORARY_PUBLISH_RETRY_LIMIT =>
+                {
+                    retries = retries.saturating_add(1);
+                    thread::sleep(Duration::from_millis(TEMPORARY_PUBLISH_RETRY_SLEEP_MS));
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn request_bytes(&mut self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
@@ -1166,6 +1197,11 @@ impl PersistentSspryClient {
 fn is_payload_too_large_error(err: &SspryError) -> bool {
     let text = err.to_string();
     text.contains("Request payload is too large") || text.contains("Payload is too large")
+}
+
+fn is_temporary_publish_retry_error(err: &SspryError) -> bool {
+    let text = err.to_string();
+    text.contains("server is publishing") && text.contains("retry later")
 }
 
 pub fn serve(
@@ -7405,6 +7441,100 @@ mod tests {
             err.to_string()
                 .contains("Single document insert request is too large")
         );
+    }
+
+    #[test]
+    fn persistent_client_retries_temporary_publish_errors() {
+        let listener = TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+
+            let (_, action, _) = read_frame(&mut stream).expect("read begin request");
+            assert_eq!(action, ACTION_INDEX_SESSION_BEGIN);
+            write_error_frame(
+                &mut stream,
+                "server is publishing; index session unavailable; retry later",
+            )
+            .expect("write begin retry error");
+
+            let (_, action, _) = read_frame(&mut stream).expect("read begin retry");
+            assert_eq!(action, ACTION_INDEX_SESSION_BEGIN);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &json_bytes(&CandidateIndexSessionResponse {
+                    message: "index session started".to_owned(),
+                })
+                .expect("begin payload"),
+            )
+            .expect("write begin success");
+
+            let (_, action, _) = read_frame(&mut stream).expect("read batch request");
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH);
+            write_error_frame(
+                &mut stream,
+                "server is publishing; insert batch temporarily disabled; retry later",
+            )
+            .expect("write batch retry error");
+
+            let (_, action, _) = read_frame(&mut stream).expect("read batch retry");
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &json_bytes(&CandidateInsertBatchResponse {
+                    inserted_count: 1,
+                    results: vec![CandidateInsertResponse {
+                        status: "inserted".to_owned(),
+                        doc_id: 1,
+                        sha256: "aa".repeat(32),
+                        grams_received: 0,
+                        grams_indexed: 0,
+                        grams_complete: true,
+                    }],
+                })
+                .expect("batch payload"),
+            )
+            .expect("write batch success");
+        });
+
+        let client = SspryClient::new(ClientConfig::new(
+            DEFAULT_RPC_HOST.to_owned(),
+            port,
+            Duration::from_secs(2),
+            None,
+        ));
+        let mut persistent = client.connect_persistent().expect("connect persistent");
+        assert_eq!(
+            persistent.begin_index_session().expect("begin session"),
+            "index session started"
+        );
+
+        let row = serde_json::to_vec(&CandidateDocumentWire {
+            sha256: "aa".repeat(32),
+            file_size: 1,
+            bloom_filter_b64: String::new(),
+            gram_count_estimate: None,
+            bloom_hashes: None,
+            tier2_bloom_filter_b64: None,
+            tier2_gram_count_estimate: None,
+            tier2_bloom_hashes: None,
+            grams_delta_b64: None,
+            grams: Vec::new(),
+            grams_complete: true,
+            effective_diversity: None,
+            metadata_b64: None,
+            external_id: None,
+        })
+        .expect("serialize row");
+        let response = persistent
+            .candidate_insert_batch_serialized_rows(&[row])
+            .expect("batch retry succeeds");
+        assert_eq!(response.inserted_count, 1);
+        assert_eq!(response.results.len(), 1);
     }
 
     #[test]
