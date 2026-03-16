@@ -197,6 +197,45 @@ Important note:
 
 Rejected experiment:
 - local uncommitted patch was benchmarked and reverted
+
+Additional rejected attempts from the `26k` / `50k` deterministic reruns:
+- Exact streaming classify against DF snapshots:
+  - `26k` artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_streaming_bounded`
+  - `50k` artifact:
+    - `/root/pertest/results/sspry_ingest_50000_20260316_streaming_bounded`
+  - result:
+    - faster on total time
+    - still failed the memory bar badly
+    - `26k` finished at about:
+      - `server_current_rss_kb = 6,839,812`
+      - `server_peak_rss_kb = 6,893,572`
+    - `50k` was stopped early at `13.6%` because the RSS slope was already worse than the bad `26k` run
+- Sparse fence-index classify + bounded forward scans:
+  - artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_fence`
+  - result:
+    - early RSS looked slightly better than the streaming classify path
+    - by `22.74%`, it was already at:
+      - `current_rss_kb = 2,628,780`
+      - `peak_rss_kb = 2,700,916`
+    - not enough improvement to justify continuing
+- Streaming DF snapshot write only:
+  - artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260316_compaction_stream`
+  - result:
+    - tests passed
+    - by `65.16%`, it was already at:
+      - `current_rss_kb = 5,501,220`
+      - `peak_rss_kb = 5,537,760`
+    - already worse than the old full-run `26k` baseline before completion
+
+Read from these failures:
+- simply changing lookup locality is not enough
+- simply removing the full merged DF payload buffer is not enough
+- the next viable path likely needs a different exact DF representation or a different
+  classify strategy that stays bounded by active batch/shard work instead of growing with
+  large snapshot state
 - A/B artifacts:
   - `/root/pertest/results/yaya_dfcompact_defer_ab_20260315/summary.json`
   - `/root/pertest/results/yaya_dfcompact_defer_ab_20260315_rev/summary.json`
