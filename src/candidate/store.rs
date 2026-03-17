@@ -49,6 +49,13 @@ struct DfCountsSegment {
     path: PathBuf,
     mmap: Mmap,
     rows: usize,
+    fence: Box<[DfCountsSegmentFenceEntry]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DfCountsSegmentFenceEntry {
+    gram: u64,
+    row: u32,
 }
 
 impl DfCountsSegment {
@@ -72,10 +79,13 @@ impl DfCountsSegment {
                 SspryError::from(format!("Failed to mmap {}: {err}", path.display()))
             })?
         };
+        let rows = len / row_bytes;
+        let fence = build_df_counts_segment_fence(&mmap, gram_bytes, row_bytes, rows);
         Ok(Self {
             path,
             mmap,
-            rows: len / row_bytes,
+            rows,
+            fence,
         })
     }
 
@@ -96,8 +106,7 @@ impl DfCountsSegment {
     ) -> i64 {
         profile.segment_point_lookups = profile.segment_point_lookups.saturating_add(1);
         let row_bytes = gram_bytes + 8;
-        let mut left = 0usize;
-        let mut right = self.rows;
+        let (mut left, mut right) = self.fence_bounds(gram);
         while left < right {
             let mid = left + (right - left) / 2;
             let start = mid * row_bytes;
@@ -116,6 +125,26 @@ impl DfCountsSegment {
             }
         }
         0
+    }
+
+    fn fence_bounds(&self, gram: u64) -> (usize, usize) {
+        if self.fence.is_empty() {
+            return (0, self.rows);
+        }
+        let idx = self.fence.partition_point(|entry| entry.gram < gram);
+        let left = if idx == 0 {
+            0
+        } else {
+            self.fence[idx - 1].row as usize
+        };
+        let right = if idx < self.fence.len() {
+            (self.fence[idx].row as usize)
+                .saturating_add(DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS)
+                .min(self.rows)
+        } else {
+            self.rows
+        };
+        (left.min(self.rows), right.max(left).min(self.rows))
     }
 
     #[cfg(test)]
@@ -880,6 +909,7 @@ const DF_COUNTS_DELTA_MEMORY_BUDGET_DIVISOR: u64 = 16;
 const DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES: u64 = 64;
 const DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER: u64 = 2;
 const DF_COUNTS_SEGMENT_MAX_FILES_PER_SHARD: usize = 2;
+const DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS: usize = 512;
 const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_GRAMS_COMPLETE: u8 = 0x01;
@@ -5031,6 +5061,28 @@ fn load_df_counts_segments(root: &Path, gram_bytes: usize) -> Result<Vec<DfCount
         segments.push(DfCountsSegment::load(path, gram_bytes)?);
     }
     Ok(segments)
+}
+
+fn build_df_counts_segment_fence(
+    mmap: &Mmap,
+    gram_bytes: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> Box<[DfCountsSegmentFenceEntry]> {
+    if rows == 0 {
+        return Box::default();
+    }
+    let mut fence = Vec::with_capacity(rows.div_ceil(DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS));
+    let mut row = 0usize;
+    while row < rows {
+        let start = row * row_bytes;
+        fence.push(DfCountsSegmentFenceEntry {
+            gram: decode_packed_exact_gram(&mmap[start..start + gram_bytes]),
+            row: row.try_into().unwrap_or(u32::MAX),
+        });
+        row = row.saturating_add(DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS);
+    }
+    fence.into_boxed_slice()
 }
 
 fn next_df_counts_segment_generation(root: &Path) -> Result<u64> {

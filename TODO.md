@@ -222,6 +222,28 @@ Clean large-run baseline with lookup-shape telemetry:
   - linear segment scans are not the main cost on this path
   - segment fan-out is already low enough that reducing point-lookup cost matters more than reducing visits
 
+Accepted follow-up:
+- sparse exact per-segment fence index for DF segment point lookups
+  - `26k` artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260317_fence_r1/summary.json`
+  - `50k` artifact:
+    - `/root/pertest/results/sspry_ingest_50000_20260317_fence_r1/summary.json`
+  - `50k` telemetry baseline -> fence:
+    - wall: `2,222,174 -> 1,939,193 ms` (`-12.7%`)
+    - `classify_df_lookup_us`: `771,462,568 -> 518,609,072` (`-32.8%`)
+    - `classify_us`: `843,705,371 -> 594,560,288` (`-29.5%`)
+    - current RSS: `5,710,748 -> 5,698,116 KB` (flat)
+    - peak RSS: `5,740,812 -> 5,841,312 KB` (`+1.8%`)
+  - read:
+    - this is the first classify_df_lookup change that materially improved the `50k` large-run baseline without breaking the memory envelope
+    - keep this path and use it as the new classify baseline
+
+Updated immediate priority order after the fence-index change:
+1. remaining `classify` cost
+2. `append_sidecars`
+3. `compact_df_counts`
+4. `apply_df_counts`
+
 Rejected follow-up after lookup-shape profiling:
 - range-aware segment pruning plus relevant-span scan selection
   - `26k` artifact:

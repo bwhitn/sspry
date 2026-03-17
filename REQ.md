@@ -22,7 +22,9 @@ Project requirements and goals for `sspry`.
 - Optimize for both HDD and SSD behavior.
 - Prefer designs that improve sequential IO and avoid unnecessary random IO.
 - Keep long-ingest memory usage bounded.
-- Operational target: peak memory should generally stay below about `10-12 GiB` during long ingest.
+- Operational target: the server component should fit on a typical `16 GiB` machine.
+- Assume the rest of the system will commonly consume about `2-6 GiB` of RAM.
+- Treat about `10 GiB` server RSS as the practical target, with `10-12 GiB` as the upper bound during long ingest.
 - Keep visible publish latency low.
 - Improve ingest throughput once correctness and memory/IO behavior are under control.
 - Keep search latency low overall, with later optimization at search, publish, and compaction layers as needed.
@@ -30,7 +32,9 @@ Project requirements and goals for `sspry`.
 ## Storage and Memory Constraints
 
 - Memory growth should be bounded by active work, not grow unbounded with corpus size.
+- Server-side memory budgeting is about the long-lived server process; transient client/index-process memory is a separate concern.
 - Avoid new resident indexes unless the measured benefit clearly justifies the memory cost.
+- Small resident helper structures are acceptable when they stay well inside the server budget and materially reduce HDD/SSD lookup cost.
 - Prefer compact on-disk representations.
 - Prefer sequential write/read patterns over rewrite-heavy or randomly probed large structures.
 - Keep disk pressure down, especially on HDDs.
