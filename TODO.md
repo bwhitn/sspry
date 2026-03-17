@@ -205,6 +205,23 @@ Current lookup-shape telemetry status:
     - a meaningful amount of segment point lookup work
   - that is enough evidence to target segment lookup shape next instead of guessing
 
+Clean large-run baseline with lookup-shape telemetry:
+- `50k` artifact:
+  - `/root/pertest/results/sspry_ingest_50000_20260317_baseline_lookupshape_r1/summary.json`
+- result:
+  - wall: `2,222,174 ms`
+  - current RSS: `5,710,748 KB`
+  - peak RSS: `5,740,812 KB`
+  - `store_classify_df_lookup_us = 771,462,568`
+  - `classify_df_lookup_segment_point_lookups = 966,912,699`
+  - `classify_df_lookup_segment_rows_examined = 0`
+  - `classify_df_lookup_segment_visits = 89,132`
+  - `classify_df_lookup_delta_lookups = 547,852,118`
+- read:
+  - on the accepted baseline, late-run classify lookup is dominated by segment point lookups
+  - linear segment scans are not the main cost on this path
+  - segment fan-out is already low enough that reducing point-lookup cost matters more than reducing visits
+
 Rejected follow-up after lookup-shape profiling:
 - range-aware segment pruning plus relevant-span scan selection
   - `26k` artifact:
