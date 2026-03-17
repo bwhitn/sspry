@@ -408,6 +408,12 @@ struct ServerState {
     index_session_server_insert_batch_store_classify_us: AtomicU64,
     index_session_server_insert_batch_store_classify_dedup_us: AtomicU64,
     index_session_server_insert_batch_store_classify_df_lookup_us: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_segment_visits: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups: AtomicU64,
+    index_session_server_insert_batch_store_classify_df_lookup_delta_lookups: AtomicU64,
     index_session_server_insert_batch_store_classify_eligibility_us: AtomicU64,
     index_session_server_insert_batch_store_classify_budget_us: AtomicU64,
     index_session_server_insert_batch_store_classify_binning_us: AtomicU64,
@@ -1756,6 +1762,18 @@ impl ServerState {
             index_session_server_insert_batch_store_classify_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_dedup_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_df_lookup_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined:
+                AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups:
+                AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_segment_visits:
+                AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined:
+                AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups:
+                AtomicU64::new(0),
+            index_session_server_insert_batch_store_classify_df_lookup_delta_lookups:
+                AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_eligibility_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_budget_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_binning_us: AtomicU64::new(0),
@@ -2308,6 +2326,18 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_classify_df_lookup_us
                     .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_segment_visits
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_delta_lookups
+                    .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_classify_eligibility_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_classify_budget_us
@@ -2491,6 +2521,36 @@ impl ServerState {
             .fetch_add(store_profile.classify_dedup_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_classify_df_lookup_us
             .fetch_add(store_profile.classify_df_lookup_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined
+            .fetch_add(
+                store_profile.classify_df_lookup_snapshot_rows_examined,
+                Ordering::SeqCst,
+            );
+        self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups
+            .fetch_add(
+                store_profile.classify_df_lookup_snapshot_point_lookups,
+                Ordering::SeqCst,
+            );
+        self.index_session_server_insert_batch_store_classify_df_lookup_segment_visits
+            .fetch_add(
+                store_profile.classify_df_lookup_segment_visits,
+                Ordering::SeqCst,
+            );
+        self.index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined
+            .fetch_add(
+                store_profile.classify_df_lookup_segment_rows_examined,
+                Ordering::SeqCst,
+            );
+        self.index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups
+            .fetch_add(
+                store_profile.classify_df_lookup_segment_point_lookups,
+                Ordering::SeqCst,
+            );
+        self.index_session_server_insert_batch_store_classify_df_lookup_delta_lookups
+            .fetch_add(
+                store_profile.classify_df_lookup_delta_lookups,
+                Ordering::SeqCst,
+            );
         self.index_session_server_insert_batch_store_classify_eligibility_us
             .fetch_add(store_profile.classify_eligibility_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_classify_budget_us
@@ -2690,6 +2750,30 @@ impl ServerState {
             (
                 "store_classify_df_lookup_us",
                 self.index_session_server_insert_batch_store_classify_df_lookup_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_snapshot_rows_examined",
+                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_snapshot_point_lookups",
+                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_segment_visits",
+                self.index_session_server_insert_batch_store_classify_df_lookup_segment_visits.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_segment_rows_examined",
+                self.index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_segment_point_lookups",
+                self.index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups.load(Ordering::Acquire),
+            ),
+            (
+                "store_classify_df_lookup_delta_lookups",
+                self.index_session_server_insert_batch_store_classify_df_lookup_delta_lookups.load(Ordering::Acquire),
             ),
             (
                 "store_classify_eligibility_us",
@@ -4506,6 +4590,25 @@ impl ServerState {
             store_profile_total.classify_df_lookup_us = store_profile_total
                 .classify_df_lookup_us
                 .saturating_add(store_profile.classify_df_lookup_us);
+            store_profile_total.classify_df_lookup_snapshot_rows_examined = store_profile_total
+                .classify_df_lookup_snapshot_rows_examined
+                .saturating_add(store_profile.classify_df_lookup_snapshot_rows_examined);
+            store_profile_total.classify_df_lookup_snapshot_point_lookups = store_profile_total
+                .classify_df_lookup_snapshot_point_lookups
+                .saturating_add(store_profile.classify_df_lookup_snapshot_point_lookups);
+            store_profile_total.classify_df_lookup_segment_visits = store_profile_total
+                .classify_df_lookup_segment_visits
+                .saturating_add(store_profile.classify_df_lookup_segment_visits);
+            store_profile_total.classify_df_lookup_segment_rows_examined = store_profile_total
+                .classify_df_lookup_segment_rows_examined
+                .saturating_add(store_profile.classify_df_lookup_segment_rows_examined);
+            store_profile_total.classify_df_lookup_segment_point_lookups =
+                store_profile_total
+                    .classify_df_lookup_segment_point_lookups
+                    .saturating_add(store_profile.classify_df_lookup_segment_point_lookups);
+            store_profile_total.classify_df_lookup_delta_lookups = store_profile_total
+                .classify_df_lookup_delta_lookups
+                .saturating_add(store_profile.classify_df_lookup_delta_lookups);
             store_profile_total.classify_eligibility_us = store_profile_total
                 .classify_eligibility_us
                 .saturating_add(store_profile.classify_eligibility_us);
@@ -4701,6 +4804,36 @@ impl ServerState {
                 store_profile_total.classify_df_lookup_us = store_profile_total
                     .classify_df_lookup_us
                     .saturating_add(store_profile.classify_df_lookup_us);
+                store_profile_total.classify_df_lookup_snapshot_rows_examined =
+                    store_profile_total
+                        .classify_df_lookup_snapshot_rows_examined
+                        .saturating_add(
+                            store_profile.classify_df_lookup_snapshot_rows_examined,
+                        );
+                store_profile_total.classify_df_lookup_snapshot_point_lookups =
+                    store_profile_total
+                        .classify_df_lookup_snapshot_point_lookups
+                        .saturating_add(
+                            store_profile.classify_df_lookup_snapshot_point_lookups,
+                        );
+                store_profile_total.classify_df_lookup_segment_visits = store_profile_total
+                    .classify_df_lookup_segment_visits
+                    .saturating_add(store_profile.classify_df_lookup_segment_visits);
+                store_profile_total.classify_df_lookup_segment_rows_examined =
+                    store_profile_total
+                        .classify_df_lookup_segment_rows_examined
+                        .saturating_add(
+                            store_profile.classify_df_lookup_segment_rows_examined,
+                        );
+                store_profile_total.classify_df_lookup_segment_point_lookups =
+                    store_profile_total
+                        .classify_df_lookup_segment_point_lookups
+                        .saturating_add(
+                            store_profile.classify_df_lookup_segment_point_lookups,
+                        );
+                store_profile_total.classify_df_lookup_delta_lookups = store_profile_total
+                    .classify_df_lookup_delta_lookups
+                    .saturating_add(store_profile.classify_df_lookup_delta_lookups);
                 store_profile_total.classify_eligibility_us = store_profile_total
                     .classify_eligibility_us
                     .saturating_add(store_profile.classify_eligibility_us);

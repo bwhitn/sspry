@@ -83,7 +83,18 @@ impl DfCountsSegment {
         self.mmap.len() as u64
     }
 
+    #[cfg(test)]
     fn get_delta(&self, gram: u64, gram_bytes: usize) -> i64 {
+        self.get_delta_profiled(gram, gram_bytes, &mut DfLookupProfile::default())
+    }
+
+    fn get_delta_profiled(
+        &self,
+        gram: u64,
+        gram_bytes: usize,
+        profile: &mut DfLookupProfile,
+    ) -> i64 {
+        profile.segment_point_lookups = profile.segment_point_lookups.saturating_add(1);
         let row_bytes = gram_bytes + 8;
         let mut left = 0usize;
         let mut right = self.rows;
@@ -107,7 +118,23 @@ impl DfCountsSegment {
         0
     }
 
+    #[cfg(test)]
     fn add_many_sorted_counts(&self, grams: &[u64], counts: &mut [i64], gram_bytes: usize) {
+        self.add_many_sorted_counts_profiled(
+            grams,
+            counts,
+            gram_bytes,
+            &mut DfLookupProfile::default(),
+        );
+    }
+
+    fn add_many_sorted_counts_profiled(
+        &self,
+        grams: &[u64],
+        counts: &mut [i64],
+        gram_bytes: usize,
+        profile: &mut DfLookupProfile,
+    ) {
         if grams.is_empty() || counts.is_empty() {
             return;
         }
@@ -117,6 +144,7 @@ impl DfCountsSegment {
             for (idx, gram) in grams.iter().enumerate() {
                 while segment_idx < self.rows {
                     let start = segment_idx * row_bytes;
+                    profile.segment_rows_examined = profile.segment_rows_examined.saturating_add(1);
                     let candidate = decode_packed_exact_gram(&self.mmap[start..start + gram_bytes]);
                     if candidate < *gram {
                         segment_idx += 1;
@@ -135,7 +163,7 @@ impl DfCountsSegment {
             return;
         }
         for (idx, gram) in grams.iter().enumerate() {
-            counts[idx] += self.get_delta(*gram, gram_bytes);
+            counts[idx] += self.get_delta_profiled(*gram, gram_bytes, profile);
         }
     }
 }
@@ -147,6 +175,16 @@ struct DfCountsState {
     snapshot_rows: usize,
     segments: Vec<DfCountsSegment>,
     delta: FastHashMap<u64, i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DfLookupProfile {
+    snapshot_rows_examined: u64,
+    snapshot_point_lookups: u64,
+    segment_visits: u64,
+    segment_rows_examined: u64,
+    segment_point_lookups: u64,
+    delta_lookups: u64,
 }
 
 impl DfCountsState {
@@ -238,10 +276,16 @@ impl DfCountsState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn snapshot_count(&self, gram: u64) -> usize {
+        self.snapshot_count_profiled(gram, &mut DfLookupProfile::default())
+    }
+
+    fn snapshot_count_profiled(&self, gram: u64, profile: &mut DfLookupProfile) -> usize {
         let Some(snapshot) = &self.snapshot else {
             return 0;
         };
+        profile.snapshot_point_lookups = profile.snapshot_point_lookups.saturating_add(1);
         let row_bytes = self.gram_bytes + 4;
         let mut left = 0usize;
         let mut right = self.snapshot_rows;
@@ -266,12 +310,20 @@ impl DfCountsState {
     }
 
     fn get(&self, gram: u64) -> usize {
-        let base = self.snapshot_count(gram) as i64;
+        self.get_profiled(gram, &mut DfLookupProfile::default())
+    }
+
+    fn get_profiled(&self, gram: u64, profile: &mut DfLookupProfile) -> usize {
+        let base = self.snapshot_count_profiled(gram, profile) as i64;
+        profile.segment_visits = profile
+            .segment_visits
+            .saturating_add(self.segments.len() as u64);
         let segment_delta = self
             .segments
             .iter()
-            .map(|segment| segment.get_delta(gram, self.gram_bytes))
+            .map(|segment| segment.get_delta_profiled(gram, self.gram_bytes, profile))
             .sum::<i64>();
+        profile.delta_lookups = profile.delta_lookups.saturating_add(1);
         let delta = self.delta.get(&gram).copied().unwrap_or(0);
         (base + segment_delta + delta).max(0) as usize
     }
@@ -287,10 +339,16 @@ impl DfCountsState {
         out
     }
 
+    #[cfg(test)]
     fn get_many_sorted_counts(&self, grams: &[u64]) -> Vec<usize> {
+        self.get_many_sorted_counts_profiled(grams).0
+    }
+
+    fn get_many_sorted_counts_profiled(&self, grams: &[u64]) -> (Vec<usize>, DfLookupProfile) {
         if grams.is_empty() {
-            return Vec::new();
+            return (Vec::new(), DfLookupProfile::default());
         }
+        let mut profile = DfLookupProfile::default();
         let mut counts = Vec::with_capacity(grams.len());
         let row_bytes = self.gram_bytes + 4;
         let mut snapshot_idx = 0usize;
@@ -298,6 +356,7 @@ impl DfCountsState {
         for gram in grams {
             while snapshot_idx < self.snapshot_rows {
                 let start = snapshot_idx * row_bytes;
+                profile.snapshot_rows_examined = profile.snapshot_rows_examined.saturating_add(1);
                 let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
                 if candidate < *gram {
                     snapshot_idx += 1;
@@ -307,6 +366,7 @@ impl DfCountsState {
             }
             let base = if snapshot_idx < self.snapshot_rows {
                 let start = snapshot_idx * row_bytes;
+                profile.snapshot_rows_examined = profile.snapshot_rows_examined.saturating_add(1);
                 let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
                 if candidate == *gram {
                     u32::from_le_bytes(
@@ -322,16 +382,28 @@ impl DfCountsState {
             };
             counts.push(base as i64);
         }
+        profile.segment_visits = profile
+            .segment_visits
+            .saturating_add(self.segments.len() as u64);
         for segment in &self.segments {
-            segment.add_many_sorted_counts(grams, &mut counts, self.gram_bytes);
+            segment.add_many_sorted_counts_profiled(
+                grams,
+                &mut counts,
+                self.gram_bytes,
+                &mut profile,
+            );
         }
+        profile.delta_lookups = profile.delta_lookups.saturating_add(grams.len() as u64);
         for (idx, gram) in grams.iter().enumerate() {
             counts[idx] += self.delta.get(gram).copied().unwrap_or(0);
         }
-        counts
-            .into_iter()
-            .map(|count| count.max(0) as usize)
-            .collect()
+        (
+            counts
+                .into_iter()
+                .map(|count| count.max(0) as usize)
+                .collect(),
+            profile,
+        )
     }
 
     fn materialize(&self) -> HashMap<u64, usize> {
@@ -502,6 +574,12 @@ pub struct CandidateInsertBatchProfile {
     pub classify_us: u64,
     pub classify_dedup_us: u64,
     pub classify_df_lookup_us: u64,
+    pub classify_df_lookup_snapshot_rows_examined: u64,
+    pub classify_df_lookup_snapshot_point_lookups: u64,
+    pub classify_df_lookup_segment_visits: u64,
+    pub classify_df_lookup_segment_rows_examined: u64,
+    pub classify_df_lookup_segment_point_lookups: u64,
+    pub classify_df_lookup_delta_lookups: u64,
     pub classify_eligibility_us: u64,
     pub classify_budget_us: u64,
     pub classify_binning_us: u64,
@@ -1209,6 +1287,12 @@ struct Tier1DfEntry {
 #[derive(Clone, Copy, Debug, Default)]
 struct Tier1SelectionProfile {
     df_lookup_us: u64,
+    df_lookup_snapshot_rows_examined: u64,
+    df_lookup_snapshot_point_lookups: u64,
+    df_lookup_segment_visits: u64,
+    df_lookup_segment_rows_examined: u64,
+    df_lookup_segment_point_lookups: u64,
+    df_lookup_delta_lookups: u64,
     eligibility_us: u64,
     budget_us: u64,
     binning_us: u64,
@@ -2017,15 +2101,24 @@ impl CandidateStore {
 
         let active_docs = active_docs.max(1);
         let df_lookup_started = Instant::now();
-        let projected = if is_strictly_sorted_unique(dedup_received) {
-            self.df_counts.get_many_sorted_counts(dedup_received)
+        let (projected, lookup_profile) = if is_strictly_sorted_unique(dedup_received) {
+            self.df_counts
+                .get_many_sorted_counts_profiled(dedup_received)
         } else {
-            dedup_received
+            let mut lookup_profile = DfLookupProfile::default();
+            let projected = dedup_received
                 .iter()
-                .map(|gram| self.df_counts.get(*gram))
-                .collect()
+                .map(|gram| self.df_counts.get_profiled(*gram, &mut lookup_profile))
+                .collect();
+            (projected, lookup_profile)
         };
         profile.df_lookup_us = elapsed_us(df_lookup_started);
+        profile.df_lookup_snapshot_rows_examined = lookup_profile.snapshot_rows_examined;
+        profile.df_lookup_snapshot_point_lookups = lookup_profile.snapshot_point_lookups;
+        profile.df_lookup_segment_visits = lookup_profile.segment_visits;
+        profile.df_lookup_segment_rows_examined = lookup_profile.segment_rows_examined;
+        profile.df_lookup_segment_point_lookups = lookup_profile.segment_point_lookups;
+        profile.df_lookup_delta_lookups = lookup_profile.delta_lookups;
         let (grams, complete) = self.select_indexed_grams_from_projected_counts_profiled(
             dedup_received,
             &projected,
@@ -2626,6 +2719,24 @@ impl CandidateStore {
             insert_profile.classify_df_lookup_us = insert_profile
                 .classify_df_lookup_us
                 .saturating_add(selection_profile.df_lookup_us);
+            insert_profile.classify_df_lookup_snapshot_rows_examined = insert_profile
+                .classify_df_lookup_snapshot_rows_examined
+                .saturating_add(selection_profile.df_lookup_snapshot_rows_examined);
+            insert_profile.classify_df_lookup_snapshot_point_lookups = insert_profile
+                .classify_df_lookup_snapshot_point_lookups
+                .saturating_add(selection_profile.df_lookup_snapshot_point_lookups);
+            insert_profile.classify_df_lookup_segment_visits = insert_profile
+                .classify_df_lookup_segment_visits
+                .saturating_add(selection_profile.df_lookup_segment_visits);
+            insert_profile.classify_df_lookup_segment_rows_examined = insert_profile
+                .classify_df_lookup_segment_rows_examined
+                .saturating_add(selection_profile.df_lookup_segment_rows_examined);
+            insert_profile.classify_df_lookup_segment_point_lookups = insert_profile
+                .classify_df_lookup_segment_point_lookups
+                .saturating_add(selection_profile.df_lookup_segment_point_lookups);
+            insert_profile.classify_df_lookup_delta_lookups = insert_profile
+                .classify_df_lookup_delta_lookups
+                .saturating_add(selection_profile.df_lookup_delta_lookups);
             insert_profile.classify_eligibility_us = insert_profile
                 .classify_eligibility_us
                 .saturating_add(selection_profile.eligibility_us);
@@ -7609,6 +7720,14 @@ rule q {
             state.get_many_sorted_counts(&[gram_a, gram_b, gram_c]),
             vec![3, 7, 1]
         );
+        let (profiled_counts, profiled) =
+            state.get_many_sorted_counts_profiled(&[gram_a, gram_b, gram_c]);
+        assert_eq!(profiled_counts, vec![3, 7, 1]);
+        assert!(profiled.snapshot_rows_examined > 0);
+        assert_eq!(profiled.snapshot_point_lookups, 0);
+        assert_eq!(profiled.segment_visits, 0);
+        assert_eq!(profiled.segment_point_lookups, 0);
+        assert_eq!(profiled.delta_lookups, 3);
         assert_eq!(
             state.materialize(),
             HashMap::from([(gram_a, 3usize), (gram_b, 7usize), (gram_c, 1usize)])
@@ -7644,6 +7763,48 @@ rule q {
         assert_eq!(roundtrip.get(gram_b), 1);
         assert_eq!(roundtrip.get(gram_c), 6);
         assert_eq!(roundtrip.delta.len(), 0);
+    }
+
+    #[test]
+    fn df_counts_profile_reports_segment_scan_and_point_lookup_modes() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        let gram_bytes = 4usize;
+        let mut state = DfCountsState {
+            gram_bytes,
+            snapshot: None,
+            snapshot_rows: 0,
+            segments: Vec::new(),
+            delta: FastHashMap::with_hasher(FxBuildHasher),
+        };
+
+        let small_a = pack_exact_gram(&[1, 0, 0, 0]);
+        let small_b = pack_exact_gram(&[2, 0, 0, 0]);
+        state.delta.insert(small_a, 1);
+        state.delta.insert(small_b, 1);
+        let (small_segment, _) =
+            flush_df_counts_delta_to_segment_profiled(root, &state).expect("flush small segment");
+        state.segments.push(small_segment);
+        state.delta.clear();
+
+        for idx in 0..64u8 {
+            state
+                .delta
+                .insert(pack_exact_gram(&[128 + idx, 0, 0, 0]), 1);
+        }
+        let query = pack_exact_gram(&[160, 0, 0, 0]);
+        let (large_segment, _) =
+            flush_df_counts_delta_to_segment_profiled(root, &state).expect("flush large segment");
+        state.segments.push(large_segment);
+        state.delta.clear();
+        state.delta.insert(query, 1);
+
+        let (counts, profile) = state.get_many_sorted_counts_profiled(&[query]);
+        assert_eq!(counts, vec![2]);
+        assert_eq!(profile.segment_visits, 2);
+        assert!(profile.segment_rows_examined > 0);
+        assert!(profile.segment_point_lookups > 0);
+        assert_eq!(profile.delta_lookups, 1);
     }
 
     #[test]

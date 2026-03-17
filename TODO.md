@@ -9,6 +9,37 @@ Current baseline:
 
 ## Current State
 
+Latest large-run stall check:
+- `120k` artifact root:
+  - `/root/pertest/results/sspry_stallcheck_120000_20260317_r2`
+- dataset:
+  - files: `120,000`
+  - bytes: `341,905,356,438`
+  - GiB: `318.424113503657`
+- result:
+  - completed successfully
+  - `index_wall_ms = 8,712,406`
+  - `files_per_minute_wall = 826.41`
+  - `avg_sampled_current_rss_kb = 7,233,236.88`
+  - `max_sampled_current_rss_kb = 11,170,672`
+  - `max_sampled_peak_rss_kb = 11,311,044`
+  - `final_db_bytes = 110,684,438,124`
+
+Important read from the `120k` run:
+- the full-corpus stall does not reproduce at `120k`
+- but ingest slows down steadily as the corpus grows
+- the cleanest steady-state slowdown is `Q2 -> Q3`, not `Q1`
+- `Q2 -> Q3` per-doc store growth:
+  - `store_us/doc`: `65.4 ms -> 73.8 ms`
+  - `classify_us/doc`: `11.0 ms -> 15.3 ms`
+  - `classify_df_lookup_us/doc`: `9.8 ms -> 14.1 ms`
+  - `compact_df_counts_us/doc`: `23.2 ms -> 29.1 ms`
+  - `append_sidecars_us/doc`: `29.3 ms -> 27.8 ms`
+- interpretation:
+  - `classify_df_lookup` is the clearest monotonic scaler
+  - `compact_df_counts` is the secondary steady-state grower
+  - `append_sidecars` is still large, but it does not show the same clean steady-state worsening
+
 Current large-ingest baseline on `master`:
 - `26k` artifact root:
   - `/root/pertest/results/sspry_ingest_26000_20260316_doublebuf_reuse_r3`
@@ -45,22 +76,23 @@ Current large-ingest baseline on `master`:
   - `current_rss_kb = 6,223,800`
   - `peak_rss_kb = 6,413,300`
 
-Current `50k` insert/store bottleneck order:
+Current large-run insert/store priority order:
 - source:
-  - `/root/pertest/results/sspry_ingest_50000_20260316_doublebuf_reuse_r1/post_publish.info.light.json`
-- `store_classify_us = 412,937,353`
-- `store_append_sidecars_us = 312,177,864`
-- `store_compact_df_counts_us = 169,653,717`
-- `store_apply_df_counts_us = 59,071,649`
-- `store_tier2_update_us = 3,560,237`
+  - `/root/pertest/results/sspry_stallcheck_120000_20260317_r2/final.info.light.json`
+- `store_append_sidecars_us = 2,552,260,490`
+- `store_classify_us = 2,356,714,720`
+- `store_classify_df_lookup_us = 2,208,038,954`
+- `store_compact_df_counts_us = 2,140,133,620`
+- `store_apply_df_counts_us = 135,508,102`
+- `store_tier2_update_us = 8,460,711`
 
 Interpretation:
 - first visible publish is no longer the main problem
 - the current system is bottlenecked by server insert/store work again
-- inside insert/store, the priorities are now:
-  1. `classify`
-  2. `append_sidecars`
-  3. `compact_df_counts`
+- inside insert/store, the immediate optimization priorities are now:
+  1. `classify_df_lookup`
+  2. `compact_df_counts`
+  3. `append_sidecars`
   4. `apply_df_counts`
 - adaptive publish is currently backing off for ingest pressure on this workload, which is expected:
   - `adaptive_publish.mode = backoff`
@@ -133,26 +165,45 @@ Important kept changes already in `master`:
 
 ## Active Backlog
 
-### 1. Server insert `classify` on large ingests
+### 1. Server insert `classify_df_lookup` on large ingests
 
 Why:
-- this is now the largest store bucket on the current `50k` baseline
-- current measurement:
-  - `store_classify_us = 412,937,353`
+- this is the clearest monotonic steady-state grower on the `120k` run
+- current `120k` measurement:
+  - `store_classify_df_lookup_us = 2,208,038,954`
+- clean steady-state growth:
+  - `Q2 -> Q3`: `9.8 ms/doc -> 14.1 ms/doc`
 
 Constraints:
 - do not reintroduce the old RSS growth / random-IO failure modes
-- memory must stay bounded on `26k` and `50k`
+- memory must stay bounded on `26k`, `50k`, and `120k`
 - HDD behavior matters as much as SSD behavior
 
 Immediate next work:
-- add finer subphase profiling inside `select_indexed_grams`
+- add finer lookup-shape profiling inside `select_indexed_grams`
 - identify the exact split between:
-  - DF/commonness lookup
-  - eligibility filtering
-  - ranking / budget selection
-  - final gram materialization
+  - snapshot scan distance
+  - segment fan-out
+  - segment linear scans vs point lookups
+  - delta overlay lookups
 - only then attempt another structural optimize pass
+
+Current lookup-shape telemetry status:
+- landed on local `master` in the current work-in-progress branch
+- early live `26k` read (`0.49%`):
+  - `classify_df_lookup_delta_lookups = 1,585,826`
+  - snapshot/segment counters were still `0`
+- later live `26k` read (`39.68%`):
+  - `classify_df_lookup_segment_visits = 10,281`
+  - `classify_df_lookup_segment_rows_examined = 1,395,035,912`
+  - `classify_df_lookup_segment_point_lookups = 3,916,265`
+  - `classify_df_lookup_delta_lookups = 119,850,601`
+- read:
+  - early classify lookup is dominated by the delta overlay
+  - later classify lookup is doing both:
+    - heavy linear segment row examination
+    - a meaningful amount of segment point lookup work
+  - that is enough evidence to target segment lookup shape next instead of guessing
 
 Latest live `26k` classify profile:
 - artifact:
@@ -178,34 +229,36 @@ Rejected follow-up:
     - early `15.8%` sample regressed `store_classify_df_lookup_us` enough to reject quickly
     - do not keep this approach
 
-### 2. `append_sidecars` on large ingests
+### 2. Large-run `compact_df_counts`
 
 Why:
-- this is now the second-largest store bucket on the current `50k` baseline
-- current measurement:
-  - `store_append_sidecars_us = 312,177,864`
+- this is the secondary steady-state grower on the `120k` run
+- current `120k` measurement:
+  - `store_compact_df_counts_us = 2,140,133,620`
+- clean steady-state growth:
+  - `Q2 -> Q3`: `23.2 ms/doc -> 29.1 ms/doc`
 
 Likely directions:
-- split payload build vs payload append vs fsync/writeback-visible stalls
-- re-check bloom payload work under the current tiered DF baseline
-- prefer reductions in re-encoding and write amplification over new resident caches
+- keep the exact segment/tiered DF representation
+- reduce merge/write cost without rebuilding large resident state
+- measure write amplification directly on `50k` and `120k`
 
-### 3. Large-run `compact_df_counts`
+### 3. `append_sidecars` on large ingests
 
 Why:
-- compaction is still expensive even though it is no longer the top bucket
-- current `50k` measurement:
-  - `store_compact_df_counts_us = 169,653,717`
+- this is still the largest absolute store bucket on the `120k` run
+- current `120k` measurement:
+  - `store_append_sidecars_us = 2,552,260,490`
 
 What is already known:
-- the old bounded-memory snapshot rewrite path paid heavily in writeback stall
-- full snapshot rewrite / writeback was the real issue, not sort cost
-- several snapshot-local fixes were already rejected
+- metadata payload writes are noise
+- bloom payload handling and doc-row build work dominate
+- sidecars are large, but they are not the cleanest steady-state scaler
 
 Next direction:
-- keep profiling and refining the newer exact segment/tiered DF approach
-- measure write amplification directly on `26k` and `50k`
-- prefer sequential IO and bounded resident state
+- keep the new subphase split
+- focus on bloom payload handling and doc-row build work
+- prefer reductions in encoding/write amplification over resident caches
 
 ### 4. `apply_df_counts` structural revisit
 
