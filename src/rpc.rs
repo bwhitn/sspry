@@ -415,14 +415,18 @@ struct ServerState {
     index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64,
+    index_session_server_insert_batch_store_append_bloom_payload_assemble_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_grams_received_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_grams_indexed_payload_us: AtomicU64,
+    index_session_server_insert_batch_store_append_metadata_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_external_id_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_tier2_bloom_payload_us: AtomicU64,
+    index_session_server_insert_batch_store_append_doc_row_build_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_grams_received_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_grams_indexed_payload_bytes: AtomicU64,
+    index_session_server_insert_batch_store_append_metadata_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_external_id_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_doc_records_us: AtomicU64,
@@ -1759,23 +1763,27 @@ impl ServerState {
             index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_bloom_payload_assemble_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_bloom_payload_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_grams_received_payload_us:
                 AtomicU64::new(0),
             index_session_server_insert_batch_store_append_grams_indexed_payload_us: AtomicU64::new(
                 0,
             ),
+            index_session_server_insert_batch_store_append_metadata_payload_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_external_id_payload_us: AtomicU64::new(
                 0,
             ),
             index_session_server_insert_batch_store_append_tier2_bloom_payload_us: AtomicU64::new(
                 0,
             ),
+            index_session_server_insert_batch_store_append_doc_row_build_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_bloom_payload_bytes: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_grams_received_payload_bytes:
                 AtomicU64::new(0),
             index_session_server_insert_batch_store_append_grams_indexed_payload_bytes:
                 AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_metadata_payload_bytes: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_external_id_payload_bytes:
                 AtomicU64::new(0),
             index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes:
@@ -2296,11 +2304,25 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_classify_us
                     .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_dedup_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_df_lookup_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_eligibility_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_budget_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_binning_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_classify_finalize_us
+                    .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_apply_df_counts_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecars_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecar_payloads_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_bloom_payload_assemble_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_bloom_payload_us
                     .store(0, Ordering::SeqCst);
@@ -2308,15 +2330,21 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_grams_indexed_payload_us
                     .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_metadata_payload_us
+                    .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_external_id_payload_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_tier2_bloom_payload_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_doc_row_build_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_bloom_payload_bytes
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_grams_received_payload_bytes
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_grams_indexed_payload_bytes
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_append_metadata_payload_bytes
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_external_id_payload_bytes
                     .store(0, Ordering::SeqCst);
@@ -2335,6 +2363,32 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_append_df_delta_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_compact_df_counts_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_check_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_bytes
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_flush_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_rename_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_close_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_refresh_snapshot_us
+                    .store(0, Ordering::SeqCst);
+                self.index_session_server_insert_batch_store_compact_df_counts_reopen_writers_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_rebalance_tier2_us
                     .store(0, Ordering::SeqCst);
@@ -2451,6 +2505,11 @@ impl ServerState {
             .fetch_add(store_profile.append_sidecars_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecar_payloads_us
             .fetch_add(store_profile.append_sidecar_payloads_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_append_bloom_payload_assemble_us
+            .fetch_add(
+                store_profile.append_bloom_payload_assemble_us,
+                Ordering::SeqCst,
+            );
         self.index_session_server_insert_batch_store_append_bloom_payload_us
             .fetch_add(store_profile.append_bloom_payload_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_grams_received_payload_us
@@ -2463,6 +2522,8 @@ impl ServerState {
                 store_profile.append_grams_indexed_payload_us,
                 Ordering::SeqCst,
             );
+        self.index_session_server_insert_batch_store_append_metadata_payload_us
+            .fetch_add(store_profile.append_metadata_payload_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_external_id_payload_us
             .fetch_add(
                 store_profile.append_external_id_payload_us,
@@ -2473,6 +2534,8 @@ impl ServerState {
                 store_profile.append_tier2_bloom_payload_us,
                 Ordering::SeqCst,
             );
+        self.index_session_server_insert_batch_store_append_doc_row_build_us
+            .fetch_add(store_profile.append_doc_row_build_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_bloom_payload_bytes
             .fetch_add(store_profile.append_bloom_payload_bytes, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_grams_received_payload_bytes
@@ -2483,6 +2546,11 @@ impl ServerState {
         self.index_session_server_insert_batch_store_append_grams_indexed_payload_bytes
             .fetch_add(
                 store_profile.append_grams_indexed_payload_bytes,
+                Ordering::SeqCst,
+            );
+        self.index_session_server_insert_batch_store_append_metadata_payload_bytes
+            .fetch_add(
+                store_profile.append_metadata_payload_bytes,
                 Ordering::SeqCst,
             );
         self.index_session_server_insert_batch_store_append_external_id_payload_bytes
@@ -2652,6 +2720,10 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_append_sidecar_payloads_us.load(Ordering::Acquire),
             ),
             (
+                "store_append_bloom_payload_assemble_us",
+                self.index_session_server_insert_batch_store_append_bloom_payload_assemble_us.load(Ordering::Acquire),
+            ),
+            (
                 "store_append_bloom_payload_us",
                 self.index_session_server_insert_batch_store_append_bloom_payload_us.load(Ordering::Acquire),
             ),
@@ -2664,12 +2736,20 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_append_grams_indexed_payload_us.load(Ordering::Acquire),
             ),
             (
+                "store_append_metadata_payload_us",
+                self.index_session_server_insert_batch_store_append_metadata_payload_us.load(Ordering::Acquire),
+            ),
+            (
                 "store_append_external_id_payload_us",
                 self.index_session_server_insert_batch_store_append_external_id_payload_us.load(Ordering::Acquire),
             ),
             (
                 "store_append_tier2_bloom_payload_us",
                 self.index_session_server_insert_batch_store_append_tier2_bloom_payload_us.load(Ordering::Acquire),
+            ),
+            (
+                "store_append_doc_row_build_us",
+                self.index_session_server_insert_batch_store_append_doc_row_build_us.load(Ordering::Acquire),
             ),
             (
                 "store_append_bloom_payload_bytes",
@@ -2682,6 +2762,10 @@ impl ServerState {
             (
                 "store_append_grams_indexed_payload_bytes",
                 self.index_session_server_insert_batch_store_append_grams_indexed_payload_bytes.load(Ordering::Acquire),
+            ),
+            (
+                "store_append_metadata_payload_bytes",
+                self.index_session_server_insert_batch_store_append_metadata_payload_bytes.load(Ordering::Acquire),
             ),
             (
                 "store_append_external_id_payload_bytes",
@@ -4443,6 +4527,9 @@ impl ServerState {
             store_profile_total.append_sidecar_payloads_us = store_profile_total
                 .append_sidecar_payloads_us
                 .saturating_add(store_profile.append_sidecar_payloads_us);
+            store_profile_total.append_bloom_payload_assemble_us = store_profile_total
+                .append_bloom_payload_assemble_us
+                .saturating_add(store_profile.append_bloom_payload_assemble_us);
             store_profile_total.append_bloom_payload_us = store_profile_total
                 .append_bloom_payload_us
                 .saturating_add(store_profile.append_bloom_payload_us);
@@ -4452,12 +4539,18 @@ impl ServerState {
             store_profile_total.append_grams_indexed_payload_us = store_profile_total
                 .append_grams_indexed_payload_us
                 .saturating_add(store_profile.append_grams_indexed_payload_us);
+            store_profile_total.append_metadata_payload_us = store_profile_total
+                .append_metadata_payload_us
+                .saturating_add(store_profile.append_metadata_payload_us);
             store_profile_total.append_external_id_payload_us = store_profile_total
                 .append_external_id_payload_us
                 .saturating_add(store_profile.append_external_id_payload_us);
             store_profile_total.append_tier2_bloom_payload_us = store_profile_total
                 .append_tier2_bloom_payload_us
                 .saturating_add(store_profile.append_tier2_bloom_payload_us);
+            store_profile_total.append_doc_row_build_us = store_profile_total
+                .append_doc_row_build_us
+                .saturating_add(store_profile.append_doc_row_build_us);
             store_profile_total.append_bloom_payload_bytes = store_profile_total
                 .append_bloom_payload_bytes
                 .saturating_add(store_profile.append_bloom_payload_bytes);
@@ -4467,6 +4560,9 @@ impl ServerState {
             store_profile_total.append_grams_indexed_payload_bytes = store_profile_total
                 .append_grams_indexed_payload_bytes
                 .saturating_add(store_profile.append_grams_indexed_payload_bytes);
+            store_profile_total.append_metadata_payload_bytes = store_profile_total
+                .append_metadata_payload_bytes
+                .saturating_add(store_profile.append_metadata_payload_bytes);
             store_profile_total.append_external_id_payload_bytes = store_profile_total
                 .append_external_id_payload_bytes
                 .saturating_add(store_profile.append_external_id_payload_bytes);
@@ -4626,6 +4722,9 @@ impl ServerState {
                 store_profile_total.append_sidecar_payloads_us = store_profile_total
                     .append_sidecar_payloads_us
                     .saturating_add(store_profile.append_sidecar_payloads_us);
+                store_profile_total.append_bloom_payload_assemble_us = store_profile_total
+                    .append_bloom_payload_assemble_us
+                    .saturating_add(store_profile.append_bloom_payload_assemble_us);
                 store_profile_total.append_bloom_payload_us = store_profile_total
                     .append_bloom_payload_us
                     .saturating_add(store_profile.append_bloom_payload_us);
@@ -4635,12 +4734,18 @@ impl ServerState {
                 store_profile_total.append_grams_indexed_payload_us = store_profile_total
                     .append_grams_indexed_payload_us
                     .saturating_add(store_profile.append_grams_indexed_payload_us);
+                store_profile_total.append_metadata_payload_us = store_profile_total
+                    .append_metadata_payload_us
+                    .saturating_add(store_profile.append_metadata_payload_us);
                 store_profile_total.append_external_id_payload_us = store_profile_total
                     .append_external_id_payload_us
                     .saturating_add(store_profile.append_external_id_payload_us);
                 store_profile_total.append_tier2_bloom_payload_us = store_profile_total
                     .append_tier2_bloom_payload_us
                     .saturating_add(store_profile.append_tier2_bloom_payload_us);
+                store_profile_total.append_doc_row_build_us = store_profile_total
+                    .append_doc_row_build_us
+                    .saturating_add(store_profile.append_doc_row_build_us);
                 store_profile_total.append_bloom_payload_bytes = store_profile_total
                     .append_bloom_payload_bytes
                     .saturating_add(store_profile.append_bloom_payload_bytes);
@@ -4650,6 +4755,9 @@ impl ServerState {
                 store_profile_total.append_grams_indexed_payload_bytes = store_profile_total
                     .append_grams_indexed_payload_bytes
                     .saturating_add(store_profile.append_grams_indexed_payload_bytes);
+                store_profile_total.append_metadata_payload_bytes = store_profile_total
+                    .append_metadata_payload_bytes
+                    .saturating_add(store_profile.append_metadata_payload_bytes);
                 store_profile_total.append_external_id_payload_bytes = store_profile_total
                     .append_external_id_payload_bytes
                     .saturating_add(store_profile.append_external_id_payload_bytes);

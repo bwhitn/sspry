@@ -2556,6 +2556,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_store_append_sidecar_payloads_us",
                             ),
                             (
+                                "store_append_bloom_payload_assemble_us",
+                                "verbose.index.server_index_insert_batch_store_append_bloom_payload_assemble_us",
+                            ),
+                            (
                                 "store_append_bloom_payload_us",
                                 "verbose.index.server_index_insert_batch_store_append_bloom_payload_us",
                             ),
@@ -2580,6 +2584,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_store_append_grams_indexed_payload_bytes",
                             ),
                             (
+                                "store_append_metadata_payload_us",
+                                "verbose.index.server_index_insert_batch_store_append_metadata_payload_us",
+                            ),
+                            (
+                                "store_append_metadata_payload_bytes",
+                                "verbose.index.server_index_insert_batch_store_append_metadata_payload_bytes",
+                            ),
+                            (
                                 "store_append_external_id_payload_us",
                                 "verbose.index.server_index_insert_batch_store_append_external_id_payload_us",
                             ),
@@ -2594,6 +2606,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             (
                                 "store_append_tier2_bloom_payload_bytes",
                                 "verbose.index.server_index_insert_batch_store_append_tier2_bloom_payload_bytes",
+                            ),
+                            (
+                                "store_append_doc_row_build_us",
+                                "verbose.index.server_index_insert_batch_store_append_doc_row_build_us",
                             ),
                             (
                                 "store_append_doc_records_us",

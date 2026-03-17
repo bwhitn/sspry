@@ -71,6 +71,33 @@ Operational notes:
 - search still only sees the published store set
 - remote indexing now retries narrow publish pauses, and publish waits for active sessions instead of poisoning them
 
+Current profiling additions on local `master`:
+- insert-side sidecar telemetry now also exposes:
+  - `store_append_bloom_payload_assemble_us`
+  - `store_append_metadata_payload_us`
+  - `store_append_doc_row_build_us`
+- per-session insert-batch submetrics are now reset correctly on new index sessions
+
+Current sidecar read from the telemetry pass (`26k` profile):
+- artifact:
+  - `/root/pertest/results/sspry_ingest_26000_20260317_sidecar_profile_r1/final.info.light.json`
+- `store_append_sidecars_us = 34,781,302`
+- `store_append_sidecar_payloads_us = 33,455,741`
+- `store_append_bloom_payload_assemble_us = 7,616,550`
+- `store_append_bloom_payload_us = 17,760,087`
+- `store_append_tier2_bloom_payload_us = 13,797,903`
+- `store_append_doc_row_build_us = 6,542,741`
+- `store_append_doc_records_us = 352,594`
+- `store_append_metadata_payload_us = 143,540`
+
+Interpretation:
+- metadata payload writes are noise
+- exact-gram sidecars are no longer the dominant sidecar problem
+- the real sidecar pressure is:
+  1. Tier1/Tier2 bloom payload handling
+  2. doc-row build work
+  3. much later, doc-record appends
+
 ## Landed Wins
 
 Important kept changes already in `master`:
@@ -292,6 +319,18 @@ These were tried and should not be repeated without a materially different hypot
   - did not clear the bar
 - naive defer-work-root DF compaction
   - mixed/order-sensitive result, reverted
+- classify partial-selection / `select_nth_unstable` pass
+  - `26k` looked good
+  - `50k` store/classify drifted the wrong way
+  - do not retry without a different late-run hypothesis
+- lower-copy vectored bloom sidecar append
+  - removed bloom assembly cost
+  - late `50k` write pressure shifted into doc-row/doc-record cost
+  - no net keepable win
+- DF row-buffer compaction write pass
+  - `26k` top-line stayed flat
+  - compaction bucket itself regressed
+  - not worth keeping
 
 ## Search Safety Checks
 

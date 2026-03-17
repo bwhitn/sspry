@@ -509,14 +509,18 @@ pub struct CandidateInsertBatchProfile {
     pub apply_df_counts_us: u64,
     pub append_sidecars_us: u64,
     pub append_sidecar_payloads_us: u64,
+    pub append_bloom_payload_assemble_us: u64,
     pub append_bloom_payload_us: u64,
     pub append_grams_received_payload_us: u64,
     pub append_grams_indexed_payload_us: u64,
+    pub append_metadata_payload_us: u64,
     pub append_external_id_payload_us: u64,
     pub append_tier2_bloom_payload_us: u64,
+    pub append_doc_row_build_us: u64,
     pub append_bloom_payload_bytes: u64,
     pub append_grams_received_payload_bytes: u64,
     pub append_grams_indexed_payload_bytes: u64,
+    pub append_metadata_payload_bytes: u64,
     pub append_external_id_payload_bytes: u64,
     pub append_tier2_bloom_payload_bytes: u64,
     pub append_doc_records_us: u64,
@@ -563,11 +567,13 @@ struct CandidateDocRowPayloadProfile {
     bloom_us: u64,
     grams_received_us: u64,
     grams_indexed_us: u64,
+    metadata_us: u64,
     external_id_us: u64,
     tier2_bloom_us: u64,
     bloom_bytes: u64,
     grams_received_bytes: u64,
     grams_indexed_bytes: u64,
+    metadata_bytes: u64,
     external_id_bytes: u64,
     tier2_bloom_bytes: u64,
 }
@@ -2788,6 +2794,7 @@ impl CandidateStore {
             let mut tier2_blooms_payload = Vec::<u8>::new();
             let mut bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
             let mut tier2_bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
+            let assemble_bloom_payloads_started = Instant::now();
             for pending in &pending_new_inserts {
                 bloom_offsets.push(bloom_base + blooms_payload.len() as u64);
                 blooms_payload.extend_from_slice(pending.bloom_filter);
@@ -2798,6 +2805,9 @@ impl CandidateStore {
                     tier2_blooms_payload.extend_from_slice(pending.tier2_bloom_filter);
                 }
             }
+            insert_profile.append_bloom_payload_assemble_us = insert_profile
+                .append_bloom_payload_assemble_us
+                .saturating_add(elapsed_us(assemble_bloom_payloads_started));
             let append_bloom_started = Instant::now();
             self.append_writers.blooms.append(&blooms_payload)?;
             insert_profile.append_bloom_payload_us = insert_profile
@@ -2822,6 +2832,7 @@ impl CandidateStore {
                 .zip(bloom_offsets.into_iter())
                 .zip(tier2_bloom_offsets.into_iter())
             {
+                let build_doc_row_started = Instant::now();
                 let (row, row_profile) = self.build_doc_row_with_bloom_offset_profile(
                     pending.doc.file_size,
                     pending.doc.filter_bytes,
@@ -2835,6 +2846,9 @@ impl CandidateStore {
                     &pending.dedup_received,
                     &pending.indexed,
                 )?;
+                insert_profile.append_doc_row_build_us = insert_profile
+                    .append_doc_row_build_us
+                    .saturating_add(elapsed_us(build_doc_row_started));
                 let tier2_row = if pending.tier2_bloom_filter.is_empty() {
                     Tier2DocMetaRow::default()
                 } else {
@@ -2857,6 +2871,12 @@ impl CandidateStore {
                 insert_profile.append_grams_indexed_payload_bytes = insert_profile
                     .append_grams_indexed_payload_bytes
                     .saturating_add(row_profile.grams_indexed_bytes);
+                insert_profile.append_metadata_payload_us = insert_profile
+                    .append_metadata_payload_us
+                    .saturating_add(row_profile.metadata_us);
+                insert_profile.append_metadata_payload_bytes = insert_profile
+                    .append_metadata_payload_bytes
+                    .saturating_add(row_profile.metadata_bytes);
                 insert_profile.append_external_id_payload_us = insert_profile
                     .append_external_id_payload_us
                     .saturating_add(row_profile.external_id_us);
@@ -4011,10 +4031,11 @@ impl CandidateStore {
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
-            (
-                self.append_writers.metadata.append(metadata)?,
-                metadata.len() as u32,
-            )
+            let metadata_started = Instant::now();
+            let offset = self.append_writers.metadata.append(metadata)?;
+            profile.metadata_us = elapsed_us(metadata_started);
+            profile.metadata_bytes = metadata.len() as u64;
+            (offset, metadata.len() as u32)
         };
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
@@ -4093,10 +4114,11 @@ impl CandidateStore {
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
-            (
-                self.append_writers.metadata.append(metadata)?,
-                metadata.len() as u32,
-            )
+            let metadata_started = Instant::now();
+            let offset = self.append_writers.metadata.append(metadata)?;
+            profile.metadata_us = elapsed_us(metadata_started);
+            profile.metadata_bytes = metadata.len() as u64;
+            (offset, metadata.len() as u32)
         };
         let (external_id_offset, external_id_len) = if let Some(external_id) = external_id {
             let bytes = external_id.as_bytes();
