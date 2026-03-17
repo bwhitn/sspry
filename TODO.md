@@ -205,6 +205,25 @@ Current lookup-shape telemetry status:
     - a meaningful amount of segment point lookup work
   - that is enough evidence to target segment lookup shape next instead of guessing
 
+Rejected follow-up after lookup-shape profiling:
+- range-aware segment pruning plus relevant-span scan selection
+  - `26k` artifact:
+    - `/root/pertest/results/sspry_ingest_26000_20260317_segmentrange_r2/summary.json`
+  - `50k` artifact:
+    - `/root/pertest/results/sspry_ingest_50000_20260317_segmentrange_r1/summary.json`
+  - `26k` baseline -> experiment:
+    - wall: `743,419 -> 770,317 ms` (`+3.6%`)
+    - current RSS: `4,068,564 -> 3,905,468 KB` (`-4.0%`)
+    - peak RSS: `4,228,352 -> 4,026,760 KB` (`-4.8%`)
+  - `50k` baseline -> experiment:
+    - wall: `1,860,862 -> 2,551,075 ms` (`+37.1%`)
+    - current RSS: `6,223,800 -> 5,648,160 KB` (`-9.2%`)
+    - peak RSS: `6,413,300 -> 5,783,752 KB` (`-9.8%`)
+  - read:
+    - memory moved the right way
+    - runtime regressed far too much, especially at `50k`
+    - do not keep this path
+
 Latest live `26k` classify profile:
 - artifact:
   - `/root/pertest/results/sspry_ingest_26000_20260316_classify_profile_r2/live.info.light.3.json`
