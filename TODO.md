@@ -8,6 +8,18 @@ Current baseline:
   - `maintenance.auto = false`
 
 ## Current State
+- Full-corpus run `r6` on `4cbcd5a` was rejected and stopped at `30,981 / 260,278` docs (`11.90%`).
+- Grouped DF segment lookups regressed into very large exact local scans:
+  - `store_classify_df_lookup_segment_rows_examined = 13,216,478,954`
+  - `store_classify_df_lookup_segment_visits = 51,626`
+  - `store_classify_df_lookup_segment_point_lookups = 0`
+  - `store_classify_df_lookup_us = 159,136,764` at only `30,981` docs
+- Memory interpretation for this regression:
+  - `VmRSS = 4,786,084 KB`
+  - `RssAnon = 1,597,620 KB`
+  - `RssFile = 3,188,464 KB`
+- Action: revert `4cbcd5a` and continue full-corpus testing from the safer fence-index baseline.
+
 
 Latest aborted full-corpus stress run:
 - artifact root:
