@@ -5311,9 +5311,6 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
     if !value.is_object() {
         return Err(SspryError::from("query plan payload must be an object"));
     }
-    if value.get("ast").is_none() {
-        return serde_json::from_value(value.clone()).map_err(SspryError::from);
-    }
 
     let patterns_raw = value
         .get("patterns")
@@ -5645,10 +5642,6 @@ fn workspace_current_root(root: &Path) -> PathBuf {
     root.join("current")
 }
 
-fn workspace_legacy_work_root(root: &Path) -> PathBuf {
-    root.join("work")
-}
-
 fn workspace_work_root_a(root: &Path) -> PathBuf {
     root.join("work_a")
 }
@@ -5811,17 +5804,13 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     }
 
     let current_root = workspace_current_root(root);
-    let legacy_work_root = workspace_legacy_work_root(root);
     let work_root_a = workspace_work_root_a(root);
     let work_root_b = workspace_work_root_b(root);
-    if legacy_work_root.exists() {
-        if work_root_a.exists() || work_root_b.exists() {
-            return Err(SspryError::from(format!(
-                "{} still contains a legacy work root alongside work_a/work_b; clean the workspace root before restarting.",
-                root.display()
-            )));
-        }
-        fs::rename(&legacy_work_root, &work_root_a)?;
+    if root.join("work").exists() {
+        return Err(SspryError::from(format!(
+            "{} contains the retired workspace work/ root; move or remove it before restarting.",
+            root.display()
+        )));
     }
     let retired_root = workspace_retired_root(root);
     let removed_retired =
@@ -5987,7 +5976,7 @@ mod tests {
     fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
         fs::write(path, bytes).expect("write sample");
         let features = crate::candidate::scan_file_features_bloom_only(path, 1024, 7, 0, 0, 1024)
-        .expect("features");
+            .expect("features");
         CandidateDocumentWire {
             sha256: hex::encode(features.sha256),
             file_size: features.file_size,
@@ -6260,10 +6249,10 @@ mod tests {
         fs::write(&sample_b, b"zzWXYZqq").expect("sample b");
         let features_a =
             crate::candidate::scan_file_features_bloom_only(&sample_a, 1024, 7, 0, 0, 1024)
-        .expect("features a");
+                .expect("features a");
         let features_b =
             crate::candidate::scan_file_features_bloom_only(&sample_b, 1024, 7, 0, 0, 1024)
-        .expect("features b");
+                .expect("features b");
         let docs = vec![
             CandidateDocumentWire {
                 sha256: hex::encode(features_a.sha256),
@@ -6644,10 +6633,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_startup_migrates_legacy_single_work_root_to_dual_work_roots() {
+    fn workspace_startup_rejects_retired_single_work_root() {
         let tmp = tempdir().expect("tmp");
         let workspace_root = tmp.path().join("candidate_workspace_1");
-        let legacy_work_root = workspace_legacy_work_root(&workspace_root);
+        let legacy_work_root = workspace_root.join("work");
         let (legacy_stores, _, _) = ensure_candidate_stores_at_root(
             &ServerConfig {
                 candidate_config: CandidateConfig {
@@ -6671,26 +6660,25 @@ mod tests {
         assert!(!workspace_work_root_a(&workspace_root).exists());
         assert!(!workspace_work_root_b(&workspace_root).exists());
 
-        let state = sample_workspace_server_state(tmp.path(), 1);
-        let work = state.work_store_set().expect("active work");
-        assert_eq!(
-            work.root().expect("work root"),
-            workspace_work_root_a(&workspace_root)
-        );
-        assert!(workspace_work_root_a(&workspace_root).exists());
-        assert!(workspace_work_root_b(&workspace_root).exists());
-        assert!(!legacy_work_root.exists());
-        let mode = state.store_mode.lock().expect("store mode");
-        match &*mode {
-            StoreMode::Workspace { work_idle, .. } => {
-                let idle = work_idle.as_ref().expect("idle work root");
-                assert_eq!(
-                    idle.root().expect("idle root"),
-                    workspace_work_root_b(&workspace_root)
-                );
-            }
-            StoreMode::Direct { .. } => panic!("expected workspace mode"),
-        }
+        let err = ServerState::new(
+            ServerConfig {
+                candidate_config: CandidateConfig {
+                    root: workspace_root.clone(),
+                    ..CandidateConfig::default()
+                },
+                candidate_shards: 1,
+                search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                tier2_superblock_budget_divisor:
+                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+                auto_publish_initial_idle_ms: 500,
+                auto_publish_storage_class: "unknown".to_owned(),
+                workspace_mode: true,
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("workspace startup must fail");
+        assert!(err.to_string().contains("retired workspace work/ root"));
     }
 
     #[test]
@@ -6702,7 +6690,7 @@ mod tests {
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let features =
             crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
-        .expect("features");
+                .expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features.sha256),
@@ -6815,7 +6803,7 @@ mod tests {
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let features =
             crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
-        .expect("features");
+                .expect("features");
         state
             .handle_begin_index_session()
             .expect("begin index session");
@@ -6902,7 +6890,7 @@ mod tests {
         fs::write(&sample, b"xxABCDyy").expect("sample");
         let features =
             crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
-        .expect("features");
+                .expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features.sha256),
@@ -7027,7 +7015,7 @@ mod tests {
         fs::write(&sample_a, b"xxABCDyy").expect("sample a");
         let features_a =
             crate::candidate::scan_file_features_bloom_only(&sample_a, 1024, 7, 0, 0, 1024)
-        .expect("features a");
+                .expect("features a");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features_a.sha256),
@@ -7049,7 +7037,7 @@ mod tests {
         fs::write(&sample_b, b"xxWXYZyy").expect("sample b");
         let features_b =
             crate::candidate::scan_file_features_bloom_only(&sample_b, 1024, 7, 0, 0, 1024)
-        .expect("features b");
+                .expect("features b");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features_b.sha256),
@@ -8917,32 +8905,7 @@ rule q {
     }
 
     #[test]
-    fn query_plan_wire_and_store_setup_cover_fallback_and_manifest_errors() {
-        let legacy_wire = serde_json::to_value(CompiledQueryPlan {
-            patterns: vec![PatternPlan {
-                pattern_id: "$a".to_owned(),
-                alternatives: vec![vec![1, 2, 3, 4]],
-                tier2_alternatives: vec![Vec::new()],
-                fixed_literals: vec![Vec::new()],
-            }],
-            root: QueryNode {
-                kind: "pattern".to_owned(),
-                pattern_id: Some("$a".to_owned()),
-                threshold: None,
-                children: Vec::new(),
-            },
-            force_tier1_only: true,
-            allow_tier2_fallback: false,
-            max_candidates: 7,
-            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
-            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
-        })
-        .expect("legacy wire");
-        let decoded = compiled_query_plan_from_wire(&legacy_wire).expect("decode legacy plan");
-        assert_eq!(decoded.max_candidates, 7);
-        assert!(decoded.force_tier1_only);
-        assert!(!decoded.allow_tier2_fallback);
-
+    fn query_plan_wire_and_store_setup_cover_manifest_errors() {
         let tmp = tempdir().expect("tmp");
         let single_root = tmp.path().join("single");
         CandidateStore::init(

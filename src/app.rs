@@ -1354,98 +1354,6 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     })
 }
 
-fn legacy_operand_from_gram(gram: u64, gram_size: usize) -> String {
-    hex::encode(&gram.to_le_bytes()[..gram_size.min(8)])
-}
-
-fn legacy_query_from_plan(plan: &crate::candidate::CompiledQueryPlan) -> Option<String> {
-    let mut pattern_expr = HashMap::<String, String>::new();
-    for pattern in &plan.patterns {
-        let mut alternatives = Vec::<String>::new();
-        for alternative in &pattern.alternatives {
-            if alternative.is_empty() {
-                continue;
-            }
-            let terms = alternative
-                .iter()
-                .map(|value| legacy_operand_from_gram(*value, plan.tier1_gram_size))
-                .collect::<Vec<_>>();
-            let mut alt_expr = terms.join(" and ");
-            if terms.len() > 1 {
-                alt_expr = format!("({alt_expr})");
-            }
-            alternatives.push(alt_expr);
-        }
-        let expr = if alternatives.is_empty() {
-            String::new()
-        } else if alternatives.len() == 1 {
-            alternatives.remove(0)
-        } else {
-            format!("({})", alternatives.join(" or "))
-        };
-        pattern_expr.insert(pattern.pattern_id.clone(), expr);
-    }
-
-    fn visit(
-        node: &crate::candidate::QueryNode,
-        pattern_expr: &HashMap<String, String>,
-    ) -> Option<String> {
-        match node.kind.as_str() {
-            "pattern" => {
-                let expr = pattern_expr
-                    .get(node.pattern_id.as_ref()?)
-                    .cloned()
-                    .unwrap_or_default();
-                if expr.is_empty() { None } else { Some(expr) }
-            }
-            "and" | "or" => {
-                let parts = node
-                    .children
-                    .iter()
-                    .map(|child| visit(child, pattern_expr))
-                    .collect::<Option<Vec<_>>>()?;
-                let body = parts.join(&format!(" {} ", node.kind));
-                if parts.len() > 1 {
-                    Some(format!("({body})"))
-                } else {
-                    Some(body)
-                }
-            }
-            "n_of" => {
-                let parts = node
-                    .children
-                    .iter()
-                    .map(|child| visit(child, pattern_expr))
-                    .collect::<Option<Vec<_>>>()?;
-                let threshold = node.threshold.unwrap_or(0);
-                if threshold == 0 {
-                    return None;
-                }
-                if threshold == 1 {
-                    let body = parts.join(" or ");
-                    return Some(if parts.len() > 1 {
-                        format!("({body})")
-                    } else {
-                        body
-                    });
-                }
-                if threshold >= parts.len() {
-                    let body = parts.join(" and ");
-                    return Some(if parts.len() > 1 {
-                        format!("({body})")
-                    } else {
-                        body
-                    });
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    visit(&plan.root, &pattern_expr)
-}
-
 fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
     let source = fs::read_to_string(rule_path)?;
     let mut compiler = YaraCompiler::new();
@@ -2860,7 +2768,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             args.max_candidates,
         )?;
         plan_time += started_plan.elapsed();
-        let legacy_query = legacy_query_from_plan(&plan);
         let literal_plan = if verify_yara_files {
             fixed_literal_match_plan(&plan)
         } else {
@@ -2972,9 +2879,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             }
         };
 
-        if let Some(query) = legacy_query {
-            println!("legacy_query: {query}");
-        }
         println!("tier_used: {tier_used}");
         println!("candidates: {total}");
         if verify_yara_files {
@@ -3436,7 +3340,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    use crate::candidate::{CandidateConfig, CompiledQueryPlan, PatternPlan, QueryNode};
+    use crate::candidate::{CandidateConfig, QueryNode};
 
     fn default_connection() -> ClientConnectionArgs {
         ClientConnectionArgs {
@@ -3805,7 +3709,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_candidate_batch_and_legacy_query_helpers_work() {
+    fn scan_candidate_batch_helpers_work() {
         let _guard = crate::perf::test_lock().lock().expect("perf lock");
         crate::perf::configure(None, false);
         let tmp = tempdir().expect("tmp");
@@ -3853,55 +3757,6 @@ mod tests {
         );
         assert!(md5_row.external_id.is_none());
 
-        assert_eq!(legacy_operand_from_gram(0x01020304, 4), "04030201");
-        let plan = CompiledQueryPlan {
-            patterns: vec![
-                PatternPlan {
-                    pattern_id: "$a".to_owned(),
-                    alternatives: vec![vec![0x01020304]],
-                    tier2_alternatives: vec![Vec::new()],
-                    fixed_literals: vec![Vec::new()],
-                },
-                PatternPlan {
-                    pattern_id: "$b".to_owned(),
-                    alternatives: vec![vec![0x05060708], vec![0x11121314, 0x21222324]],
-                    tier2_alternatives: vec![Vec::new(), Vec::new()],
-                    fixed_literals: vec![Vec::new(), Vec::new()],
-                },
-            ],
-            root: QueryNode {
-                kind: "and".to_owned(),
-                pattern_id: None,
-                threshold: None,
-                children: vec![
-                    QueryNode {
-                        kind: "pattern".to_owned(),
-                        pattern_id: Some("$a".to_owned()),
-                        threshold: None,
-                        children: Vec::new(),
-                    },
-                    QueryNode {
-                        kind: "n_of".to_owned(),
-                        pattern_id: None,
-                        threshold: Some(1),
-                        children: vec![QueryNode {
-                            kind: "pattern".to_owned(),
-                            pattern_id: Some("$b".to_owned()),
-                            threshold: None,
-                            children: Vec::new(),
-                        }],
-                    },
-                ],
-            },
-            force_tier1_only: false,
-            allow_tier2_fallback: true,
-            max_candidates: 100,
-            tier2_gram_size: 3,
-            tier1_gram_size: 4,
-        };
-        let legacy = legacy_query_from_plan(&plan).expect("legacy query");
-        assert!(legacy.contains("04030201"));
-        assert!(legacy.contains("08070605"));
         assert_eq!(merge_tier_used(Vec::<String>::new()), "unknown");
         assert_eq!(merge_tier_used(vec![" tier1 ".to_owned()]), "tier1");
         assert_eq!(
@@ -3970,32 +3825,6 @@ mod tests {
         assert!(verify_fixed_literal_plan_on_file(&fixed_match_path, &fixed_plan).expect("match"));
         fs::write(&fixed_match_path, b"--ABCD----").expect("fixed miss");
         assert!(!verify_fixed_literal_plan_on_file(&fixed_match_path, &fixed_plan).expect("miss"));
-
-        let degenerate = CompiledQueryPlan {
-            patterns: vec![PatternPlan {
-                pattern_id: "$empty".to_owned(),
-                alternatives: vec![Vec::new()],
-                tier2_alternatives: vec![Vec::new()],
-                fixed_literals: vec![Vec::new()],
-            }],
-            root: QueryNode {
-                kind: "n_of".to_owned(),
-                pattern_id: None,
-                threshold: Some(0),
-                children: vec![QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$empty".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                }],
-            },
-            force_tier1_only: false,
-            allow_tier2_fallback: true,
-            max_candidates: 1,
-            tier2_gram_size: 3,
-            tier1_gram_size: 4,
-        };
-        assert!(legacy_query_from_plan(&degenerate).is_none());
     }
 
     #[test]

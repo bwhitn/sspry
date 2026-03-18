@@ -12,6 +12,9 @@ Current baseline:
   - public `candidate_df` replanning transport is removed
   - live exact-gram persistence is removed from ingest/import/delete
   - compatibility-only gram wire fields are removed from the app/RPC surface
+  - the CLI no longer prints the retired `legacy_query:` exact-gram expression on search
+  - query-plan wire decode no longer accepts the retired pre-`ast` payload shape
+  - workspace startup now rejects the retired single `work/` root instead of auto-migrating it
 - `features.rs` status:
   - default ingest already scans with `collect_unique_grams = false`
   - `DocumentFeatures.unique_grams`, `unique_grams_truncated`, and `effective_diversity` still exist mainly for compatibility/test scaffolding

@@ -339,7 +339,6 @@ rule q {
         "--rule",
         rule.to_str().expect("rule"),
     ]);
-    assert!(search.contains("legacy_query:"));
     assert!(search.contains("tier_used:"));
     assert!(search.contains("candidates: 2"));
 
