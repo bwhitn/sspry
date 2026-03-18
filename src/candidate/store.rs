@@ -741,10 +741,6 @@ pub struct ImportedCandidateDocument {
     pub tier2_bloom_hashes: usize,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
-    pub grams_received_bytes: Vec<u8>,
-    pub grams_received_count: usize,
-    pub grams_indexed_bytes: Vec<u8>,
-    pub grams_indexed_count: usize,
     pub grams_complete: bool,
     pub metadata_bytes: Vec<u8>,
     pub external_id: Option<String>,
@@ -2792,10 +2788,6 @@ impl CandidateStore {
                 tier2_bloom_hashes: doc.tier2_bloom_hashes,
                 bloom_filter: self.doc_bloom_bytes(pos)?.into_owned(),
                 tier2_bloom_filter: self.doc_tier2_bloom_bytes(pos)?.into_owned(),
-                grams_received_bytes: self.doc_received_bytes(pos)?.into_owned(),
-                grams_received_count: self.doc_rows[pos].grams_received_count as usize,
-                grams_indexed_bytes: self.doc_indexed_bytes(pos)?.into_owned(),
-                grams_indexed_count: self.doc_rows[pos].grams_indexed_count as usize,
                 grams_complete: doc.grams_complete,
                 metadata_bytes: self.doc_metadata_bytes(pos)?.into_owned(),
                 external_id: self.doc_external_id(pos)?,
@@ -2852,7 +2844,7 @@ impl CandidateStore {
         } else {
             Vec::new()
         };
-        let mut aggregate_df_unit_delta_payload = Vec::<u8>::new();
+        let aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
         let mut meta_dirty = false;
@@ -2860,24 +2852,18 @@ impl CandidateStore {
         let mut indexed_grams_total = 0u64;
         let mut max_received_grams = 0u64;
         let mut max_indexed_grams = 0u64;
-        let gram_bytes = self.meta.exact_gram_bytes();
         let mut import_profile = CandidateImportBatchProfile::default();
 
         let classify_started = Instant::now();
         for document in documents {
             total_scope.add_bytes(document.file_size);
             let sha256_hex = document.sha256_hex.clone();
-            let received_len = document.grams_received_count as u64;
-            let indexed_len = document.grams_indexed_count as u64;
+            let received_len = 0u64;
+            let indexed_len = 0u64;
             received_grams_total = received_grams_total.saturating_add(received_len);
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
-            extend_unit_df_payload_from_packed(
-                &mut aggregate_df_unit_delta_payload,
-                &document.grams_received_bytes,
-                gram_bytes,
-            )?;
 
             if !assume_new {
                 if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
@@ -2917,8 +2903,8 @@ impl CandidateStore {
                         &document.metadata_bytes,
                         document.external_id.as_deref(),
                         &document.bloom_filter,
-                        &decode_exact_gram_vec(&document.grams_received_bytes, gram_bytes)?,
-                        &decode_exact_gram_vec(&document.grams_indexed_bytes, gram_bytes)?,
+                        &[],
+                        &[],
                     )?;
                     let tier2_row = self.build_tier2_doc_row(
                         snapshot.tier2_filter_bytes,
@@ -2935,14 +2921,14 @@ impl CandidateStore {
                     )?;
                     modified = true;
                     if collect_results {
-                        results.push(CandidateInsertResult {
-                            status: "restored".to_owned(),
-                            doc_id: snapshot.doc_id,
-                            sha256: sha256_hex,
-                            grams_received: document.grams_received_count,
-                            grams_indexed: document.grams_indexed_count,
-                            grams_complete: document.grams_complete,
-                        });
+                            results.push(CandidateInsertResult {
+                                status: "restored".to_owned(),
+                                doc_id: snapshot.doc_id,
+                                sha256: sha256_hex,
+                                grams_received: 0,
+                                grams_indexed: 0,
+                                grams_complete: document.grams_complete,
+                            });
                     }
                     continue;
                 }
@@ -2966,14 +2952,10 @@ impl CandidateStore {
 
         if !pending_inserts.is_empty() {
             let bloom_base = self.append_writers.blooms.offset;
-            let grams_received_base = self.append_writers.grams_received.offset;
-            let grams_indexed_base = self.append_writers.grams_indexed.offset;
             let external_ids_base = self.append_writers.external_ids.offset;
             let metadata_base = self.append_writers.metadata.offset;
             let tier2_blooms_base = self.append_writers.tier2_blooms.offset;
             let mut blooms_payload = Vec::<u8>::new();
-            let mut grams_received_payload = Vec::<u8>::new();
-            let mut grams_indexed_payload = Vec::<u8>::new();
             let mut external_ids_payload = Vec::<u8>::new();
             let mut metadata_payload = Vec::<u8>::new();
             let mut tier2_blooms_payload = Vec::<u8>::new();
@@ -3000,13 +2982,6 @@ impl CandidateStore {
                 let document = pending.document;
                 let bloom_offset = bloom_base + blooms_payload.len() as u64;
                 blooms_payload.extend_from_slice(&document.bloom_filter);
-
-                let grams_received_offset =
-                    grams_received_base + grams_received_payload.len() as u64;
-                grams_received_payload.extend_from_slice(&document.grams_received_bytes);
-
-                let grams_indexed_offset = grams_indexed_base + grams_indexed_payload.len() as u64;
-                grams_indexed_payload.extend_from_slice(&document.grams_indexed_bytes);
 
                 let (external_id_offset, external_id_len) =
                     if let Some(external_id) = document.external_id.as_deref() {
@@ -3045,10 +3020,10 @@ impl CandidateStore {
                     bloom_hashes: document.bloom_hashes.min(u8::MAX as usize) as u8,
                     bloom_offset,
                     bloom_len: document.bloom_filter.len() as u32,
-                    grams_received_offset,
-                    grams_received_count: document.grams_received_count as u32,
-                    grams_indexed_offset,
-                    grams_indexed_count: document.grams_indexed_count as u32,
+                    grams_received_offset: 0,
+                    grams_received_count: 0,
+                    grams_indexed_offset: 0,
+                    grams_indexed_count: 0,
                     external_id_offset,
                     external_id_len,
                     metadata_offset,
@@ -3078,8 +3053,8 @@ impl CandidateStore {
                     document.filter_bytes,
                     document.bloom_hashes,
                     document.bloom_filter.as_slice(),
-                    document.grams_received_count,
-                    document.grams_indexed_count,
+                    0,
+                    0,
                     document.grams_complete,
                 ));
             }
@@ -3091,12 +3066,6 @@ impl CandidateStore {
 
             let append_sidecars_started = Instant::now();
             self.append_writers.blooms.append(&blooms_payload)?;
-            self.append_writers
-                .grams_received
-                .append(&grams_received_payload)?;
-            self.append_writers
-                .grams_indexed
-                .append(&grams_indexed_payload)?;
             self.append_writers
                 .external_ids
                 .append(&external_ids_payload)?;
@@ -3508,28 +3477,6 @@ impl CandidateStore {
             row.grams_received_count,
             self.meta.exact_gram_bytes(),
             "grams_received",
-            doc.doc_id,
-        )
-    }
-
-    fn doc_received_bytes<'a>(&'a self, pos: usize) -> Result<Cow<'a, [u8]>> {
-        let doc = &self.docs[pos];
-        let row = self.doc_rows[pos];
-        self.sidecars.grams_received.read_bytes(
-            row.grams_received_offset,
-            row.grams_received_count as usize * self.meta.exact_gram_bytes(),
-            "grams_received",
-            doc.doc_id,
-        )
-    }
-
-    fn doc_indexed_bytes<'a>(&'a self, pos: usize) -> Result<Cow<'a, [u8]>> {
-        let doc = &self.docs[pos];
-        let row = self.doc_rows[pos];
-        self.sidecars.grams_indexed.read_bytes(
-            row.grams_indexed_offset,
-            row.grams_indexed_count as usize * self.meta.exact_gram_bytes(),
-            "grams_indexed",
             doc.doc_id,
         )
     }
@@ -5290,19 +5237,6 @@ fn append_df_count_unit_payload_with_writer(writer: &mut AppendFile, payload: &[
     Ok(())
 }
 
-fn extend_unit_df_payload_from_packed(
-    payload: &mut Vec<u8>,
-    packed_grams: &[u8],
-    gram_bytes: usize,
-) -> Result<()> {
-    if gram_bytes == 0 || packed_grams.len() % gram_bytes != 0 {
-        return Err(SspryError::from("Invalid packed exact gram payload."));
-    }
-    payload.reserve(packed_grams.len());
-    payload.extend_from_slice(packed_grams);
-    Ok(())
-}
-
 fn extend_unit_df_payload_from_values(payload: &mut Vec<u8>, grams: &[u64], gram_bytes: usize) {
     payload.reserve(grams.len() * gram_bytes);
     for gram in grams {
@@ -5589,17 +5523,6 @@ fn read_exact_gram_vec_from_path(
 ) -> Result<Vec<u64>> {
     let bytes = read_blob_from_path(path, offset, count as usize * gram_bytes, label, doc_id)?;
     let mut out = Vec::with_capacity(count as usize);
-    for chunk in bytes.chunks_exact(gram_bytes) {
-        out.push(decode_packed_exact_gram(chunk));
-    }
-    Ok(out)
-}
-
-fn decode_exact_gram_vec(bytes: &[u8], gram_bytes: usize) -> Result<Vec<u64>> {
-    if gram_bytes == 0 || bytes.len() % gram_bytes != 0 {
-        return Err(SspryError::from("Invalid packed exact gram payload."));
-    }
-    let mut out = Vec::with_capacity(bytes.len() / gram_bytes);
     for chunk in bytes.chunks_exact(gram_bytes) {
         out.push(decode_packed_exact_gram(chunk));
     }

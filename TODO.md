@@ -316,9 +316,9 @@ Removal phases:
    - done:
      - live bloom-only ingest no longer persists exact grams
      - empty `grams_received.bin` / `grams_indexed.bin` files are no longer materialized during compaction/import
+     - publish/import structs no longer carry gram payload bytes/counts through the live bloom-only path
      - dead tier1 exact-gram selection code has been removed
    - next:
-     - stop carrying gram payload fields through import/export paths when the row counts are zero
      - remove the gram sidecar plumbing entirely once no compatibility path still needs it
 4. CLI/test cutover
    - make bloom-only the documented/default ingest posture
