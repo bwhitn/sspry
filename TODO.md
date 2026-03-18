@@ -46,6 +46,39 @@ Current large-ingest baseline on `master`:
 - `50k` artifact root:
   - `/root/pertest/results/sspry_ingest_50000_20260316_doublebuf_reuse_r1`
 
+Pressure-publish/backpressure validation on local `master`:
+- valid `26k` pressure run:
+  - `/root/pertest/results/sspry_ingest_26000_20260317_pressure_r6`
+- tuned `50k` pressure validation:
+  - `/root/pertest/results/sspry_ingest_50000_20260317_pressure_r3`
+- current read:
+  - the tuned policy now does the right thing operationally:
+    - first pressure publish during active indexing is cheap and reuses work stores
+    - later active-session publish thresholds shrink to smaller chunks
+    - seal backlog blocks another pressure publish and converts into stronger ingest backpressure
+    - current tuned active-session republish thresholds are:
+      - `2048` docs
+      - `4 GiB` estimated input bytes
+  - validated large-run memory:
+    - `26k`: `peak_rss_kb = 9,971,436`
+    - `50k`: validated through `97.886%` with `peak_rss_kb = 9,851,628`
+  - validated `26k` timing:
+    - `total_ms = 725,760.387`
+    - `submit_ms = 335,424.167`
+    - `publish_runs_total = 2`
+  - validated `50k` behavior:
+    - `97.886%` sample:
+      - `submitted_documents = 48,943`
+      - `publish_runs_total = 2`
+      - `last_publish_imported_docs = 9,228`
+      - `index_backpressure_events_total = 687`
+      - `index_backpressure_sleep_ms_total = 54,350`
+      - `current_rss_kb = 9,184,488`
+    - the earlier `13 GiB` second-publish spike did not recur after the tighter republish thresholds
+  - operational follow-up:
+    - verbose remote index RSS reporting now uses the lightweight status endpoint instead of full stats
+    - the earlier `Resource temporarily unavailable (os error 11)` tail failure should be rechecked later on a full completed `50k`/larger run, but it is no longer blocking this pressure-policy tuning pass
+
 `26k` current system:
 - dataset:
   - files: `26,000`
@@ -97,6 +130,7 @@ Interpretation:
 - adaptive publish is currently backing off for ingest pressure on this workload, which is expected:
   - `adaptive_publish.mode = backoff`
   - `adaptive_publish.reason = submit_pressure_high`
+- with the tuned pressure policy, active-session publish/import can now stay under the practical memory envelope on `26k` and `50k`
 
 Operational notes:
 - the first-publish double-buffer reuse fix removed the pathological first-publish memory spike

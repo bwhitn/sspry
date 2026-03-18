@@ -414,9 +414,11 @@ fn index_queue_capacity(memory_budget_bytes: u64, workers: usize) -> usize {
 }
 
 fn server_memory_kb(connection: &ClientConnectionArgs) -> Result<Option<(u64, u64)>> {
-    let stats = rpc_client(connection).candidate_stats()?;
-    let current = stats.get("current_rss_kb").and_then(|value| value.as_u64());
-    let peak = stats.get("peak_rss_kb").and_then(|value| value.as_u64());
+    let status = rpc_client(connection).candidate_status()?;
+    let current = status
+        .get("current_rss_kb")
+        .and_then(|value| value.as_u64());
+    let peak = status.get("peak_rss_kb").and_then(|value| value.as_u64());
     Ok(match (current, peak) {
         (Some(current), Some(peak)) => Some((current, peak)),
         _ => None,

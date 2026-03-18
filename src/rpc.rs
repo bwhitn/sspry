@@ -390,6 +390,11 @@ struct ServerState {
     active_mutations: AtomicUsize,
     active_index_sessions: AtomicUsize,
     work_dirty: AtomicBool,
+    work_active_estimated_documents: AtomicU64,
+    work_active_estimated_input_bytes: AtomicU64,
+    index_backpressure_events_total: AtomicU64,
+    index_backpressure_sleep_ms_total: AtomicU64,
+    last_index_backpressure_delay_ms: AtomicU64,
     last_work_mutation_unix_ms: AtomicU64,
     index_session_total_documents: AtomicU64,
     index_session_submitted_documents: AtomicU64,
@@ -567,9 +572,37 @@ struct ActiveMutationGuard<'a> {
 struct PublishReadiness {
     eligible: bool,
     blocked_reason: &'static str,
+    trigger_mode: &'static str,
+    trigger_reason: &'static str,
     idle_elapsed_ms: u64,
     idle_threshold_ms: u64,
     idle_remaining_ms: u64,
+    work_buffer_estimated_documents: u64,
+    work_buffer_estimated_input_bytes: u64,
+    work_buffer_document_threshold: u64,
+    work_buffer_input_bytes_threshold: u64,
+    work_buffer_rss_threshold_bytes: u64,
+    current_rss_bytes: u64,
+    pressure_publish_blocked_by_seal_backlog: bool,
+    pending_df_snapshot_shards: u64,
+    pending_tier2_snapshot_shards: u64,
+    index_backpressure_delay_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkBufferPressure {
+    estimated_documents: u64,
+    estimated_input_bytes: u64,
+    current_rss_bytes: u64,
+    document_threshold: u64,
+    input_bytes_threshold: u64,
+    rss_threshold_bytes: u64,
+    pressure_triggered: bool,
+    trigger_reason: &'static str,
+    pressure_publish_blocked_by_seal_backlog: bool,
+    pending_df_snapshot_shards: u64,
+    pending_tier2_snapshot_shards: u64,
+    index_backpressure_delay_ms: u64,
 }
 
 const ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW: usize = 16;
@@ -584,6 +617,19 @@ const ADAPTIVE_PUBLISH_BACKOFF_STORE_MS: u64 = 4_000;
 const ADAPTIVE_PUBLISH_GROW_STEP_MS: u64 = 500;
 const ADAPTIVE_PUBLISH_SHRINK_STEP_MS: u64 = 100;
 const ADAPTIVE_PUBLISH_HEALTHY_CYCLES_TO_SHRINK: u64 = 3;
+const WORK_BUFFER_MIN_DOCUMENT_THRESHOLD: u64 = 64;
+const WORK_BUFFER_MAX_DOCUMENT_THRESHOLD: u64 = 12_500;
+const WORK_BUFFER_DOCUMENT_BUDGET_BYTES: u64 = 640 * 1024;
+const WORK_BUFFER_INPUT_BYTES_MULTIPLIER: u64 = 2;
+const WORK_BUFFER_MIN_INPUT_BYTES_THRESHOLD: u64 = 1 << 30;
+const WORK_BUFFER_REPUBLISH_MAX_DOCUMENT_THRESHOLD: u64 = 2_048;
+const WORK_BUFFER_REPUBLISH_INPUT_BYTES_DIVISOR: u64 = 4;
+const WORK_BUFFER_REPUBLISH_MIN_INPUT_BYTES_THRESHOLD: u64 = 4 << 30;
+const WORK_BUFFER_RSS_TRIGGER_NUMERATOR: u64 = 3;
+const WORK_BUFFER_RSS_TRIGGER_DENOMINATOR: u64 = 4;
+const INDEX_BACKPRESSURE_PUBLISH_DELAY_MS: u64 = 10;
+const INDEX_BACKPRESSURE_HEAVY_DELAY_MS: u64 = 50;
+const INDEX_BACKPRESSURE_BACKLOG_DELAY_MS: u64 = 100;
 
 #[derive(Clone, Debug)]
 struct AdaptivePublishSnapshot {
@@ -1730,6 +1776,10 @@ impl ServerState {
         let (store_mode, startup_cleanup_removed_roots, mut startup_profile) =
             ensure_candidate_stores(&config)?;
         startup_profile.total_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let startup_work_documents = match &store_mode {
+            StoreMode::Workspace { .. } => startup_profile.work.doc_count,
+            StoreMode::Direct { .. } => 0,
+        };
         let auto_publish_storage_class = config.auto_publish_storage_class.clone();
         let auto_publish_initial_idle_ms = config.auto_publish_initial_idle_ms;
         let candidate_shards = config.candidate_shards;
@@ -1744,6 +1794,11 @@ impl ServerState {
             active_mutations: AtomicUsize::new(0),
             active_index_sessions: AtomicUsize::new(0),
             work_dirty: AtomicBool::new(false),
+            work_active_estimated_documents: AtomicU64::new(startup_work_documents),
+            work_active_estimated_input_bytes: AtomicU64::new(0),
+            index_backpressure_events_total: AtomicU64::new(0),
+            index_backpressure_sleep_ms_total: AtomicU64::new(0),
+            last_index_backpressure_delay_ms: AtomicU64::new(0),
             last_work_mutation_unix_ms: AtomicU64::new(0),
             index_session_total_documents: AtomicU64::new(0),
             index_session_submitted_documents: AtomicU64::new(0),
@@ -2024,6 +2079,192 @@ impl ServerState {
     fn invalidate_published_stats_cache(&self) -> Result<()> {
         let published = self.published_store_set()?;
         published.invalidate_stats_cache()
+    }
+
+    fn work_buffer_document_threshold(&self) -> u64 {
+        let scaled = self
+            .config
+            .memory_budget_bytes
+            .checked_div(WORK_BUFFER_DOCUMENT_BUDGET_BYTES)
+            .unwrap_or(0);
+        scaled.clamp(
+            WORK_BUFFER_MIN_DOCUMENT_THRESHOLD,
+            WORK_BUFFER_MAX_DOCUMENT_THRESHOLD,
+        )
+    }
+
+    fn work_buffer_input_bytes_threshold(&self) -> u64 {
+        self.config
+            .memory_budget_bytes
+            .saturating_mul(WORK_BUFFER_INPUT_BYTES_MULTIPLIER)
+            .max(WORK_BUFFER_MIN_INPUT_BYTES_THRESHOLD)
+    }
+
+    fn work_buffer_rss_threshold_bytes(&self) -> u64 {
+        self.config
+            .memory_budget_bytes
+            .saturating_mul(WORK_BUFFER_RSS_TRIGGER_NUMERATOR)
+            / WORK_BUFFER_RSS_TRIGGER_DENOMINATOR
+    }
+
+    fn work_buffer_pressure_snapshot(
+        &self,
+        current_rss_bytes: u64,
+        pending_df_snapshot_shards: u64,
+        pending_tier2_snapshot_shards: u64,
+    ) -> WorkBufferPressure {
+        let estimated_documents = self.work_active_estimated_documents.load(Ordering::Acquire);
+        let estimated_input_bytes = self
+            .work_active_estimated_input_bytes
+            .load(Ordering::Acquire);
+        let active_index_sessions = self.active_index_sessions.load(Ordering::Acquire);
+        let publish_runs_total = self.publish_runs_total.load(Ordering::Acquire);
+        let mut document_threshold = self.work_buffer_document_threshold();
+        let mut input_bytes_threshold = self.work_buffer_input_bytes_threshold();
+        if active_index_sessions > 0 && publish_runs_total > 0 {
+            document_threshold =
+                document_threshold.min(WORK_BUFFER_REPUBLISH_MAX_DOCUMENT_THRESHOLD);
+            input_bytes_threshold = input_bytes_threshold.min(
+                (self
+                    .config
+                    .memory_budget_bytes
+                    .checked_div(WORK_BUFFER_REPUBLISH_INPUT_BYTES_DIVISOR)
+                    .unwrap_or(0))
+                .max(WORK_BUFFER_REPUBLISH_MIN_INPUT_BYTES_THRESHOLD),
+            );
+        }
+        let rss_threshold_bytes = self.work_buffer_rss_threshold_bytes();
+        let pressure_publish_blocked_by_seal_backlog =
+            pending_df_snapshot_shards > 0 || pending_tier2_snapshot_shards > 0;
+        let pressure_triggered = estimated_documents >= document_threshold
+            || estimated_input_bytes >= input_bytes_threshold
+            || current_rss_bytes >= rss_threshold_bytes;
+        let trigger_reason = if estimated_documents >= document_threshold {
+            "work_document_threshold"
+        } else if estimated_input_bytes >= input_bytes_threshold {
+            "work_input_bytes_threshold"
+        } else if current_rss_bytes >= rss_threshold_bytes {
+            "rss_threshold"
+        } else {
+            "idle_window"
+        };
+        let index_backpressure_delay_ms = if self.active_index_sessions.load(Ordering::Acquire) == 0
+        {
+            0
+        } else if pressure_triggered && pressure_publish_blocked_by_seal_backlog {
+            INDEX_BACKPRESSURE_BACKLOG_DELAY_MS
+        } else if self.publish_in_progress.load(Ordering::Acquire) {
+            if estimated_documents >= document_threshold
+                || estimated_input_bytes >= input_bytes_threshold
+                || current_rss_bytes >= rss_threshold_bytes
+            {
+                INDEX_BACKPRESSURE_HEAVY_DELAY_MS
+            } else {
+                INDEX_BACKPRESSURE_PUBLISH_DELAY_MS
+            }
+        } else if self.publish_requested.load(Ordering::Acquire)
+            || self.mutations_paused.load(Ordering::Acquire)
+            || pressure_triggered
+        {
+            INDEX_BACKPRESSURE_PUBLISH_DELAY_MS
+        } else {
+            0
+        };
+        WorkBufferPressure {
+            estimated_documents,
+            estimated_input_bytes,
+            current_rss_bytes,
+            document_threshold,
+            input_bytes_threshold,
+            rss_threshold_bytes,
+            pressure_triggered,
+            trigger_reason,
+            pressure_publish_blocked_by_seal_backlog,
+            pending_df_snapshot_shards,
+            pending_tier2_snapshot_shards,
+            index_backpressure_delay_ms,
+        }
+    }
+
+    fn record_work_buffer_growth(&self, inserted_documents: u64, inserted_input_bytes: u64) {
+        if !self.config.workspace_mode {
+            return;
+        }
+        if inserted_documents > 0 {
+            self.work_active_estimated_documents
+                .fetch_add(inserted_documents, Ordering::SeqCst);
+        }
+        if inserted_input_bytes > 0 {
+            self.work_active_estimated_input_bytes
+                .fetch_add(inserted_input_bytes, Ordering::SeqCst);
+        }
+    }
+
+    fn reset_work_buffer_estimates(&self) {
+        self.work_active_estimated_documents
+            .store(0, Ordering::SeqCst);
+        self.work_active_estimated_input_bytes
+            .store(0, Ordering::SeqCst);
+    }
+
+    fn maybe_apply_index_backpressure(&self, batch_documents: usize, batch_input_bytes: u64) {
+        if !self.config.workspace_mode || batch_documents == 0 {
+            self.last_index_backpressure_delay_ms
+                .store(0, Ordering::SeqCst);
+            return;
+        }
+        let adaptive = self.adaptive_publish_snapshot_or_default(current_unix_ms());
+        let (current_rss_kb, _) = current_process_memory_kb();
+        let mut pressure = self.work_buffer_pressure_snapshot(
+            current_rss_kb
+                .saturating_mul(1024)
+                .try_into()
+                .unwrap_or(u64::MAX),
+            adaptive.df_pending_shards,
+            adaptive.tier2_pending_shards,
+        );
+        pressure.estimated_documents = pressure
+            .estimated_documents
+            .saturating_add(batch_documents as u64);
+        pressure.estimated_input_bytes = pressure
+            .estimated_input_bytes
+            .saturating_add(batch_input_bytes);
+        let delay_ms = if self.active_index_sessions.load(Ordering::Acquire) == 0 {
+            0
+        } else if pressure.pressure_publish_blocked_by_seal_backlog
+            && (pressure.estimated_documents >= pressure.document_threshold
+                || pressure.estimated_input_bytes >= pressure.input_bytes_threshold)
+        {
+            INDEX_BACKPRESSURE_BACKLOG_DELAY_MS
+        } else if self.publish_in_progress.load(Ordering::Acquire) {
+            if pressure.estimated_documents >= pressure.document_threshold
+                || pressure.estimated_input_bytes >= pressure.input_bytes_threshold
+                || pressure.current_rss_bytes >= pressure.rss_threshold_bytes
+            {
+                INDEX_BACKPRESSURE_HEAVY_DELAY_MS
+            } else {
+                INDEX_BACKPRESSURE_PUBLISH_DELAY_MS
+            }
+        } else if self.publish_requested.load(Ordering::Acquire)
+            || self.mutations_paused.load(Ordering::Acquire)
+            || pressure.estimated_documents >= pressure.document_threshold
+            || pressure.estimated_input_bytes >= pressure.input_bytes_threshold
+            || pressure.current_rss_bytes >= pressure.rss_threshold_bytes
+        {
+            INDEX_BACKPRESSURE_PUBLISH_DELAY_MS
+        } else {
+            0
+        };
+        self.last_index_backpressure_delay_ms
+            .store(delay_ms, Ordering::SeqCst);
+        if delay_ms == 0 {
+            return;
+        }
+        self.index_backpressure_events_total
+            .fetch_add(1, Ordering::SeqCst);
+        self.index_backpressure_sleep_ms_total
+            .fetch_add(delay_ms, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(delay_ms));
     }
 
     fn enqueue_published_df_snapshot_shards<I>(&self, shard_indexes: I) -> Result<()>
@@ -2965,7 +3206,24 @@ impl ServerState {
         let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
         let idle_threshold_ms = adaptive.current_idle_ms;
         let idle_remaining_ms = idle_threshold_ms.saturating_sub(idle_elapsed_ms);
-        let eligible = self.config.workspace_mode
+        let (current_rss_kb, _) = current_process_memory_kb();
+        let pressure = self.work_buffer_pressure_snapshot(
+            current_rss_kb
+                .saturating_mul(1024)
+                .try_into()
+                .unwrap_or(u64::MAX),
+            adaptive.df_pending_shards,
+            adaptive.tier2_pending_shards,
+        );
+        let pressure_eligible = self.config.workspace_mode
+            && work_dirty
+            && active_mutations == 0
+            && !publish_requested
+            && !publish_in_progress
+            && !mutations_paused
+            && !pressure.pressure_publish_blocked_by_seal_backlog
+            && pressure.pressure_triggered;
+        let idle_eligible = self.config.workspace_mode
             && work_dirty
             && active_index_sessions == 0
             && active_mutations == 0
@@ -2974,8 +3232,11 @@ impl ServerState {
             && !mutations_paused
             && last_mutation != 0
             && idle_elapsed_ms >= idle_threshold_ms;
+        let eligible = pressure_eligible || idle_eligible;
         let blocked_reason = if !self.config.workspace_mode {
             "workspace_disabled"
+        } else if pressure_eligible || idle_eligible {
+            "ready"
         } else if !work_dirty {
             "work_clean"
         } else if publish_requested {
@@ -2984,6 +3245,12 @@ impl ServerState {
             "publish_in_progress"
         } else if mutations_paused {
             "mutations_paused"
+        } else if pressure.pressure_triggered && pressure.pressure_publish_blocked_by_seal_backlog {
+            "seal_backlog_present"
+        } else if pressure.pressure_triggered && active_mutations > 0 {
+            "active_mutations"
+        } else if pressure.pressure_triggered {
+            "pressure_threshold"
         } else if active_index_sessions > 0 {
             "active_index_sessions"
         } else if active_mutations > 0 {
@@ -2998,9 +3265,32 @@ impl ServerState {
         PublishReadiness {
             eligible,
             blocked_reason,
+            trigger_mode: if pressure_eligible {
+                "pressure"
+            } else if idle_eligible {
+                "idle"
+            } else {
+                "blocked"
+            },
+            trigger_reason: if pressure.pressure_triggered {
+                pressure.trigger_reason
+            } else {
+                adaptive.reason
+            },
             idle_elapsed_ms,
             idle_threshold_ms,
             idle_remaining_ms,
+            work_buffer_estimated_documents: pressure.estimated_documents,
+            work_buffer_estimated_input_bytes: pressure.estimated_input_bytes,
+            work_buffer_document_threshold: pressure.document_threshold,
+            work_buffer_input_bytes_threshold: pressure.input_bytes_threshold,
+            work_buffer_rss_threshold_bytes: pressure.rss_threshold_bytes,
+            current_rss_bytes: pressure.current_rss_bytes,
+            pressure_publish_blocked_by_seal_backlog: pressure
+                .pressure_publish_blocked_by_seal_backlog,
+            pending_df_snapshot_shards: pressure.pending_df_snapshot_shards,
+            pending_tier2_snapshot_shards: pressure.pending_tier2_snapshot_shards,
+            index_backpressure_delay_ms: pressure.index_backpressure_delay_ms,
         }
     }
 
@@ -3385,6 +3675,65 @@ impl ServerState {
             publish.insert(
                 "adaptive_storage_class".to_owned(),
                 Value::String(adaptive.storage_class),
+            );
+            publish.insert(
+                "trigger_mode".to_owned(),
+                Value::String(readiness.trigger_mode.to_owned()),
+            );
+            publish.insert(
+                "trigger_reason".to_owned(),
+                Value::String(readiness.trigger_reason.to_owned()),
+            );
+            publish.insert(
+                "work_buffer_estimated_documents".to_owned(),
+                json!(readiness.work_buffer_estimated_documents),
+            );
+            publish.insert(
+                "work_buffer_estimated_input_bytes".to_owned(),
+                json!(readiness.work_buffer_estimated_input_bytes),
+            );
+            publish.insert(
+                "work_buffer_document_threshold".to_owned(),
+                json!(readiness.work_buffer_document_threshold),
+            );
+            publish.insert(
+                "work_buffer_input_bytes_threshold".to_owned(),
+                json!(readiness.work_buffer_input_bytes_threshold),
+            );
+            publish.insert(
+                "work_buffer_rss_threshold_bytes".to_owned(),
+                json!(readiness.work_buffer_rss_threshold_bytes),
+            );
+            publish.insert(
+                "current_rss_bytes".to_owned(),
+                json!(readiness.current_rss_bytes),
+            );
+            publish.insert(
+                "pressure_publish_blocked_by_seal_backlog".to_owned(),
+                json!(readiness.pressure_publish_blocked_by_seal_backlog),
+            );
+            publish.insert(
+                "pending_df_snapshot_shards".to_owned(),
+                json!(readiness.pending_df_snapshot_shards),
+            );
+            publish.insert(
+                "pending_tier2_snapshot_shards".to_owned(),
+                json!(readiness.pending_tier2_snapshot_shards),
+            );
+            publish.insert(
+                "index_backpressure_delay_ms".to_owned(),
+                json!(readiness.index_backpressure_delay_ms),
+            );
+            publish.insert(
+                "index_backpressure_events_total".to_owned(),
+                json!(self.index_backpressure_events_total.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "index_backpressure_sleep_ms_total".to_owned(),
+                json!(
+                    self.index_backpressure_sleep_ms_total
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "adaptive_recent_publish_p95_ms".to_owned(),
@@ -3829,49 +4178,276 @@ impl ServerState {
                 "work_root".to_owned(),
                 Value::String(work_root.display().to_string()),
             );
-            stats.insert(
-                "publish".to_owned(),
-                json!({
-                    "pending": self.work_dirty.load(Ordering::Acquire),
-                    "eligible": readiness.eligible,
-                    "blocked_reason": readiness.blocked_reason,
-                    "idle_elapsed_ms": readiness.idle_elapsed_ms,
-                    "idle_remaining_ms": readiness.idle_remaining_ms,
-                    "retired_published_root_count": retired_published_root_count,
-                    "retired_published_disk_usage_bytes": retired_published_disk_usage_bytes,
-                    "retired_published_roots_to_keep": DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP as u64,
-                    "last_publish_started_unix_ms": self.last_publish_started_unix_ms.load(Ordering::Acquire),
-                    "last_publish_completed_unix_ms": self.last_publish_completed_unix_ms.load(Ordering::Acquire),
-                    "last_publish_duration_ms": self.last_publish_duration_ms.load(Ordering::Acquire),
-                    "last_publish_swap_ms": self.last_publish_swap_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_ms": self.last_publish_promote_work_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_export_ms": self.last_publish_promote_work_export_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_ms": self.last_publish_promote_work_import_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_classify_ms": self.last_publish_promote_work_import_classify_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_apply_df_counts_ms": self.last_publish_promote_work_import_apply_df_counts_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_build_payloads_ms": self.last_publish_promote_work_import_build_payloads_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_append_sidecars_ms": self.last_publish_promote_work_import_append_sidecars_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_install_docs_ms": self.last_publish_promote_work_import_install_docs_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_tier2_update_ms": self.last_publish_promote_work_import_tier2_update_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_persist_meta_ms": self.last_publish_promote_work_import_persist_meta_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_append_df_delta_ms": self.last_publish_promote_work_import_append_df_delta_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_compact_df_counts_ms": self.last_publish_promote_work_import_compact_df_counts_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_import_rebalance_tier2_ms": self.last_publish_promote_work_import_rebalance_tier2_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_remove_work_root_ms": self.last_publish_promote_work_remove_work_root_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_other_ms": self.last_publish_promote_work_other_ms.load(Ordering::Acquire),
-                    "last_publish_promote_work_imported_docs": self.last_publish_promote_work_imported_docs.load(Ordering::Acquire),
-                    "last_publish_promote_work_imported_shards": self.last_publish_promote_work_imported_shards.load(Ordering::Acquire),
-                    "last_publish_persist_df_counts_ms": self.last_publish_persist_df_counts_ms.load(Ordering::Acquire),
-                    "last_publish_df_snapshot_persist_failures": self.last_publish_df_snapshot_persist_failures.load(Ordering::Acquire),
-                    "last_publish_init_work_ms": self.last_publish_init_work_ms.load(Ordering::Acquire),
-                    "last_publish_persist_tier2_superblocks_ms": self.last_publish_persist_tier2_superblocks_ms.load(Ordering::Acquire),
-                    "last_publish_tier2_snapshot_persist_failures": self.last_publish_tier2_snapshot_persist_failures.load(Ordering::Acquire),
-                    "last_publish_persisted_snapshot_shards": self.last_publish_persisted_snapshot_shards.load(Ordering::Acquire),
-                    "last_publish_reused_work_stores": self.last_publish_reused_work_stores.load(Ordering::Acquire),
-                    "publish_runs_total": self.publish_runs_total.load(Ordering::Acquire),
-                    "observed_at_unix_ms": now_unix_ms,
-                }),
+            let mut publish = Map::new();
+            publish.insert(
+                "pending".to_owned(),
+                json!(self.work_dirty.load(Ordering::Acquire)),
             );
+            publish.insert("eligible".to_owned(), json!(readiness.eligible));
+            publish.insert(
+                "blocked_reason".to_owned(),
+                Value::String(readiness.blocked_reason.to_owned()),
+            );
+            publish.insert(
+                "trigger_mode".to_owned(),
+                Value::String(readiness.trigger_mode.to_owned()),
+            );
+            publish.insert(
+                "trigger_reason".to_owned(),
+                Value::String(readiness.trigger_reason.to_owned()),
+            );
+            publish.insert(
+                "idle_elapsed_ms".to_owned(),
+                json!(readiness.idle_elapsed_ms),
+            );
+            publish.insert(
+                "idle_remaining_ms".to_owned(),
+                json!(readiness.idle_remaining_ms),
+            );
+            publish.insert(
+                "work_buffer_estimated_documents".to_owned(),
+                json!(readiness.work_buffer_estimated_documents),
+            );
+            publish.insert(
+                "work_buffer_estimated_input_bytes".to_owned(),
+                json!(readiness.work_buffer_estimated_input_bytes),
+            );
+            publish.insert(
+                "work_buffer_document_threshold".to_owned(),
+                json!(readiness.work_buffer_document_threshold),
+            );
+            publish.insert(
+                "work_buffer_input_bytes_threshold".to_owned(),
+                json!(readiness.work_buffer_input_bytes_threshold),
+            );
+            publish.insert(
+                "work_buffer_rss_threshold_bytes".to_owned(),
+                json!(readiness.work_buffer_rss_threshold_bytes),
+            );
+            publish.insert(
+                "current_rss_bytes".to_owned(),
+                json!(readiness.current_rss_bytes),
+            );
+            publish.insert(
+                "pressure_publish_blocked_by_seal_backlog".to_owned(),
+                json!(readiness.pressure_publish_blocked_by_seal_backlog),
+            );
+            publish.insert(
+                "pending_df_snapshot_shards".to_owned(),
+                json!(readiness.pending_df_snapshot_shards),
+            );
+            publish.insert(
+                "pending_tier2_snapshot_shards".to_owned(),
+                json!(readiness.pending_tier2_snapshot_shards),
+            );
+            publish.insert(
+                "index_backpressure_delay_ms".to_owned(),
+                json!(readiness.index_backpressure_delay_ms),
+            );
+            publish.insert(
+                "index_backpressure_events_total".to_owned(),
+                json!(self.index_backpressure_events_total.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "index_backpressure_sleep_ms_total".to_owned(),
+                json!(
+                    self.index_backpressure_sleep_ms_total
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "retired_published_root_count".to_owned(),
+                json!(retired_published_root_count),
+            );
+            publish.insert(
+                "retired_published_disk_usage_bytes".to_owned(),
+                json!(retired_published_disk_usage_bytes),
+            );
+            publish.insert(
+                "retired_published_roots_to_keep".to_owned(),
+                json!(DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP as u64),
+            );
+            publish.insert(
+                "last_publish_started_unix_ms".to_owned(),
+                json!(self.last_publish_started_unix_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_completed_unix_ms".to_owned(),
+                json!(self.last_publish_completed_unix_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_duration_ms".to_owned(),
+                json!(self.last_publish_duration_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_swap_ms".to_owned(),
+                json!(self.last_publish_swap_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_promote_work_ms".to_owned(),
+                json!(self.last_publish_promote_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_promote_work_export_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_export_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_classify_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_classify_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_apply_df_counts_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_apply_df_counts_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_build_payloads_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_build_payloads_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_append_sidecars_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_append_sidecars_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_install_docs_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_install_docs_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_tier2_update_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_tier2_update_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_persist_meta_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_persist_meta_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_append_df_delta_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_append_df_delta_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_compact_df_counts_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_compact_df_counts_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_import_rebalance_tier2_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_import_rebalance_tier2_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_remove_work_root_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_remove_work_root_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_other_ms".to_owned(),
+                json!(
+                    self.last_publish_promote_work_other_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_imported_docs".to_owned(),
+                json!(
+                    self.last_publish_promote_work_imported_docs
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_promote_work_imported_shards".to_owned(),
+                json!(
+                    self.last_publish_promote_work_imported_shards
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_persist_df_counts_ms".to_owned(),
+                json!(
+                    self.last_publish_persist_df_counts_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_df_snapshot_persist_failures".to_owned(),
+                json!(
+                    self.last_publish_df_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_init_work_ms".to_owned(),
+                json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_persist_tier2_superblocks_ms".to_owned(),
+                json!(
+                    self.last_publish_persist_tier2_superblocks_ms
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_tier2_snapshot_persist_failures".to_owned(),
+                json!(
+                    self.last_publish_tier2_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_persisted_snapshot_shards".to_owned(),
+                json!(
+                    self.last_publish_persisted_snapshot_shards
+                        .load(Ordering::Acquire)
+                ),
+            );
+            publish.insert(
+                "last_publish_reused_work_stores".to_owned(),
+                json!(self.last_publish_reused_work_stores.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "publish_runs_total".to_owned(),
+                json!(self.publish_runs_total.load(Ordering::Acquire)),
+            );
+            publish.insert("observed_at_unix_ms".to_owned(), json!(now_unix_ms));
+            stats.insert("publish".to_owned(), Value::Object(publish));
             stats.insert(
                 "published_df_snapshot_seal".to_owned(),
                 json!({
@@ -4469,6 +5045,7 @@ impl ServerState {
         document: &CandidateDocumentWire,
     ) -> Result<CandidateInsertResponse> {
         let _scope = scope("rpc.handle_candidate_insert");
+        self.maybe_apply_index_backpressure(1, document.file_size);
         let _mutation = self.begin_mutation("insert")?;
         let _op = if self.mutation_affects_published_queries()? {
             Some(
@@ -4504,6 +5081,7 @@ impl ServerState {
         )?;
         drop(store);
         self.mark_work_mutation();
+        self.record_work_buffer_growth(1, document.file_size);
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
         }
@@ -4516,6 +5094,11 @@ impl ServerState {
         documents: &[CandidateDocumentWire],
     ) -> Result<CandidateInsertBatchResponse> {
         let _scope = scope("rpc.handle_candidate_insert_batch");
+        let batch_input_bytes = documents
+            .iter()
+            .map(|document| document.file_size)
+            .sum::<u64>();
+        self.maybe_apply_index_backpressure(documents.len(), batch_input_bytes);
         let _mutation = self.begin_mutation("insert batch")?;
         let _op = if self.mutation_affects_published_queries()? {
             Some(
@@ -4602,10 +5185,9 @@ impl ServerState {
             store_profile_total.classify_df_lookup_segment_rows_examined = store_profile_total
                 .classify_df_lookup_segment_rows_examined
                 .saturating_add(store_profile.classify_df_lookup_segment_rows_examined);
-            store_profile_total.classify_df_lookup_segment_point_lookups =
-                store_profile_total
-                    .classify_df_lookup_segment_point_lookups
-                    .saturating_add(store_profile.classify_df_lookup_segment_point_lookups);
+            store_profile_total.classify_df_lookup_segment_point_lookups = store_profile_total
+                .classify_df_lookup_segment_point_lookups
+                .saturating_add(store_profile.classify_df_lookup_segment_point_lookups);
             store_profile_total.classify_df_lookup_delta_lookups = store_profile_total
                 .classify_df_lookup_delta_lookups
                 .saturating_add(store_profile.classify_df_lookup_delta_lookups);
@@ -4804,33 +5386,21 @@ impl ServerState {
                 store_profile_total.classify_df_lookup_us = store_profile_total
                     .classify_df_lookup_us
                     .saturating_add(store_profile.classify_df_lookup_us);
-                store_profile_total.classify_df_lookup_snapshot_rows_examined =
-                    store_profile_total
-                        .classify_df_lookup_snapshot_rows_examined
-                        .saturating_add(
-                            store_profile.classify_df_lookup_snapshot_rows_examined,
-                        );
-                store_profile_total.classify_df_lookup_snapshot_point_lookups =
-                    store_profile_total
-                        .classify_df_lookup_snapshot_point_lookups
-                        .saturating_add(
-                            store_profile.classify_df_lookup_snapshot_point_lookups,
-                        );
+                store_profile_total.classify_df_lookup_snapshot_rows_examined = store_profile_total
+                    .classify_df_lookup_snapshot_rows_examined
+                    .saturating_add(store_profile.classify_df_lookup_snapshot_rows_examined);
+                store_profile_total.classify_df_lookup_snapshot_point_lookups = store_profile_total
+                    .classify_df_lookup_snapshot_point_lookups
+                    .saturating_add(store_profile.classify_df_lookup_snapshot_point_lookups);
                 store_profile_total.classify_df_lookup_segment_visits = store_profile_total
                     .classify_df_lookup_segment_visits
                     .saturating_add(store_profile.classify_df_lookup_segment_visits);
-                store_profile_total.classify_df_lookup_segment_rows_examined =
-                    store_profile_total
-                        .classify_df_lookup_segment_rows_examined
-                        .saturating_add(
-                            store_profile.classify_df_lookup_segment_rows_examined,
-                        );
-                store_profile_total.classify_df_lookup_segment_point_lookups =
-                    store_profile_total
-                        .classify_df_lookup_segment_point_lookups
-                        .saturating_add(
-                            store_profile.classify_df_lookup_segment_point_lookups,
-                        );
+                store_profile_total.classify_df_lookup_segment_rows_examined = store_profile_total
+                    .classify_df_lookup_segment_rows_examined
+                    .saturating_add(store_profile.classify_df_lookup_segment_rows_examined);
+                store_profile_total.classify_df_lookup_segment_point_lookups = store_profile_total
+                    .classify_df_lookup_segment_point_lookups
+                    .saturating_add(store_profile.classify_df_lookup_segment_point_lookups);
                 store_profile_total.classify_df_lookup_delta_lookups = store_profile_total
                     .classify_df_lookup_delta_lookups
                     .saturating_add(store_profile.classify_df_lookup_delta_lookups);
@@ -4983,6 +5553,7 @@ impl ServerState {
         let results = results.into_iter().flatten().collect::<Vec<_>>();
         if !results.is_empty() {
             self.mark_work_mutation();
+            self.record_work_buffer_growth(results.len() as u64, batch_input_bytes);
         }
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
@@ -5307,6 +5878,7 @@ impl ServerState {
                 )
             };
             self.work_dirty.store(false, Ordering::SeqCst);
+            self.reset_work_buffer_estimates();
             self.last_work_mutation_unix_ms.store(0, Ordering::SeqCst);
             self.mutations_paused.store(false, Ordering::SeqCst);
             let publish_shard_count = self.candidate_shard_count();
@@ -6504,6 +7076,18 @@ mod tests {
     }
 
     fn sample_workspace_server_state(base: &Path, candidate_shards: usize) -> Arc<ServerState> {
+        sample_workspace_server_state_with_budget(
+            base,
+            candidate_shards,
+            crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+        )
+    }
+
+    fn sample_workspace_server_state_with_budget(
+        base: &Path,
+        candidate_shards: usize,
+        memory_budget_bytes: u64,
+    ) -> Arc<ServerState> {
         Arc::new(
             ServerState::new(
                 ServerConfig {
@@ -6513,7 +7097,7 @@ mod tests {
                     },
                     candidate_shards,
                     search_workers: 1,
-                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    memory_budget_bytes,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
@@ -7375,6 +7959,158 @@ mod tests {
     }
 
     #[test]
+    fn publish_readiness_switches_to_pressure_mode_with_active_index_session() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.work_dirty.store(true, Ordering::SeqCst);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        state
+            .work_active_estimated_documents
+            .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
+        state
+            .last_work_mutation_unix_ms
+            .store(current_unix_ms(), Ordering::SeqCst);
+
+        let readiness = state.publish_readiness(current_unix_ms());
+        assert!(readiness.eligible);
+        assert_eq!(readiness.blocked_reason, "ready");
+        assert_eq!(readiness.trigger_mode, "pressure");
+        assert_eq!(readiness.trigger_reason, "work_document_threshold");
+    }
+
+    #[test]
+    fn auto_publish_pressure_mode_rotates_work_even_with_active_index_session() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let sample = tmp.path().join("pressure-publish.bin");
+        fs::write(&sample, b"xxABCDyy").expect("sample");
+        let features = crate::candidate::scan_file_features(
+            &sample, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+        )
+        .expect("features");
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(features.sha256),
+                file_size: features.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features.bloom_filter),
+                gram_count_estimate: None,
+                bloom_hashes: Some(7),
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: features.unique_grams,
+                grams_complete: !features.unique_grams_truncated,
+                effective_diversity: None,
+                metadata_b64: None,
+                external_id: Some("pressure-doc".to_owned()),
+            })
+            .expect("insert doc");
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        state
+            .work_active_estimated_documents
+            .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
+        state.run_auto_publish_cycle().expect("pressure publish");
+
+        let stats = state.current_stats_json().expect("stats");
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(1),);
+        assert_eq!(
+            stats
+                .get("publish")
+                .and_then(Value::as_object)
+                .and_then(|publish| publish.get("publish_runs_total"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats
+                .get("work")
+                .and_then(Value::as_object)
+                .and_then(|work| work.get("doc_count"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn publish_in_progress_enables_insert_backpressure() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state_with_budget(tmp.path(), 1, 32 * 1024 * 1024);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        state.publish_in_progress.store(true, Ordering::SeqCst);
+        state
+            .work_active_estimated_documents
+            .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
+        let pressure = state.work_buffer_pressure_snapshot(0, 0, 0);
+        assert_eq!(
+            pressure.index_backpressure_delay_ms,
+            INDEX_BACKPRESSURE_HEAVY_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn publish_readiness_blocks_pressure_publish_when_seal_backlog_exists() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.work_dirty.store(true, Ordering::SeqCst);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        state
+            .work_active_estimated_documents
+            .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
+        state
+            .last_work_mutation_unix_ms
+            .store(current_unix_ms(), Ordering::SeqCst);
+        state
+            .enqueue_published_df_snapshot_shards([0usize])
+            .expect("enqueue df shard");
+
+        let readiness = state.publish_readiness(current_unix_ms());
+        assert!(!readiness.eligible);
+        assert_eq!(readiness.blocked_reason, "seal_backlog_present");
+        assert!(readiness.pressure_publish_blocked_by_seal_backlog);
+        assert_eq!(readiness.pending_df_snapshot_shards, 1);
+    }
+
+    #[test]
+    fn seal_backlog_pressure_enables_stronger_insert_backpressure() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state_with_budget(tmp.path(), 1, 32 * 1024 * 1024);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        state
+            .work_active_estimated_documents
+            .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
+        state
+            .enqueue_published_df_snapshot_shards([0usize])
+            .expect("enqueue df shard");
+
+        let pressure = state.work_buffer_pressure_snapshot(0, 1, 0);
+        assert!(pressure.pressure_publish_blocked_by_seal_backlog);
+        assert_eq!(
+            pressure.index_backpressure_delay_ms,
+            INDEX_BACKPRESSURE_BACKLOG_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn pressure_thresholds_shrink_after_first_publish_during_active_index() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        state.active_index_sessions.store(1, Ordering::SeqCst);
+        state.publish_runs_total.store(1, Ordering::SeqCst);
+
+        let pressure = state.work_buffer_pressure_snapshot(0, 0, 0);
+        assert_eq!(
+            pressure.document_threshold,
+            WORK_BUFFER_REPUBLISH_MAX_DOCUMENT_THRESHOLD
+        );
+        assert_eq!(
+            pressure.input_bytes_threshold,
+            WORK_BUFFER_REPUBLISH_MIN_INPUT_BYTES_THRESHOLD
+        );
+    }
+
+    #[test]
     fn workspace_publish_merges_incremental_work_into_published_root() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -7624,6 +8360,18 @@ mod tests {
     }
 
     fn start_tcp_workspace_server(base: &Path, candidate_shards: usize) -> ClientConfig {
+        start_tcp_workspace_server_with_budget(
+            base,
+            candidate_shards,
+            crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+        )
+    }
+
+    fn start_tcp_workspace_server_with_budget(
+        base: &Path,
+        candidate_shards: usize,
+        memory_budget_bytes: u64,
+    ) -> ClientConfig {
         let probe = TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind probe");
         let port = probe.local_addr().expect("probe addr").port();
         drop(probe);
@@ -7641,7 +8389,7 @@ mod tests {
                     },
                     candidate_shards,
                     search_workers: 1,
-                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    memory_budget_bytes,
                     tier2_superblock_budget_divisor:
                         crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
@@ -8251,6 +8999,79 @@ mod tests {
             .expect("query published doc c");
         assert_eq!(query_c_after.total_candidates, 1);
 
+        assert_eq!(client.shutdown().expect("shutdown"), "shutdown requested");
+    }
+
+    #[test]
+    fn workspace_auto_publish_rotates_work_buffers_under_pressure() {
+        let tmp = tempdir().expect("tmp");
+        let config = start_tcp_workspace_server_with_budget(tmp.path(), 1, 32 * 1024 * 1024);
+        let client = SspryClient::new(config.clone());
+        let mut persistent = client.connect_persistent().expect("connect persistent");
+        assert_eq!(
+            persistent
+                .begin_index_session()
+                .expect("begin index session"),
+            "index session started"
+        );
+
+        let mut rows = Vec::new();
+        for idx in 0..80u32 {
+            let path = tmp.path().join(format!("pressure-{idx:04}.bin"));
+            let bytes = format!("doc-{idx:04}-ABCD-{idx:04}").into_bytes();
+            let wire = candidate_document_wire_from_bytes(&path, &bytes);
+            rows.push(serde_json::to_vec(&wire).expect("serialize row"));
+        }
+
+        let inserted = persistent
+            .candidate_insert_batch_serialized_rows(&rows[..40])
+            .expect("insert first pressure batch");
+        assert_eq!(inserted.inserted_count, 40);
+        let inserted = persistent
+            .candidate_insert_batch_serialized_rows(&rows[40..])
+            .expect("insert second pressure batch");
+        assert_eq!(inserted.inserted_count, 40);
+
+        let status_client = SspryClient::new(config.clone());
+        let wait_started = Instant::now();
+        loop {
+            let status = status_client.candidate_status().expect("candidate status");
+            if status
+                .get("publish")
+                .and_then(Value::as_object)
+                .and_then(|publish| publish.get("publish_runs_total"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                >= 1
+            {
+                let trigger_mode = status
+                    .get("publish")
+                    .and_then(Value::as_object)
+                    .and_then(|publish| publish.get("trigger_mode"))
+                    .and_then(Value::as_str);
+                assert!(matches!(trigger_mode, Some("pressure") | Some("blocked")));
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(10),
+                "pressure-triggered publish did not complete"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let extra = candidate_document_wire_from_bytes(
+            &tmp.path().join("pressure-extra.bin"),
+            b"doc-extra-LMNO",
+        );
+        let extra_row = serde_json::to_vec(&extra).expect("serialize extra row");
+        let inserted = persistent
+            .candidate_insert_batch_serialized_rows(&[extra_row])
+            .expect("insert after pressure publish");
+        assert_eq!(inserted.inserted_count, 1);
+        assert_eq!(
+            persistent.end_index_session().expect("end index session"),
+            "index session finished"
+        );
         assert_eq!(client.shutdown().expect("shutdown"), "shutdown requested");
     }
 
