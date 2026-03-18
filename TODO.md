@@ -53,6 +53,9 @@ Current baseline:
   - `search --verify`
   - `delete` the matching file path
   - assert the published search path immediately stops returning that verified match
+  - note:
+    - delete applies directly to the published store and the active work store
+    - it does not wait for a second publish cycle
 
 - Full-corpus run `r6` on `4cbcd5a` was rejected and stopped at `30,981 / 260,278` docs (`11.90%`).
 - Grouped DF segment lookups regressed into very large exact local scans:
