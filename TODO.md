@@ -19,6 +19,7 @@ Current baseline:
   - live duplicate/import timing metrics are renamed from `classify_*` to `resolve_doc_state_*`
   - the dead `ENABLE_PRESSURE_PUBLISH = false` gate is removed; live backpressure/pressure telemetry remains
   - bloom sizing no longer carries the dead `filter_size_divisor` parameter or its hardcoded `= 1` constants
+  - the old test-only `scan_file_features_bloom_only()` convenience wrapper is removed; tests use the explicit gram-size scanner entrypoint now
 - `features.rs` status:
   - default ingest is on the bloom-only scanner path
   - production `DocumentFeatures` no longer exposes the retired gram-era fields

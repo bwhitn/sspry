@@ -5,9 +5,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::candidate::BloomFilter;
-use crate::candidate::grams::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
-};
+use crate::candidate::grams::{GramSizes, pack_exact_gram};
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
 
@@ -20,12 +18,6 @@ pub struct DocumentFeatures {
     pub file_size: u64,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
-}
-
-impl DocumentFeatures {
-    pub fn sha256_hex(&self) -> String {
-        hex::encode(self.sha256)
-    }
 }
 
 #[cfg(test)]
@@ -350,26 +342,6 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn scan_file_features_bloom_only(
-    path: impl AsRef<Path>,
-    filter_bytes: usize,
-    bloom_hashes: usize,
-    tier2_filter_bytes: usize,
-    tier2_bloom_hashes: usize,
-    chunk_size: usize,
-) -> Result<DocumentFeatures> {
-    scan_file_features_bloom_only_with_gram_sizes(
-        path,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
-        filter_bytes,
-        bloom_hashes,
-        tier2_filter_bytes,
-        tier2_bloom_hashes,
-        chunk_size,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -378,13 +350,33 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        estimate_unique_default_tier2_grams_hll, estimate_unique_grams_pair_hll,
-        estimate_unique_grams4_hll, HLL_DEFAULT_PRECISION,
-        estimate_unique_tier2_grams_hll, iter_default_tier2_grams_from_bytes, iter_grams4_from_bytes,
-        iter_tier2_grams_from_bytes, scan_file_features_bloom_only,
+        HLL_DEFAULT_PRECISION, estimate_unique_default_tier2_grams_hll,
+        estimate_unique_grams_pair_hll, estimate_unique_grams4_hll,
+        estimate_unique_tier2_grams_hll, iter_default_tier2_grams_from_bytes,
+        iter_grams4_from_bytes, iter_tier2_grams_from_bytes,
         scan_file_features_bloom_only_with_gram_sizes,
     };
-    use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, GramSizes};
+    use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
+
+    fn scan_file_features_default_grams(
+        path: impl AsRef<std::path::Path>,
+        filter_bytes: usize,
+        bloom_hashes: usize,
+        tier2_filter_bytes: usize,
+        tier2_bloom_hashes: usize,
+        chunk_size: usize,
+    ) -> crate::Result<super::DocumentFeatures> {
+        scan_file_features_bloom_only_with_gram_sizes(
+            path,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+            filter_bytes,
+            bloom_hashes,
+            tier2_filter_bytes,
+            tier2_bloom_hashes,
+            chunk_size,
+        )
+    }
 
     #[test]
     fn grams4_iterates_sliding_windows() {
@@ -401,7 +393,7 @@ mod tests {
             bloom_filter: Vec::new(),
             tier2_bloom_filter: Vec::new(),
         };
-        assert_eq!(features.sha256_hex(), hex::encode([0xAB; 32]));
+        assert_eq!(hex::encode(features.sha256), hex::encode([0xAB; 32]));
     }
 
     #[test]
@@ -410,12 +402,13 @@ mod tests {
         let path = tmp.path().join("doc.bin");
         fs::write(&path, b"xxABCDyy").expect("write");
         assert!(
-            scan_file_features_bloom_only(&path, 64, 4, 0, 0, 0)
+            scan_file_features_default_grams(&path, 64, 4, 0, 0, 0)
                 .expect_err("chunk size zero")
                 .to_string()
                 .contains("chunk_size must be > 0")
         );
-        let features = scan_file_features_bloom_only(&path, 64, 4, 0, 0, 1024).expect("features");
+        let features =
+            scan_file_features_default_grams(&path, 64, 4, 0, 0, 1024).expect("features");
         assert_eq!(features.file_size, 8);
         assert!(!features.bloom_filter.is_empty());
     }

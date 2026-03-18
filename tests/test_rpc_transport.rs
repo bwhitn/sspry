@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use tempfile::tempdir;
 
-use sspry::candidate::{compile_query_plan_from_file, scan_file_features_bloom_only};
+use sspry::candidate::{
+    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, compile_query_plan_from_file,
+    scan_file_features_bloom_only_with_gram_sizes,
+};
 use sspry::rpc::{CandidateDocumentWire, ClientConfig, SspryClient};
 
 fn bin_path() -> PathBuf {
@@ -69,6 +72,19 @@ fn wait_for_server(port: u16) -> SspryClient {
     panic!("server did not start on port {port}");
 }
 
+fn scan_features_default_grams(path: &Path) -> sspry::Result<sspry::candidate::DocumentFeatures> {
+    scan_file_features_bloom_only_with_gram_sizes(
+        path,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            .expect("default gram sizes"),
+        1024,
+        7,
+        0,
+        0,
+        4096,
+    )
+}
+
 #[test]
 fn tcp_rpc_transport_covers_candidate_actions() {
     let tmp = tempdir().expect("tmp");
@@ -98,25 +114,8 @@ rule q {
     let _server = spawn_tcp_serve(port, &candidate_root);
     let client = wait_for_server(port);
 
-    let bloom_hashes = 7;
-    let features_a = scan_file_features_bloom_only(
-        &cand_a,
-        1024,
-        bloom_hashes,
-        0,
-        0,
-        4096,
-    )
-    .expect("features a");
-    let features_b = scan_file_features_bloom_only(
-        &cand_b,
-        1024,
-        bloom_hashes,
-        0,
-        0,
-        4096,
-    )
-    .expect("features b");
+    let features_a = scan_features_default_grams(&cand_a).expect("features a");
+    let features_b = scan_features_default_grams(&cand_b).expect("features b");
     let docs = vec![
         CandidateDocumentWire {
             sha256: hex::encode(features_a.sha256),

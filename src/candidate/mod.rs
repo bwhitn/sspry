@@ -11,8 +11,7 @@ pub use bloom::{BloomFilter, bloom_positions};
 pub use cache::BoundedCache;
 pub use features::{
     DocumentFeatures, HLL_DEFAULT_PRECISION, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams_pair_hll, scan_file_features_bloom_only,
-    scan_file_features_bloom_only_with_gram_sizes,
+    estimate_unique_grams_pair_hll, scan_file_features_bloom_only_with_gram_sizes,
 };
 pub use filter_policy::{
     choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,

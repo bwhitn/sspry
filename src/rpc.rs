@@ -2552,11 +2552,7 @@ impl ServerState {
         PublishReadiness {
             eligible,
             blocked_reason,
-            trigger_mode: if idle_eligible {
-                "idle"
-            } else {
-                "blocked"
-            },
+            trigger_mode: if idle_eligible { "idle" } else { "blocked" },
             trigger_reason: adaptive.reason,
             idle_elapsed_ms,
             idle_threshold_ms,
@@ -5896,8 +5892,7 @@ mod tests {
 
     fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
         fs::write(path, bytes).expect("write sample");
-        let features = crate::candidate::scan_file_features_bloom_only(path, 1024, 7, 0, 0, 1024)
-            .expect("features");
+        let features = scan_features_default_grams(path).expect("features");
         CandidateDocumentWire {
             sha256: hex::encode(features.sha256),
             file_size: features.file_size,
@@ -5911,6 +5906,24 @@ mod tests {
             metadata_b64: None,
             external_id: None,
         }
+    }
+
+    fn scan_features_default_grams(
+        path: impl AsRef<Path>,
+    ) -> Result<crate::candidate::DocumentFeatures> {
+        crate::candidate::scan_file_features_bloom_only_with_gram_sizes(
+            path,
+            crate::candidate::GramSizes::new(
+                crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
+                crate::candidate::DEFAULT_TIER1_GRAM_SIZE,
+            )
+            .expect("default gram sizes"),
+            1024,
+            7,
+            0,
+            0,
+            1024,
+        )
     }
 
     #[test]
@@ -6168,12 +6181,8 @@ mod tests {
         let sample_b = tmp.path().join("session-b.bin");
         fs::write(&sample_a, b"xxABCDyy").expect("sample a");
         fs::write(&sample_b, b"zzWXYZqq").expect("sample b");
-        let features_a =
-            crate::candidate::scan_file_features_bloom_only(&sample_a, 1024, 7, 0, 0, 1024)
-                .expect("features a");
-        let features_b =
-            crate::candidate::scan_file_features_bloom_only(&sample_b, 1024, 7, 0, 0, 1024)
-                .expect("features b");
+        let features_a = scan_features_default_grams(&sample_a).expect("features a");
+        let features_b = scan_features_default_grams(&sample_b).expect("features b");
         let docs = vec![
             CandidateDocumentWire {
                 sha256: hex::encode(features_a.sha256),
@@ -6609,9 +6618,7 @@ mod tests {
         let sample = tmp.path().join("workspace-doc.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let features =
-            crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
-                .expect("features");
+        let features = scan_features_default_grams(&sample).expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features.sha256),
@@ -6722,9 +6729,7 @@ mod tests {
         let sample = tmp.path().join("auto-publish.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let features =
-            crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
-                .expect("features");
+        let features = scan_features_default_grams(&sample).expect("features");
         state
             .handle_begin_index_session()
             .expect("begin index session");
@@ -6809,9 +6814,7 @@ mod tests {
         let state = sample_workspace_server_state(tmp.path(), 1);
         let sample = tmp.path().join("pressure-publish.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
-        let features =
-            crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
-                .expect("features");
+        let features = scan_features_default_grams(&sample).expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features.sha256),
@@ -6934,9 +6937,7 @@ mod tests {
 
         let sample_a = tmp.path().join("inc-a.bin");
         fs::write(&sample_a, b"xxABCDyy").expect("sample a");
-        let features_a =
-            crate::candidate::scan_file_features_bloom_only(&sample_a, 1024, 7, 0, 0, 1024)
-                .expect("features a");
+        let features_a = scan_features_default_grams(&sample_a).expect("features a");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features_a.sha256),
@@ -6956,9 +6957,7 @@ mod tests {
 
         let sample_b = tmp.path().join("inc-b.bin");
         fs::write(&sample_b, b"xxWXYZyy").expect("sample b");
-        let features_b =
-            crate::candidate::scan_file_features_bloom_only(&sample_b, 1024, 7, 0, 0, 1024)
-                .expect("features b");
+        let features_b = scan_features_default_grams(&sample_b).expect("features b");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: hex::encode(features_b.sha256),
@@ -8132,25 +8131,8 @@ rule q {
         )
         .expect("rule");
 
-        let bloom_hashes = 7;
-        let features_a = crate::candidate::scan_file_features_bloom_only(
-            &cand_a,
-            1024,
-            bloom_hashes,
-            0,
-            0,
-            1024,
-        )
-        .expect("features a");
-        let features_b = crate::candidate::scan_file_features_bloom_only(
-            &cand_b,
-            1024,
-            bloom_hashes,
-            0,
-            0,
-            1024,
-        )
-        .expect("features b");
+        let features_a = scan_features_default_grams(&cand_a).expect("features a");
+        let features_b = scan_features_default_grams(&cand_b).expect("features b");
         let doc_a = CandidateDocumentWire {
             sha256: hex::encode(features_a.sha256),
             file_size: features_a.file_size,
@@ -8495,25 +8477,8 @@ rule q {
 "#,
         )
         .expect("rule");
-        let bloom_hashes = 7;
-        let features_a = crate::candidate::scan_file_features_bloom_only(
-            &cand_a,
-            1024,
-            bloom_hashes,
-            0,
-            0,
-            1024,
-        )
-        .expect("features a");
-        let features_b = crate::candidate::scan_file_features_bloom_only(
-            &cand_b,
-            1024,
-            bloom_hashes,
-            0,
-            0,
-            1024,
-        )
-        .expect("features b");
+        let features_a = scan_features_default_grams(&cand_a).expect("features a");
+        let features_b = scan_features_default_grams(&cand_b).expect("features b");
         let doc_a = CandidateDocumentWire {
             sha256: hex::encode(features_a.sha256),
             file_size: features_a.file_size,
