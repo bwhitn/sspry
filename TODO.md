@@ -326,13 +326,32 @@ Current read after the `8/16/32 KiB` matrix:
 
 Immediate search improvements on the bloom-only baseline:
 1. keep `32 KiB` as the current coarse-summary baseline
-2. remove search-side dependence on the remote DF planning round-trip
-3. raise or tune the search RPC timeout so heavy rules finish instead of truncating at `~180 s`
-4. profile why:
-   - `01` still times out
-   - `08` is still heavy
-   - `09` improved sharply with larger superblock summaries
+2. done:
+   - search no longer replans through the retired remote DF path
+   - per-doc search evaluation now lazy-loads metadata and bloom sidecars instead of reading metadata + tier1 + tier2 up front for every scanned doc
+3. re-profile the heavy supported rules on the `50k` `32 KiB` baseline after the lazy-load patch
+4. if `01` / `08` are still heavy, profile block admission and per-doc bloom reads next
 5. after that, test `64 KiB` only if `32 KiB` still leaves too much block-level false-positive pressure
+
+Current local `26k` smoke check for the lazy-load search patch:
+- artifact:
+  - `/root/pertest/results/sspry_searchopt_26000_32k_20260318_r1`
+- `index_wall_ms = 550,937`
+- `db_bytes = 18,590,729,011`
+- `current_rss_kb = 701,284`
+- `peak_rss_kb = 701,284`
+- `last_publish_duration_ms = 88`
+- supported-rule search totals:
+  - `01`: `0.810 s`, `0` candidates
+  - `08`: `0.705 s`, `151` candidates
+  - `09`: `0.777 s`, `168` candidates
+  - `10`: `0.852 s`, `0` candidates
+  - `11`: `0.802 s`, `3` candidates
+  - `12`: `0.776 s`, `10` candidates
+- read:
+  - the lazy-load patch is functionally clean on a real bloom-only ingest/search pass
+  - all six supported rules completed without timeout on the `26k` smoke run
+  - next validation should be the same search pack on the `50k` `32 KiB` baseline
 
 ### 0a. Bloom-only cutover and dead-code removal
 

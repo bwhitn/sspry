@@ -715,6 +715,69 @@ struct QueryEvalCache {
     pattern_outcomes: HashMap<String, MatchOutcome>,
 }
 
+struct LazyDocQueryInputs<'a> {
+    doc: &'a CandidateDoc,
+    metadata_bytes: Option<Cow<'a, [u8]>>,
+    tier1_bloom_bytes: Option<Cow<'a, [u8]>>,
+    tier2_bloom_bytes: Option<Cow<'a, [u8]>>,
+}
+
+impl<'a> LazyDocQueryInputs<'a> {
+    fn new(doc: &'a CandidateDoc) -> Self {
+        Self {
+            doc,
+            metadata_bytes: None,
+            tier1_bloom_bytes: None,
+            tier2_bloom_bytes: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_prefetched(
+        doc: &'a CandidateDoc,
+        metadata_bytes: &'a [u8],
+        tier1_bloom_bytes: &'a [u8],
+        tier2_bloom_bytes: &'a [u8],
+    ) -> Self {
+        Self {
+            doc,
+            metadata_bytes: Some(Cow::Borrowed(metadata_bytes)),
+            tier1_bloom_bytes: Some(Cow::Borrowed(tier1_bloom_bytes)),
+            tier2_bloom_bytes: Some(Cow::Borrowed(tier2_bloom_bytes)),
+        }
+    }
+
+    fn metadata_bytes<F>(&mut self, load: &mut F) -> Result<&[u8]>
+    where
+        F: FnMut() -> Result<Cow<'a, [u8]>>,
+    {
+        if self.metadata_bytes.is_none() {
+            self.metadata_bytes = Some(load()?);
+        }
+        Ok(self.metadata_bytes.as_deref().unwrap_or(&[]))
+    }
+
+    fn tier1_bloom_bytes<F>(&mut self, load: &mut F) -> Result<&[u8]>
+    where
+        F: FnMut() -> Result<Cow<'a, [u8]>>,
+    {
+        if self.tier1_bloom_bytes.is_none() {
+            self.tier1_bloom_bytes = Some(load()?);
+        }
+        Ok(self.tier1_bloom_bytes.as_deref().unwrap_or(&[]))
+    }
+
+    fn tier2_bloom_bytes<F>(&mut self, load: &mut F) -> Result<&[u8]>
+    where
+        F: FnMut() -> Result<Cow<'a, [u8]>>,
+    {
+        if self.tier2_bloom_bytes.is_none() {
+            self.tier2_bloom_bytes = Some(load()?);
+        }
+        Ok(self.tier2_bloom_bytes.as_deref().unwrap_or(&[]))
+    }
+}
+
 impl TierFlags {
     fn merge(&mut self, other: TierFlags) {
         self.used_tier1 |= other.used_tier1;
@@ -2274,16 +2337,17 @@ impl CandidateStore {
                     continue;
                 }
                 docs_scanned += 1;
-                let metadata_bytes = self.doc_metadata_bytes(pos)?;
-                let tier1_bloom_bytes = self.doc_bloom_bytes(pos)?;
-                let tier2_bloom_bytes = self.doc_tier2_bloom_bytes(pos)?;
+                let mut doc_inputs = LazyDocQueryInputs::new(doc);
+                let mut load_metadata = || self.doc_metadata_bytes(pos);
+                let mut load_tier1 = || self.doc_bloom_bytes(pos);
+                let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
                 let mut eval_cache = QueryEvalCache::default();
                 let outcome = evaluate_node(
                     &plan.root,
-                    doc,
-                    metadata_bytes.as_ref(),
-                    tier1_bloom_bytes.as_ref(),
-                    tier2_bloom_bytes.as_ref(),
+                    &mut doc_inputs,
+                    &mut load_metadata,
+                    &mut load_tier1,
+                    &mut load_tier2,
                     &prepared.patterns,
                     &prepared.mask_cache,
                     plan,
@@ -3870,14 +3934,18 @@ fn block_maybe_matches_node(
     }
 }
 
-fn evaluate_pattern(
+fn evaluate_pattern<'a, FT1, FT2>(
     pattern: &PatternPlan,
     pattern_masks: &PreparedPatternMasks,
-    doc: &CandidateDoc,
-    bloom_bytes: &[u8],
-    tier2_bloom_bytes: &[u8],
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
     plan: &CompiledQueryPlan,
-) -> Result<MatchOutcome> {
+) -> Result<MatchOutcome>
+where
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
     let allow_tier2 = !plan.force_tier1_only && plan.allow_tier2_fallback;
     for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
         if alternative.is_empty() {
@@ -3890,6 +3958,8 @@ fn evaluate_pattern(
                 score: 10_000,
             });
         }
+        let doc = doc_inputs.doc;
+        let bloom_bytes = doc_inputs.tier1_bloom_bytes(load_tier1)?;
         let primary_match = pattern_masks
             .tier1
             .get(alt_index)
@@ -3908,8 +3978,11 @@ fn evaluate_pattern(
             && !tier2_alternative.is_empty()
             && doc.tier2_filter_bytes > 0
             && doc.tier2_bloom_hashes > 0
-            && !tier2_bloom_bytes.is_empty()
         {
+            let tier2_bloom_bytes = doc_inputs.tier2_bloom_bytes(load_tier2)?;
+            if tier2_bloom_bytes.is_empty() {
+                continue;
+            }
             let tier2_match = pattern_masks
                 .tier2
                 .get(alt_index)
@@ -3940,18 +4013,23 @@ fn evaluate_pattern(
     Ok(MatchOutcome::default())
 }
 
-fn evaluate_node(
+fn evaluate_node<'a, FM, FT1, FT2>(
     node: &QueryNode,
-    doc: &CandidateDoc,
-    metadata_bytes: &[u8],
-    bloom_bytes: &[u8],
-    tier2_bloom_bytes: &[u8],
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_metadata: &mut FM,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
     patterns: &HashMap<String, PatternPlan>,
     mask_cache: &PatternMaskCache,
     plan: &CompiledQueryPlan,
     query_now_unix: u64,
     eval_cache: &mut QueryEvalCache,
-) -> Result<MatchOutcome> {
+) -> Result<MatchOutcome>
+where
+    FM: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
     match node.kind.as_str() {
         "pattern" => {
             let pattern_id = node
@@ -3970,9 +4048,9 @@ fn evaluate_node(
             let outcome = evaluate_pattern(
                 pattern,
                 pattern_masks,
-                doc,
-                bloom_bytes,
-                tier2_bloom_bytes,
+                doc_inputs,
+                load_tier1,
+                load_tier2,
                 plan,
             )?;
             eval_cache
@@ -3991,7 +4069,7 @@ fn evaluate_node(
                 .ok_or_else(|| SspryError::from("filesize_eq node requires threshold"))?
                 as u64;
             Ok(MatchOutcome {
-                matched: doc.file_size == expected_size,
+                matched: doc_inputs.doc.file_size == expected_size,
                 tiers: TierFlags::default(),
                 score: 0,
             })
@@ -4005,6 +4083,7 @@ fn evaluate_node(
                 .threshold
                 .ok_or_else(|| SspryError::from("metadata_eq node requires threshold"))?
                 as u64;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
             let matched =
                 metadata_field_matches_eq(metadata_bytes, field, expected)?.unwrap_or(true);
             Ok(MatchOutcome {
@@ -4030,10 +4109,10 @@ fn evaluate_node(
             for child in &node.children {
                 let outcome = evaluate_node(
                     child,
-                    doc,
-                    metadata_bytes,
-                    bloom_bytes,
-                    tier2_bloom_bytes,
+                    doc_inputs,
+                    load_metadata,
+                    load_tier1,
+                    load_tier2,
                     patterns,
                     mask_cache,
                     plan,
@@ -4056,10 +4135,10 @@ fn evaluate_node(
             for child in &node.children {
                 let outcome = evaluate_node(
                     child,
-                    doc,
-                    metadata_bytes,
-                    bloom_bytes,
-                    tier2_bloom_bytes,
+                    doc_inputs,
+                    load_metadata,
+                    load_tier1,
+                    load_tier2,
                     patterns,
                     mask_cache,
                     plan,
@@ -4082,10 +4161,10 @@ fn evaluate_node(
             for child in &node.children {
                 let outcome = evaluate_node(
                     child,
-                    doc,
-                    metadata_bytes,
-                    bloom_bytes,
-                    tier2_bloom_bytes,
+                    doc_inputs,
+                    load_metadata,
+                    load_tier1,
+                    load_tier2,
                     patterns,
                     mask_cache,
                     plan,
@@ -4133,6 +4212,34 @@ mod tests {
     };
 
     use super::*;
+
+    fn borrowed_bytes<'a>(bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        Ok(Cow::Borrowed(bytes))
+    }
+
+    fn prefetched_query_inputs<'a>(
+        doc: &'a CandidateDoc,
+        metadata_bytes: &'a [u8],
+        tier1_bloom_bytes: &'a [u8],
+        tier2_bloom_bytes: &'a [u8],
+    ) -> (
+        LazyDocQueryInputs<'a>,
+        impl FnMut() -> Result<Cow<'a, [u8]>>,
+        impl FnMut() -> Result<Cow<'a, [u8]>>,
+        impl FnMut() -> Result<Cow<'a, [u8]>>,
+    ) {
+        (
+            LazyDocQueryInputs::from_prefetched(
+                doc,
+                metadata_bytes,
+                tier1_bloom_bytes,
+                tier2_bloom_bytes,
+            ),
+            move || borrowed_bytes(metadata_bytes),
+            move || borrowed_bytes(tier1_bloom_bytes),
+            move || borrowed_bytes(tier2_bloom_bytes),
+        )
+    }
 
     fn insert_primary(
         store: &mut CandidateStore,
@@ -5498,12 +5605,14 @@ rule q {
         )
         .expect("pattern mask cache");
 
+        let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_pattern(
             patterns.get("empty").expect("empty"),
             mask_cache.get("empty").expect("empty masks"),
-            &doc,
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_tier1,
+            &mut load_tier2,
             &eval_plan,
         )
         .expect("empty pattern");
@@ -5517,12 +5626,14 @@ rule q {
             ..eval_plan.clone()
         };
         let complete_doc = doc.clone();
+        let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&complete_doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_pattern(
             patterns.get("missing").expect("missing"),
             mask_cache.get("missing").expect("missing masks"),
-            &complete_doc,
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_tier1,
+            &mut load_tier2,
             &no_fallback_plan,
         )
         .expect("no match");
@@ -5535,12 +5646,14 @@ rule q {
             allow_tier2_fallback: true,
             ..eval_plan.clone()
         };
+        let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&complete_doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_pattern(
             patterns.get("tier2").expect("tier2"),
             mask_cache.get("tier2").expect("tier2 masks"),
-            &complete_doc,
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_tier1,
+            &mut load_tier2,
             &allow_fallback_plan,
         )
         .expect("complete doc should match via bloom path");
@@ -5549,12 +5662,14 @@ rule q {
         assert!(outcome.score > 0);
 
         let no_overlap_doc = doc.clone();
+        let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&no_overlap_doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_pattern(
             patterns.get("tier2").expect("tier2"),
             mask_cache.get("tier2").expect("tier2 masks"),
-            &no_overlap_doc,
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_tier1,
+            &mut load_tier2,
             &allow_fallback_plan,
         )
         .expect("bloom-only path should match from bloom anchors");
@@ -5562,6 +5677,8 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_node(
             &QueryNode {
                 kind: "and".to_owned(),
@@ -5582,10 +5699,10 @@ rule q {
                     },
                 ],
             },
-            &doc,
-            &[],
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -5597,6 +5714,8 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "none");
         assert_eq!(outcome.score, 0);
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_node(
             &QueryNode {
                 kind: "or".to_owned(),
@@ -5617,10 +5736,10 @@ rule q {
                     },
                 ],
             },
-            &doc,
-            &[],
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -5632,6 +5751,8 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
         let outcome = evaluate_node(
             &QueryNode {
                 kind: "n_of".to_owned(),
@@ -5652,10 +5773,10 @@ rule q {
                     },
                 ],
             },
-            &doc,
-            &[],
-            &bloom_bytes,
-            tier2_bloom_bytes,
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -5668,45 +5789,53 @@ rule q {
         assert!(outcome.score > 0);
 
         assert!(
-            evaluate_node(
-                &QueryNode {
-                    kind: "n_of".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &doc,
-                &[],
-                &bloom_bytes,
-                tier2_bloom_bytes,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                0,
-                &mut QueryEvalCache::default(),
-            )
+            {
+                let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+                    prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
+                evaluate_node(
+                    &QueryNode {
+                        kind: "n_of".to_owned(),
+                        pattern_id: None,
+                        threshold: None,
+                        children: Vec::new(),
+                    },
+                    &mut doc_inputs,
+                    &mut load_metadata,
+                    &mut load_tier1,
+                    &mut load_tier2,
+                    &patterns,
+                    &mask_cache,
+                    &eval_plan,
+                    0,
+                    &mut QueryEvalCache::default(),
+                )
+            }
             .expect_err("missing threshold")
             .to_string()
             .contains("requires threshold")
         );
         assert!(
-            evaluate_node(
-                &QueryNode {
-                    kind: "bogus".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &doc,
-                &[],
-                &bloom_bytes,
-                tier2_bloom_bytes,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                0,
-                &mut QueryEvalCache::default(),
-            )
+            {
+                let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+                    prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
+                evaluate_node(
+                    &QueryNode {
+                        kind: "bogus".to_owned(),
+                        pattern_id: None,
+                        threshold: None,
+                        children: Vec::new(),
+                    },
+                    &mut doc_inputs,
+                    &mut load_metadata,
+                    &mut load_tier1,
+                    &mut load_tier2,
+                    &patterns,
+                    &mask_cache,
+                    &eval_plan,
+                    0,
+                    &mut QueryEvalCache::default(),
+                )
+            }
             .expect_err("unsupported kind")
             .to_string()
             .contains("Unsupported ast node kind")
@@ -5757,12 +5886,14 @@ rule q {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
         let metadata_outcome = evaluate_node(
             &eval_plan.root,
-            &doc,
-            &metadata_bytes,
-            &[],
-            &[],
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -5772,6 +5903,8 @@ rule q {
         .expect("metadata eq");
         assert!(metadata_outcome.matched);
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &[], &[], &[]);
         let unknown_outcome = evaluate_node(
             &QueryNode {
                 kind: "metadata_eq".to_owned(),
@@ -5779,10 +5912,10 @@ rule q {
                 threshold: Some(62),
                 children: Vec::new(),
             },
-            &doc,
-            &[],
-            &[],
-            &[],
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -5792,6 +5925,8 @@ rule q {
         .expect("unknown metadata eq");
         assert!(unknown_outcome.matched);
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
         let time_outcome = evaluate_node(
             &QueryNode {
                 kind: "time_now_eq".to_owned(),
@@ -5799,10 +5934,10 @@ rule q {
                 threshold: Some(1234),
                 children: Vec::new(),
             },
-            &doc,
-            &metadata_bytes,
-            &[],
-            &[],
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -5812,6 +5947,8 @@ rule q {
         .expect("time now eq");
         assert!(time_outcome.matched);
 
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
         let verifier_outcome = evaluate_node(
             &QueryNode {
                 kind: "verifier_only_eq".to_owned(),
@@ -5819,10 +5956,10 @@ rule q {
                 threshold: None,
                 children: Vec::new(),
             },
-            &doc,
-            &metadata_bytes,
-            &[],
-            &[],
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
             &patterns,
             &mask_cache,
             &eval_plan,
