@@ -757,6 +757,27 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn scan_file_features_bloom_only(
+    path: impl AsRef<Path>,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+    tier2_filter_bytes: usize,
+    tier2_bloom_hashes: usize,
+    chunk_size: usize,
+) -> Result<DocumentFeatures> {
+    scan_file_features_bloom_only_with_gram_sizes(
+        path,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
+        filter_bytes,
+        bloom_hashes,
+        tier2_filter_bytes,
+        tier2_bloom_hashes,
+        chunk_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn scan_file_features(
     path: impl AsRef<Path>,
     filter_bytes: usize,

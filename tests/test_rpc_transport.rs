@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use tempfile::tempdir;
 
-use sspry::candidate::{compile_query_plan_from_file, scan_file_features};
+use sspry::candidate::{compile_query_plan_from_file, scan_file_features_bloom_only};
 use sspry::rpc::{CandidateDocumentWire, ClientConfig, SspryClient};
 
 fn bin_path() -> PathBuf {
@@ -99,34 +99,22 @@ rule q {
     let client = wait_for_server(port);
 
     let bloom_hashes = 7;
-    let features_a = scan_file_features(
+    let features_a = scan_file_features_bloom_only(
         &cand_a,
         1024,
         bloom_hashes,
         0,
         0,
         4096,
-        false,
-        None,
-        None,
-        2048,
-        1,
-        1337,
     )
     .expect("features a");
-    let features_b = scan_file_features(
+    let features_b = scan_file_features_bloom_only(
         &cand_b,
         1024,
         bloom_hashes,
         0,
         0,
         4096,
-        false,
-        None,
-        None,
-        2048,
-        1,
-        1337,
     )
     .expect("features b");
     let docs = vec![

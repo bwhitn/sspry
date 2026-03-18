@@ -5986,9 +5986,7 @@ mod tests {
 
     fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
         fs::write(path, bytes).expect("write sample");
-        let features = crate::candidate::scan_file_features(
-            path, 1024, 7, 0, 0, 1024, false, None, None, 2048, 1, 1337,
-        )
+        let features = crate::candidate::scan_file_features_bloom_only(path, 1024, 7, 0, 0, 1024)
         .expect("features");
         CandidateDocumentWire {
             sha256: hex::encode(features.sha256),
@@ -6260,13 +6258,11 @@ mod tests {
         let sample_b = tmp.path().join("session-b.bin");
         fs::write(&sample_a, b"xxABCDyy").expect("sample a");
         fs::write(&sample_b, b"zzWXYZqq").expect("sample b");
-        let features_a = crate::candidate::scan_file_features(
-            &sample_a, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features_a =
+            crate::candidate::scan_file_features_bloom_only(&sample_a, 1024, 7, 0, 0, 1024)
         .expect("features a");
-        let features_b = crate::candidate::scan_file_features(
-            &sample_b, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features_b =
+            crate::candidate::scan_file_features_bloom_only(&sample_b, 1024, 7, 0, 0, 1024)
         .expect("features b");
         let docs = vec![
             CandidateDocumentWire {
@@ -6704,9 +6700,8 @@ mod tests {
         let sample = tmp.path().join("workspace-doc.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let features = crate::candidate::scan_file_features(
-            &sample, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features =
+            crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
         .expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
@@ -6818,9 +6813,8 @@ mod tests {
         let sample = tmp.path().join("auto-publish.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let features = crate::candidate::scan_file_features(
-            &sample, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features =
+            crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
         .expect("features");
         state
             .handle_begin_index_session()
@@ -6906,9 +6900,8 @@ mod tests {
         let state = sample_workspace_server_state(tmp.path(), 1);
         let sample = tmp.path().join("pressure-publish.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
-        let features = crate::candidate::scan_file_features(
-            &sample, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features =
+            crate::candidate::scan_file_features_bloom_only(&sample, 1024, 7, 0, 0, 1024)
         .expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
@@ -7032,9 +7025,8 @@ mod tests {
 
         let sample_a = tmp.path().join("inc-a.bin");
         fs::write(&sample_a, b"xxABCDyy").expect("sample a");
-        let features_a = crate::candidate::scan_file_features(
-            &sample_a, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features_a =
+            crate::candidate::scan_file_features_bloom_only(&sample_a, 1024, 7, 0, 0, 1024)
         .expect("features a");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
@@ -7055,9 +7047,8 @@ mod tests {
 
         let sample_b = tmp.path().join("inc-b.bin");
         fs::write(&sample_b, b"xxWXYZyy").expect("sample b");
-        let features_b = crate::candidate::scan_file_features(
-            &sample_b, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-        )
+        let features_b =
+            crate::candidate::scan_file_features_bloom_only(&sample_b, 1024, 7, 0, 0, 1024)
         .expect("features b");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
@@ -8227,34 +8218,22 @@ rule q {
         .expect("rule");
 
         let bloom_hashes = 7;
-        let features_a = crate::candidate::scan_file_features(
+        let features_a = crate::candidate::scan_file_features_bloom_only(
             &cand_a,
             1024,
             bloom_hashes,
             0,
             0,
             1024,
-            true,
-            None,
-            None,
-            2048,
-            1,
-            1337,
         )
         .expect("features a");
-        let features_b = crate::candidate::scan_file_features(
+        let features_b = crate::candidate::scan_file_features_bloom_only(
             &cand_b,
             1024,
             bloom_hashes,
             0,
             0,
             1024,
-            true,
-            None,
-            None,
-            2048,
-            1,
-            1337,
         )
         .expect("features b");
         let doc_a = CandidateDocumentWire {
@@ -8602,34 +8581,22 @@ rule q {
         )
         .expect("rule");
         let bloom_hashes = 7;
-        let features_a = crate::candidate::scan_file_features(
+        let features_a = crate::candidate::scan_file_features_bloom_only(
             &cand_a,
             1024,
             bloom_hashes,
             0,
             0,
             1024,
-            true,
-            None,
-            None,
-            256,
-            1,
-            1337,
         )
         .expect("features a");
-        let features_b = crate::candidate::scan_file_features(
+        let features_b = crate::candidate::scan_file_features_bloom_only(
             &cand_b,
             1024,
             bloom_hashes,
             0,
             0,
             1024,
-            true,
-            None,
-            None,
-            256,
-            1,
-            1337,
         )
         .expect("features b");
         let doc_a = CandidateDocumentWire {
