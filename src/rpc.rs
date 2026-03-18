@@ -392,18 +392,6 @@ struct ServerState {
     index_session_server_insert_batch_store_us: AtomicU64,
     index_session_server_insert_batch_finalize_us: AtomicU64,
     index_session_server_insert_batch_store_classify_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_dedup_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_segment_visits: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups: AtomicU64,
-    index_session_server_insert_batch_store_classify_df_lookup_delta_lookups: AtomicU64,
-    index_session_server_insert_batch_store_classify_eligibility_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_budget_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_binning_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_finalize_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_assemble_us: AtomicU64,
@@ -1634,24 +1622,6 @@ impl ServerState {
             index_session_server_insert_batch_store_us: AtomicU64::new(0),
             index_session_server_insert_batch_finalize_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_dedup_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_segment_visits:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_df_lookup_delta_lookups:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_eligibility_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_budget_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_binning_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_finalize_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_bloom_payload_assemble_us:
@@ -2220,30 +2190,6 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_classify_us
                     .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_dedup_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_segment_visits
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_df_lookup_delta_lookups
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_eligibility_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_budget_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_binning_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_finalize_us
-                    .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecars_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecar_payloads_us
@@ -2375,48 +2321,6 @@ impl ServerState {
             );
         self.index_session_server_insert_batch_store_classify_us
             .fetch_add(store_profile.classify_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_classify_dedup_us
-            .fetch_add(store_profile.classify_dedup_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_classify_df_lookup_us
-            .fetch_add(store_profile.classify_df_lookup_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined
-            .fetch_add(
-                store_profile.classify_df_lookup_snapshot_rows_examined,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups
-            .fetch_add(
-                store_profile.classify_df_lookup_snapshot_point_lookups,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_classify_df_lookup_segment_visits
-            .fetch_add(
-                store_profile.classify_df_lookup_segment_visits,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined
-            .fetch_add(
-                store_profile.classify_df_lookup_segment_rows_examined,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups
-            .fetch_add(
-                store_profile.classify_df_lookup_segment_point_lookups,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_classify_df_lookup_delta_lookups
-            .fetch_add(
-                store_profile.classify_df_lookup_delta_lookups,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_classify_eligibility_us
-            .fetch_add(store_profile.classify_eligibility_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_classify_budget_us
-            .fetch_add(store_profile.classify_budget_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_classify_binning_us
-            .fetch_add(store_profile.classify_binning_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_classify_finalize_us
-            .fetch_add(store_profile.classify_finalize_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecars_us
             .fetch_add(store_profile.append_sidecars_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecar_payloads_us
@@ -2491,147 +2395,145 @@ impl ServerState {
     fn index_server_insert_batch_profile_json(&self) -> Value {
         let mut out = Map::new();
         for (key, value) in [
-            ("batches", self.index_session_server_insert_batch_count.load(Ordering::Acquire)),
+            (
+                "batches",
+                self.index_session_server_insert_batch_count
+                    .load(Ordering::Acquire),
+            ),
             (
                 "documents",
-                self.index_session_server_insert_batch_documents.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_documents
+                    .load(Ordering::Acquire),
             ),
             (
                 "shards_touched_total",
-                self.index_session_server_insert_batch_shards_touched.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_shards_touched
+                    .load(Ordering::Acquire),
             ),
-            ("total_us", self.index_session_server_insert_batch_total_us.load(Ordering::Acquire)),
-            ("parse_us", self.index_session_server_insert_batch_parse_us.load(Ordering::Acquire)),
-            ("group_us", self.index_session_server_insert_batch_group_us.load(Ordering::Acquire)),
-            ("build_us", self.index_session_server_insert_batch_build_us.load(Ordering::Acquire)),
-            ("store_us", self.index_session_server_insert_batch_store_us.load(Ordering::Acquire)),
+            (
+                "total_us",
+                self.index_session_server_insert_batch_total_us
+                    .load(Ordering::Acquire),
+            ),
+            (
+                "parse_us",
+                self.index_session_server_insert_batch_parse_us
+                    .load(Ordering::Acquire),
+            ),
+            (
+                "group_us",
+                self.index_session_server_insert_batch_group_us
+                    .load(Ordering::Acquire),
+            ),
+            (
+                "build_us",
+                self.index_session_server_insert_batch_build_us
+                    .load(Ordering::Acquire),
+            ),
+            (
+                "store_us",
+                self.index_session_server_insert_batch_store_us
+                    .load(Ordering::Acquire),
+            ),
             (
                 "finalize_us",
-                self.index_session_server_insert_batch_finalize_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_finalize_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_classify_us",
-                self.index_session_server_insert_batch_store_classify_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_dedup_us",
-                self.index_session_server_insert_batch_store_classify_dedup_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_us",
-                self.index_session_server_insert_batch_store_classify_df_lookup_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_snapshot_rows_examined",
-                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_rows_examined.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_snapshot_point_lookups",
-                self.index_session_server_insert_batch_store_classify_df_lookup_snapshot_point_lookups.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_segment_visits",
-                self.index_session_server_insert_batch_store_classify_df_lookup_segment_visits.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_segment_rows_examined",
-                self.index_session_server_insert_batch_store_classify_df_lookup_segment_rows_examined.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_segment_point_lookups",
-                self.index_session_server_insert_batch_store_classify_df_lookup_segment_point_lookups.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_df_lookup_delta_lookups",
-                self.index_session_server_insert_batch_store_classify_df_lookup_delta_lookups.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_eligibility_us",
-                self.index_session_server_insert_batch_store_classify_eligibility_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_budget_us",
-                self.index_session_server_insert_batch_store_classify_budget_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_binning_us",
-                self.index_session_server_insert_batch_store_classify_binning_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_classify_finalize_us",
-                self.index_session_server_insert_batch_store_classify_finalize_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_classify_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_sidecars_us",
-                self.index_session_server_insert_batch_store_append_sidecars_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_sidecars_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_sidecar_payloads_us",
-                self.index_session_server_insert_batch_store_append_sidecar_payloads_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_sidecar_payloads_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_bloom_payload_assemble_us",
-                self.index_session_server_insert_batch_store_append_bloom_payload_assemble_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_bloom_payload_assemble_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_bloom_payload_us",
-                self.index_session_server_insert_batch_store_append_bloom_payload_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_bloom_payload_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_metadata_payload_us",
-                self.index_session_server_insert_batch_store_append_metadata_payload_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_metadata_payload_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_external_id_payload_us",
-                self.index_session_server_insert_batch_store_append_external_id_payload_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_external_id_payload_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_tier2_bloom_payload_us",
-                self.index_session_server_insert_batch_store_append_tier2_bloom_payload_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_tier2_bloom_payload_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_doc_row_build_us",
-                self.index_session_server_insert_batch_store_append_doc_row_build_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_doc_row_build_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_bloom_payload_bytes",
-                self.index_session_server_insert_batch_store_append_bloom_payload_bytes.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_bloom_payload_bytes
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_metadata_payload_bytes",
-                self.index_session_server_insert_batch_store_append_metadata_payload_bytes.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_metadata_payload_bytes
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_external_id_payload_bytes",
-                self.index_session_server_insert_batch_store_append_external_id_payload_bytes.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_external_id_payload_bytes
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_tier2_bloom_payload_bytes",
-                self.index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_append_doc_records_us",
-                self.index_session_server_insert_batch_store_append_doc_records_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_append_doc_records_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_write_existing_us",
-                self.index_session_server_insert_batch_store_write_existing_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_write_existing_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_install_docs_us",
-                self.index_session_server_insert_batch_store_install_docs_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_install_docs_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_tier2_update_us",
-                self.index_session_server_insert_batch_store_tier2_update_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_tier2_update_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_persist_meta_us",
-                self.index_session_server_insert_batch_store_persist_meta_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_persist_meta_us
+                    .load(Ordering::Acquire),
             ),
             (
                 "store_rebalance_tier2_us",
-                self.index_session_server_insert_batch_store_rebalance_tier2_us.load(Ordering::Acquire),
+                self.index_session_server_insert_batch_store_rebalance_tier2_us
+                    .load(Ordering::Acquire),
             ),
         ] {
             out.insert(key.to_owned(), json!(value));
@@ -4452,42 +4354,6 @@ impl ServerState {
             store_profile_total.classify_us = store_profile_total
                 .classify_us
                 .saturating_add(store_profile.classify_us);
-            store_profile_total.classify_dedup_us = store_profile_total
-                .classify_dedup_us
-                .saturating_add(store_profile.classify_dedup_us);
-            store_profile_total.classify_df_lookup_us = store_profile_total
-                .classify_df_lookup_us
-                .saturating_add(store_profile.classify_df_lookup_us);
-            store_profile_total.classify_df_lookup_snapshot_rows_examined = store_profile_total
-                .classify_df_lookup_snapshot_rows_examined
-                .saturating_add(store_profile.classify_df_lookup_snapshot_rows_examined);
-            store_profile_total.classify_df_lookup_snapshot_point_lookups = store_profile_total
-                .classify_df_lookup_snapshot_point_lookups
-                .saturating_add(store_profile.classify_df_lookup_snapshot_point_lookups);
-            store_profile_total.classify_df_lookup_segment_visits = store_profile_total
-                .classify_df_lookup_segment_visits
-                .saturating_add(store_profile.classify_df_lookup_segment_visits);
-            store_profile_total.classify_df_lookup_segment_rows_examined = store_profile_total
-                .classify_df_lookup_segment_rows_examined
-                .saturating_add(store_profile.classify_df_lookup_segment_rows_examined);
-            store_profile_total.classify_df_lookup_segment_point_lookups = store_profile_total
-                .classify_df_lookup_segment_point_lookups
-                .saturating_add(store_profile.classify_df_lookup_segment_point_lookups);
-            store_profile_total.classify_df_lookup_delta_lookups = store_profile_total
-                .classify_df_lookup_delta_lookups
-                .saturating_add(store_profile.classify_df_lookup_delta_lookups);
-            store_profile_total.classify_eligibility_us = store_profile_total
-                .classify_eligibility_us
-                .saturating_add(store_profile.classify_eligibility_us);
-            store_profile_total.classify_budget_us = store_profile_total
-                .classify_budget_us
-                .saturating_add(store_profile.classify_budget_us);
-            store_profile_total.classify_binning_us = store_profile_total
-                .classify_binning_us
-                .saturating_add(store_profile.classify_binning_us);
-            store_profile_total.classify_finalize_us = store_profile_total
-                .classify_finalize_us
-                .saturating_add(store_profile.classify_finalize_us);
             store_profile_total.append_sidecars_us = store_profile_total
                 .append_sidecars_us
                 .saturating_add(store_profile.append_sidecars_us);
@@ -4590,42 +4456,6 @@ impl ServerState {
                 store_profile_total.classify_us = store_profile_total
                     .classify_us
                     .saturating_add(store_profile.classify_us);
-                store_profile_total.classify_dedup_us = store_profile_total
-                    .classify_dedup_us
-                    .saturating_add(store_profile.classify_dedup_us);
-                store_profile_total.classify_df_lookup_us = store_profile_total
-                    .classify_df_lookup_us
-                    .saturating_add(store_profile.classify_df_lookup_us);
-                store_profile_total.classify_df_lookup_snapshot_rows_examined = store_profile_total
-                    .classify_df_lookup_snapshot_rows_examined
-                    .saturating_add(store_profile.classify_df_lookup_snapshot_rows_examined);
-                store_profile_total.classify_df_lookup_snapshot_point_lookups = store_profile_total
-                    .classify_df_lookup_snapshot_point_lookups
-                    .saturating_add(store_profile.classify_df_lookup_snapshot_point_lookups);
-                store_profile_total.classify_df_lookup_segment_visits = store_profile_total
-                    .classify_df_lookup_segment_visits
-                    .saturating_add(store_profile.classify_df_lookup_segment_visits);
-                store_profile_total.classify_df_lookup_segment_rows_examined = store_profile_total
-                    .classify_df_lookup_segment_rows_examined
-                    .saturating_add(store_profile.classify_df_lookup_segment_rows_examined);
-                store_profile_total.classify_df_lookup_segment_point_lookups = store_profile_total
-                    .classify_df_lookup_segment_point_lookups
-                    .saturating_add(store_profile.classify_df_lookup_segment_point_lookups);
-                store_profile_total.classify_df_lookup_delta_lookups = store_profile_total
-                    .classify_df_lookup_delta_lookups
-                    .saturating_add(store_profile.classify_df_lookup_delta_lookups);
-                store_profile_total.classify_eligibility_us = store_profile_total
-                    .classify_eligibility_us
-                    .saturating_add(store_profile.classify_eligibility_us);
-                store_profile_total.classify_budget_us = store_profile_total
-                    .classify_budget_us
-                    .saturating_add(store_profile.classify_budget_us);
-                store_profile_total.classify_binning_us = store_profile_total
-                    .classify_binning_us
-                    .saturating_add(store_profile.classify_binning_us);
-                store_profile_total.classify_finalize_us = store_profile_total
-                    .classify_finalize_us
-                    .saturating_add(store_profile.classify_finalize_us);
                 store_profile_total.append_sidecars_us = store_profile_total
                     .append_sidecars_us
                     .saturating_add(store_profile.append_sidecars_us);

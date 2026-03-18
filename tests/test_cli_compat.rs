@@ -1439,8 +1439,6 @@ fn removed_public_aliases_and_flags_are_rejected() {
         "--candidate-tier1-gram-budget",
         "--candidate-tier1-gram-sample-mod",
         "--candidate-tier1-gram-hash-seed",
-        "--candidate-df-min",
-        "--candidate-df-max",
         "--candidate-segment-bloom-bits",
         "--candidate-segment-bloom-hashes",
         "--candidate-compaction-trigger-segments",

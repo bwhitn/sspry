@@ -2458,54 +2458,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_store_classify_us",
                             ),
                             (
-                                "store_classify_dedup_us",
-                                "verbose.index.server_index_insert_batch_store_classify_dedup_us",
-                            ),
-                            (
-                                "store_classify_df_lookup_us",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_us",
-                            ),
-                            (
-                                "store_classify_df_lookup_snapshot_rows_examined",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_snapshot_rows_examined",
-                            ),
-                            (
-                                "store_classify_df_lookup_snapshot_point_lookups",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_snapshot_point_lookups",
-                            ),
-                            (
-                                "store_classify_df_lookup_segment_visits",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_segment_visits",
-                            ),
-                            (
-                                "store_classify_df_lookup_segment_rows_examined",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_segment_rows_examined",
-                            ),
-                            (
-                                "store_classify_df_lookup_segment_point_lookups",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_segment_point_lookups",
-                            ),
-                            (
-                                "store_classify_df_lookup_delta_lookups",
-                                "verbose.index.server_index_insert_batch_store_classify_df_lookup_delta_lookups",
-                            ),
-                            (
-                                "store_classify_eligibility_us",
-                                "verbose.index.server_index_insert_batch_store_classify_eligibility_us",
-                            ),
-                            (
-                                "store_classify_budget_us",
-                                "verbose.index.server_index_insert_batch_store_classify_budget_us",
-                            ),
-                            (
-                                "store_classify_binning_us",
-                                "verbose.index.server_index_insert_batch_store_classify_binning_us",
-                            ),
-                            (
-                                "store_classify_finalize_us",
-                                "verbose.index.server_index_insert_batch_store_classify_finalize_us",
-                            ),
-                            (
                                 "store_append_sidecars_us",
                                 "verbose.index.server_index_insert_batch_store_append_sidecars_us",
                             ),

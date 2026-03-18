@@ -29,8 +29,6 @@ const DEFAULT_BLOOM_HASHES: usize = 7;
 const DEFAULT_FILTER_MIN_BYTES: usize = 1;
 const DEFAULT_FILTER_MAX_BYTES: usize = 0;
 const DEFAULT_FILTER_SIZE_DIVISOR: usize = 1;
-const DEFAULT_DF_MIN: usize = 1;
-const DEFAULT_DF_MAX: usize = 0;
 const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 128;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
@@ -45,8 +43,6 @@ pub struct CandidateConfig {
     pub tier1_gram_size: usize,
     pub tier2_superblock_summary_cap_bytes: usize,
     pub filter_target_fp: Option<f64>,
-    pub df_min: usize,
-    pub df_max: usize,
     pub compaction_idle_cooldown_s: f64,
 }
 
@@ -60,8 +56,6 @@ impl Default for CandidateConfig {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             filter_target_fp: Some(0.35),
-            df_min: DEFAULT_DF_MIN,
-            df_max: DEFAULT_DF_MAX,
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
     }
@@ -77,18 +71,6 @@ pub struct CandidateInsertResult {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateInsertBatchProfile {
     pub classify_us: u64,
-    pub classify_dedup_us: u64,
-    pub classify_df_lookup_us: u64,
-    pub classify_df_lookup_snapshot_rows_examined: u64,
-    pub classify_df_lookup_snapshot_point_lookups: u64,
-    pub classify_df_lookup_segment_visits: u64,
-    pub classify_df_lookup_segment_rows_examined: u64,
-    pub classify_df_lookup_segment_point_lookups: u64,
-    pub classify_df_lookup_delta_lookups: u64,
-    pub classify_eligibility_us: u64,
-    pub classify_budget_us: u64,
-    pub classify_binning_us: u64,
-    pub classify_finalize_us: u64,
     pub append_sidecars_us: u64,
     pub append_sidecar_payloads_us: u64,
     pub append_bloom_payload_assemble_us: u64,
@@ -200,8 +182,6 @@ pub struct CandidateStats {
     pub filter_target_fp: Option<f64>,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
-    pub df_min: usize,
-    pub df_max: usize,
     pub compaction_idle_cooldown_s: f64,
     pub compaction_cooldown_remaining_s: f64,
     pub compaction_waiting_for_cooldown: bool,
@@ -229,8 +209,6 @@ struct StoreMeta {
     tier1_gram_size: usize,
     tier2_superblock_summary_cap_bytes: usize,
     filter_target_fp: Option<f64>,
-    df_min: usize,
-    df_max: usize,
     compaction_idle_cooldown_s: f64,
 }
 
@@ -261,8 +239,6 @@ impl Default for StoreMeta {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             filter_target_fp: Some(0.35),
-            df_min: DEFAULT_DF_MIN,
-            df_max: DEFAULT_DF_MAX,
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
     }
@@ -929,8 +905,6 @@ impl CandidateStore {
                     .tier2_superblock_summary_cap_bytes
                     .max(1),
                 filter_target_fp: config.filter_target_fp,
-                df_min: config.df_min,
-                df_max: config.df_max,
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
             },
             docs: Vec::new(),
@@ -1079,8 +1053,6 @@ impl CandidateStore {
             tier1_gram_size: self.meta.tier1_gram_size,
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
             filter_target_fp: self.meta.filter_target_fp,
-            df_min: self.meta.df_min,
-            df_max: self.meta.df_max,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
         }
     }
@@ -2406,8 +2378,6 @@ impl CandidateStore {
             filter_target_fp: self.meta.filter_target_fp,
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
-            df_min: self.meta.df_min,
-            df_max: self.meta.df_max,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
             compaction_cooldown_remaining_s: cooldown_remaining,
             compaction_waiting_for_cooldown: cooldown_remaining > 0.0,
@@ -3844,12 +3814,6 @@ fn read_u32_vec(
 }
 
 fn validate_config(config: &CandidateConfig) -> Result<()> {
-    if config.df_min == 0 {
-        return Err(SspryError::from("candidate config values must be positive"));
-    }
-    if config.df_max != 0 && config.df_max < config.df_min {
-        return Err(SspryError::from("df_max must be >= df_min"));
-    }
     if !matches!(
         config.id_source.as_str(),
         "sha256" | "md5" | "sha1" | "sha512"
@@ -4940,30 +4904,6 @@ rule q {
     }
 
     #[test]
-    fn df_min_suppresses_first_occurrence() {
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path().join("candidate_db");
-        let mut store = CandidateStore::init(
-            CandidateConfig {
-                root,
-                filter_target_fp: None,
-                df_min: 2,
-                ..CandidateConfig::default()
-            },
-            true,
-        )
-        .expect("init");
-
-        let first = insert_primary(&mut store, [0xAA; 32], 32, None, None, 32, &[0u8; 32], None)
-            .expect("insert");
-        assert_eq!(first.status, "inserted");
-
-        let second = insert_primary(&mut store, [0xBB; 32], 32, None, None, 32, &[0u8; 32], None)
-            .expect("insert");
-        assert_eq!(second.status, "inserted");
-    }
-
-    #[test]
     fn target_fp_derives_effective_bloom_hash_count() {
         let tmp = tempdir().expect("tmp");
         let store = CandidateStore::init(
@@ -5097,27 +5037,6 @@ rule q {
             .contains("already exists")
         );
 
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                df_min: 0,
-                ..CandidateConfig::default()
-            })
-            .expect_err("positive config")
-            .to_string()
-            .contains("must be positive")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                df_min: 2,
-                df_max: 1,
-                ..CandidateConfig::default()
-            })
-            .expect_err("df order")
-            .to_string()
-            .contains("df_max")
-        );
         assert!(
             validate_config(&CandidateConfig {
                 root: root.clone(),
