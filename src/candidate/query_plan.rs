@@ -5,8 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, metadata_field_is_boolean,
-    normalize_query_metadata_field, pack_exact_gram,
+    GramSizes, metadata_field_is_boolean, normalize_query_metadata_field, pack_exact_gram,
 };
 use crate::{Result, SspryError};
 
@@ -1122,23 +1121,6 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
     }
 }
 
-pub fn compile_query_plan(
-    rule_text: &str,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: usize,
-) -> Result<CompiledQueryPlan> {
-    compile_query_plan_with_gram_sizes(
-        rule_text,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
 pub fn compile_query_plan_with_gram_sizes(
     rule_text: &str,
     gram_sizes: GramSizes,
@@ -1248,23 +1230,6 @@ pub fn compile_query_plan_with_gram_sizes(
     })
 }
 
-pub fn compile_query_plan_from_file(
-    rule_path: impl AsRef<Path>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: usize,
-) -> Result<CompiledQueryPlan> {
-    compile_query_plan_from_file_with_gram_sizes(
-        rule_path,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
 pub fn compile_query_plan_from_file_with_gram_sizes(
     rule_path: impl AsRef<Path>,
     gram_sizes: GramSizes,
@@ -1284,42 +1249,6 @@ pub fn compile_query_plan_from_file_with_gram_sizes(
     )
 }
 
-pub fn compile_query_plan_with_tier2_gram_size(
-    rule_text: &str,
-    tier2_gram_size: usize,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: usize,
-) -> Result<CompiledQueryPlan> {
-    compile_query_plan_with_gram_sizes(
-        rule_text,
-        GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn compile_query_plan_from_file_with_tier2_gram_size(
-    rule_path: impl AsRef<Path>,
-    tier2_gram_size: usize,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: usize,
-) -> Result<CompiledQueryPlan> {
-    compile_query_plan_from_file_with_gram_sizes(
-        rule_path,
-        GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -1327,7 +1256,84 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
+
     use super::*;
+
+    fn default_gram_sizes() -> GramSizes {
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            .expect("default gram sizes")
+    }
+
+    fn compile_query_plan_default(
+        rule_text: &str,
+        max_anchors_per_alt: usize,
+        force_tier1_only: bool,
+        allow_tier2_fallback: bool,
+        max_candidates: usize,
+    ) -> Result<CompiledQueryPlan> {
+        compile_query_plan_with_gram_sizes(
+            rule_text,
+            default_gram_sizes(),
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )
+    }
+
+    fn compile_query_plan_from_file_default(
+        rule_path: impl AsRef<Path>,
+        max_anchors_per_alt: usize,
+        force_tier1_only: bool,
+        allow_tier2_fallback: bool,
+        max_candidates: usize,
+    ) -> Result<CompiledQueryPlan> {
+        compile_query_plan_from_file_with_gram_sizes(
+            rule_path,
+            default_gram_sizes(),
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )
+    }
+
+    fn compile_query_plan_with_tier2_default_tier1(
+        rule_text: &str,
+        tier2_gram_size: usize,
+        max_anchors_per_alt: usize,
+        force_tier1_only: bool,
+        allow_tier2_fallback: bool,
+        max_candidates: usize,
+    ) -> Result<CompiledQueryPlan> {
+        compile_query_plan_with_gram_sizes(
+            rule_text,
+            GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )
+    }
+
+    fn compile_query_plan_from_file_with_tier2_default_tier1(
+        rule_path: impl AsRef<Path>,
+        tier2_gram_size: usize,
+        max_anchors_per_alt: usize,
+        force_tier1_only: bool,
+        allow_tier2_fallback: bool,
+        max_candidates: usize,
+    ) -> Result<CompiledQueryPlan> {
+        compile_query_plan_from_file_with_gram_sizes(
+            rule_path,
+            GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )
+    }
 
     #[test]
     fn compile_restricted_yara_rule() {
@@ -1341,7 +1347,7 @@ rule sample {
     $a and ($b or 1 of ($a, $c))
 }
 "#;
-        let plan = compile_query_plan(rule, 16, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
         assert!(matches!(plan, CompiledQueryPlan { .. }));
         let patterns = plan
             .patterns
@@ -1365,7 +1371,7 @@ rule bad {
     $a
 }
 "#;
-        assert!(compile_query_plan(rule, 8, false, true, 100_000).is_err());
+        assert!(compile_query_plan_default(rule, 8, false, true, 100_000).is_err());
     }
 
     #[test]
@@ -1378,7 +1384,7 @@ rule sized {
     $a and filesize == 8
 }
 "#;
-        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 1);
         assert_eq!(plan.root.kind, "and");
         assert_eq!(plan.root.children.len(), 2);
@@ -1402,7 +1408,7 @@ rule module_meta {
     $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true and ELF.OSABI == 3 and time.now == 42
 }
 "#;
-        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 1);
         assert_eq!(plan.root.kind, "and");
         assert_eq!(plan.root.children.len(), 6);
@@ -1443,7 +1449,7 @@ rule numeric_reads {
     $a and uint32(0) == 0x14c and float32be(4) == 2.5
 }
 "#;
-        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 3);
         assert_eq!(plan.root.kind, "and");
         assert!(plan.patterns.iter().any(|pattern| {
@@ -1491,7 +1497,7 @@ rule numeric_only {
     uint32(0) == 0x4000
 }
 "#;
-        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 2);
         assert_eq!(plan.root.kind, "and");
         assert!(plan.patterns.iter().any(|pattern| {
@@ -1795,7 +1801,7 @@ rule sample {
     ($a or $b) and 1 of ($a, $c)
 }
 "#;
-        let plan = compile_query_plan(rule, 1, true, false, 9).expect("compile");
+        let plan = compile_query_plan_default(rule, 1, true, false, 9).expect("compile");
         assert!(plan.force_tier1_only);
         assert!(!plan.allow_tier2_fallback);
         assert_eq!(plan.max_candidates, 9);
@@ -1809,13 +1815,13 @@ rule sample {
         }));
 
         assert_eq!(
-            compile_query_plan(rule, 1, false, true, 0)
+            compile_query_plan_default(rule, 1, false, true, 0)
                 .expect("zero means unlimited")
                 .max_candidates,
             usize::MAX
         );
         assert!(
-            compile_query_plan(
+            compile_query_plan_default(
                 r#"
 rule bad {
   strings:
@@ -1834,7 +1840,7 @@ rule bad {
             .contains("unknown string id")
         );
 
-        let numeric_only = compile_query_plan(
+        let numeric_only = compile_query_plan_default(
             r#"
 rule numeric_only {
   strings:
@@ -1879,7 +1885,7 @@ rule numeric_too_short_for_gram_sizes {
         );
 
         assert!(
-            compile_query_plan(
+            compile_query_plan_default(
                 r#"
 rule numeric_rhs {
   strings:
@@ -1910,7 +1916,7 @@ rule sample {
     $a or $b
 }
 "#;
-        let plan = compile_query_plan(rule, 16, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
         let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
         assert_eq!(literal_plan.literals["$a"], vec![b"ABCD".to_vec()]);
         let mut matches = HashMap::new();
@@ -1929,7 +1935,7 @@ rule sample {
     $a
 }
 "#;
-        let plan = compile_query_plan(rule, 16, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
         let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
         let literals = literal_plan.literals.get("$a").expect("literals");
         assert_eq!(literals.len(), 2);
@@ -1949,7 +1955,7 @@ rule sample {
     $a or $b or $c
 }
 "#;
-        let plan = compile_query_plan(rule, 4, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan_default(rule, 4, false, true, 100_000).expect("plan");
         for pattern in &plan.patterns {
             assert!(pattern.alternatives[0].len() <= 2);
         }
@@ -1971,8 +1977,8 @@ rule disk_rule {
 "#,
         )
         .expect("write rule");
-        let plan =
-            compile_query_plan_from_file(&rule_path, 8, false, true, 100).expect("plan from file");
+        let plan = compile_query_plan_from_file_default(&rule_path, 8, false, true, 100)
+            .expect("plan from file");
         assert_eq!(plan.patterns.len(), 1);
     }
 
@@ -2134,16 +2140,17 @@ rule q {
 }
 "#;
         let plan =
-            compile_query_plan_with_tier2_gram_size(rule, 3, 8, false, true, 50).expect("plan");
+            compile_query_plan_with_tier2_default_tier1(rule, 3, 8, false, true, 50).expect("plan");
         assert_eq!(plan.tier2_gram_size, 3);
         assert_eq!(plan.tier1_gram_size, DEFAULT_TIER1_GRAM_SIZE);
 
         let tmp = tempdir().expect("tmp");
         let rule_path = tmp.path().join("rule.yar");
         fs::write(&rule_path, rule).expect("rule");
-        let plan =
-            compile_query_plan_from_file_with_tier2_gram_size(&rule_path, 3, 8, false, true, 50)
-                .expect("plan from file");
+        let plan = compile_query_plan_from_file_with_tier2_default_tier1(
+            &rule_path, 3, 8, false, true, 50,
+        )
+        .expect("plan from file");
         assert_eq!(plan.tier2_gram_size, 3);
         assert_eq!(plan.max_candidates, 50);
     }

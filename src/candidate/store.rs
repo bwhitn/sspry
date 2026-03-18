@@ -4127,8 +4127,9 @@ mod tests {
 
     use crate::candidate::BloomFilter;
     use crate::candidate::{
-        extract_compact_document_metadata, pack_exact_gram, query_plan::compile_query_plan,
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
+        extract_compact_document_metadata, pack_exact_gram,
+        query_plan::compile_query_plan_with_gram_sizes, GramSizes, DEFAULT_TIER1_GRAM_SIZE,
+        DEFAULT_TIER2_GRAM_SIZE,
     };
 
     use super::*;
@@ -4210,7 +4211,7 @@ mod tests {
         .expect("insert");
         assert_eq!(result.status, "inserted");
 
-        let plan = compile_query_plan(
+        let plan = compile_query_plan_with_gram_sizes(
             r#"
 rule q {
   strings:
@@ -4219,6 +4220,8 @@ rule q {
     $a
 }
 "#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
             8,
             false,
             true,

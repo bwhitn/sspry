@@ -22,10 +22,8 @@ pub use metadata::{
     metadata_field_matches_eq, normalize_query_metadata_field,
 };
 pub use query_plan::{
-    CompiledQueryPlan, PatternPlan, QueryNode, compile_query_plan, compile_query_plan_from_file,
-    compile_query_plan_from_file_with_gram_sizes,
-    compile_query_plan_from_file_with_tier2_gram_size, compile_query_plan_with_gram_sizes,
-    compile_query_plan_with_tier2_gram_size, normalize_max_candidates,
+    CompiledQueryPlan, PatternPlan, QueryNode, compile_query_plan_from_file_with_gram_sizes,
+    compile_query_plan_with_gram_sizes, normalize_max_candidates,
 };
 pub use store::{
     CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryResult,

@@ -5926,6 +5926,27 @@ mod tests {
         )
     }
 
+    fn compile_query_plan_from_file_default(
+        rule_path: impl AsRef<Path>,
+        max_anchors_per_alt: usize,
+        force_tier1_only: bool,
+        allow_tier2_fallback: bool,
+        max_candidates: usize,
+    ) -> Result<crate::candidate::CompiledQueryPlan> {
+        crate::candidate::compile_query_plan_from_file_with_gram_sizes(
+            rule_path,
+            crate::candidate::GramSizes::new(
+                crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
+                crate::candidate::DEFAULT_TIER1_GRAM_SIZE,
+            )
+            .expect("default gram sizes"),
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )
+    }
+
     #[test]
     fn current_stats_json_returns_busy_error_when_shard_locked() {
         let tmp = tempdir().expect("tmp");
@@ -8185,8 +8206,8 @@ rule q {
         .expect("decode candidate batch");
         assert_eq!(inserted_docs.inserted_count, 1);
 
-        let plan = crate::candidate::compile_query_plan_from_file(&rule, 8, false, true, 100_000)
-            .expect("plan");
+        let plan =
+            compile_query_plan_from_file_default(&rule, 8, false, true, 100_000).expect("plan");
         let query_with_ids: CandidateQueryResponse = json_from_bytes(
             &state
                 .dispatch(
@@ -8516,8 +8537,8 @@ rule q {
         assert_eq!(batch.inserted_count, 1);
         assert_eq!(batch.results.len(), 1);
 
-        let plan = crate::candidate::compile_query_plan_from_file(&rule, 8, false, true, 100_000)
-            .expect("plan");
+        let plan =
+            compile_query_plan_from_file_default(&rule, 8, false, true, 100_000).expect("plan");
         let query = client
             .candidate_query_plan_with_options(&plan, 0, Some(1), true)
             .expect("query");

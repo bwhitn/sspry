@@ -9,8 +9,8 @@ use base64::Engine;
 use tempfile::tempdir;
 
 use sspry::candidate::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, compile_query_plan_from_file,
-    scan_file_features_bloom_only_with_gram_sizes,
+    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
+    compile_query_plan_from_file_with_gram_sizes, scan_file_features_bloom_only_with_gram_sizes,
 };
 use sspry::rpc::{CandidateDocumentWire, ClientConfig, SspryClient};
 
@@ -85,6 +85,24 @@ fn scan_features_default_grams(path: &Path) -> sspry::Result<sspry::candidate::D
     )
 }
 
+fn compile_query_plan_from_file_default(
+    rule_path: &Path,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: usize,
+) -> sspry::Result<sspry::candidate::CompiledQueryPlan> {
+    compile_query_plan_from_file_with_gram_sizes(
+        rule_path,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            .expect("default gram sizes"),
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
 #[test]
 fn tcp_rpc_transport_covers_candidate_actions() {
     let tmp = tempdir().expect("tmp");
@@ -151,7 +169,7 @@ rule q {
     let publish = client.publish().expect("publish");
     assert!(publish.contains("published work root"));
 
-    let plan = compile_query_plan_from_file(&rule, 8, false, true, 100_000).expect("plan");
+    let plan = compile_query_plan_from_file_default(&rule, 8, false, true, 100_000).expect("plan");
     let result = client
         .candidate_query_plan_with_options(&plan, 0, Some(32), true)
         .expect("candidate query");
