@@ -2730,12 +2730,17 @@ impl CandidateStore {
                     doc_id: None,
                 });
             }
-            let grams_received = self.doc_grams_received(pos)?;
-            let df_deltas = grams_received
-                .iter()
-                .map(|gram| (*gram, -1))
-                .collect::<Vec<_>>();
-            self.df_counts.apply_deltas(&df_deltas);
+            let df_deltas = if self.doc_rows[pos].grams_received_count == 0 {
+                Vec::new()
+            } else {
+                let grams_received = self.doc_grams_received(pos)?;
+                let df_deltas = grams_received
+                    .iter()
+                    .map(|gram| (*gram, -1))
+                    .collect::<Vec<_>>();
+                self.df_counts.apply_deltas(&df_deltas);
+                df_deltas
+            };
             let snapshot = {
                 let doc = &mut self.docs[pos];
                 doc.deleted = true;
@@ -2751,12 +2756,14 @@ impl CandidateStore {
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
             self.rebuild_tier2_superblocks()?;
-            append_df_count_deltas_with_writer(
-                &mut self.append_writers.df_counts_delta,
-                self.meta.exact_gram_bytes(),
-                &df_deltas,
-            )?;
-            let _ = self.maybe_compact_df_counts()?;
+            if !df_deltas.is_empty() {
+                append_df_count_deltas_with_writer(
+                    &mut self.append_writers.df_counts_delta,
+                    self.meta.exact_gram_bytes(),
+                    &df_deltas,
+                )?;
+                let _ = self.maybe_compact_df_counts()?;
+            }
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
             return Ok(result);
@@ -3137,16 +3144,18 @@ impl CandidateStore {
             if meta_dirty {
                 self.mark_meta_dirty();
             }
-            let append_df_delta_started = Instant::now();
-            append_df_count_unit_payload_with_writer(
-                &mut self.append_writers.df_counts_unit_delta,
-                &aggregate_df_unit_delta_payload,
-            )?;
-            import_profile.append_df_delta_ms = append_df_delta_started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
+            if !aggregate_df_unit_delta_payload.is_empty() {
+                let append_df_delta_started = Instant::now();
+                append_df_count_unit_payload_with_writer(
+                    &mut self.append_writers.df_counts_unit_delta,
+                    &aggregate_df_unit_delta_payload,
+                )?;
+                import_profile.append_df_delta_ms = append_df_delta_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+            }
             let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
             import_profile.rebalance_tier2_ms = rebalance_tier2_started
