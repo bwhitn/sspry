@@ -17,6 +17,9 @@ Current baseline:
   - `DocumentFeatures.unique_grams`, `unique_grams_truncated`, and `effective_diversity` still exist mainly for compatibility/test scaffolding
   - next cleanup there should target compatibility/test-only paths, not the default scanner hot path
   - production `DocumentFeatures` no longer exposes those gram-era fields; they are unit-test-only now
+  - the `entropy_*`, `bucket_*`, and exact-gram selection helpers are now test-only in `features.rs`
+  - production still keeps the HLL `estimate_*grams*` helpers because app-side bloom sizing depends on them
+  - dead public reexports for exact-gram helper utilities were removed from `candidate/mod.rs`
 - `26k` bloom-only verification after the compatibility-wire cleanup:
   - artifact:
     - `/root/pertest/results/sspry_verify_26000_bloomcut_20260318_r2`

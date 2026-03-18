@@ -11,12 +11,8 @@ pub mod store;
 pub use bloom::{BloomFilter, bloom_positions};
 pub use cache::BoundedCache;
 pub use features::{
-    DocumentFeatures, HLL_DEFAULT_PRECISION, estimate_unique_default_tier2_grams_hll,
-    estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll, estimate_unique_grams4_hll,
-    estimate_unique_tier2_grams_hll, iter_default_tier2_grams_from_bytes,
-    iter_grams_from_bytes_exact_u64, iter_grams4_from_bytes, iter_tier2_grams_from_bytes,
-    scan_file_features, scan_file_features_with_gram_sizes,
-    scan_file_features_with_tier2_gram_size, select_tier1_grams,
+    DocumentFeatures, HLL_DEFAULT_PRECISION, estimate_unique_grams_for_size_hll,
+    estimate_unique_grams_pair_hll, scan_file_features, scan_file_features_with_gram_sizes,
 };
 pub use filter_policy::{
     choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,

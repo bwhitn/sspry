@@ -1,8 +1,10 @@
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+#[cfg(test)]
 use hashbrown::HashSet;
 use sha2::{Digest, Sha256};
 
@@ -13,11 +15,17 @@ use crate::candidate::grams::{
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
 
+#[cfg(test)]
 const ENTROPY_WINDOW_BYTES: usize = 1024;
+#[cfg(test)]
 const ENTROPY_REGION_COUNT: usize = 16;
+#[cfg(test)]
 const ENTROPY_BUCKET_MAXIMA: [f64; 6] = [4.94, 6.83, 7.55, 7.82, 7.93, 8.00];
+#[cfg(test)]
 const ENTROPY_BUCKET_WEIGHTS: [usize; 6] = [455, 318, 145, 55, 18, 5];
+#[cfg(test)]
 const MIN_SCALED_GRAM_BUDGET: usize = 1024;
+#[cfg(test)]
 const MAX_SCALED_GRAM_BUDGET: usize = 16_384;
 pub const HLL_DEFAULT_PRECISION: u8 = 14;
 const U64_MASK: u64 = u64::MAX;
@@ -42,6 +50,7 @@ impl DocumentFeatures {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct EntropyWindow {
     window_index: usize,
@@ -49,6 +58,7 @@ struct EntropyWindow {
     unique_grams: Vec<u64>,
 }
 
+#[cfg(test)]
 pub fn iter_grams_from_bytes_exact_u64(data: &[u8], gram_size: usize) -> Vec<u64> {
     if data.len() < gram_size {
         return Vec::new();
@@ -58,6 +68,7 @@ pub fn iter_grams_from_bytes_exact_u64(data: &[u8], gram_size: usize) -> Vec<u64
         .collect()
 }
 
+#[cfg(test)]
 fn stable_gram_rank(gram: u64, sha256_prefix: u64, hash_seed: u64) -> u64 {
     let seed_mix = mix_u64_to_u64(hash_seed ^ sha256_prefix.rotate_left(29));
     mix_u64_to_u64(gram ^ seed_mix ^ sha256_prefix.rotate_right(11))
@@ -252,6 +263,7 @@ pub fn estimate_unique_grams_for_size_hll(
     estimate_unique_grams_hll(path, gram_size, chunk_size, precision)
 }
 
+#[cfg(test)]
 pub fn estimate_unique_grams4_hll(
     path: impl AsRef<Path>,
     chunk_size: usize,
@@ -260,6 +272,7 @@ pub fn estimate_unique_grams4_hll(
     estimate_unique_grams_for_size_hll(path, 4, chunk_size, precision)
 }
 
+#[cfg(test)]
 pub fn estimate_unique_default_tier2_grams_hll(
     path: impl AsRef<Path>,
     chunk_size: usize,
@@ -268,6 +281,7 @@ pub fn estimate_unique_default_tier2_grams_hll(
     estimate_unique_grams_for_size_hll(path, 5, chunk_size, precision)
 }
 
+#[cfg(test)]
 pub fn estimate_unique_tier2_grams_hll(
     path: impl AsRef<Path>,
     tier2_gram_size: usize,
@@ -277,18 +291,22 @@ pub fn estimate_unique_tier2_grams_hll(
     estimate_unique_grams_for_size_hll(path, tier2_gram_size, chunk_size, precision)
 }
 
+#[cfg(test)]
 pub fn iter_grams4_from_bytes(data: &[u8]) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, 4)
 }
 
+#[cfg(test)]
 pub fn iter_default_tier2_grams_from_bytes(data: &[u8]) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, 5)
 }
 
+#[cfg(test)]
 pub fn iter_tier2_grams_from_bytes(data: &[u8], tier2_gram_size: usize) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, tier2_gram_size)
 }
 
+#[cfg(test)]
 pub fn scale_tier1_gram_budget(base_budget: usize, estimated_unique_grams: usize) -> usize {
     if base_budget == 0 {
         return 0;
@@ -307,6 +325,7 @@ pub fn scale_tier1_gram_budget(base_budget: usize, estimated_unique_grams: usize
     scaled.clamp(min_cap, max_cap)
 }
 
+#[cfg(test)]
 fn entropy_for_window(data: &[u8]) -> f64 {
     if data.is_empty() {
         return 0.0;
@@ -327,6 +346,7 @@ fn entropy_for_window(data: &[u8]) -> f64 {
     entropy
 }
 
+#[cfg(test)]
 fn entropy_bucket(entropy: f64) -> usize {
     for (index, maximum) in ENTROPY_BUCKET_MAXIMA.iter().enumerate() {
         if entropy <= *maximum {
@@ -336,6 +356,7 @@ fn entropy_bucket(entropy: f64) -> usize {
     ENTROPY_BUCKET_MAXIMA.len() - 1
 }
 
+#[cfg(test)]
 fn split_weighted(total: usize, weights: &[usize]) -> Vec<usize> {
     if total == 0 {
         return vec![0; weights.len()];
@@ -358,6 +379,7 @@ fn split_weighted(total: usize, weights: &[usize]) -> Vec<usize> {
     quotas
 }
 
+#[cfg(test)]
 fn split_evenly(total: usize, buckets: usize) -> Vec<usize> {
     if buckets == 0 {
         return Vec::new();
@@ -444,6 +466,7 @@ fn compute_effective_diversity(
         .clamp(0.0, 1.0)
 }
 
+#[cfg(test)]
 fn resolve_collection_budget(
     max_unique_grams: Option<usize>,
     tier1_gram_budget: usize,
@@ -459,6 +482,7 @@ fn resolve_collection_budget(
     }
 }
 
+#[cfg(test)]
 fn push_unique(vec: &mut Vec<u64>, gram: u64) {
     if !vec.contains(&gram) {
         vec.push(gram);
@@ -466,6 +490,7 @@ fn push_unique(vec: &mut Vec<u64>, gram: u64) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn flush_entropy_window(
     window_index: usize,
     entropy: f64,
@@ -506,6 +531,7 @@ fn flush_entropy_window(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn push_ready_window(
     queue: &mut VecDeque<EntropyWindow>,
     window: EntropyWindow,
@@ -541,6 +567,7 @@ fn push_ready_window(
     truncated
 }
 
+#[cfg(test)]
 fn bucket_window_counter_name(bucket: usize) -> &'static str {
     match bucket {
         0 => "candidate.scan_file_features_entropy_bucket0_windows_total",
@@ -552,6 +579,7 @@ fn bucket_window_counter_name(bucket: usize) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn bucket_selected_counter_name(bucket: usize) -> &'static str {
     match bucket {
         0 => "candidate.scan_file_features_entropy_bucket0_selected_total",
@@ -563,6 +591,7 @@ fn bucket_selected_counter_name(bucket: usize) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn select_tier1_grams(
     grams: &[u64],
     sha256: &[u8; 32],
@@ -700,7 +729,10 @@ pub fn scan_file_features_with_gram_sizes(
     }
 
     let file_path = path.as_ref();
+    #[cfg(test)]
     let expected_file_size = file_path.metadata()?.len();
+    #[cfg(not(test))]
+    let _ = file_path.metadata()?.len();
     let mut file = File::open(file_path)?;
     let mut digest = Sha256::new();
     let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes)?;
@@ -716,31 +748,55 @@ pub fn scan_file_features_with_gram_sizes(
     };
     let mut file_size = 0u64;
     let mut trailing = Vec::<u8>::new();
+    #[cfg(test)]
     let mut truncated = false;
     let mut buf = vec![0u8; chunk_size];
     let mut gram_windows = 0u64;
 
+    #[cfg(not(test))]
+    let _ = (
+        collect_unique_grams,
+        max_unique_grams,
+        tier1_gram_estimate,
+        tier1_gram_budget,
+        tier1_gram_sample_mod,
+        tier1_gram_hash_seed,
+    );
+
+    #[cfg(test)]
     let target_budget =
         resolve_collection_budget(max_unique_grams, tier1_gram_budget, tier1_gram_estimate);
+    #[cfg(test)]
     let total_windows = (((expected_file_size.max(1) as usize) + ENTROPY_WINDOW_BYTES - 1)
         / ENTROPY_WINDOW_BYTES)
         .max(1);
+    #[cfg(test)]
     let region_count = ENTROPY_REGION_COUNT.min(total_windows).max(1);
+    #[cfg(test)]
     let bucket_target_quotas = split_weighted(target_budget, &ENTROPY_BUCKET_WEIGHTS);
+    #[cfg(test)]
     let oversample_factor = tier1_gram_sample_mod.clamp(2, 4);
+    #[cfg(test)]
     let mut pool_budget = if target_budget > 0 {
         target_budget.saturating_mul(oversample_factor)
     } else {
         0
     };
+    #[cfg(test)]
     if let Some(limit) = max_unique_grams {
         pool_budget = pool_budget.min(limit);
     }
+    #[cfg(test)]
     let bucket_pool_quotas = split_weighted(pool_budget, &ENTROPY_BUCKET_WEIGHTS);
+    #[cfg(test)]
     let mut bucket_region_remaining = Vec::with_capacity(bucket_pool_quotas.len());
+    #[cfg(test)]
     let mut bucket_spill_remaining = Vec::with_capacity(bucket_pool_quotas.len());
+    #[cfg(test)]
     let mut bucket_region_grams = Vec::with_capacity(bucket_pool_quotas.len());
+    #[cfg(test)]
     let mut bucket_spill_grams = Vec::with_capacity(bucket_pool_quotas.len());
+    #[cfg(test)]
     for bucket_pool_quota in &bucket_pool_quotas {
         if *bucket_pool_quota == 0 {
             bucket_region_remaining.push(vec![0usize; region_count]);
@@ -756,16 +812,26 @@ pub fn scan_file_features_with_gram_sizes(
         bucket_region_grams.push(vec![Vec::<u64>::new(); region_count]);
         bucket_spill_grams.push(Vec::<u64>::new());
     }
+    #[cfg(test)]
     let mut bucket_window_counts = [0u64; 6];
+    #[cfg(test)]
     let mut global_pool = HashSet::<u64>::new();
+    #[cfg(test)]
     let mut pending_window: Option<EntropyWindow> = None;
+    #[cfg(test)]
     let mut smoothing_queue = VecDeque::<EntropyWindow>::new();
+    #[cfg(test)]
     let mut current_window_index = 0usize;
+    #[cfg(test)]
     let mut stream_buffer = Vec::<u8>::new();
+    #[cfg(test)]
     let mut buffer_start = 0usize;
+    #[cfg(test)]
     let mut window_data = Vec::<u8>::with_capacity(ENTROPY_WINDOW_BYTES + trailing_bytes);
+    #[cfg(test)]
     let mut current_seen = HashSet::<u64>::new();
 
+    #[cfg(test)]
     if collect_unique_grams && target_budget > 0 {
         loop {
             let read_len = file.read(&mut buf)?;
@@ -960,12 +1026,44 @@ pub fn scan_file_features_with_gram_sizes(
             trailing = data[data.len() - trailing_bytes..].to_vec();
         }
     }
+    #[cfg(not(test))]
+    loop {
+        let read_len = file.read(&mut buf)?;
+        if read_len == 0 {
+            break;
+        }
+        let chunk = &buf[..read_len];
+        file_size = file_size.saturating_add(read_len as u64);
+        digest.update(chunk);
+        let mut data = trailing.clone();
+        data.extend_from_slice(chunk);
+        if data.len() < gram_sizes.tier1 {
+            trailing = data;
+            continue;
+        }
+        for idx in 0..=(data.len() - gram_sizes.tier1) {
+            bloom.add(pack_exact_gram(&data[idx..idx + gram_sizes.tier1]))?;
+            gram_windows = gram_windows.saturating_add(1);
+        }
+        if let Some(tier2_bloom_ref) = tier2_bloom.as_mut() {
+            if data.len() >= gram_sizes.tier2 {
+                for idx in 0..=(data.len() - gram_sizes.tier2) {
+                    tier2_bloom_ref.add(pack_exact_gram(&data[idx..idx + gram_sizes.tier2]))?;
+                }
+            }
+        }
+        trailing = data[data.len() - trailing_bytes..].to_vec();
+    }
 
     let digest_bytes = digest.finalize();
     let mut sha256 = [0u8; 32];
     sha256.copy_from_slice(&digest_bytes);
 
+    #[cfg(test)]
     let mut bucket_selected_counts = [0u64; 6];
+    #[cfg(not(test))]
+    let _bucket_selected_counts = [0u64; 6];
+    #[cfg(test)]
     let (unique_grams, dropped) = if collect_unique_grams {
         if target_budget > 0 {
             let mut selected = Vec::<u64>::new();
@@ -1076,9 +1174,15 @@ pub fn scan_file_features_with_gram_sizes(
         (Vec::new(), false)
     };
     #[cfg(not(test))]
+    let (unique_grams, dropped) = (Vec::<u64>::new(), false);
+    #[cfg(not(test))]
     let _ = dropped;
     #[cfg(test)]
     let retained_unique_grams = unique_grams.len();
+    #[cfg(test)]
+    let effective_budget_total = target_budget as u64;
+    #[cfg(not(test))]
+    let effective_budget_total = 0u64;
 
     total_scope.add_bytes(file_size);
     total_scope.add_items(gram_windows);
@@ -1090,7 +1194,7 @@ pub fn scan_file_features_with_gram_sizes(
     );
     record_counter(
         "candidate.scan_file_features_effective_budget_total",
-        target_budget as u64,
+        effective_budget_total,
     );
     record_max("candidate.scan_file_features_max_bytes", file_size);
     record_max(
@@ -1099,13 +1203,15 @@ pub fn scan_file_features_with_gram_sizes(
     );
     record_max(
         "candidate.scan_file_features_max_effective_budget",
-        target_budget as u64,
+        effective_budget_total,
     );
+    #[cfg(test)]
     for (bucket, count) in bucket_window_counts.iter().copied().enumerate() {
         if count > 0 {
             record_counter(bucket_window_counter_name(bucket), count);
         }
     }
+    #[cfg(test)]
     for (bucket, count) in bucket_selected_counts.iter().copied().enumerate() {
         if count > 0 {
             record_counter(bucket_selected_counter_name(bucket), count);
@@ -1139,6 +1245,7 @@ pub fn scan_file_features_with_gram_sizes(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn scan_file_features_with_tier2_gram_size(
     path: impl AsRef<Path>,
     tier2_gram_size: usize,
