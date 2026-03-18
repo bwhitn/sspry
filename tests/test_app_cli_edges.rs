@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn bin_path() -> String {
@@ -70,6 +71,35 @@ fn wait_for_info(addr: &str) {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("server did not become ready on {addr}");
+}
+
+fn wait_for_published_doc_count(addr: &str, expected_docs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let output = Command::new(bin_path())
+            .args(["info", "--addr", addr])
+            .output()
+            .expect("run info");
+        if output.status.success() {
+            let parsed: Value =
+                serde_json::from_slice(&output.stdout).expect("stats json from info");
+            let publish_runs_total = parsed
+                .get("publish")
+                .and_then(|value| value.get("publish_runs_total"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let doc_count = parsed.get("doc_count").and_then(Value::as_u64).unwrap_or(0);
+            let work_dirty = parsed
+                .get("work_dirty")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if publish_runs_total >= 1 && doc_count == expected_docs && !work_dirty {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server did not publish {expected_docs} docs on {addr}");
 }
 
 fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
@@ -280,4 +310,95 @@ rule NumericReads {
     ]);
     assert!(out.contains("matched: yes"));
     assert!(out.contains("match_rule: NumericReads"));
+}
+
+#[test]
+fn tcp_cli_index_publish_search_roundtrip_verifies_match() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("candidate_db");
+    let dataset = tmp.path().join("dataset");
+    fs::create_dir_all(&dataset).expect("dataset dir");
+    let hit_path = dataset.join("hit.bin");
+    let miss_path = dataset.join("miss.bin");
+    let hit_bytes = b"xxABCDyy";
+    let miss_bytes = b"zzzzzzzz";
+    fs::write(&hit_path, hit_bytes).expect("hit");
+    fs::write(&miss_path, miss_bytes).expect("miss");
+    let expected_hit_sha = hex::encode(Sha256::digest(hit_bytes));
+    let expected_miss_sha = hex::encode(Sha256::digest(miss_bytes));
+
+    let rule_path = tmp.path().join("rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule q {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("rule");
+
+    let port = reserve_tcp_port();
+    let addr = tcp_addr(port);
+    let mut child = spawn_serve_tcp(port, &root, &["--store-path"]);
+    wait_for_info(&addr);
+
+    let index_output = Command::new(bin_path())
+        .args([
+            "index",
+            "--addr",
+            &addr,
+            dataset.to_str().expect("dataset"),
+        ])
+        .output()
+        .expect("run index");
+    assert!(
+        index_output.status.success(),
+        "index failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&index_output.stdout),
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+
+    wait_for_published_doc_count(&addr, 2);
+
+    let info = run_ok(&["info", "--addr", &addr]);
+    let parsed: Value = serde_json::from_str(&info).expect("stats json");
+    assert_eq!(parsed.get("doc_count").and_then(Value::as_u64), Some(2));
+    assert_eq!(
+        parsed
+            .get("publish")
+            .and_then(|value| value.get("publish_runs_total"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let search_output = Command::new(bin_path())
+        .args([
+            "search",
+            "--addr",
+            &addr,
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--verify",
+        ])
+        .output()
+        .expect("run search");
+    assert!(
+        search_output.status.success(),
+        "search failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let stdout = String::from_utf8(search_output.stdout).expect("utf8 search stdout");
+    assert!(stdout.contains("tier_used:"));
+    assert!(stdout.contains("verified_matched: 1"));
+    assert!(stdout.contains("verified_skipped: 0"));
+    assert!(stdout.contains(&expected_hit_sha));
+    assert!(!stdout.contains(&expected_miss_sha));
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

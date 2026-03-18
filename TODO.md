@@ -46,6 +46,12 @@ Current baseline:
   - the bloom-only cleanup held under a real release ingest
   - the default path no longer performs any DF/classify lookup work
   - ingest/store time is now overwhelmingly bloom-side append work
+- verification coverage now includes one full CLI roundtrip test:
+  - `serve --store-path`
+  - `index` over a temp dataset
+  - wait for auto-publish
+  - `search --verify`
+  - assert exactly one verified match survives the published search path
 
 - Full-corpus run `r6` on `4cbcd5a` was rejected and stopped at `30,981 / 260,278` docs (`11.90%`).
 - Grouped DF segment lookups regressed into very large exact local scans:
