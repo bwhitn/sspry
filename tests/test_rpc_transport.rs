@@ -72,37 +72,6 @@ fn wait_for_server(port: u16) -> SspryClient {
     panic!("server did not start on port {port}");
 }
 
-fn scan_features_default_grams(path: &Path) -> sspry::Result<sspry::candidate::DocumentFeatures> {
-    scan_file_features_bloom_only_with_gram_sizes(
-        path,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
-            .expect("default gram sizes"),
-        1024,
-        7,
-        0,
-        0,
-        4096,
-    )
-}
-
-fn compile_query_plan_from_file_default(
-    rule_path: &Path,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: usize,
-) -> sspry::Result<sspry::candidate::CompiledQueryPlan> {
-    compile_query_plan_from_file_with_gram_sizes(
-        rule_path,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
-            .expect("default gram sizes"),
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
 #[test]
 fn tcp_rpc_transport_covers_candidate_actions() {
     let tmp = tempdir().expect("tmp");
@@ -132,19 +101,37 @@ rule q {
     let _server = spawn_tcp_serve(port, &candidate_root);
     let client = wait_for_server(port);
 
-    let features_a = scan_features_default_grams(&cand_a).expect("features a");
-    let features_b = scan_features_default_grams(&cand_b).expect("features b");
+    let features_a = scan_file_features_bloom_only_with_gram_sizes(
+        &cand_a,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            .expect("default gram sizes"),
+        1024,
+        7,
+        0,
+        0,
+        4096,
+    )
+    .expect("features a");
+    let features_b = scan_file_features_bloom_only_with_gram_sizes(
+        &cand_b,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            .expect("default gram sizes"),
+        1024,
+        7,
+        0,
+        0,
+        4096,
+    )
+    .expect("features b");
     let docs = vec![
         CandidateDocumentWire {
             sha256: hex::encode(features_a.sha256),
             file_size: features_a.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_a.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: Some("cand-a".to_owned()),
         },
@@ -153,11 +140,9 @@ rule q {
             file_size: features_b.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_b.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: Some("cand-b".to_owned()),
         },
@@ -169,7 +154,16 @@ rule q {
     let publish = client.publish().expect("publish");
     assert!(publish.contains("published work root"));
 
-    let plan = compile_query_plan_from_file_default(&rule, 8, false, true, 100_000).expect("plan");
+    let plan = compile_query_plan_from_file_with_gram_sizes(
+        &rule,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            .expect("default gram sizes"),
+        8,
+        false,
+        true,
+        100_000,
+    )
+    .expect("plan");
     let result = client
         .candidate_query_plan_with_options(&plan, 0, Some(32), true)
         .expect("candidate query");

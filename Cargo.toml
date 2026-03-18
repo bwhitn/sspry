@@ -6,7 +6,6 @@ license = "BSD-3-Clause"
 description = "Scalable Screening and Prefiltering of Rules for YARA"
 
 [dependencies]
-hashbrown = "0.15.5"
 base64 = "0.22.1"
 clap = { version = "4.6.0", features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
@@ -14,7 +13,6 @@ ctrlc = "3.5.2"
 hex = "0.4.3"
 memmap2 = "0.9.10"
 md-5 = "0.10.6"
-rustc-hash = "2.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha1 = "0.10.6"

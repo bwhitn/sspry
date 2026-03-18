@@ -16,7 +16,7 @@ use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
     choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
-use crate::candidate::grams::{GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
+use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
 use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::perf::{record_counter, record_max, scope};
@@ -1194,7 +1194,7 @@ impl CandidateStore {
     fn resolve_filter_bytes_for_file_size(
         &self,
         file_size: u64,
-        gram_count_estimate: Option<usize>,
+        bloom_item_estimate: Option<usize>,
     ) -> Result<usize> {
         choose_filter_bytes_for_file_size(
             file_size,
@@ -1202,19 +1202,19 @@ impl CandidateStore {
             Some(DEFAULT_FILTER_MIN_BYTES),
             Some(DEFAULT_FILTER_MAX_BYTES),
             self.meta.filter_target_fp,
-            gram_count_estimate,
+            bloom_item_estimate,
         )
     }
 
     fn resolve_bloom_hashes_for_document(
         &self,
         filter_bytes: usize,
-        gram_count_estimate: Option<usize>,
+        bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
     ) -> usize {
         derive_document_bloom_hash_count(
             filter_bytes,
-            gram_count_estimate,
+            bloom_item_estimate,
             bloom_hashes.unwrap_or(DEFAULT_BLOOM_HASHES),
         )
     }
@@ -1223,9 +1223,9 @@ impl CandidateStore {
         &mut self,
         sha256: [u8; 32],
         file_size: u64,
-        gram_count_estimate: Option<usize>,
+        bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
-        tier2_gram_count_estimate: Option<usize>,
+        tier2_bloom_item_estimate: Option<usize>,
         tier2_bloom_hashes: Option<usize>,
         filter_bytes: usize,
         bloom_filter: &[u8],
@@ -1236,9 +1236,9 @@ impl CandidateStore {
         self.insert_document_with_metadata(
             sha256,
             file_size,
-            gram_count_estimate,
+            bloom_item_estimate,
             bloom_hashes,
-            tier2_gram_count_estimate,
+            tier2_bloom_item_estimate,
             tier2_bloom_hashes,
             filter_bytes,
             bloom_filter,
@@ -1253,9 +1253,9 @@ impl CandidateStore {
         &mut self,
         sha256: [u8; 32],
         file_size: u64,
-        gram_count_estimate: Option<usize>,
+        bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
-        tier2_gram_count_estimate: Option<usize>,
+        tier2_bloom_item_estimate: Option<usize>,
         tier2_bloom_hashes: Option<usize>,
         filter_bytes: usize,
         bloom_filter: &[u8],
@@ -1270,10 +1270,10 @@ impl CandidateStore {
             return Err(SspryError::from("filter_bytes must be > 0"));
         }
         let expected_filter_bytes =
-            self.resolve_filter_bytes_for_file_size(file_size, gram_count_estimate)?;
+            self.resolve_filter_bytes_for_file_size(file_size, bloom_item_estimate)?;
         let expected_bloom_hashes = self.resolve_bloom_hashes_for_document(
             expected_filter_bytes,
-            gram_count_estimate,
+            bloom_item_estimate,
             bloom_hashes,
         );
         if filter_bytes != expected_filter_bytes {
@@ -1287,10 +1287,10 @@ impl CandidateStore {
             )));
         }
         let expected_tier2_filter_bytes =
-            self.resolve_filter_bytes_for_file_size(file_size, tier2_gram_count_estimate)?;
+            self.resolve_filter_bytes_for_file_size(file_size, tier2_bloom_item_estimate)?;
         let expected_tier2_bloom_hashes = self.resolve_bloom_hashes_for_document(
             expected_tier2_filter_bytes,
-            tier2_gram_count_estimate,
+            tier2_bloom_item_estimate,
             tier2_bloom_hashes,
         );
         if !tier2_bloom_filter.is_empty() {
@@ -1457,9 +1457,9 @@ impl CandidateStore {
             let (
                 sha256,
                 file_size,
-                gram_count_estimate,
+                bloom_item_estimate,
                 bloom_hashes,
-                tier2_gram_count_estimate,
+                tier2_bloom_item_estimate,
                 tier2_bloom_hashes,
                 filter_bytes,
                 bloom_filter,
@@ -1473,10 +1473,10 @@ impl CandidateStore {
                 return Err(SspryError::from("filter_bytes must be > 0"));
             }
             let expected_filter_bytes =
-                self.resolve_filter_bytes_for_file_size(*file_size, *gram_count_estimate)?;
+                self.resolve_filter_bytes_for_file_size(*file_size, *bloom_item_estimate)?;
             let expected_bloom_hashes = self.resolve_bloom_hashes_for_document(
                 expected_filter_bytes,
-                *gram_count_estimate,
+                *bloom_item_estimate,
                 *bloom_hashes,
             );
             if *filter_bytes != expected_filter_bytes {
@@ -1492,10 +1492,10 @@ impl CandidateStore {
                 )));
             }
             let expected_tier2_filter_bytes =
-                self.resolve_filter_bytes_for_file_size(*file_size, *tier2_gram_count_estimate)?;
+                self.resolve_filter_bytes_for_file_size(*file_size, *tier2_bloom_item_estimate)?;
             let expected_tier2_bloom_hashes = self.resolve_bloom_hashes_for_document(
                 expected_tier2_filter_bytes,
-                *tier2_gram_count_estimate,
+                *tier2_bloom_item_estimate,
                 *tier2_bloom_hashes,
             );
             if !tier2_bloom_filter.is_empty() {
@@ -1515,7 +1515,7 @@ impl CandidateStore {
 
             let resolve_doc_state_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
-            let _ = gram_count_estimate;
+            let _ = bloom_item_estimate;
 
             if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
                 if !self.docs[existing_pos].deleted {
@@ -4127,9 +4127,9 @@ mod tests {
 
     use crate::candidate::BloomFilter;
     use crate::candidate::{
+        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
         extract_compact_document_metadata, pack_exact_gram,
-        query_plan::compile_query_plan_with_gram_sizes, GramSizes, DEFAULT_TIER1_GRAM_SIZE,
-        DEFAULT_TIER2_GRAM_SIZE,
+        query_plan::compile_query_plan_with_gram_sizes,
     };
 
     use super::*;
@@ -4138,7 +4138,7 @@ mod tests {
         store: &mut CandidateStore,
         sha256: [u8; 32],
         file_size: u64,
-        gram_count_estimate: Option<usize>,
+        bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
         filter_bytes: usize,
         bloom_filter: &[u8],
@@ -4147,7 +4147,7 @@ mod tests {
         store.insert_document(
             sha256,
             file_size,
-            gram_count_estimate,
+            bloom_item_estimate,
             bloom_hashes,
             None,
             None,
@@ -4463,11 +4463,13 @@ rule q {
 
         let manifest = ShardCompactionManifest {
             current_generation: 7,
-            retired_roots: vec![retired_root
-                .file_name()
-                .expect("retired file name")
-                .to_string_lossy()
-                .into_owned()],
+            retired_roots: vec![
+                retired_root
+                    .file_name()
+                    .expect("retired file name")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
         };
         fs::create_dir_all(&retired_root).expect("create retired root");
         write_shard_compaction_manifest(&root, &manifest).expect("write manifest");
@@ -4570,10 +4572,12 @@ rule q {
         )
         .expect("insert third");
 
-        assert!(store
-            .apply_compaction_snapshot(&snapshot, &compacted_root)
-            .expect("apply compaction")
-            .is_none());
+        assert!(
+            store
+                .apply_compaction_snapshot(&snapshot, &compacted_root)
+                .expect("apply compaction")
+                .is_none()
+        );
         assert_eq!(store.stats().doc_count, 2);
         assert_eq!(store.stats().deleted_doc_count, 1);
         let _ = fs::remove_dir_all(compacted_root);
@@ -4599,10 +4603,12 @@ rule q {
         bloom.add(0x4443_4241).expect("add gram");
         let bloom_bytes = bloom.into_bytes();
 
-        assert!(store
-            .prepare_compaction_snapshot(false)
-            .expect("snapshot without deletes")
-            .is_none());
+        assert!(
+            store
+                .prepare_compaction_snapshot(false)
+                .expect("snapshot without deletes")
+                .is_none()
+        );
 
         insert_primary(
             &mut store,
@@ -4619,14 +4625,18 @@ rule q {
             .delete_document(&hex::encode([0x11; 32]))
             .expect("delete");
 
-        assert!(store
-            .prepare_compaction_snapshot(false)
-            .expect("cooldown snapshot")
-            .is_none());
-        assert!(store
-            .prepare_compaction_snapshot(true)
-            .expect("forced snapshot")
-            .is_some());
+        assert!(
+            store
+                .prepare_compaction_snapshot(false)
+                .expect("cooldown snapshot")
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_compaction_snapshot(true)
+                .expect("forced snapshot")
+                .is_some()
+        );
     }
 
     #[test]
@@ -4746,49 +4756,59 @@ rule q {
             true,
         )
         .expect("init");
-        assert!(CandidateStore::init(
-            CandidateConfig {
-                root: root.clone(),
-                ..CandidateConfig::default()
-            },
-            false
-        )
-        .expect_err("existing store")
-        .to_string()
-        .contains("already exists"));
+        assert!(
+            CandidateStore::init(
+                CandidateConfig {
+                    root: root.clone(),
+                    ..CandidateConfig::default()
+                },
+                false
+            )
+            .expect_err("existing store")
+            .to_string()
+            .contains("already exists")
+        );
 
-        assert!(validate_config(&CandidateConfig {
-            root: root.clone(),
-            id_source: "filepath".to_owned(),
-            ..CandidateConfig::default()
-        })
-        .expect_err("id source")
-        .to_string()
-        .contains("id_source"));
-        assert!(validate_config(&CandidateConfig {
-            root: root.clone(),
-            filter_target_fp: Some(1.0),
-            ..CandidateConfig::default()
-        })
-        .expect_err("target fp")
-        .to_string()
-        .contains("filter_target_fp"));
+        assert!(
+            validate_config(&CandidateConfig {
+                root: root.clone(),
+                id_source: "filepath".to_owned(),
+                ..CandidateConfig::default()
+            })
+            .expect_err("id source")
+            .to_string()
+            .contains("id_source")
+        );
+        assert!(
+            validate_config(&CandidateConfig {
+                root: root.clone(),
+                filter_target_fp: Some(1.0),
+                ..CandidateConfig::default()
+            })
+            .expect_err("target fp")
+            .to_string()
+            .contains("filter_target_fp")
+        );
         assert_eq!(
             normalize_sha256_hex(&format!("  {}  ", "AB".repeat(32))).expect("normalize"),
             "ab".repeat(32)
         );
-        assert!(normalize_sha256_hex("not-a-sha")
-            .expect_err("invalid sha")
-            .to_string()
-            .contains("64 hexadecimal"));
+        assert!(
+            normalize_sha256_hex("not-a-sha")
+                .expect_err("invalid sha")
+                .to_string()
+                .contains("64 hexadecimal")
+        );
 
         let open_root = tmp.path().join("open_checks");
         fs::create_dir_all(&open_root).expect("open root");
         fs::write(meta_path(&open_root), b"{").expect("bad meta");
-        assert!(CandidateStore::open(&open_root)
-            .expect_err("invalid meta")
-            .to_string()
-            .contains("Invalid candidate metadata"));
+        assert!(
+            CandidateStore::open(&open_root)
+                .expect_err("invalid meta")
+                .to_string()
+                .contains("Invalid candidate metadata")
+        );
 
         let bad_version = StoreMeta {
             version: STORE_VERSION + 1,
@@ -4799,10 +4819,12 @@ rule q {
             serde_json::to_vec_pretty(&bad_version).expect("version json"),
         )
         .expect("write version");
-        assert!(CandidateStore::open(&open_root)
-            .expect_err("unsupported version")
-            .to_string()
-            .contains("Unsupported candidate store version"));
+        assert!(
+            CandidateStore::open(&open_root)
+                .expect_err("unsupported version")
+                .to_string()
+                .contains("Unsupported candidate store version")
+        );
 
         fs::write(
             meta_path(&open_root),
@@ -4917,10 +4939,12 @@ rule q {
         )
         .expect("insert invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
-        assert!(load_candidate_binary_store(&invalid_len_root)
-            .expect_err("invalid binary len")
-            .to_string()
-            .contains("Invalid candidate binary document state"));
+        assert!(
+            load_candidate_binary_store(&invalid_len_root)
+                .expect_err("invalid binary len")
+                .to_string()
+                .contains("Invalid candidate binary document state")
+        );
 
         let mismatch_root = tmp.path().join("mismatch_root");
         let mut mismatch_store = CandidateStore::init(
@@ -4948,10 +4972,12 @@ rule q {
         )
         .expect("insert mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
-        assert!(load_candidate_binary_store(&mismatch_root)
-            .expect_err("mismatch state")
-            .to_string()
-            .contains("Mismatched candidate binary document state"));
+        assert!(
+            load_candidate_binary_store(&mismatch_root)
+                .expect_err("mismatch state")
+                .to_string()
+                .contains("Mismatched candidate binary document state")
+        );
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
         let mut invalid_bloom_store = CandidateStore::init(
@@ -4988,10 +5014,12 @@ rule q {
             serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
-        assert!(CandidateStore::open(&invalid_bloom_root)
-            .expect_err("invalid bloom offset")
-            .to_string()
-            .contains("Invalid bloom payload stored"));
+        assert!(
+            CandidateStore::open(&invalid_bloom_root)
+                .expect_err("invalid bloom offset")
+                .to_string()
+                .contains("Invalid bloom payload stored")
+        );
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
         let mut invalid_utf8_store = CandidateStore::init(
@@ -5024,12 +5052,14 @@ rule q {
             serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad utf8 meta"),
         )
         .expect("write bad utf8 meta");
-        assert!(CandidateStore::open(&invalid_utf8_root)
-            .expect("open utf8 root")
-            .doc_external_id(0)
-            .expect_err("invalid external id utf8")
-            .to_string()
-            .contains("Invalid external_id payload stored"));
+        assert!(
+            CandidateStore::open(&invalid_utf8_root)
+                .expect("open utf8 root")
+                .doc_external_id(0)
+                .expect_err("invalid external id utf8")
+                .to_string()
+                .contains("Invalid external_id payload stored")
+        );
     }
 
     #[test]
@@ -5055,10 +5085,12 @@ rule q {
         assert_eq!(decoded.bloom_len, row.bloom_len);
         assert_eq!(decoded.external_id_offset, row.external_id_offset);
         assert_eq!(decoded.external_id_len, row.external_id_len);
-        assert!(DocMetaRow::decode(&encoded[..encoded.len() - 1])
-            .expect_err("short row")
-            .to_string()
-            .contains("Invalid candidate doc meta row size"));
+        assert!(
+            DocMetaRow::decode(&encoded[..encoded.len() - 1])
+                .expect_err("short row")
+                .to_string()
+                .contains("Invalid candidate doc meta row size")
+        );
 
         let tmp = tempdir().expect("tmp");
         let blob_path = tmp.path().join("blob.bin");
@@ -5074,10 +5106,12 @@ rule q {
         write_at(blob_path.clone(), 1, b"Z").expect("write at");
         bytes = fs::read(&blob_path).expect("re-read blob file");
         assert_eq!(&bytes, b"aZcde");
-        assert!(read_blob(&bytes, 99, 1, "blob", 1)
-            .expect_err("invalid blob range")
-            .to_string()
-            .contains("Invalid blob payload stored"));
+        assert!(
+            read_blob(&bytes, 99, 1, "blob", 1)
+                .expect_err("invalid blob range")
+                .to_string()
+                .contains("Invalid blob payload stored")
+        );
 
         let u32_path = tmp.path().join("u32.bin");
         let offset = append_u32_slice(u32_path.clone(), &[7, 8, 9]).expect("append u32");
@@ -5086,10 +5120,12 @@ rule q {
             read_u32_vec(&u32_bytes, offset, 3, "grams", 9).expect("read u32 vec"),
             vec![7, 8, 9]
         );
-        assert!(read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
-            .expect_err("invalid u32 range")
-            .to_string()
-            .contains("Invalid grams payload stored"));
+        assert!(
+            read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
+                .expect_err("invalid u32 range")
+                .to_string()
+                .contains("Invalid grams payload stored")
+        );
     }
 
     #[test]
@@ -5111,11 +5147,13 @@ rule q {
                 .as_ref(),
             b"bcd"
         );
-        assert!(sidecar
-            .read_bytes(99, 1, "blob", 7)
-            .expect_err("invalid range")
-            .to_string()
-            .contains("Invalid blob payload stored"));
+        assert!(
+            sidecar
+                .read_bytes(99, 1, "blob", 7)
+                .expect_err("invalid range")
+                .to_string()
+                .contains("Invalid blob payload stored")
+        );
         sidecar.invalidate();
         assert_eq!(
             sidecar
@@ -5200,28 +5238,32 @@ rule q {
         )
         .expect("init");
 
-        assert!(store
-            .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
-            .expect_err("zero filter bytes")
-            .to_string()
-            .contains("filter_bytes must be > 0"));
-        assert!(store
-            .insert_document(
-                [0x10; 32],
-                8,
-                None,
-                None,
-                None,
-                None,
-                1024,
-                &vec![0u8; 32],
-                0,
-                &[],
-                None,
-            )
-            .expect_err("length mismatch")
-            .to_string()
-            .contains("bloom_filter length"));
+        assert!(
+            store
+                .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
+                .expect_err("zero filter bytes")
+                .to_string()
+                .contains("filter_bytes must be > 0")
+        );
+        assert!(
+            store
+                .insert_document(
+                    [0x10; 32],
+                    8,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1024,
+                    &vec![0u8; 32],
+                    0,
+                    &[],
+                    None,
+                )
+                .expect_err("length mismatch")
+                .to_string()
+                .contains("bloom_filter length")
+        );
 
         let inserted = insert_primary(
             &mut store,
@@ -5625,46 +5667,50 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
-        assert!(evaluate_node(
-            &QueryNode {
-                kind: "n_of".to_owned(),
-                pattern_id: None,
-                threshold: None,
-                children: Vec::new(),
-            },
-            &doc,
-            &[],
-            &bloom_bytes,
-            tier2_bloom_bytes,
-            &patterns,
-            &mask_cache,
-            &eval_plan,
-            0,
-            &mut QueryEvalCache::default(),
-        )
-        .expect_err("missing threshold")
-        .to_string()
-        .contains("requires threshold"));
-        assert!(evaluate_node(
-            &QueryNode {
-                kind: "bogus".to_owned(),
-                pattern_id: None,
-                threshold: None,
-                children: Vec::new(),
-            },
-            &doc,
-            &[],
-            &bloom_bytes,
-            tier2_bloom_bytes,
-            &patterns,
-            &mask_cache,
-            &eval_plan,
-            0,
-            &mut QueryEvalCache::default(),
-        )
-        .expect_err("unsupported kind")
-        .to_string()
-        .contains("Unsupported ast node kind"));
+        assert!(
+            evaluate_node(
+                &QueryNode {
+                    kind: "n_of".to_owned(),
+                    pattern_id: None,
+                    threshold: None,
+                    children: Vec::new(),
+                },
+                &doc,
+                &[],
+                &bloom_bytes,
+                tier2_bloom_bytes,
+                &patterns,
+                &mask_cache,
+                &eval_plan,
+                0,
+                &mut QueryEvalCache::default(),
+            )
+            .expect_err("missing threshold")
+            .to_string()
+            .contains("requires threshold")
+        );
+        assert!(
+            evaluate_node(
+                &QueryNode {
+                    kind: "bogus".to_owned(),
+                    pattern_id: None,
+                    threshold: None,
+                    children: Vec::new(),
+                },
+                &doc,
+                &[],
+                &bloom_bytes,
+                tier2_bloom_bytes,
+                &patterns,
+                &mask_cache,
+                &eval_plan,
+                0,
+                &mut QueryEvalCache::default(),
+            )
+            .expect_err("unsupported kind")
+            .to_string()
+            .contains("Unsupported ast node kind")
+        );
     }
 
     #[test]
@@ -5902,13 +5948,13 @@ rule q {
         .expect("init");
         let sha256 = [0x11; 32];
         let file_size = 64 * 1024 * 1024u64;
-        let gram_count_estimate = 1_000_000usize;
+        let bloom_item_estimate = 1_000_000usize;
         let filter_bytes = store
-            .resolve_filter_bytes_for_file_size(file_size, Some(gram_count_estimate))
+            .resolve_filter_bytes_for_file_size(file_size, Some(bloom_item_estimate))
             .expect("large primary filter bytes");
         assert!(filter_bytes > DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES);
         let bloom_hashes =
-            store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
+            store.resolve_bloom_hashes_for_document(filter_bytes, Some(bloom_item_estimate), None);
         let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
         primary_bloom
             .add(pack_exact_gram(&[1, 2, 3]))
@@ -5927,7 +5973,7 @@ rule q {
             .insert_document(
                 sha256,
                 file_size,
-                Some(gram_count_estimate),
+                Some(bloom_item_estimate),
                 Some(bloom_hashes),
                 Some(2),
                 Some(tier2_bloom_hashes),
@@ -5978,13 +6024,13 @@ rule q {
         .expect("init");
         let sha256 = [0x22; 32];
         let file_size = 64 * 1024 * 1024u64;
-        let gram_count_estimate = 1_000_000usize;
+        let bloom_item_estimate = 1_000_000usize;
         let filter_bytes = store
-            .resolve_filter_bytes_for_file_size(file_size, Some(gram_count_estimate))
+            .resolve_filter_bytes_for_file_size(file_size, Some(bloom_item_estimate))
             .expect("large primary filter bytes");
         assert!(filter_bytes > cap_bytes);
         let bloom_hashes =
-            store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
+            store.resolve_bloom_hashes_for_document(filter_bytes, Some(bloom_item_estimate), None);
         let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
         primary_bloom
             .add(pack_exact_gram(&[9, 8, 7]))
@@ -6003,7 +6049,7 @@ rule q {
             .insert_document(
                 sha256,
                 file_size,
-                Some(gram_count_estimate),
+                Some(bloom_item_estimate),
                 Some(bloom_hashes),
                 Some(2),
                 Some(tier2_bloom_hashes),

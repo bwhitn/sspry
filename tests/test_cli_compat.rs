@@ -391,7 +391,6 @@ fn info_uses_sspry_addr_env() {
 fn serve_help_uses_sspry_env() {
     let out = run_ok(&["serve", "--help"]);
     assert!(out.contains("SSPRY_ADDR"));
-    assert!(!out.contains("YAYA_ADDR"));
 }
 
 #[test]

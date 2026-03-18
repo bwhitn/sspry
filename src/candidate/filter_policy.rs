@@ -61,14 +61,14 @@ pub fn derive_bloom_hash_count(target_fp: Option<f64>, fallback_hashes: usize) -
 
 pub fn derive_document_bloom_hash_count(
     filter_bytes: usize,
-    gram_count_estimate: Option<usize>,
+    bloom_item_estimate: Option<usize>,
     fallback_hashes: usize,
 ) -> usize {
     let fallback = fallback_hashes.max(1);
-    let Some(gram_count_estimate) = gram_count_estimate else {
+    let Some(bloom_item_estimate) = bloom_item_estimate else {
         return fallback;
     };
-    let gram_count = gram_count_estimate.max(1) as f64;
+    let gram_count = bloom_item_estimate.max(1) as f64;
     let bits = (filter_bytes.max(1) * 8) as f64;
     let estimate = ((bits / gram_count) * LN_2).round() as usize;
     estimate.clamp(1, 16)
@@ -80,7 +80,7 @@ pub fn choose_filter_bytes_for_file_size(
     filter_min_bytes: Option<usize>,
     filter_max_bytes: Option<usize>,
     filter_target_fp: Option<f64>,
-    gram_count_estimate: Option<usize>,
+    bloom_item_estimate: Option<usize>,
 ) -> Result<usize> {
     let (minimum, maximum, target_fp) = normalize_filter_policy(
         base_filter_bytes,
@@ -92,7 +92,7 @@ pub fn choose_filter_bytes_for_file_size(
     let size_target = minimum.max(size);
     let target = if let Some(fp) = target_fp {
         let gram_count =
-            gram_count_estimate.unwrap_or_else(|| size.saturating_sub(3).max(1)) as f64;
+            bloom_item_estimate.unwrap_or_else(|| size.saturating_sub(3).max(1)) as f64;
         let bits = ((-gram_count * fp.ln()) / LN_2_SQ).ceil() as usize;
         let theoretical_bytes = bits.div_ceil(8).max(1);
         let _ = (minimum, maximum, size_target);
@@ -124,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn target_fp_mode_uses_gram_count_estimate_when_present() {
+    fn target_fp_mode_uses_bloom_item_estimate_when_present() {
         let from_size = choose_filter_bytes_for_file_size(
             1024 * 1024,
             512 * 1024,

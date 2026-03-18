@@ -177,15 +177,11 @@ pub struct CandidateDocumentWire {
     pub file_size: u64,
     pub bloom_filter_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gram_count_estimate: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bloom_hashes: Option<usize>,
+    pub bloom_item_estimate: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier2_bloom_filter_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier2_gram_count_estimate: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier2_bloom_hashes: Option<usize>,
+    pub tier2_bloom_item_estimate: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,9 +232,7 @@ type ParsedCandidateInsertDocument = (
     [u8; 32],
     u64,
     Option<usize>,
-    Option<usize>,
     Vec<u8>,
-    Option<usize>,
     Option<usize>,
     Vec<u8>,
     Vec<u8>,
@@ -4093,19 +4087,18 @@ impl ServerState {
         } else {
             Vec::new()
         };
-        let gram_count_estimate = document
-            .gram_count_estimate
+        let bloom_item_estimate = document
+            .bloom_item_estimate
             .map(|value| {
                 if value < 0 {
                     Err(SspryError::from(format!(
-                        "{field_prefix}.gram_count_estimate must be >= 0."
+                        "{field_prefix}.bloom_item_estimate must be >= 0."
                     )))
                 } else {
                     Ok(value as usize)
                 }
             })
             .transpose()?;
-        let bloom_hashes = document.bloom_hashes.filter(|value| *value > 0);
         let metadata = if let Some(payload) = &document.metadata_b64 {
             base64::engine::general_purpose::STANDARD
                 .decode(payload.as_bytes())
@@ -4115,27 +4108,24 @@ impl ServerState {
         } else {
             Vec::new()
         };
-        let tier2_gram_count_estimate = document
-            .tier2_gram_count_estimate
+        let tier2_bloom_item_estimate = document
+            .tier2_bloom_item_estimate
             .map(|value| {
                 if value < 0 {
                     Err(SspryError::from(format!(
-                        "{field_prefix}.tier2_gram_count_estimate must be >= 0."
+                        "{field_prefix}.tier2_bloom_item_estimate must be >= 0."
                     )))
                 } else {
                     Ok(value as usize)
                 }
             })
             .transpose()?;
-        let tier2_bloom_hashes = document.tier2_bloom_hashes.filter(|value| *value > 0);
         Ok((
             sha256,
             document.file_size,
-            gram_count_estimate,
-            bloom_hashes,
+            bloom_item_estimate,
             bloom_filter,
-            tier2_gram_count_estimate,
-            tier2_bloom_hashes,
+            tier2_bloom_item_estimate,
             tier2_bloom_filter,
             metadata,
             document.external_id.clone(),
@@ -4177,15 +4167,15 @@ impl ServerState {
             parsed.0,
             parsed.1,
             parsed.2,
-            parsed.3,
-            parsed.5,
-            parsed.6,
-            parsed.4.len(),
-            &parsed.4,
-            parsed.7.len(),
-            &parsed.7,
-            parsed.8.as_slice(),
-            parsed.9,
+            None,
+            parsed.4,
+            None,
+            parsed.3.len(),
+            &parsed.3,
+            parsed.5.len(),
+            &parsed.5,
+            parsed.6.as_slice(),
+            parsed.7,
         )?;
         drop(store);
         self.mark_work_mutation();
@@ -4246,15 +4236,15 @@ impl ServerState {
                         row.0,
                         row.1,
                         row.2,
-                        row.3,
-                        row.5,
-                        row.6,
-                        row.4.len(),
-                        row.4.clone(),
-                        row.7.len(),
+                        None,
+                        row.4,
+                        None,
+                        row.3.len(),
+                        row.3.clone(),
+                        row.5.len(),
+                        row.5.clone(),
+                        row.6.clone(),
                         row.7.clone(),
-                        row.8.clone(),
-                        row.9.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4349,15 +4339,15 @@ impl ServerState {
                             row.0,
                             row.1,
                             row.2,
-                            row.3,
-                            row.5,
-                            row.6,
-                            row.4.len(),
-                            row.4.clone(),
-                            row.7.len(),
+                            None,
+                            row.4,
+                            None,
+                            row.3.len(),
+                            row.3.clone(),
+                            row.5.len(),
+                            row.5.clone(),
+                            row.6.clone(),
                             row.7.clone(),
-                            row.8.clone(),
-                            row.9.clone(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -5898,11 +5888,9 @@ mod tests {
             file_size: features.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: Some(7),
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: None,
         }
@@ -5997,11 +5985,9 @@ mod tests {
                 sha256: "11".repeat(32),
                 file_size: 16,
                 bloom_filter_b64,
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             })
@@ -6101,11 +6087,9 @@ mod tests {
                 sha256: "11".repeat(32),
                 file_size: 1,
                 bloom_filter_b64: String::new(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             })
@@ -6210,11 +6194,9 @@ mod tests {
                 file_size: features_a.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features_a.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -6223,11 +6205,9 @@ mod tests {
                 file_size: features_b.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features_b.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -6646,11 +6626,9 @@ mod tests {
                 file_size: features.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("work-doc".to_owned()),
             })
@@ -6760,11 +6738,9 @@ mod tests {
                 file_size: features.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("auto-publish-doc".to_owned()),
             })
@@ -6842,11 +6818,9 @@ mod tests {
                 file_size: features.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("pressure-doc".to_owned()),
             })
@@ -6965,11 +6939,9 @@ mod tests {
                 file_size: features_a.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features_a.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("inc-a".to_owned()),
             })
@@ -6985,11 +6957,9 @@ mod tests {
                 file_size: features_b.file_size,
                 bloom_filter_b64: base64::engine::general_purpose::STANDARD
                     .encode(features_b.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("inc-b".to_owned()),
             })
@@ -7329,7 +7299,7 @@ mod tests {
         .expect("init");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let bloom_filter = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 2).expect("bloom");
+            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
             bloom.add(gram).expect("add gram");
             bloom.into_bytes()
         };
@@ -7515,11 +7485,9 @@ mod tests {
                 sha256: "11".repeat(32),
                 file_size: 1,
                 bloom_filter_b64: String::new(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -7527,11 +7495,9 @@ mod tests {
                 sha256: "22".repeat(32),
                 file_size: 1,
                 bloom_filter_b64: String::new(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -7627,11 +7593,9 @@ mod tests {
             sha256: "aa".repeat(32),
             file_size: 1,
             bloom_filter_b64: String::new(),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: None,
         })
@@ -8159,11 +8123,9 @@ rule q {
             file_size: features_a.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_a.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
@@ -8172,11 +8134,9 @@ rule q {
             file_size: features_b.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_b.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
@@ -8460,11 +8420,9 @@ rule q {
                 sha256: "33".repeat(32),
                 file_size: 4,
                 bloom_filter_b64: "AQID".to_owned(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("doc".to_owned()),
             }])
@@ -8505,11 +8463,9 @@ rule q {
             file_size: features_a.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_a.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
@@ -8518,11 +8474,9 @@ rule q {
             file_size: features_b.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_b.bloom_filter),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
@@ -8599,11 +8553,9 @@ rule q {
             sha256: "aa".repeat(32),
             file_size: 4,
             bloom_filter_b64: String::new(),
-            gram_count_estimate: None,
-            bloom_hashes: None,
+            bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: None,
+            tier2_bloom_item_estimate: None,
             metadata_b64: None,
             external_id: None,
         })
@@ -8613,11 +8565,9 @@ rule q {
                 sha256: "bb".repeat(32),
                 file_size: 4,
                 bloom_filter_b64: String::new(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             }],
@@ -8692,11 +8642,9 @@ rule q {
                 sha256: "00".repeat(32),
                 file_size: 16,
                 bloom_filter_b64: bloom_filter_b64.clone(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("shard-a".to_owned()),
             },
@@ -8704,11 +8652,9 @@ rule q {
                 sha256: "01".repeat(32),
                 file_size: 16,
                 bloom_filter_b64: bloom_filter_b64.clone(),
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("shard-b".to_owned()),
             },
@@ -8769,11 +8715,9 @@ rule q {
                     sha256: "ab".repeat(32),
                     file_size: 1,
                     bloom_filter_b64: "**".to_owned(),
-                    gram_count_estimate: None,
-                    bloom_hashes: None,
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -8787,11 +8731,9 @@ rule q {
                     sha256: "ab".repeat(32),
                     file_size: 1,
                     bloom_filter_b64: bloom_filter_b64.clone(),
-                    gram_count_estimate: None,
-                    bloom_hashes: None,
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -8803,11 +8745,9 @@ rule q {
                     sha256: "not hex".to_owned(),
                     file_size: 1,
                     bloom_filter_b64,
-                    gram_count_estimate: None,
-                    bloom_hashes: None,
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -8936,11 +8876,9 @@ rule q {
                 sha256: "AA".repeat(32),
                 file_size: 16,
                 bloom_filter_b64,
-                gram_count_estimate: None,
-                bloom_hashes: None,
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: Some("single-shard-id".to_owned()),
             })
@@ -9029,7 +8967,7 @@ rule q {
         .expect("server state");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(16, 2).expect("bloom");
+            let mut bloom = crate::candidate::BloomFilter::new(16, 7).expect("bloom");
             bloom.add(gram).expect("add gram");
             base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
         };
@@ -9053,11 +8991,9 @@ rule q {
                     sha256: hex::encode(sha),
                     file_size: 16,
                     bloom_filter_b64: bloom_filter_b64.clone(),
-                    gram_count_estimate: None,
-                    bloom_hashes: Some(2),
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: Some(format!("parallel-{index}")),
                 })
@@ -9164,7 +9100,7 @@ rule q {
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 2).expect("bloom");
+            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
             bloom.add(gram).expect("add gram");
             base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
         };
@@ -9175,11 +9111,9 @@ rule q {
                     sha256: hex::encode([byte; 32]),
                     file_size: 32,
                     bloom_filter_b64: bloom_filter_b64.clone(),
-                    gram_count_estimate: None,
-                    bloom_hashes: Some(2),
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
@@ -9257,7 +9191,7 @@ rule q {
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 2).expect("bloom");
+            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
             bloom.add(gram).expect("add gram");
             base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
         };
@@ -9271,11 +9205,9 @@ rule q {
                     sha256: hex::encode(sha),
                     file_size: 32,
                     bloom_filter_b64: bloom_filter_b64.clone(),
-                    gram_count_estimate: None,
-                    bloom_hashes: Some(2),
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
@@ -9341,7 +9273,7 @@ rule q {
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
         let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 2).expect("bloom");
+            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
             bloom.add(gram).expect("add gram");
             base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
         };
@@ -9352,11 +9284,9 @@ rule q {
                     sha256: hex::encode([byte; 32]),
                     file_size: 32,
                     bloom_filter_b64: bloom_filter_b64.clone(),
-                    gram_count_estimate: None,
-                    bloom_hashes: Some(2),
+                    bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
-                    tier2_gram_count_estimate: None,
-                    tier2_bloom_hashes: None,
+                    tier2_bloom_item_estimate: None,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })

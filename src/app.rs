@@ -19,17 +19,17 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
 use crate::candidate::query_plan::{
-    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
+    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
 };
 #[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
-    compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
-    estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
-    extract_compact_document_metadata, read_candidate_shard_count,
-    scan_file_features_bloom_only_with_gram_sizes, BoundedCache, CandidateConfig, CandidateStore,
-    GramSizes, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, HLL_DEFAULT_PRECISION,
+    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+    GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
+    choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
+    derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
+    estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
+    scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -892,14 +892,12 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(row.bloom_filter)
         },
-        gram_count_estimate: row.gram_count_estimate.map(|value| value as i64),
-        bloom_hashes: Some(row.bloom_hashes),
+        bloom_item_estimate: row.bloom_item_estimate.map(|value| value as i64),
         tier2_bloom_filter_b64: Some({
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(row.tier2_bloom_filter)
         }),
-        tier2_gram_count_estimate: row.tier2_gram_count_estimate.map(|value| value as i64),
-        tier2_bloom_hashes: Some(row.tier2_bloom_hashes),
+        tier2_bloom_item_estimate: row.tier2_bloom_item_estimate.map(|value| value as i64),
         metadata_b64: Some({
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(row.metadata)
@@ -1048,10 +1046,10 @@ fn flush_local_pending_rows(
         let _ = stores[shard_idx].insert_document_with_metadata(
             row.sha256,
             row.file_size,
-            row.gram_count_estimate,
-            Some(row.bloom_hashes),
-            row.tier2_gram_count_estimate,
-            Some(row.tier2_bloom_hashes),
+            row.bloom_item_estimate,
+            None,
+            row.tier2_bloom_item_estimate,
+            None,
             row.filter_bytes,
             &row.bloom_filter,
             row.tier2_filter_bytes,
@@ -1208,12 +1206,10 @@ struct IndexBatchRow {
     sha256: [u8; 32],
     file_size: u64,
     filter_bytes: usize,
-    gram_count_estimate: Option<usize>,
-    bloom_hashes: usize,
+    bloom_item_estimate: Option<usize>,
     bloom_filter: Vec<u8>,
     tier2_filter_bytes: usize,
-    tier2_gram_count_estimate: Option<usize>,
-    tier2_bloom_hashes: usize,
+    tier2_bloom_item_estimate: Option<usize>,
     tier2_bloom_filter: Vec<u8>,
     metadata: Vec<u8>,
     external_id: Option<String>,
@@ -1268,7 +1264,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     };
     let scan_path = resolved_path.as_deref().unwrap_or(file_path);
     let file_size = scan_path.metadata()?.len();
-    let (gram_count_estimate, tier2_gram_count_estimate) = if policy.filter_target_fp.is_some() {
+    let (bloom_item_estimate, tier2_bloom_item_estimate) = if policy.filter_target_fp.is_some() {
         if policy.gram_sizes.tier1 == policy.gram_sizes.tier2 {
             let estimate = estimate_unique_grams_for_size_hll(
                 scan_path,
@@ -1299,7 +1295,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
             policy.filter_target_fp,
-            gram_count_estimate,
+            bloom_item_estimate,
         )?
     };
     let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
@@ -1311,14 +1307,14 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
             policy.filter_target_fp,
-            tier2_gram_count_estimate,
+            tier2_bloom_item_estimate,
         )?
     };
     let bloom_hashes =
-        derive_document_bloom_hash_count(filter_bytes, gram_count_estimate, INTERNAL_BLOOM_HASHES);
+        derive_document_bloom_hash_count(filter_bytes, bloom_item_estimate, INTERNAL_BLOOM_HASHES);
     let tier2_bloom_hashes = derive_document_bloom_hash_count(
         tier2_filter_bytes,
-        tier2_gram_count_estimate,
+        tier2_bloom_item_estimate,
         INTERNAL_BLOOM_HASHES,
     );
     let started = Instant::now();
@@ -1346,12 +1342,10 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         },
         file_size: features.file_size,
         filter_bytes,
-        gram_count_estimate,
-        bloom_hashes,
+        bloom_item_estimate,
         bloom_filter: features.bloom_filter,
         tier2_filter_bytes,
-        tier2_gram_count_estimate,
-        tier2_bloom_hashes,
+        tier2_bloom_item_estimate,
         tier2_bloom_filter: features.tier2_bloom_filter,
         metadata: extract_compact_document_metadata(scan_path)?,
         external_id: resolved_path.map(|path| path.display().to_string()),
@@ -1667,10 +1661,10 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
             let result = stores[shard_idx].insert_document_with_metadata(
                 row.sha256,
                 row.file_size,
-                row.gram_count_estimate,
-                Some(row.bloom_hashes),
-                row.tier2_gram_count_estimate,
-                Some(row.tier2_bloom_hashes),
+                row.bloom_item_estimate,
+                None,
+                row.tier2_bloom_item_estimate,
+                None,
                 row.filter_bytes,
                 &row.bloom_filter,
                 row.tier2_filter_bytes,
@@ -3420,11 +3414,9 @@ mod tests {
                 sha256: "11".repeat(32),
                 file_size: 123,
                 bloom_filter_b64: "AQID".to_owned(),
-                gram_count_estimate: Some(3),
-                bloom_hashes: Some(7),
+                bloom_item_estimate: Some(3),
                 tier2_bloom_filter_b64: Some("BAUG".to_owned()),
-                tier2_gram_count_estimate: Some(2),
-                tier2_bloom_hashes: Some(5),
+                tier2_bloom_item_estimate: Some(2),
                 metadata_b64: None,
                 external_id: Some("doc-1".to_owned()),
             },
@@ -3432,11 +3424,9 @@ mod tests {
                 sha256: "22".repeat(32),
                 file_size: 456,
                 bloom_filter_b64: "CgsM".to_owned(),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
+                bloom_item_estimate: None,
                 tier2_bloom_filter_b64: Some("DQ4P".to_owned()),
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: Some(5),
+                tier2_bloom_item_estimate: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -3535,10 +3525,12 @@ mod tests {
             file_digest,
             path_identity_sha256(&sample).expect("path digest")
         );
-        assert!(sha256_file(&sample, 0)
-            .expect_err("zero chunk size")
-            .to_string()
-            .contains("positive integer"));
+        assert!(
+            sha256_file(&sample, 0)
+                .expect_err("zero chunk size")
+                .to_string()
+                .contains("positive integer")
+        );
 
         let mut files = Vec::new();
         collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -3610,12 +3602,10 @@ mod tests {
             sha256: [0xAA; 32],
             file_size: 123,
             filter_bytes: 2048,
-            gram_count_estimate: Some(77),
-            bloom_hashes: 3,
+            bloom_item_estimate: Some(77),
             bloom_filter: vec![1, 2, 3, 4],
             tier2_filter_bytes: 0,
-            tier2_gram_count_estimate: None,
-            tier2_bloom_hashes: 0,
+            tier2_bloom_item_estimate: None,
             tier2_bloom_filter: Vec::new(),
             metadata: vec![9, 8, 7],
             external_id: Some("x".to_owned()),
@@ -4409,18 +4399,24 @@ rule remote_q {
         let sample = tmp.path().join("sample.bin");
         fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-        assert!(md5_file(&sample, 0)
-            .expect_err("md5 zero chunk")
-            .to_string()
-            .contains("positive integer"));
-        assert!(sha1_file(&sample, 0)
-            .expect_err("sha1 zero chunk")
-            .to_string()
-            .contains("positive integer"));
-        assert!(sha512_file(&sample, 0)
-            .expect_err("sha512 zero chunk")
-            .to_string()
-            .contains("positive integer"));
+        assert!(
+            md5_file(&sample, 0)
+                .expect_err("md5 zero chunk")
+                .to_string()
+                .contains("positive integer")
+        );
+        assert!(
+            sha1_file(&sample, 0)
+                .expect_err("sha1 zero chunk")
+                .to_string()
+                .contains("positive integer")
+        );
+        assert!(
+            sha512_file(&sample, 0)
+                .expect_err("sha512 zero chunk")
+                .to_string()
+                .contains("positive integer")
+        );
 
         assert_eq!(
             detect_digest_identity_source(&"aa".repeat(16)),

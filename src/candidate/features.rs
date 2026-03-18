@@ -346,7 +346,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
 mod tests {
     use std::fs;
 
-    use hashbrown::HashSet;
+    use std::collections::HashSet;
     use tempfile::tempdir;
 
     use super::{

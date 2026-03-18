@@ -21,6 +21,9 @@ Current baseline:
   - bloom sizing no longer carries the dead `filter_size_divisor` parameter or its hardcoded `= 1` constants
   - the old test-only `scan_file_features_bloom_only()` convenience wrapper is removed; tests use the explicit gram-size scanner entrypoint now
   - the old default/tier2-size query-plan convenience wrappers are removed; tests use local helpers over `*_with_gram_sizes`
+  - candidate insert wire now carries `bloom_item_estimate` / `tier2_bloom_item_estimate` and no longer carries redundant explicit bloom-hash counts
+  - unused cargo dependencies `rustc-hash` and `hashbrown` are removed
+  - the rpc transport integration test no longer duplicates local default-size bloom/query helper wrappers
 - `features.rs` status:
   - default ingest is on the bloom-only scanner path
   - production `DocumentFeatures` no longer exposes the retired gram-era fields
