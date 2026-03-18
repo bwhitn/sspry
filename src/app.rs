@@ -1347,7 +1347,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         scan_path.display().to_string(),
         started.elapsed().as_nanos(),
         file_size,
-        features.unique_grams.len() as u64,
+        0,
     );
     Ok(IndexBatchRow {
         sha256: if policy.id_source == CandidateIdSource::Sha256 {

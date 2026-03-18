@@ -28,8 +28,11 @@ pub struct DocumentFeatures {
     pub file_size: u64,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
+    #[cfg(test)]
     pub unique_grams: Vec<u64>,
+    #[cfg(test)]
     pub unique_grams_truncated: bool,
+    #[cfg(test)]
     pub effective_diversity: Option<f64>,
 }
 
@@ -369,6 +372,7 @@ fn split_evenly(total: usize, buckets: usize) -> Vec<usize> {
         .collect()
 }
 
+#[cfg(test)]
 fn normalized_entropy_from_counts(counts: &[usize]) -> f64 {
     let total: usize = counts.iter().sum();
     let occupied = counts.iter().filter(|count| **count > 0).count();
@@ -388,6 +392,7 @@ fn normalized_entropy_from_counts(counts: &[usize]) -> f64 {
     (entropy / max_entropy).clamp(0.0, 1.0)
 }
 
+#[cfg(test)]
 fn compute_effective_diversity(
     tier1_gram_estimate: Option<usize>,
     selected_count: usize,
@@ -1070,6 +1075,10 @@ pub fn scan_file_features_with_gram_sizes(
     } else {
         (Vec::new(), false)
     };
+    #[cfg(not(test))]
+    let _ = dropped;
+    #[cfg(test)]
+    let retained_unique_grams = unique_grams.len();
 
     total_scope.add_bytes(file_size);
     total_scope.add_items(gram_windows);
@@ -1103,14 +1112,16 @@ pub fn scan_file_features_with_gram_sizes(
         }
     }
 
-    let retained_unique_grams = unique_grams.len();
     Ok(DocumentFeatures {
         sha256,
         file_size,
         bloom_filter: bloom.into_bytes(),
         tier2_bloom_filter: tier2_bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
+        #[cfg(test)]
         unique_grams,
+        #[cfg(test)]
         unique_grams_truncated: dropped,
+        #[cfg(test)]
         effective_diversity: if collect_unique_grams {
             Some(compute_effective_diversity(
                 tier1_gram_estimate,

@@ -16,6 +16,7 @@ Current baseline:
   - default ingest already scans with `collect_unique_grams = false`
   - `DocumentFeatures.unique_grams`, `unique_grams_truncated`, and `effective_diversity` still exist mainly for compatibility/test scaffolding
   - next cleanup there should target compatibility/test-only paths, not the default scanner hot path
+  - production `DocumentFeatures` no longer exposes those gram-era fields; they are unit-test-only now
 - `26k` bloom-only verification after the compatibility-wire cleanup:
   - artifact:
     - `/root/pertest/results/sspry_verify_26000_bloomcut_20260318_r2`
