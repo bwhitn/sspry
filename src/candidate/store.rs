@@ -127,11 +127,17 @@ impl DfCountsSegment {
         0
     }
 
-    fn fence_bounds(&self, gram: u64) -> (usize, usize) {
+    fn fence_partition_index(&self, gram: u64) -> usize {
+        if self.fence.is_empty() {
+            return 0;
+        }
+        self.fence.partition_point(|entry| entry.gram < gram)
+    }
+
+    fn fence_bounds_from_index(&self, idx: usize) -> (usize, usize) {
         if self.fence.is_empty() {
             return (0, self.rows);
         }
-        let idx = self.fence.partition_point(|entry| entry.gram < gram);
         let left = if idx == 0 {
             0
         } else {
@@ -145,6 +151,10 @@ impl DfCountsSegment {
             self.rows
         };
         (left.min(self.rows), right.max(left).min(self.rows))
+    }
+
+    fn fence_bounds(&self, gram: u64) -> (usize, usize) {
+        self.fence_bounds_from_index(self.fence_partition_index(gram))
     }
 
     #[cfg(test)]
@@ -191,8 +201,38 @@ impl DfCountsSegment {
             }
             return;
         }
-        for (idx, gram) in grams.iter().enumerate() {
-            counts[idx] += self.get_delta_profiled(*gram, gram_bytes, profile);
+        let mut gram_idx = 0usize;
+        while gram_idx < grams.len() {
+            let fence_idx = self.fence_partition_index(grams[gram_idx]);
+            let group_start = gram_idx;
+            gram_idx += 1;
+            while gram_idx < grams.len()
+                && self.fence_partition_index(grams[gram_idx]) == fence_idx
+            {
+                gram_idx += 1;
+            }
+            let (mut segment_idx, right) = self.fence_bounds_from_index(fence_idx);
+            for (local_idx, gram) in grams[group_start..gram_idx].iter().enumerate() {
+                while segment_idx < right {
+                    let start = segment_idx * row_bytes;
+                    profile.segment_rows_examined =
+                        profile.segment_rows_examined.saturating_add(1);
+                    let candidate = decode_packed_exact_gram(&self.mmap[start..start + gram_bytes]);
+                    if candidate < *gram {
+                        segment_idx += 1;
+                        continue;
+                    }
+                    if candidate == *gram {
+                        counts[group_start + local_idx] += i64::from_le_bytes(
+                            self.mmap[start + gram_bytes..start + row_bytes]
+                                .try_into()
+                                .expect("df segment delta"),
+                        );
+                        segment_idx += 1;
+                    }
+                    break;
+                }
+            }
         }
     }
 }
@@ -7855,7 +7895,7 @@ rule q {
         assert_eq!(counts, vec![2]);
         assert_eq!(profile.segment_visits, 2);
         assert!(profile.segment_rows_examined > 0);
-        assert!(profile.segment_point_lookups > 0);
+        assert_eq!(profile.segment_point_lookups, 0);
         assert_eq!(profile.delta_lookups, 1);
     }
 
@@ -9069,6 +9109,35 @@ rule q {
         assert_eq!(store.df_counts.get(gram), 2);
         assert!(!df_counts_segments_dir(&root).exists());
         assert!(df_counts_path(&root).exists());
+    }
+
+    #[test]
+    fn large_segment_grouped_lookup_matches_point_lookup_results() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let segments_dir = df_counts_segments_dir(&root);
+        fs::create_dir_all(&segments_dir).expect("segments dir");
+        let path = df_counts_segment_path(&root, 1);
+        let mut bytes = Vec::new();
+        for value in 0u64..2048 {
+            bytes.extend_from_slice(&pack_exact_gram(&value.to_le_bytes()[..4]).to_le_bytes()[..4]);
+            bytes.extend_from_slice(&(1i64).to_le_bytes());
+        }
+        fs::write(&path, bytes).expect("write segment");
+
+        let segment = DfCountsSegment::load(path, 4).expect("load segment");
+        let grams = vec![5, 511, 512, 513, 1023, 1024, 1536, 2047, 4096];
+        let mut counts = vec![0i64; grams.len()];
+        let mut profile = DfLookupProfile::default();
+        segment.add_many_sorted_counts_profiled(&grams, &mut counts, 4, &mut profile);
+
+        let expected = grams
+            .iter()
+            .map(|gram| segment.get_delta_profiled(*gram, 4, &mut DfLookupProfile::default()))
+            .collect::<Vec<_>>();
+        assert_eq!(counts, expected);
+        assert_eq!(profile.segment_point_lookups, 0);
+        assert!(profile.segment_rows_examined > 0);
     }
 
     #[test]
