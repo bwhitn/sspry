@@ -64,6 +64,7 @@ pub fn pack_exact_gram(window: &[u8]) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+#[cfg(test)]
 pub fn exact_gram_to_le_bytes(value: u64, gram_size: usize) -> Vec<u8> {
     value.to_le_bytes()[..gram_size].to_vec()
 }

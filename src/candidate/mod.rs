@@ -2,7 +2,6 @@ pub mod bloom;
 pub mod cache;
 pub mod features;
 pub mod filter_policy;
-pub mod gram_wire;
 pub mod grams;
 pub mod metadata;
 pub mod query_plan;
@@ -19,12 +18,8 @@ pub use filter_policy::{
     choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,
     normalize_filter_policy,
 };
-pub use gram_wire::{
-    decode_grams_delta_u32, decode_grams_delta_u64, encode_grams_delta_u32, encode_grams_delta_u64,
-};
 pub use grams::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, exact_gram_to_le_bytes,
-    pack_exact_gram,
+    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
 };
 pub use metadata::{
     extract_compact_document_metadata, metadata_field_is_boolean, metadata_field_is_integer,
