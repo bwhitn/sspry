@@ -29,7 +29,7 @@ use crate::candidate::{
     choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
-    scan_file_features_with_gram_sizes,
+    scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -785,9 +785,6 @@ const INTERNAL_FILTER_MIN_BYTES: usize = 1;
 const INTERNAL_FILTER_MAX_BYTES: usize = 0;
 const INTERNAL_FILTER_SIZE_DIVISOR: usize = 1;
 const INTERNAL_BLOOM_HASHES: usize = 7;
-const INTERNAL_TIER1_GRAM_BUDGET: usize = 4096;
-const INTERNAL_TIER1_GRAM_SAMPLE_MOD: usize = 1;
-const INTERNAL_TIER1_GRAM_HASH_SEED: u64 = 1337;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ServerScanPolicy {
@@ -1321,7 +1318,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         INTERNAL_BLOOM_HASHES,
     );
     let started = Instant::now();
-    let features = scan_file_features_with_gram_sizes(
+    let features = scan_file_features_bloom_only_with_gram_sizes(
         scan_path,
         policy.gram_sizes,
         filter_bytes,
@@ -1329,12 +1326,6 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_filter_bytes,
         tier2_bloom_hashes,
         policy.chunk_size,
-        false,
-        None,
-        gram_count_estimate,
-        INTERNAL_TIER1_GRAM_BUDGET,
-        INTERNAL_TIER1_GRAM_SAMPLE_MOD,
-        INTERNAL_TIER1_GRAM_HASH_SEED,
     )?;
     perf::record_sample(
         "candidate.scan_file_features.file",

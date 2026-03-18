@@ -671,40 +671,7 @@ fn select_tier1_grams(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn scan_file_features(
-    path: impl AsRef<Path>,
-    filter_bytes: usize,
-    bloom_hashes: usize,
-    tier2_filter_bytes: usize,
-    tier2_bloom_hashes: usize,
-    chunk_size: usize,
-    collect_unique_grams: bool,
-    max_unique_grams: Option<usize>,
-    tier1_gram_estimate: Option<usize>,
-    tier1_gram_budget: usize,
-    tier1_gram_sample_mod: usize,
-    tier1_gram_hash_seed: u64,
-) -> Result<DocumentFeatures> {
-    scan_file_features_with_gram_sizes(
-        path,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
-        filter_bytes,
-        bloom_hashes,
-        tier2_filter_bytes,
-        tier2_bloom_hashes,
-        chunk_size,
-        collect_unique_grams,
-        max_unique_grams,
-        tier1_gram_estimate,
-        tier1_gram_budget,
-        tier1_gram_sample_mod,
-        tier1_gram_hash_seed,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(not(test))]
-pub fn scan_file_features_with_gram_sizes(
+pub fn scan_file_features_bloom_only_with_gram_sizes(
     path: impl AsRef<Path>,
     gram_sizes: GramSizes,
     filter_bytes: usize,
@@ -712,26 +679,11 @@ pub fn scan_file_features_with_gram_sizes(
     tier2_filter_bytes: usize,
     tier2_bloom_hashes: usize,
     chunk_size: usize,
-    collect_unique_grams: bool,
-    max_unique_grams: Option<usize>,
-    tier1_gram_estimate: Option<usize>,
-    tier1_gram_budget: usize,
-    tier1_gram_sample_mod: usize,
-    tier1_gram_hash_seed: u64,
 ) -> Result<DocumentFeatures> {
     let mut total_scope = scope("candidate.scan_file_features");
     if chunk_size == 0 {
         return Err(SspryError::from("chunk_size must be > 0"));
     }
-
-    let _ = (
-        collect_unique_grams,
-        max_unique_grams,
-        tier1_gram_estimate,
-        tier1_gram_budget,
-        tier1_gram_sample_mod,
-        tier1_gram_hash_seed,
-    );
 
     let file_path = path.as_ref();
     let mut file = File::open(file_path)?;
@@ -795,8 +747,70 @@ pub fn scan_file_features_with_gram_sizes(
         file_size,
         bloom_filter: bloom.into_bytes(),
         tier2_bloom_filter: tier2_bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
+        #[cfg(test)]
+        unique_grams: Vec::new(),
+        #[cfg(test)]
+        unique_grams_truncated: false,
+        #[cfg(test)]
+        effective_diversity: None,
     })
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn scan_file_features(
+    path: impl AsRef<Path>,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+    tier2_filter_bytes: usize,
+    tier2_bloom_hashes: usize,
+    chunk_size: usize,
+    collect_unique_grams: bool,
+    max_unique_grams: Option<usize>,
+    tier1_gram_estimate: Option<usize>,
+    tier1_gram_budget: usize,
+    tier1_gram_sample_mod: usize,
+    tier1_gram_hash_seed: u64,
+) -> Result<DocumentFeatures> {
+    #[cfg(not(test))]
+    {
+        let _ = (
+            collect_unique_grams,
+            max_unique_grams,
+            tier1_gram_estimate,
+            tier1_gram_budget,
+            tier1_gram_sample_mod,
+            tier1_gram_hash_seed,
+        );
+        return scan_file_features_bloom_only_with_gram_sizes(
+            path,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
+            filter_bytes,
+            bloom_hashes,
+            tier2_filter_bytes,
+            tier2_bloom_hashes,
+            chunk_size,
+        );
+    }
+    #[cfg(test)]
+    scan_file_features_with_gram_sizes(
+        path,
+        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
+        filter_bytes,
+        bloom_hashes,
+        tier2_filter_bytes,
+        tier2_bloom_hashes,
+        chunk_size,
+        collect_unique_grams,
+        max_unique_grams,
+        tier1_gram_estimate,
+        tier1_gram_budget,
+        tier1_gram_sample_mod,
+        tier1_gram_hash_seed,
+    )
+}
+
+#[cfg(not(test))]
+pub use scan_file_features_bloom_only_with_gram_sizes as scan_file_features_with_gram_sizes;
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
