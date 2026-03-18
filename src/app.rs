@@ -22,11 +22,11 @@ use crate::candidate::query_plan::{
 #[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, GramSizes, HLL_DEFAULT_PRECISION,
-    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
-    compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
-    encode_grams_delta_u64, estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
-    extract_compact_document_metadata, read_candidate_shard_count,
+    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+    GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
+    choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
+    derive_document_bloom_hash_count, encode_grams_delta_u64, estimate_unique_grams_for_size_hll,
+    estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
     scan_file_features_with_gram_sizes,
 };
 use crate::perf;
@@ -47,6 +47,8 @@ pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
 pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
+pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB: usize =
+    DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES / 1024;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
 pub const DEFAULT_INCREMENTAL_SHARDS: usize = 64;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
@@ -1097,6 +1099,7 @@ fn store_config_from_parts(
     filter_target_fp: f64,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
+    tier2_superblock_summary_cap_kib: usize,
     compaction_idle_cooldown_s: f64,
 ) -> CandidateConfig {
     CandidateConfig {
@@ -1105,6 +1108,9 @@ fn store_config_from_parts(
         store_path,
         tier2_gram_size,
         tier1_gram_size,
+        tier2_superblock_summary_cap_bytes: tier2_superblock_summary_cap_kib
+            .max(1)
+            .saturating_mul(1024),
         filter_target_fp: Some(filter_target_fp),
         compaction_idle_cooldown_s: compaction_idle_cooldown_s.max(0.0),
         ..CandidateConfig::default()
@@ -1121,6 +1127,7 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         args.filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
+        args.tier2_superblock_summary_cap_kib,
         CandidateConfig::default().compaction_idle_cooldown_s,
     )
 }
@@ -1136,6 +1143,7 @@ fn store_config_from_init_args(args: &InternalInitArgs) -> CandidateConfig {
         args.filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
+        args.tier2_superblock_summary_cap_kib,
         args.compaction_idle_cooldown_s,
     )
 }
@@ -1323,7 +1331,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_filter_bytes,
         tier2_bloom_hashes,
         policy.chunk_size,
-        true,
+        !policy._no_grams,
         policy.max_unique_grams,
         gram_count_estimate,
         INTERNAL_TIER1_GRAM_BUDGET,
@@ -1352,8 +1360,12 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_gram_count_estimate,
         tier2_bloom_hashes,
         tier2_bloom_filter: features.tier2_bloom_filter,
-        grams: features.unique_grams,
-        grams_complete: !features.unique_grams_truncated,
+        grams: if policy._no_grams {
+            Vec::new()
+        } else {
+            features.unique_grams
+        },
+        grams_complete: !policy._no_grams && !features.unique_grams_truncated,
         effective_diversity: features.effective_diversity,
         metadata: extract_compact_document_metadata(scan_path)?,
         external_id: resolved_path.map(|path| path.display().to_string()),
@@ -3064,7 +3076,7 @@ fn cmd_index(args: &IndexArgs) -> i32 {
         workers: args.workers.unwrap_or(0),
         chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
         max_unique_grams: None,
-        no_grams: false,
+        no_grams: args.no_grams,
         external_id_from_path: server_policy.store_path,
         verbose: args.verbose,
     })
@@ -3417,6 +3429,12 @@ struct IndexArgs {
         help = "Process workers for recursive file scan/feature extraction before batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
     )]
     workers: Option<usize>,
+    #[arg(
+        long = "no-grams",
+        action = ArgAction::SetTrue,
+        help = "Do not send exact grams to Tier1 postings; use only bloom coverage."
+    )]
+    no_grams: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
 }
@@ -3529,6 +3547,12 @@ struct ServeArgs {
     )]
     tier2_superblock_budget_divisor: u64,
     #[arg(
+        long = "tier2-superblock-summary-cap-kib",
+        default_value_t = DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
+        help = "Cap per-superblock summary bytes in KiB. Larger values spend more block-level bytes to reduce coarse-filter collisions."
+    )]
+    tier2_superblock_summary_cap_kib: usize,
+    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. SSPRY will manage current/, work/, and retired/ under this path."
@@ -3604,6 +3628,12 @@ struct InternalInitArgs {
         help = "Minimum idle time after writes before compaction is allowed to run."
     )]
     compaction_idle_cooldown_s: f64,
+    #[arg(
+        long = "tier2-superblock-summary-cap-kib",
+        default_value_t = DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
+        help = "Cap per-superblock summary bytes in KiB."
+    )]
+    tier2_superblock_summary_cap_kib: usize,
 }
 
 #[cfg(test)]
@@ -3768,6 +3798,7 @@ mod tests {
             filter_target_fp: 0.35,
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
+            tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
         }
     }
 
@@ -3869,6 +3900,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
@@ -3986,6 +4018,7 @@ mod tests {
             0.001,
             3,
             4,
+            8,
             33.5,
         );
         assert_eq!(fixed.root, PathBuf::from("root"));
@@ -3993,6 +4026,7 @@ mod tests {
         assert!(fixed.store_path);
         assert_eq!(fixed.tier2_gram_size, 3);
         assert_eq!(fixed.tier1_gram_size, 4);
+        assert_eq!(fixed.tier2_superblock_summary_cap_bytes, 8 * 1024);
         assert_eq!(fixed.filter_target_fp, Some(0.001));
         assert_eq!(fixed.compaction_idle_cooldown_s, 33.5);
 
@@ -4003,6 +4037,7 @@ mod tests {
             0.01,
             5,
             4,
+            16,
             9.25,
         );
         assert_eq!(variable.root, PathBuf::from("root"));
@@ -4011,6 +4046,7 @@ mod tests {
         assert_eq!(variable.filter_target_fp, Some(0.01));
         assert_eq!(variable.tier2_gram_size, 5);
         assert_eq!(variable.tier1_gram_size, 4);
+        assert_eq!(variable.tier2_superblock_summary_cap_bytes, 16 * 1024);
         assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
         let wire = batch_row_to_wire(IndexBatchRow {
@@ -4185,7 +4221,7 @@ mod tests {
             md5_row.sha256,
             identity_from_file(&sample, 4, CandidateIdSource::Md5).expect("md5 id")
         );
-        assert!(!md5_row.grams.is_empty());
+        assert!(md5_row.grams.is_empty());
         assert!(!md5_row.grams_complete);
         assert!(md5_row.external_id.is_none());
 
@@ -4660,6 +4696,7 @@ rule remote_q {
                 ],
                 batch_size: 1,
                 workers: Some(2),
+                no_grams: false,
                 verbose: false,
             }),
             0
@@ -4876,6 +4913,7 @@ rule remote_q {
                 paths: vec![sample.display().to_string()],
                 batch_size: 1,
                 workers: Some(1),
+                no_grams: false,
                 verbose: false,
             }),
             0

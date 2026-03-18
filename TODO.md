@@ -143,6 +143,9 @@ Interpretation:
   - `adaptive_publish.mode = backoff`
   - `adaptive_publish.reason = submit_pressure_high`
 - with the tuned pressure policy, active-session publish/import can now stay under the practical memory envelope on `26k` and `50k`
+- for memory budgeting on a `16 GiB` deployment target, treat anon pressure as the primary limit:
+  - monitor `RssAnon` / `Pss_Anon` and system `Active(anon) + Inactive(anon)` alongside `VmRSS`
+  - file-backed mmap growth still matters for IO/locality, but `VmRSS` alone is too pessimistic for the server budget
 
 Operational notes:
 - the first-publish double-buffer reuse fix removed the pathological first-publish memory spike
@@ -210,6 +213,35 @@ Important kept changes already in `master`:
   - `35f7786`
 
 ## Active Backlog
+
+### 0. Bloom-only `50k` experiment matrix
+
+Why:
+- exact indexed grams are currently a relatively small disk component compared with blooms
+- if most real searches still fall through to bloom checks, exact grams/DF may be paying too much ingest cost for too little search value
+- block-level coarse summaries scale better than adding more per-file structures
+
+Immediate matrix:
+- baseline `50k`: current exact-gram path with the default `4 KiB` Tier2 superblock summary cap
+- bloom-only `50k`: `--no-grams` with the default `4 KiB` summary cap
+- bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 8`
+- bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 16`
+
+Record for each run:
+- index wall time
+- average and interval files/minute
+- DB bytes and largest file sizes per top-level buffer/root
+- server `VmRSS`, `RssAnon`, `RssFile`, and system `Active(anon) + Inactive(anon)`
+- compaction and publish timings
+- post-publish search timings and candidate counts
+
+Search set for the matrix:
+- the 7 user-provided YARA rules as-is
+- plus a few additional indexed-safe rules so the matrix still has meaningful indexed-search coverage when unsupported syntax appears in the user set
+
+Interpretation target:
+- if bloom-only materially improves ingest while search timings/candidate counts stay acceptable, revisit whether exact grams and DF should remain in the default path
+- if bloom-only hurts search too much, keep exact grams and spend any extra budget on stronger block/superblock summaries before touching per-file bloom size
 
 ### 1. Server insert `classify_df_lookup` on large ingests
 

@@ -4696,8 +4696,19 @@ impl ServerState {
         let mut filter_keys = HashSet::<(usize, usize)>::new();
         let mut tier2_doc_filter_keys = HashSet::<(usize, usize)>::new();
         let published = self.published_store_set()?;
+        let mut summary_cap_bytes = None::<usize>;
         for (shard_idx, store_lock) in published.stores.iter().enumerate() {
             let store = lock_candidate_store_with_timeout(store_lock, shard_idx, "query prepare")?;
+            let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
+            if let Some(existing) = summary_cap_bytes {
+                if existing != shard_summary_cap {
+                    return Err(SspryError::from(
+                        "published shards use mixed tier2 superblock summary caps",
+                    ));
+                }
+            } else {
+                summary_cap_bytes = Some(shard_summary_cap);
+            }
             filter_keys.extend(store.tier1_superblock_filter_keys());
             tier2_doc_filter_keys.extend(store.tier2_doc_filter_keys());
         }
@@ -4710,6 +4721,8 @@ impl ServerState {
             plan,
             &ordered_filter_keys,
             &ordered_tier2_doc_filter_keys,
+            summary_cap_bytes
+                .unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
         )?;
         let mut cache = self
             .prepared_plan_cache

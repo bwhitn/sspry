@@ -37,7 +37,7 @@ const DEFAULT_DF_MAX: usize = 0;
 const DEFAULT_TIER1_GRAM_BUDGET: usize = 4096;
 const DEFAULT_TIER1_GRAM_HASH_SEED: u64 = 1337;
 const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 128;
-const MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES: usize = 4096;
+pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
 
@@ -566,6 +566,7 @@ pub struct CandidateConfig {
     pub store_path: bool,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
+    pub tier2_superblock_summary_cap_bytes: usize,
     pub filter_target_fp: Option<f64>,
     pub df_min: usize,
     pub df_max: usize,
@@ -580,6 +581,7 @@ impl Default for CandidateConfig {
             store_path: false,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+            tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             filter_target_fp: Some(0.35),
             df_min: DEFAULT_DF_MIN,
             df_max: DEFAULT_DF_MAX,
@@ -820,6 +822,7 @@ struct StoreMeta {
     store_path: bool,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
+    tier2_superblock_summary_cap_bytes: usize,
     filter_target_fp: Option<f64>,
     df_min: usize,
     df_max: usize,
@@ -851,6 +854,7 @@ impl Default for StoreMeta {
             store_path: false,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+            tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             filter_target_fp: Some(0.35),
             df_min: DEFAULT_DF_MIN,
             df_max: DEFAULT_DF_MAX,
@@ -1360,8 +1364,8 @@ fn split_weighted_quota(total: usize, weights: &[usize]) -> Vec<usize> {
     quotas
 }
 
-fn tier2_superblock_summary_bytes(filter_bytes: usize) -> usize {
-    filter_bytes.max(1).min(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
+fn tier2_superblock_summary_bytes(filter_bytes: usize, summary_cap_bytes: usize) -> usize {
+    filter_bytes.max(1).min(summary_cap_bytes.max(1))
 }
 
 fn fold_bloom_bytes_into_summary(summary: &mut [u8], bloom_bytes: &[u8]) {
@@ -1698,6 +1702,9 @@ impl CandidateStore {
                 store_path: config.store_path,
                 tier2_gram_size: config.tier2_gram_size,
                 tier1_gram_size: config.tier1_gram_size,
+                tier2_superblock_summary_cap_bytes: config
+                    .tier2_superblock_summary_cap_bytes
+                    .max(1),
                 filter_target_fp: config.filter_target_fp,
                 df_min: config.df_min,
                 df_max: config.df_max,
@@ -1858,6 +1865,7 @@ impl CandidateStore {
             store_path: self.meta.store_path,
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
+            tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
             filter_target_fp: self.meta.filter_target_fp,
             df_min: self.meta.df_min,
             df_max: self.meta.df_max,
@@ -4380,6 +4388,10 @@ impl CandidateStore {
         )
     }
 
+    fn tier2_superblock_summary_bytes(&self, filter_bytes: usize) -> usize {
+        tier2_superblock_summary_bytes(filter_bytes, self.meta.tier2_superblock_summary_cap_bytes)
+    }
+
     fn ensure_tier2_superblock_capacity(
         &mut self,
         block_idx: usize,
@@ -4394,7 +4406,7 @@ impl CandidateStore {
         }
         let filter_key = (filter_bytes, bloom_hashes);
         let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
-        let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0);
+        let summary_bytes = self.tier2_superblock_summary_bytes(bucket_key.0);
         self.tier2_superblocks
             .bucket_for_key
             .insert(filter_key, bucket_key);
@@ -4459,7 +4471,7 @@ impl CandidateStore {
             max_needed_blocks = max_needed_blocks.max(block_idx + 1);
             let filter_key = (*filter_bytes, *bloom_hashes);
             let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-            let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0).max(1);
+            let summary_bytes = self.tier2_superblock_summary_bytes(bucket_key.0).max(1);
             keys_by_block.entry(block_idx).or_default().push(filter_key);
             max_block_by_bucket
                 .entry(bucket_key)
@@ -4478,7 +4490,7 @@ impl CandidateStore {
         }
 
         for (bucket_key, max_block_idx) in max_block_by_bucket {
-            let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0);
+            let summary_bytes = self.tier2_superblock_summary_bytes(bucket_key.0);
             self.tier2_superblocks
                 .summary_bytes_by_bucket
                 .insert(bucket_key, summary_bytes);
@@ -4700,7 +4712,7 @@ impl CandidateStore {
                 .summary_bytes_by_bucket
                 .get(&(*filter_bucket, *bloom_hashes))
                 .copied()
-                .unwrap_or_else(|| tier2_superblock_summary_bytes(*filter_bucket));
+                .unwrap_or_else(|| self.tier2_superblock_summary_bytes(*filter_bucket));
             append_u64(&mut payload, summary_bytes as u64);
             append_u64(&mut payload, blocks.len() as u64);
             for block in blocks {
@@ -4761,7 +4773,7 @@ impl CandidateStore {
             let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
             let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
             let summary_bytes = read_u64(&bytes, &mut cursor)? as usize;
-            let expected_summary_bytes = tier2_superblock_summary_bytes(filter_bucket);
+            let expected_summary_bytes = self.tier2_superblock_summary_bytes(filter_bucket);
             if summary_bytes != expected_summary_bytes {
                 return Ok(None);
             }
@@ -4823,6 +4835,7 @@ impl CandidateStore {
             plan,
             &self.tier1_superblock_filter_keys(),
             &self.tier2_doc_filter_keys(),
+            self.meta.tier2_superblock_summary_cap_bytes,
         )?;
         self.prepared_query_cache.insert(key, entry.clone());
         Ok(entry)
@@ -6055,6 +6068,11 @@ fn validate_config(config: &CandidateConfig) -> Result<()> {
     }
     GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)
         .map_err(|err| SspryError::from(format!("invalid gram size pair: {err}")))?;
+    if config.tier2_superblock_summary_cap_bytes == 0 {
+        return Err(SspryError::from(
+            "tier2_superblock_summary_cap_bytes must be > 0",
+        ));
+    }
     if !config.compaction_idle_cooldown_s.is_finite() || config.compaction_idle_cooldown_s < 0.0 {
         return Err(SspryError::from(
             "compaction_idle_cooldown_s must be finite and >= 0",
@@ -6139,6 +6157,7 @@ fn build_pattern_mask_cache(
     patterns: &[PatternPlan],
     tier1_filter_keys: &[(usize, usize)],
     tier2_filter_keys: &[(usize, usize)],
+    tier2_superblock_summary_cap_bytes: usize,
 ) -> Result<PatternMaskCache> {
     let mut out = HashMap::with_capacity(patterns.len());
     let mut tier1_gram_cache = HashMap::<(u64, usize, usize), Vec<(usize, u8)>>::new();
@@ -6159,7 +6178,13 @@ fn build_pattern_mask_cache(
                 let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
                 superblock_by_key.insert(
                     (*filter_bytes, *bloom_hashes),
-                    fold_bloom_masks(&required, tier2_superblock_summary_bytes(summary_bucket.0)),
+                    fold_bloom_masks(
+                        &required,
+                        tier2_superblock_summary_bytes(
+                            summary_bucket.0,
+                            tier2_superblock_summary_cap_bytes,
+                        ),
+                    ),
                 );
                 by_key.insert((*filter_bytes, *bloom_hashes), required);
             }
@@ -6200,6 +6225,7 @@ pub(crate) fn build_prepared_query_artifacts(
     plan: &CompiledQueryPlan,
     tier1_filter_keys: &[(usize, usize)],
     tier2_filter_keys: &[(usize, usize)],
+    tier2_superblock_summary_cap_bytes: usize,
 ) -> Result<Arc<PreparedQueryArtifacts>> {
     let patterns = plan
         .patterns
@@ -6207,8 +6233,12 @@ pub(crate) fn build_prepared_query_artifacts(
         .cloned()
         .map(|pattern| (pattern.pattern_id.clone(), pattern))
         .collect::<HashMap<_, _>>();
-    let mask_cache =
-        build_pattern_mask_cache(&plan.patterns, tier1_filter_keys, tier2_filter_keys)?;
+    let mask_cache = build_pattern_mask_cache(
+        &plan.patterns,
+        tier1_filter_keys,
+        tier2_filter_keys,
+        tier2_superblock_summary_cap_bytes,
+    )?;
     Ok(Arc::new(PreparedQueryArtifacts {
         patterns,
         mask_cache,
@@ -8297,8 +8327,13 @@ rule q {
         };
         let bloom_bytes = bloom.into_bytes();
         let tier2_bloom_bytes = &[][..];
-        let mask_cache = build_pattern_mask_cache(&patterns_vec, &[(64, 2)], &[(64, 2)])
-            .expect("pattern mask cache");
+        let mask_cache = build_pattern_mask_cache(
+            &patterns_vec,
+            &[(64, 2)],
+            &[(64, 2)],
+            DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+        )
+        .expect("pattern mask cache");
 
         let outcome = evaluate_pattern(
             patterns.get("empty").expect("empty"),
@@ -8780,7 +8815,7 @@ rule q {
         let filter_bytes = store
             .resolve_filter_bytes_for_file_size(file_size, Some(gram_count_estimate))
             .expect("large primary filter bytes");
-        assert!(filter_bytes > MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
+        assert!(filter_bytes > DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES);
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
         let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
@@ -8829,7 +8864,7 @@ rule q {
                 .summary_bytes_by_bucket
                 .get(&bucket_key)
                 .copied(),
-            Some(MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES)
+            Some(DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES)
         );
         let blocks = store
             .tier2_superblocks
@@ -8837,7 +8872,75 @@ rule q {
             .get(&bucket_key)
             .expect("superblock masks");
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].len(), MAX_TIER2_SUPERBLOCK_SUMMARY_BYTES);
+        assert_eq!(blocks[0].len(), DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES);
+    }
+
+    #[test]
+    fn tier2_superblocks_respect_custom_summary_cap() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let cap_bytes = 8 * 1024;
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                tier2_superblock_summary_cap_bytes: cap_bytes,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let sha256 = [0x22; 32];
+        let file_size = 64 * 1024 * 1024u64;
+        let gram_count_estimate = 1_000_000usize;
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(gram_count_estimate))
+            .expect("large primary filter bytes");
+        assert!(filter_bytes > cap_bytes);
+        let bloom_hashes =
+            store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count_estimate), None);
+        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
+        primary_bloom
+            .add(pack_exact_gram(&[9, 8, 7]))
+            .expect("add primary gram");
+        let tier2_filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(2))
+            .expect("tier2 filter bytes");
+        let tier2_bloom_hashes =
+            store.resolve_bloom_hashes_for_document(tier2_filter_bytes, Some(2), None);
+        let mut tier2_bloom =
+            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("tier2 bloom");
+        tier2_bloom
+            .add(pack_exact_gram(&[9, 8, 7, 6]))
+            .expect("add tier2 gram");
+        store
+            .insert_document(
+                sha256,
+                file_size,
+                Some(gram_count_estimate),
+                Some(bloom_hashes),
+                Some(2),
+                Some(tier2_bloom_hashes),
+                filter_bytes,
+                &primary_bloom.into_bytes(),
+                tier2_filter_bytes,
+                &tier2_bloom.into_bytes(),
+                &[pack_exact_gram(&[9, 8, 7, 6])],
+                false,
+                None,
+                None,
+                true,
+            )
+            .expect("insert");
+
+        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+        let blocks = store
+            .tier2_superblocks
+            .masks_by_bucket
+            .get(&bucket_key)
+            .expect("superblock masks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), cap_bytes);
+        assert_eq!(store.config().tier2_superblock_summary_cap_bytes, cap_bytes);
     }
 
     #[test]

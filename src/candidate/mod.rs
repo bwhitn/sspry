@@ -41,6 +41,7 @@ pub use query_plan::{
 };
 pub use store::{
     CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryResult,
-    CandidateStats, CandidateStore, candidate_shard_index, candidate_shard_manifest_path,
-    candidate_shard_root, read_candidate_shard_count, write_candidate_shard_count,
+    CandidateStats, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+    candidate_shard_index, candidate_shard_manifest_path, candidate_shard_root,
+    read_candidate_shard_count, write_candidate_shard_count,
 };
