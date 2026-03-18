@@ -910,7 +910,7 @@ impl CandidateStore {
             )));
         }
         let load_state_started = Instant::now();
-        let (docs, doc_rows, tier2_doc_rows) = load_candidate_store_state(&root, &meta)?;
+        let (docs, doc_rows, tier2_doc_rows) = load_candidate_store_state(&root)?;
         let load_state_ms = load_state_started
             .elapsed()
             .as_millis()
@@ -3495,10 +3495,7 @@ fn append_u32_slice(path: PathBuf, values: &[u32]) -> Result<u64> {
     append_blob(path, &payload)
 }
 
-fn load_candidate_store_state(
-    root: &Path,
-    _meta: &StoreMeta,
-) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
+fn load_candidate_store_state(root: &Path) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
     if binary_store_exists(root) {
         return load_candidate_binary_store(root);
     }
