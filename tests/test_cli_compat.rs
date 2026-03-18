@@ -1416,7 +1416,6 @@ fn removed_public_aliases_and_flags_are_rejected() {
         "--socket-path",
         "--force-tier1-only",
         "--no-tier2-fallback",
-        "--no-df-lookup",
         "--no-verify-yara-files",
         "--host",
         "--port",

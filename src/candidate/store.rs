@@ -271,14 +271,11 @@ struct LegacyCandidateDoc {
     tier2_bloom_hashes: usize,
     #[serde(default)]
     tier2_bloom_hex: String,
-    grams_received: Vec<u32>,
-    grams_indexed: Vec<u32>,
-    grams_complete: bool,
     deleted: bool,
     external_id: Option<String>,
 }
 
-const DOC_META_ROW_BYTES: usize = 80;
+const DOC_META_ROW_BYTES: usize = 56;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
@@ -292,10 +289,6 @@ struct DocMetaRow {
     bloom_hashes: u8,
     bloom_offset: u64,
     bloom_len: u32,
-    grams_received_offset: u64,
-    grams_received_count: u32,
-    grams_indexed_offset: u64,
-    grams_indexed_count: u32,
     external_id_offset: u64,
     external_id_len: u32,
     metadata_offset: u64,
@@ -344,14 +337,10 @@ impl DocMetaRow {
         out[13] = self.bloom_hashes;
         out[16..24].copy_from_slice(&self.bloom_offset.to_le_bytes());
         out[24..28].copy_from_slice(&self.bloom_len.to_le_bytes());
-        out[28..36].copy_from_slice(&self.grams_received_offset.to_le_bytes());
-        out[36..40].copy_from_slice(&self.grams_received_count.to_le_bytes());
-        out[40..48].copy_from_slice(&self.grams_indexed_offset.to_le_bytes());
-        out[48..52].copy_from_slice(&self.grams_indexed_count.to_le_bytes());
-        out[52..60].copy_from_slice(&self.external_id_offset.to_le_bytes());
-        out[60..64].copy_from_slice(&self.external_id_len.to_le_bytes());
-        out[64..72].copy_from_slice(&self.metadata_offset.to_le_bytes());
-        out[72..76].copy_from_slice(&self.metadata_len.to_le_bytes());
+        out[28..36].copy_from_slice(&self.external_id_offset.to_le_bytes());
+        out[36..40].copy_from_slice(&self.external_id_len.to_le_bytes());
+        out[40..48].copy_from_slice(&self.metadata_offset.to_le_bytes());
+        out[48..52].copy_from_slice(&self.metadata_len.to_le_bytes());
         out
     }
 
@@ -366,24 +355,12 @@ impl DocMetaRow {
             bloom_hashes: bytes[13],
             bloom_offset: u64::from_le_bytes(bytes[16..24].try_into().expect("bloom_offset")),
             bloom_len: u32::from_le_bytes(bytes[24..28].try_into().expect("bloom_len")),
-            grams_received_offset: u64::from_le_bytes(
-                bytes[28..36].try_into().expect("grams_received_offset"),
-            ),
-            grams_received_count: u32::from_le_bytes(
-                bytes[36..40].try_into().expect("grams_received_count"),
-            ),
-            grams_indexed_offset: u64::from_le_bytes(
-                bytes[40..48].try_into().expect("grams_indexed_offset"),
-            ),
-            grams_indexed_count: u32::from_le_bytes(
-                bytes[48..52].try_into().expect("grams_indexed_count"),
-            ),
             external_id_offset: u64::from_le_bytes(
-                bytes[52..60].try_into().expect("external_id_offset"),
+                bytes[28..36].try_into().expect("external_id_offset"),
             ),
-            external_id_len: u32::from_le_bytes(bytes[60..64].try_into().expect("external_id_len")),
-            metadata_offset: u64::from_le_bytes(bytes[64..72].try_into().expect("metadata_offset")),
-            metadata_len: u32::from_le_bytes(bytes[72..76].try_into().expect("metadata_len")),
+            external_id_len: u32::from_le_bytes(bytes[36..40].try_into().expect("external_id_len")),
+            metadata_offset: u64::from_le_bytes(bytes[40..48].try_into().expect("metadata_offset")),
+            metadata_len: u32::from_le_bytes(bytes[48..52].try_into().expect("metadata_len")),
         })
     }
 }
@@ -843,8 +820,6 @@ impl CandidateStore {
         let doc_metadata_path = doc_metadata_path(&config.root);
         let blooms_path = blooms_path(&config.root);
         let tier2_blooms_path = tier2_blooms_path(&config.root);
-        let legacy_grams_received_path = config.root.join("grams_received.bin");
-        let legacy_grams_indexed_path = config.root.join("grams_indexed.bin");
         let external_ids_path = external_ids_path(&config.root);
         if !force
             && (meta_path.exists()
@@ -856,8 +831,6 @@ impl CandidateStore {
                 || doc_metadata_path.exists()
                 || blooms_path.exists()
                 || tier2_blooms_path.exists()
-                || legacy_grams_received_path.exists()
-                || legacy_grams_indexed_path.exists()
                 || external_ids_path.exists())
         {
             return Err(SspryError::from(format!(
@@ -886,8 +859,6 @@ impl CandidateStore {
             let _ = fs::remove_file(&doc_metadata_path);
             let _ = fs::remove_file(&blooms_path);
             let _ = fs::remove_file(&tier2_blooms_path);
-            let _ = fs::remove_file(&legacy_grams_received_path);
-            let _ = fs::remove_file(&legacy_grams_indexed_path);
             let _ = fs::remove_file(&external_ids_path);
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
         }
@@ -2077,10 +2048,6 @@ impl CandidateStore {
                     bloom_hashes: document.bloom_hashes.min(u8::MAX as usize) as u8,
                     bloom_offset,
                     bloom_len: document.bloom_filter.len() as u32,
-                    grams_received_offset: 0,
-                    grams_received_count: 0,
-                    grams_indexed_offset: 0,
-                    grams_indexed_count: 0,
                     external_id_offset,
                     external_id_len,
                     metadata_offset,
@@ -2587,10 +2554,6 @@ impl CandidateStore {
                 bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
                 bloom_offset,
                 bloom_len: bloom_len as u32,
-                grams_received_offset: 0,
-                grams_received_count: 0,
-                grams_indexed_offset: 0,
-                grams_indexed_count: 0,
                 external_id_offset,
                 external_id_len,
                 metadata_offset,
@@ -2648,10 +2611,6 @@ impl CandidateStore {
             bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset,
             bloom_len: bloom_filter.len() as u32,
-            grams_received_offset: 0,
-            grams_received_count: 0,
-            grams_indexed_offset: 0,
-            grams_indexed_count: 0,
             external_id_offset,
             external_id_len,
             metadata_offset,
@@ -3266,10 +3225,6 @@ pub(crate) fn write_compacted_snapshot(
             bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset: append_blob(blooms_path(compacted_root), &bloom_bytes)?,
             bloom_len: bloom_bytes.len() as u32,
-            grams_received_offset: 0,
-            grams_received_count: 0,
-            grams_indexed_offset: 0,
-            grams_indexed_count: 0,
             external_id_offset: if let Some(external_id) = &external_id {
                 append_blob(external_ids_path(compacted_root), external_id.as_bytes())?
             } else {
@@ -3691,10 +3646,6 @@ fn persist_docs_as_binary(
             bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset: append_blob(blooms_path(root), &bloom_bytes)?,
             bloom_len: bloom_bytes.len() as u32,
-            grams_received_offset: 0,
-            grams_received_count: 0,
-            grams_indexed_offset: 0,
-            grams_indexed_count: 0,
             external_id_offset: if let Some(external_id) = &doc.external_id {
                 append_blob(external_ids_path(root), external_id.as_bytes())?
             } else {
@@ -4372,9 +4323,7 @@ mod tests {
         sha_byte: u8,
         filter_bytes: usize,
         bloom_hashes: usize,
-        indexed: &[u32],
         bloom_grams: &[u32],
-        grams_complete: bool,
         deleted: bool,
         external_id: Option<&str>,
     ) -> LegacyCandidateDoc {
@@ -4388,9 +4337,6 @@ mod tests {
             tier2_filter_bytes: 0,
             tier2_bloom_hashes: 0,
             tier2_bloom_hex: String::new(),
-            grams_received: indexed.to_vec(),
-            grams_indexed: indexed.to_vec(),
-            grams_complete,
             deleted,
             external_id: external_id.map(str::to_owned),
         }
@@ -5115,18 +5061,8 @@ rule q {
     fn binary_sidecars_roundtrip_and_legacy_sources_migrate() {
         let tmp = tempdir().expect("tmp");
         let docs = vec![
-            legacy_doc(2, 0x22, 64, 7, &[2, 3, 4], &[2, 3, 4], false, true, None),
-            legacy_doc(
-                1,
-                0x11,
-                64,
-                7,
-                &[1, 2],
-                &[1, 2],
-                true,
-                false,
-                Some("legacy-one"),
-            ),
+            legacy_doc(2, 0x22, 64, 7, &[2, 3, 4], true, None),
+            legacy_doc(1, 0x11, 64, 7, &[1, 2], false, Some("legacy-one")),
         ];
 
         let binary_root = tmp.path().join("binary_root");
@@ -5215,17 +5151,7 @@ rule q {
     #[test]
     fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
         let tmp = tempdir().expect("tmp");
-        let docs = vec![legacy_doc(
-            1,
-            0x11,
-            64,
-            7,
-            &[10, 20],
-            &[10, 20],
-            true,
-            false,
-            Some("ok"),
-        )];
+        let docs = vec![legacy_doc(1, 0x11, 64, 7, &[10, 20], false, Some("ok"))];
 
         let invalid_len_root = tmp.path().join("invalid_len_root");
         persist_docs_as_binary(&invalid_len_root, &docs).expect("persist invalid len root");
@@ -5293,10 +5219,6 @@ rule q {
             bloom_hashes: 7,
             bloom_offset: 7,
             bloom_len: 8,
-            grams_received_offset: 9,
-            grams_received_count: 2,
-            grams_indexed_offset: 17,
-            grams_indexed_count: 1,
             external_id_offset: 21,
             external_id_len: 4,
             metadata_offset: 25,
@@ -5309,10 +5231,6 @@ rule q {
         assert_eq!(decoded.flags, row.flags);
         assert_eq!(decoded.bloom_offset, row.bloom_offset);
         assert_eq!(decoded.bloom_len, row.bloom_len);
-        assert_eq!(decoded.grams_received_offset, row.grams_received_offset);
-        assert_eq!(decoded.grams_received_count, row.grams_received_count);
-        assert_eq!(decoded.grams_indexed_offset, row.grams_indexed_offset);
-        assert_eq!(decoded.grams_indexed_count, row.grams_indexed_count);
         assert_eq!(decoded.external_id_offset, row.external_id_offset);
         assert_eq!(decoded.external_id_len, row.external_id_len);
         assert!(
