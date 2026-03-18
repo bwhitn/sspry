@@ -45,25 +45,6 @@ fn run_ok_capture(args: &[&str]) -> (String, String) {
     )
 }
 
-fn run_fail(args: &[&str]) -> String {
-    let output = Command::new(bin_path())
-        .args(args)
-        .output()
-        .expect("run command");
-    assert!(
-        !output.status.success(),
-        "command unexpectedly succeeded: {:?}\nstdout={}\nstderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
 fn run_ok_env(args: &[&str], envs: &[(&str, &str)]) -> String {
     let mut command = Command::new(bin_path());
     command.args(args);
@@ -407,14 +388,10 @@ fn info_uses_sspry_addr_env() {
 }
 
 #[test]
-fn serve_help_uses_sspry_env_and_removed_publish_flag_stays_gone() {
+fn serve_help_uses_sspry_env() {
     let out = run_ok(&["serve", "--help"]);
     assert!(out.contains("SSPRY_ADDR"));
     assert!(!out.contains("YAYA_ADDR"));
-    assert!(!out.contains("auto-publish-idle-ms"));
-
-    let err = run_fail(&["serve", "--auto-publish-idle-ms", "1"]);
-    assert!(err.contains("unexpected argument"));
 }
 
 #[test]

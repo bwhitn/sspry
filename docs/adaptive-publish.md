@@ -21,10 +21,9 @@ From the current incremental workspace implementation on this machine:
     - `last_publish_promote_work_ms: 154`
     - `last_publish_promote_work_import_ms: 56`
     - visibility lag after `index` return: `391ms`
-- background sealing is still the hidden tail
-  - right after visibility flips, both DF and Tier2 queues can still have about one shard set pending
+- background Tier2 summary sealing is still the hidden tail
+  - right after visibility flips, the Tier2 queue can still have about one shard set pending
   - example after the `+500` publish:
-    - `published_df_snapshot_seal.pending_shards: 62`
     - `published_tier2_snapshot_seal.pending_shards: 61`
 - current ingest on this SSD box is no longer worker-bound and no longer client-buffer-bound
   - `2000`-doc base ingest:
@@ -52,8 +51,7 @@ The server should maintain moving averages or recent-window samples for:
   - `last_publish_promote_work_ms`
   - `last_publish_promote_work_import_ms`
 - background seal backlog
-  - pending DF snapshot shards
-  - pending Tier2 snapshot shards
+  - pending Tier2 summary snapshot shards
 - publish cadence
   - time since last completed publish
   - number of publishes in the recent window
@@ -91,7 +89,6 @@ Then adjust from runtime signals:
 1. Fast path
 - if:
   - recent visible publish p95 `< 500ms`
-  - DF backlog is below one shard set
   - Tier2 backlog is below one shard set
   - recent publish rate is low
 - set idle to `0-100ms`

@@ -19,10 +19,8 @@ Current baseline:
   - live duplicate/import timing metrics are renamed from `classify_*` to `resolve_doc_state_*`
   - the dead `ENABLE_PRESSURE_PUBLISH = false` gate is removed; live backpressure/pressure telemetry remains
 - `features.rs` status:
-  - default ingest already scans with `collect_unique_grams = false`
-  - `DocumentFeatures.unique_grams`, `unique_grams_truncated`, and `effective_diversity` still exist mainly for compatibility/test scaffolding
-  - next cleanup there should target compatibility/test-only paths, not the default scanner hot path
-  - production `DocumentFeatures` no longer exposes those gram-era fields; they are unit-test-only now
+  - default ingest is on the bloom-only scanner path
+  - production `DocumentFeatures` no longer exposes the retired gram-era fields
   - the `entropy_*`, `bucket_*`, and exact-gram selection helpers are now test-only in `features.rs`
   - production still keeps the HLL `estimate_*grams*` helpers because app-side bloom sizing depends on them
   - dead public reexports for exact-gram helper utilities were removed from `candidate/mod.rs`
@@ -358,22 +356,19 @@ Removal phases:
 4. CLI/test cutover
    - done:
      - added coverage for the planner cutover and store cleanup slices
-   - next:
-     - remove dual-mode compatibility tests and fixtures that only exist to preserve exact-gram wire behavior
+     - removed dual-mode compatibility tests and fixtures that only existed to preserve exact-gram wire behavior
 5. Final cleanup
    - remove `--no-grams` once bloom-only is the only ingest mode
    - remove dead docs, counters, and benchmark branches tied only to exact grams/DF
 6. DF storage removal
    - done:
      - removed DF deltas, segments, compaction/seal paths, RPC stats, and related tests from the normal bloom-only path
-   - next:
-     - remove any remaining compatibility-only field names/counters that still mention grams or DF externally
+     - removed the remaining compatibility-only field names/counters that still mentioned grams or DF externally
 
 `features.rs` read after the bloom-only cutover:
-- the main app index path already calls `scan_file_features_with_gram_sizes(..., false, ...)`
-- normal ingest is no longer collecting `unique_grams`
-- the remaining `unique_grams` collection is mostly in RPC/test compatibility helpers and fixtures
-- next cleanup there should target compatibility wire/test paths, not the default scanner
+- the main app index path is now on the dedicated bloom-only scan entrypoint
+- normal ingest no longer collects `unique_grams`
+- the remaining gram-era logic in `features.rs` is test scaffolding, not live ingest behavior
 
 Current local `26k` verification on the bloom-only cleanup tree:
 - artifact:
@@ -762,7 +757,7 @@ Current state:
 - landed dual work roots for workspace mode:
   - `work_a`
   - `work_b`
-- startup migrates a legacy single `work/` root to `work_a/`
+- startup rejects the retired single `work/` root
 - publish now swaps the active work root first, then publishes the old root
 - workspace inserts are no longer blocked on the global publish gate
 - search still reads only the published root and remains isolated from in-flight work

@@ -6,13 +6,13 @@
     <text x="95" y="130">Rule Parse</text>
     <rect x="190" y="90" width="150" height="70" rx="10" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
     <text x="265" y="120">Anchor Selection</text>
-    <text x="265" y="142">DF + branch ordering</text>
+    <text x="265" y="142">branch ordering</text>
     <rect x="370" y="90" width="150" height="70" rx="10" fill="#fde68a" stroke="#a16207" stroke-width="2"/>
     <text x="445" y="120">Shard Fanout</text>
     <text x="445" y="142">dynamic workers</text>
     <rect x="550" y="90" width="150" height="70" rx="10" fill="#fecaca" stroke="#b91c1c" stroke-width="2"/>
-    <text x="625" y="120">Tier1 Exact</text>
-    <text x="625" y="142">Tier2 Bloom Fallback</text>
+    <text x="625" y="120">Bloom Checks</text>
+    <text x="625" y="142">Tier1 + Tier2</text>
     <rect x="730" y="90" width="100" height="70" rx="10" fill="#e9d5ff" stroke="#7e22ce" stroke-width="2"/>
     <text x="780" y="130">Score</text>
     <rect x="860" y="90" width="90" height="70" rx="10" fill="#fbcfe8" stroke="#be185d" stroke-width="2"/>

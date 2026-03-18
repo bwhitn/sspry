@@ -138,7 +138,7 @@ Each feature should be classified as one of:
   - `26k`
   - `50k`
 - Add larger runs when the bottleneck or scaling question requires them.
-- Search-safety regressions should be checked whenever classify, DF, publish/import, or search planning changes.
+- Search-safety regressions should be checked whenever bloom layout, publish/import, verification behavior, or search planning changes.
 - Coverage goals:
   - `95%+` line coverage
   - `100%` function coverage where practical

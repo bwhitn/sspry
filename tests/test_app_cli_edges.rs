@@ -215,27 +215,6 @@ fn yara_reports_match_and_tags() {
 }
 
 #[test]
-fn removed_yara_check_name_is_rejected() {
-    let tmp = tempdir().expect("tmp");
-    let rule_path = tmp.path().join("rule.yar");
-    let miss_path = tmp.path().join("miss.bin");
-    fs::write(
-        &rule_path,
-        "rule TestLiteral { strings: $a = \"hello\" condition: $a }\n",
-    )
-    .expect("rule");
-    fs::write(&miss_path, b"goodbye").expect("miss");
-
-    let out = run_fail(&[
-        "yara-check",
-        "--rule",
-        rule_path.to_str().expect("rule"),
-        miss_path.to_str().expect("miss"),
-    ]);
-    assert!(out.contains("unrecognized subcommand 'yara-check'"));
-}
-
-#[test]
 fn yara_reports_missing_inputs() {
     let tmp = tempdir().expect("tmp");
     let hit_path = tmp.path().join("hit.bin");

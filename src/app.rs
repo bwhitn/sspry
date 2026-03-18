@@ -3141,7 +3141,7 @@ struct ServeArgs {
     #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
-        help = "Workspace root directory. SSPRY will manage current/, work/, and retired/ under this path."
+        help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
     )]
     root: String,
     #[arg(
@@ -3293,7 +3293,7 @@ struct InternalQueryArgs {
         long = "max-anchors-per-pattern",
         alias = "max-anchors-per-alt",
         default_value_t = 16,
-        help = "Maximum grams kept per pattern alternative after DF ranking."
+        help = "Maximum anchor grams kept per pattern alternative after planner reduction."
     )]
     max_anchors_per_pattern: usize,
     #[arg(long = "force-tier1-only", action = ArgAction::SetTrue, help = "Disable tier2 fallback for complete documents.")]
@@ -4514,7 +4514,7 @@ rule remote_q {
                 CandidateIdSource::Sha256,
                 1024,
             )
-            .expect("legacy helper"),
+            .expect("resolved identity"),
             hex::encode(
                 identity_from_hex(&sha256_hex, CandidateIdSource::Sha256)
                     .expect("normalized sha256")

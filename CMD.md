@@ -55,7 +55,7 @@ Options:
       --tier2-superblock-budget-divisor <TIER2_SUPERBLOCK_BUDGET_DIVISOR>
           Divides the server memory budget to derive the per-shard Tier2 summary-memory budget. Lower values allow more RAM for Tier2 summaries. [default: 4]
       --root <ROOT>
-          Workspace root directory. SSPRY will manage current/, work/, and retired/ under this path. [default: candidate_db]
+          Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path. [default: candidate_db]
       --layout-profile <LAYOUT_PROFILE>
           Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 64 shards for lower publish fanout. [default: standard] [possible values: standard, incremental]
       --shards <SHARDS>

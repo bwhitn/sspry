@@ -1,6 +1,6 @@
 # Implementation
 
-`sspry` is a mutable file-search engine built around exact gram postings, per-document bloom filters, and optional local YARA verification.
+`sspry` is a mutable file-search engine built around per-document bloom filters, per-superblock Tier2 summaries, and optional local YARA verification.
 
 ## Architecture
 
@@ -11,8 +11,9 @@ At a high level:
 1. `serve` starts the TCP server and owns the store.
 2. `index` scans files client-side and sends batched documents.
 3. The server stores:
-   - exact Tier1 gram postings
+   - per-document Tier1 bloom filters
    - per-document Tier2 bloom filters
+   - per-superblock Tier2 summaries
    - metadata and optional stored file paths
 4. `search` compiles a restricted YARA rule into a query plan.
 5. The store returns candidate digests.
@@ -26,10 +27,10 @@ The query path is:
 
 1. Parse restricted YARA into fixed literals / boolean structure.
 2. Extract Tier1 and Tier2 grams from the rule using the DB-wide gram sizes.
-3. Build an anchor plan.
+3. Build an anchor plan with branch ordering and per-pattern anchor reduction.
 4. Query shards in parallel.
-5. Use exact Tier1 postings first.
-6. Use Tier2 bloom fallback for incomplete exact coverage.
+5. Use Tier2 superblock summaries to skip groups of files.
+6. Use per-document Tier1 and Tier2 blooms to refine candidates.
 7. Rank and page candidates.
 8. Optionally verify file paths locally.
 
@@ -43,11 +44,10 @@ Per shard, the implementation persists binary sidecars for:
 
 - document metadata
 - normalized document ids
-- tier1 bloom blobs
-- tier2 bloom blobs
-- retained exact gram lists
+- Tier1 bloom blobs
+- Tier2 bloom blobs
+- Tier2 superblock summaries
 - deleted state
-- DF state
 - optional `external_id` values
 
 The open/search path is intentionally lazy:
@@ -64,7 +64,7 @@ Deletes are immediate logically:
 
 - the document is marked deleted
 - query paths stop returning it
-- DF counts are updated immediately
+- Tier2 summaries are updated so deleted docs stop contributing to future block checks
 
 Physical reclaim is deferred.
 
@@ -120,14 +120,9 @@ Supported pairs:
 Rules:
 
 - smaller size = Tier2 bloom gram size
-- larger size = Tier1 exact gram size
+- larger size = Tier1 bloom gram size
 - the choice is persisted in metadata
 - stores must be queried with the same gram model they were created with
-
-Tier1 exact key width is chosen from the larger gram size:
-
-- Tier1 up to 4 bytes uses `u32`
-- Tier1 5 to 8 bytes uses `u64`
 
 ## Ingest Path
 
@@ -136,9 +131,8 @@ Client-side indexing does the expensive file scan and feature extraction before 
 For each file, the client computes:
 
 - normalized document id
-- tier1 bloom grams
-- tier2 bloom grams
-- retained Tier1 exact grams
+- Tier1 bloom grams
+- Tier2 bloom grams
 - file size
 - optional stored path
 
@@ -159,7 +153,6 @@ Current search improvements include:
 - OR branch ordering by estimated selectivity
 - duplicate OR subtree and alternative dedup
 - dynamic shard scheduling across server search workers
-- bounded server-side DF cache
 - bounded server-side query-result cache
 - prepared-query artifact cache inside the store
 - candidate scoring before verification/pagination
@@ -189,8 +182,8 @@ These are the main implementation gaps worth keeping in view:
 
 - compaction is shard-local and working, but it is not yet a full multi-generation MVCC design
 - long-lived store cleanup and sweep behavior need another pass
-- short common literals are still the hardest precision case because the engine is fundamentally gram-based and mostly non-positional
-- some advanced search-planner ideas are still not implemented, including stronger exact positional rescue for short literals
+- short common literals are still the hardest precision case because the engine is gram-based and mostly non-positional
+- some advanced search-planner ideas are still not implemented, including stronger rescue for very common literals
 - shutdown drains existing requests, rejects new mutations during drain, and is available both by signal and explicit RPC/CLI command
 
 ## Why The Design Looks Like This
@@ -198,7 +191,6 @@ These are the main implementation gaps worth keeping in view:
 The current tradeoffs are deliberate:
 
 - mutable store instead of rebuild-only index
-- exact Tier1 postings for precision
-- per-document Tier2 blooms for recall on incomplete docs
+- bloom tiers and superblock summaries instead of retained exact gram postings
 - server-owned store policy so clients stay simple
 - narrow public CLI so alpha users only touch meaningful knobs
