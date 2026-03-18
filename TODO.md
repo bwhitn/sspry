@@ -8,6 +8,31 @@ Current baseline:
   - `maintenance.auto = false`
 
 ## Current State
+- Bloom-only cutover is now the default live path:
+  - public `candidate_df` replanning transport is removed
+  - live exact-gram persistence is removed from ingest/import/delete
+  - compatibility-only gram wire fields are removed from the app/RPC surface
+- `features.rs` status:
+  - default ingest already scans with `collect_unique_grams = false`
+  - `DocumentFeatures.unique_grams`, `unique_grams_truncated`, and `effective_diversity` still exist mainly for compatibility/test scaffolding
+  - next cleanup there should target compatibility/test-only paths, not the default scanner hot path
+- `26k` bloom-only verification after the compatibility-wire cleanup:
+  - artifact:
+    - `/root/pertest/results/sspry_verify_26000_bloomcut_20260318_r2`
+  - `index_wall_ms = 563,508`
+  - `files_per_minute_wall = 2768.37`
+  - `current_rss_kb = 243,800`
+  - `peak_rss_kb = 354,084`
+  - `db_bytes = 18,539,136,064`
+  - `store_us = 28,269,116`
+  - `store_classify_df_lookup_us = 0`
+  - `store_append_sidecars_us = 26,714,030`
+  - `store_tier2_update_us = 1,363,948`
+- Read from that `26k` verification:
+  - the bloom-only cleanup held under a real release ingest
+  - the default path no longer performs any DF/classify lookup work
+  - ingest/store time is now overwhelmingly bloom-side append work
+
 - Full-corpus run `r6` on `4cbcd5a` was rejected and stopped at `30,981 / 260,278` docs (`11.90%`).
 - Grouped DF segment lookups regressed into very large exact local scans:
   - `store_classify_df_lookup_segment_rows_examined = 13,216,478,954`

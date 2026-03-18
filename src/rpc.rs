@@ -144,9 +144,6 @@ pub struct CandidateInsertResponse {
     pub status: String,
     pub doc_id: u64,
     pub sha256: String,
-    pub grams_received: usize,
-    pub grams_indexed: usize,
-    pub grams_complete: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,14 +186,6 @@ pub struct CandidateDocumentWire {
     pub tier2_gram_count_estimate: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier2_bloom_hashes: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grams_delta_b64: Option<String>,
-    #[serde(default)]
-    pub grams: Vec<u64>,
-    #[serde(default = "default_true")]
-    pub grams_complete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_diversity: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4301,7 +4290,6 @@ impl ServerState {
         } else {
             Vec::new()
         };
-        let _ = (&document.grams_delta_b64, &document.grams);
         let gram_count_estimate = document
             .gram_count_estimate
             .map(|value| {
@@ -4349,9 +4337,7 @@ impl ServerState {
             tier2_bloom_filter,
             selected_grams,
             false,
-            document
-                .effective_diversity
-                .map(|value| value.clamp(0.0, 1.0)),
+            None,
             metadata,
             document.external_id.clone(),
             true,
@@ -4365,9 +4351,6 @@ impl ServerState {
             status: result.status,
             doc_id: result.doc_id,
             sha256: result.sha256,
-            grams_received: result.grams_received,
-            grams_indexed: result.grams_indexed,
-            grams_complete: result.grams_complete,
         }
     }
 
@@ -6087,10 +6070,6 @@ fn normalize_sha256_hex(value: &str) -> Result<String> {
     Ok(text)
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn disk_usage_under(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -6123,9 +6102,7 @@ mod tests {
     use std::io::Cursor;
     use std::net::TcpListener;
 
-    use crate::candidate::{
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, encode_grams_delta_u64,
-    };
+    use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
     use base64::Engine;
     use tempfile::tempdir;
 
@@ -6213,7 +6190,7 @@ mod tests {
     fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
         fs::write(path, bytes).expect("write sample");
         let features = crate::candidate::scan_file_features(
-            path, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
+            path, 1024, 7, 0, 0, 1024, false, None, None, 2048, 1, 1337,
         )
         .expect("features");
         CandidateDocumentWire {
@@ -6226,10 +6203,6 @@ mod tests {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: None,
-            grams: features.unique_grams,
-            grams_complete: !features.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: None,
         }
@@ -6290,10 +6263,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: vec![gram],
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             })
@@ -6398,10 +6367,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: Vec::new(),
-                grams_complete: false,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             })
@@ -6517,10 +6482,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features_a.unique_grams,
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -6534,10 +6495,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features_b.unique_grams,
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -6965,10 +6922,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features.unique_grams,
-                grams_complete: !features.unique_grams_truncated,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("work-doc".to_owned()),
             })
@@ -7086,10 +7039,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features.unique_grams,
-                grams_complete: !features.unique_grams_truncated,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("auto-publish-doc".to_owned()),
             })
@@ -7175,10 +7124,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features.unique_grams,
-                grams_complete: !features.unique_grams_truncated,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("pressure-doc".to_owned()),
             })
@@ -7305,10 +7250,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features_a.unique_grams,
-                grams_complete: !features_a.unique_grams_truncated,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("inc-a".to_owned()),
             })
@@ -7332,10 +7273,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features_b.unique_grams,
-                grams_complete: !features_b.unique_grams_truncated,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("inc-b".to_owned()),
             })
@@ -7840,9 +7777,6 @@ mod tests {
                                 status: "inserted".to_owned(),
                                 doc_id: request_idx as u64,
                                 sha256: format!("{:064x}", request_idx),
-                                grams_received: 0,
-                                grams_indexed: 0,
-                                grams_complete: true,
                             }],
                         })
                         .expect("batch bytes"),
@@ -7867,10 +7801,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: Vec::new(),
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -7883,10 +7813,6 @@ mod tests {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: Vec::new(),
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -7959,9 +7885,6 @@ mod tests {
                         status: "inserted".to_owned(),
                         doc_id: 1,
                         sha256: "aa".repeat(32),
-                        grams_received: 0,
-                        grams_indexed: 0,
-                        grams_complete: true,
                     }],
                 })
                 .expect("batch payload"),
@@ -7990,10 +7913,6 @@ mod tests {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: None,
-            grams: Vec::new(),
-            grams_complete: true,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: None,
         })
@@ -8555,10 +8474,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: None,
-            grams: features_a.unique_grams,
-            grams_complete: !features_a.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
@@ -8572,13 +8487,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: Some(
-                base64::engine::general_purpose::STANDARD
-                    .encode(encode_grams_delta_u64(features_b.unique_grams.clone())),
-            ),
-            grams: Vec::new(),
-            grams_complete: !features_b.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
@@ -8867,10 +8775,6 @@ rule q {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: vec![1, 2, 3],
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("doc".to_owned()),
             }])
@@ -8945,10 +8849,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: None,
-            grams: features_a.unique_grams.clone(),
-            grams_complete: !features_a.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
@@ -8962,13 +8862,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: Some(
-                base64::engine::general_purpose::STANDARD
-                    .encode(encode_grams_delta_u64(features_b.unique_grams.clone())),
-            ),
-            grams: Vec::new(),
-            grams_complete: !features_b.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
@@ -9050,10 +8943,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: None,
-            grams: Vec::new(),
-            grams_complete: false,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: None,
         })
@@ -9068,10 +8957,6 @@ rule q {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: Vec::new(),
-                grams_complete: false,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             }],
@@ -9151,10 +9036,6 @@ rule q {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: vec![gram],
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("shard-a".to_owned()),
             },
@@ -9167,13 +9048,6 @@ rule q {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: Some(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(encode_grams_delta_u64(vec![gram])),
-                ),
-                grams: Vec::new(),
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("shard-b".to_owned()),
             },
@@ -9239,10 +9113,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -9261,10 +9131,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: Some("**".to_owned()),
-                    grams: Vec::new(),
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -9281,10 +9147,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -9443,10 +9305,6 @@ rule q {
                 tier2_bloom_filter_b64: None,
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: vec![gram],
-                grams_complete: true,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: Some("single-shard-id".to_owned()),
             })
@@ -9564,10 +9422,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: Some(format!("parallel-{index}")),
                 })
@@ -9690,10 +9544,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
@@ -9790,10 +9640,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
@@ -9875,10 +9721,6 @@ rule q {
                     tier2_bloom_filter_b64: None,
                     tier2_gram_count_estimate: None,
                     tier2_bloom_hashes: None,
-                    grams_delta_b64: None,
-                    grams: vec![gram],
-                    grams_complete: true,
-                    effective_diversity: None,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })

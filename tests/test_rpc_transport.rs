@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use tempfile::tempdir;
 
-use sspry::candidate::{compile_query_plan_from_file, encode_grams_delta_u64, scan_file_features};
+use sspry::candidate::{compile_query_plan_from_file, scan_file_features};
 use sspry::rpc::{CandidateDocumentWire, ClientConfig, SspryClient};
 
 fn bin_path() -> PathBuf {
@@ -106,7 +106,7 @@ rule q {
         0,
         0,
         4096,
-        true,
+        false,
         None,
         None,
         2048,
@@ -121,7 +121,7 @@ rule q {
         0,
         0,
         4096,
-        true,
+        false,
         None,
         None,
         2048,
@@ -140,13 +140,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: Some(
-                base64::engine::general_purpose::STANDARD
-                    .encode(encode_grams_delta_u64(features_a.unique_grams.clone())),
-            ),
-            grams: Vec::new(),
-            grams_complete: !features_a.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: Some("cand-a".to_owned()),
         },
@@ -160,10 +153,6 @@ rule q {
             tier2_bloom_filter_b64: None,
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: None,
-            grams_delta_b64: None,
-            grams: features_b.unique_grams,
-            grams_complete: !features_b.unique_grams_truncated,
-            effective_diversity: None,
             metadata_b64: None,
             external_id: Some("cand-b".to_owned()),
         },

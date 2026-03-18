@@ -27,7 +27,7 @@ use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
     GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
     choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
-    derive_document_bloom_hash_count, encode_grams_delta_u64, estimate_unique_grams_for_size_hll,
+    derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
     scan_file_features_with_gram_sizes,
 };
@@ -897,13 +897,6 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
         }),
         tier2_gram_count_estimate: row.tier2_gram_count_estimate.map(|value| value as i64),
         tier2_bloom_hashes: Some(row.tier2_bloom_hashes),
-        grams_delta_b64: Some({
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(encode_grams_delta_u64(row.grams))
-        }),
-        grams: Vec::new(),
-        grams_complete: row.grams_complete,
-        effective_diversity: row.effective_diversity,
         metadata_b64: Some({
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(row.metadata)
@@ -1060,9 +1053,9 @@ fn flush_local_pending_rows(
             &row.bloom_filter,
             row.tier2_filter_bytes,
             &row.tier2_bloom_filter,
-            &row.grams,
-            row.grams_complete,
-            row.effective_diversity,
+            &[],
+            false,
+            None,
             &row.metadata,
             row.external_id,
             true,
@@ -1223,9 +1216,6 @@ struct IndexBatchRow {
     tier2_gram_count_estimate: Option<usize>,
     tier2_bloom_hashes: usize,
     tier2_bloom_filter: Vec<u8>,
-    grams: Vec<u64>,
-    grams_complete: bool,
-    effective_diversity: Option<f64>,
     metadata: Vec<u8>,
     external_id: Option<String>,
 }
@@ -1374,10 +1364,6 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_gram_count_estimate,
         tier2_bloom_hashes,
         tier2_bloom_filter: features.tier2_bloom_filter,
-        // Bloom-only ingest no longer persists exact grams.
-        grams: Vec::new(),
-        grams_complete: false,
-        effective_diversity: features.effective_diversity,
         metadata: extract_compact_document_metadata(scan_path)?,
         external_id: resolved_path.map(|path| path.display().to_string()),
     })
@@ -1794,9 +1780,9 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 &row.bloom_filter,
                 row.tier2_filter_bytes,
                 &row.tier2_bloom_filter,
-                &row.grams,
-                row.grams_complete,
-                row.effective_diversity,
+                &[],
+                false,
+                None,
                 &row.metadata,
                 row.external_id,
                 true,
@@ -1805,9 +1791,6 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 status: result.status,
                 doc_id: result.doc_id,
                 sha256: result.sha256,
-                grams_received: result.grams_received,
-                grams_indexed: result.grams_indexed,
-                grams_complete: result.grams_complete,
             }
         } else {
             let server_policy = server_scan_policy(&args.connection)?;
@@ -1831,9 +1814,6 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
         println!("status: {}", result.status);
         println!("doc_id: {}", result.doc_id);
         println!("sha256: {}", result.sha256);
-        println!("grams_received: {}", result.grams_received);
-        println!("grams_indexed: {}", result.grams_indexed);
-        println!("grams_complete: {}", result.grams_complete);
         Ok(0)
     })() {
         Ok(code) => code,
@@ -3639,10 +3619,6 @@ mod tests {
                 tier2_bloom_filter_b64: Some("BAUG".to_owned()),
                 tier2_gram_count_estimate: Some(2),
                 tier2_bloom_hashes: Some(5),
-                grams_delta_b64: Some("BwgJ".to_owned()),
-                grams: Vec::new(),
-                grams_complete: true,
-                effective_diversity: Some(0.5),
                 metadata_b64: None,
                 external_id: Some("doc-1".to_owned()),
             },
@@ -3655,10 +3631,6 @@ mod tests {
                 tier2_bloom_filter_b64: Some("DQ4P".to_owned()),
                 tier2_gram_count_estimate: None,
                 tier2_bloom_hashes: Some(5),
-                grams_delta_b64: Some("EBES".to_owned()),
-                grams: Vec::new(),
-                grams_complete: false,
-                effective_diversity: None,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -3841,26 +3813,11 @@ mod tests {
             tier2_gram_count_estimate: None,
             tier2_bloom_hashes: 0,
             tier2_bloom_filter: Vec::new(),
-            grams: vec![1, 2, 3],
-            grams_complete: true,
-            effective_diversity: None,
             metadata: vec![9, 8, 7],
             external_id: Some("x".to_owned()),
         });
         assert_eq!(wire.sha256, hex::encode([0xAA; 32]));
         assert_eq!(wire.file_size, 123);
-        assert!(wire.grams.is_empty());
-        assert_eq!(
-            crate::candidate::decode_grams_delta_u32(
-                &base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    wire.grams_delta_b64.expect("packed grams"),
-                )
-                .expect("decode b64")
-            )
-            .expect("decode grams"),
-            vec![1, 2, 3]
-        );
         assert_eq!(wire.external_id.as_deref(), Some("x"));
 
         let tmp = tempdir().expect("tmp");
@@ -3981,8 +3938,6 @@ mod tests {
                     .as_ref()
             )
         );
-        assert!(row.grams.is_empty());
-        assert!(!row.grams_complete);
 
         let md5_row = scan_index_batch_row(
             &sample,
@@ -4002,8 +3957,6 @@ mod tests {
             md5_row.sha256,
             identity_from_file(&sample, 4, CandidateIdSource::Md5).expect("md5 id")
         );
-        assert!(md5_row.grams.is_empty());
-        assert!(!md5_row.grams_complete);
         assert!(md5_row.external_id.is_none());
 
         assert_eq!(legacy_operand_from_gram(0x01020304, 4), "04030201");
