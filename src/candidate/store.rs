@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -254,25 +254,6 @@ struct CandidateDoc {
     tier2_filter_bytes: usize,
     tier2_bloom_hashes: usize,
     deleted: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct LegacyCandidateDoc {
-    doc_id: u64,
-    sha256: String,
-    file_size: u64,
-    filter_bytes: usize,
-    #[serde(default)]
-    bloom_hashes: usize,
-    bloom_hex: String,
-    #[serde(default)]
-    tier2_filter_bytes: usize,
-    #[serde(default)]
-    tier2_bloom_hashes: usize,
-    #[serde(default)]
-    tier2_bloom_hex: String,
-    deleted: bool,
-    external_id: Option<String>,
 }
 
 const DOC_META_ROW_BYTES: usize = 56;
@@ -812,8 +793,6 @@ impl CandidateStore {
         fs::create_dir_all(&config.root)?;
         let compaction_manifest_path = shard_compaction_manifest_path(&config.root);
         let meta_path = meta_path(&config.root);
-        let docs_path = docs_path(&config.root);
-        let docs_log_path = docs_log_path(&config.root);
         let sha_path = sha_by_docid_path(&config.root);
         let doc_meta_path = doc_meta_path(&config.root);
         let tier2_doc_meta_path = tier2_doc_meta_path(&config.root);
@@ -823,8 +802,6 @@ impl CandidateStore {
         let external_ids_path = external_ids_path(&config.root);
         if !force
             && (meta_path.exists()
-                || docs_path.exists()
-                || docs_log_path.exists()
                 || sha_path.exists()
                 || doc_meta_path.exists()
                 || tier2_doc_meta_path.exists()
@@ -851,8 +828,6 @@ impl CandidateStore {
             }
             let _ = fs::remove_file(&compaction_manifest_path);
             let _ = fs::remove_file(&meta_path);
-            let _ = fs::remove_file(&docs_path);
-            let _ = fs::remove_file(&docs_log_path);
             let _ = fs::remove_file(&sha_path);
             let _ = fs::remove_file(&doc_meta_path);
             let _ = fs::remove_file(&tier2_doc_meta_path);
@@ -3266,14 +3241,6 @@ fn meta_path(root: &Path) -> PathBuf {
     root.join("meta.json")
 }
 
-fn docs_path(root: &Path) -> PathBuf {
-    root.join("docs.json")
-}
-
-fn docs_log_path(root: &Path) -> PathBuf {
-    root.join("docs.jsonl")
-}
-
 fn sha_by_docid_path(root: &Path) -> PathBuf {
     root.join("sha256_by_docid.dat")
 }
@@ -3488,23 +3455,6 @@ pub(crate) fn cleanup_abandoned_compaction_roots(root: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-fn legacy_docs_to_docs(docs: &[LegacyCandidateDoc]) -> Vec<CandidateDoc> {
-    let mut out = Vec::with_capacity(docs.len());
-    for doc in docs {
-        out.push(CandidateDoc {
-            doc_id: doc.doc_id,
-            sha256: doc.sha256.clone(),
-            file_size: doc.file_size,
-            filter_bytes: doc.filter_bytes,
-            bloom_hashes: doc.bloom_hashes.max(1),
-            tier2_filter_bytes: doc.tier2_filter_bytes,
-            tier2_bloom_hashes: doc.tier2_bloom_hashes,
-            deleted: doc.deleted,
-        });
-    }
-    out
-}
-
 fn append_u32(payload: &mut Vec<u8>, value: u32) {
     payload.extend_from_slice(&value.to_le_bytes());
 }
@@ -3552,49 +3502,7 @@ fn load_candidate_store_state(
     if binary_store_exists(root) {
         return load_candidate_binary_store(root);
     }
-    let log_path = docs_log_path(root);
-    if log_path.exists() {
-        let docs = load_candidate_docs_log(&log_path)?;
-        let (rows, tier2_rows) = persist_docs_as_binary(root, &docs)?;
-        let _ = fs::remove_file(log_path);
-        let _ = fs::remove_file(docs_path(root));
-        return Ok((legacy_docs_to_docs(&docs), rows, tier2_rows));
-    }
-    let legacy_path = docs_path(root);
-    if !legacy_path.exists() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
-    }
-    let docs = serde_json::from_slice::<Vec<LegacyCandidateDoc>>(&fs::read(&legacy_path)?)
-        .map_err(|_| {
-            SspryError::from(format!(
-                "Invalid candidate document state at {}",
-                root.display()
-            ))
-        })?;
-    let (rows, tier2_rows) = persist_docs_as_binary(root, &docs)?;
-    let _ = fs::remove_file(legacy_path);
-    Ok((legacy_docs_to_docs(&docs), rows, tier2_rows))
-}
-
-fn load_candidate_docs_log(path: &Path) -> Result<Vec<LegacyCandidateDoc>> {
-    let handle = fs::File::open(path)?;
-    let reader = BufReader::new(handle);
-    let mut docs_by_id = BTreeMap::<u64, LegacyCandidateDoc>::new();
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let doc = serde_json::from_str::<LegacyCandidateDoc>(&line).map_err(|_| {
-            SspryError::from(format!(
-                "Invalid candidate document log at {}:{}",
-                path.display(),
-                line_no + 1
-            ))
-        })?;
-        docs_by_id.insert(doc.doc_id, doc);
-    }
-    Ok(docs_by_id.into_values().collect())
+    Ok((Vec::new(), Vec::new(), Vec::new()))
 }
 
 fn binary_store_exists(root: &Path) -> bool {
@@ -3602,80 +3510,6 @@ fn binary_store_exists(root: &Path) -> bool {
         || doc_meta_path(root).exists()
         || tier2_doc_meta_path(root).exists()
         || doc_metadata_path(root).exists()
-}
-
-fn persist_docs_as_binary(
-    root: &Path,
-    docs: &[LegacyCandidateDoc],
-) -> Result<(Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
-    fs::create_dir_all(root)?;
-    let paths = [
-        sha_by_docid_path(root),
-        doc_meta_path(root),
-        tier2_doc_meta_path(root),
-        doc_metadata_path(root),
-        blooms_path(root),
-        tier2_blooms_path(root),
-        external_ids_path(root),
-    ];
-    for path in &paths {
-        let _ = fs::remove_file(path);
-    }
-    let mut rows = Vec::with_capacity(docs.len());
-    let mut tier2_rows = Vec::with_capacity(docs.len());
-    let mut ordered_docs = docs.to_vec();
-    ordered_docs.sort_by_key(|doc| doc.doc_id);
-    for doc in &ordered_docs {
-        let bloom_bytes = hex::decode(&doc.bloom_hex).map_err(|_| {
-            SspryError::from(format!("Invalid bloom payload stored for {}", doc.sha256))
-        })?;
-        let tier2_bloom_bytes = if doc.tier2_bloom_hex.is_empty() {
-            Vec::new()
-        } else {
-            hex::decode(&doc.tier2_bloom_hex).map_err(|_| {
-                SspryError::from(format!(
-                    "Invalid tier2_bloom payload stored for {}",
-                    doc.sha256
-                ))
-            })?
-        };
-        let row = DocMetaRow {
-            file_size: doc.file_size,
-            filter_bytes: doc.filter_bytes as u32,
-            flags: u8::from(doc.deleted) * DOC_FLAG_DELETED,
-            bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
-            bloom_offset: append_blob(blooms_path(root), &bloom_bytes)?,
-            bloom_len: bloom_bytes.len() as u32,
-            external_id_offset: if let Some(external_id) = &doc.external_id {
-                append_blob(external_ids_path(root), external_id.as_bytes())?
-            } else {
-                0
-            },
-            external_id_len: doc
-                .external_id
-                .as_ref()
-                .map(|value| value.len() as u32)
-                .unwrap_or(0),
-            metadata_offset: 0,
-            metadata_len: 0,
-        };
-        let tier2_row = if tier2_bloom_bytes.is_empty() {
-            Tier2DocMetaRow::default()
-        } else {
-            Tier2DocMetaRow {
-                filter_bytes: doc.tier2_filter_bytes as u32,
-                bloom_hashes: doc.tier2_bloom_hashes.min(u8::MAX as usize) as u8,
-                bloom_offset: append_blob(tier2_blooms_path(root), &tier2_bloom_bytes)?,
-                bloom_len: tier2_bloom_bytes.len() as u32,
-            }
-        };
-        append_blob(sha_by_docid_path(root), &hex::decode(&doc.sha256)?)?;
-        append_blob(doc_meta_path(root), &row.encode())?;
-        append_blob(tier2_doc_meta_path(root), &tier2_row.encode())?;
-        rows.push(row);
-        tier2_rows.push(tier2_row);
-    }
-    Ok((rows, tier2_rows))
 }
 
 fn load_candidate_binary_store(
@@ -4310,38 +4144,6 @@ mod tests {
 
     use super::*;
 
-    fn bloom_hex(filter_bytes: usize, bloom_hashes: usize, grams: &[u32]) -> String {
-        let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
-        for gram in grams {
-            bloom.add(u64::from(*gram)).expect("add gram");
-        }
-        hex::encode(bloom.into_bytes())
-    }
-
-    fn legacy_doc(
-        doc_id: u64,
-        sha_byte: u8,
-        filter_bytes: usize,
-        bloom_hashes: usize,
-        bloom_grams: &[u32],
-        deleted: bool,
-        external_id: Option<&str>,
-    ) -> LegacyCandidateDoc {
-        LegacyCandidateDoc {
-            doc_id,
-            sha256: hex::encode([sha_byte; 32]),
-            file_size: 1234,
-            filter_bytes,
-            bloom_hashes,
-            bloom_hex: bloom_hex(filter_bytes, bloom_hashes, bloom_grams),
-            tier2_filter_bytes: 0,
-            tier2_bloom_hashes: 0,
-            tier2_bloom_hex: String::new(),
-            deleted,
-            external_id: external_id.map(str::to_owned),
-        }
-    }
-
     fn insert_primary(
         store: &mut CandidateStore,
         sha256: [u8; 32],
@@ -4365,10 +4167,6 @@ mod tests {
             &[],
             external_id,
         )
-    }
-
-    fn default_test_meta() -> StoreMeta {
-        StoreMeta::default()
     }
 
     fn dir_size(root: &Path) -> u64 {
@@ -5047,114 +4845,108 @@ rule q {
         .expect("write good meta");
         let opened = CandidateStore::open(&open_root).expect("open without docs");
         assert_eq!(opened.stats().doc_count, 0);
-
-        fs::write(docs_path(&open_root), b"{").expect("bad docs");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("invalid docs")
-                .to_string()
-                .contains("Invalid candidate document state")
-        );
     }
 
     #[test]
-    fn binary_sidecars_roundtrip_and_legacy_sources_migrate() {
+    fn binary_sidecars_roundtrip_and_reopen() {
         let tmp = tempdir().expect("tmp");
-        let docs = vec![
-            legacy_doc(2, 0x22, 64, 7, &[2, 3, 4], true, None),
-            legacy_doc(1, 0x11, 64, 7, &[1, 2], false, Some("legacy-one")),
-        ];
+        let root = tmp.path().join("candidate_db");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
 
-        let binary_root = tmp.path().join("binary_root");
-        let (rows, tier2_rows) =
-            persist_docs_as_binary(&binary_root, &docs).expect("persist binary");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(tier2_rows.len(), 2);
-        assert!(binary_store_exists(&binary_root));
-        let (loaded_docs, loaded_rows, loaded_rows5) =
-            load_candidate_binary_store(&binary_root).expect("load binary");
+        let file_size = 1234;
+        let gram_count = 2;
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(gram_count))
+            .expect("filter bytes");
+        let bloom_hashes =
+            store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count), None);
+        let mut bloom_one = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom one");
+        bloom_one.add(u64::from(0x0201_u32)).expect("add bloom one");
+        let mut bloom_two = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom two");
+        bloom_two.add(u64::from(0x0403_u32)).expect("add bloom two");
+
+        insert_primary(
+            &mut store,
+            [0x11; 32],
+            file_size,
+            Some(gram_count),
+            Some(bloom_hashes),
+            filter_bytes,
+            &bloom_one.into_bytes(),
+            Some("doc-one".to_owned()),
+        )
+        .expect("insert one");
+        insert_primary(
+            &mut store,
+            [0x22; 32],
+            file_size,
+            Some(gram_count),
+            Some(bloom_hashes),
+            filter_bytes,
+            &bloom_two.into_bytes(),
+            None,
+        )
+        .expect("insert two");
+        store
+            .delete_document(&hex::encode([0x22; 32]))
+            .expect("delete two");
+
+        let (loaded_docs, loaded_rows, loaded_tier2_rows) =
+            load_candidate_binary_store(&root).expect("load binary");
         assert_eq!(loaded_docs.len(), 2);
         assert_eq!(loaded_rows.len(), 2);
-        assert_eq!(loaded_rows5.len(), 2);
+        assert_eq!(loaded_tier2_rows.len(), 2);
         assert_eq!(loaded_docs[0].doc_id, 1);
         assert!(loaded_docs[1].deleted);
-        fs::write(
-            meta_path(&binary_root),
-            serde_json::to_vec_pretty(&StoreMeta::default()).expect("binary meta"),
-        )
-        .expect("write binary meta");
-        let opened_binary = CandidateStore::open(&binary_root).expect("open binary store");
+
+        let reopened = CandidateStore::open(&root).expect("reopen");
         assert_eq!(
-            opened_binary.external_ids_for_sha256(&[hex::encode([0x11; 32])]),
-            vec![Some("legacy-one".to_owned())]
-        );
-
-        let legacy_json_root = tmp.path().join("legacy_json_root");
-        fs::create_dir_all(&legacy_json_root).expect("legacy json root");
-        fs::write(
-            docs_path(&legacy_json_root),
-            serde_json::to_vec_pretty(&docs).expect("legacy docs json"),
-        )
-        .expect("write legacy json");
-        let (migrated_docs, migrated_rows, migrated_rows5) =
-            load_candidate_store_state(&legacy_json_root, &default_test_meta())
-                .expect("migrate json");
-        assert_eq!(migrated_docs.len(), 2);
-        assert_eq!(migrated_rows.len(), 2);
-        assert_eq!(migrated_rows5.len(), 2);
-        assert_eq!(migrated_docs[0].doc_id, 2);
-        assert!(!docs_path(&legacy_json_root).exists());
-        assert!(binary_store_exists(&legacy_json_root));
-        let (reopened_migrated_docs, reopened_migrated_rows, reopened_migrated_rows5) =
-            load_candidate_binary_store(&legacy_json_root).expect("reload migrated json");
-        assert_eq!(reopened_migrated_docs.len(), 2);
-        assert_eq!(reopened_migrated_rows.len(), 2);
-        assert_eq!(reopened_migrated_rows5.len(), 2);
-        assert_eq!(reopened_migrated_docs[0].doc_id, 1);
-
-        let legacy_log_root = tmp.path().join("legacy_log_root");
-        fs::create_dir_all(&legacy_log_root).expect("legacy log root");
-        let mut log = fs::File::create(docs_log_path(&legacy_log_root)).expect("create log");
-        writeln!(
-            log,
-            "{}",
-            serde_json::to_string(&docs[0]).expect("log doc 0")
-        )
-        .expect("write log doc 0");
-        writeln!(log).expect("blank line");
-        writeln!(
-            log,
-            "{}",
-            serde_json::to_string(&docs[1]).expect("log doc 1")
-        )
-        .expect("write log doc 1");
-        let (migrated_log_docs, migrated_log_rows, migrated_log_rows5) =
-            load_candidate_store_state(&legacy_log_root, &default_test_meta())
-                .expect("migrate log");
-        assert_eq!(migrated_log_docs.len(), 2);
-        assert_eq!(migrated_log_rows.len(), 2);
-        assert_eq!(migrated_log_rows5.len(), 2);
-        assert_eq!(migrated_log_docs[0].doc_id, 1);
-        assert!(!docs_log_path(&legacy_log_root).exists());
-        assert!(binary_store_exists(&legacy_log_root));
-
-        let invalid_log = tmp.path().join("invalid_log.jsonl");
-        fs::write(&invalid_log, b"{\n").expect("write invalid log");
-        assert!(
-            load_candidate_docs_log(&invalid_log)
-                .expect_err("invalid log")
-                .to_string()
-                .contains("Invalid candidate document log")
+            reopened.external_ids_for_sha256(&[hex::encode([0x11; 32])]),
+            vec![Some("doc-one".to_owned())]
         );
     }
 
     #[test]
     fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
         let tmp = tempdir().expect("tmp");
-        let docs = vec![legacy_doc(1, 0x11, 64, 7, &[10, 20], false, Some("ok"))];
-
         let invalid_len_root = tmp.path().join("invalid_len_root");
-        persist_docs_as_binary(&invalid_len_root, &docs).expect("persist invalid len root");
+        let mut invalid_len_store = CandidateStore::init(
+            CandidateConfig {
+                root: invalid_len_root.clone(),
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init invalid len root");
+        let file_size = 1234;
+        let gram_count = 2;
+        let filter_bytes = invalid_len_store
+            .resolve_filter_bytes_for_file_size(file_size, Some(gram_count))
+            .expect("filter bytes");
+        let bloom_hashes =
+            invalid_len_store.resolve_bloom_hashes_for_document(filter_bytes, Some(gram_count), None);
+        let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
+        bloom.add(u64::from(10_u32)).expect("add gram");
+        insert_primary(
+            &mut invalid_len_store,
+            [0x11; 32],
+            file_size,
+            Some(gram_count),
+            Some(bloom_hashes),
+            filter_bytes,
+            &bloom.into_bytes(),
+            Some("ok".to_owned()),
+        )
+        .expect("insert invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
         assert!(
             load_candidate_binary_store(&invalid_len_root)
@@ -5164,7 +4956,30 @@ rule q {
         );
 
         let mismatch_root = tmp.path().join("mismatch_root");
-        persist_docs_as_binary(&mismatch_root, &docs).expect("persist mismatch root");
+        let mut mismatch_store = CandidateStore::init(
+            CandidateConfig {
+                root: mismatch_root.clone(),
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init mismatch root");
+        let mut mismatch_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("mismatch");
+        mismatch_bloom
+            .add(u64::from(20_u32))
+            .expect("add mismatch gram");
+        insert_primary(
+            &mut mismatch_store,
+            [0x11; 32],
+            file_size,
+            Some(gram_count),
+            Some(bloom_hashes),
+            filter_bytes,
+            &mismatch_bloom.into_bytes(),
+            Some("ok".to_owned()),
+        )
+        .expect("insert mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
         assert!(
             load_candidate_binary_store(&mismatch_root)
@@ -5174,7 +4989,30 @@ rule q {
         );
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
-        persist_docs_as_binary(&invalid_bloom_root, &docs).expect("persist invalid bloom root");
+        let mut invalid_bloom_store = CandidateStore::init(
+            CandidateConfig {
+                root: invalid_bloom_root.clone(),
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init invalid bloom root");
+        let mut invalid_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("invalid");
+        invalid_bloom
+            .add(u64::from(30_u32))
+            .expect("add invalid gram");
+        insert_primary(
+            &mut invalid_bloom_store,
+            [0x11; 32],
+            file_size,
+            Some(gram_count),
+            Some(bloom_hashes),
+            filter_bytes,
+            &invalid_bloom.into_bytes(),
+            Some("ok".to_owned()),
+        )
+        .expect("insert invalid bloom root");
         let mut row =
             DocMetaRow::decode(&fs::read(doc_meta_path(&invalid_bloom_root)).expect("row"))
                 .expect("decode row");
@@ -5193,7 +5031,30 @@ rule q {
         );
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
-        persist_docs_as_binary(&invalid_utf8_root, &docs).expect("persist invalid utf8 root");
+        let mut invalid_utf8_store = CandidateStore::init(
+            CandidateConfig {
+                root: invalid_utf8_root.clone(),
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init invalid utf8 root");
+        let mut invalid_utf8_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("utf8");
+        invalid_utf8_bloom
+            .add(u64::from(40_u32))
+            .expect("add utf8 gram");
+        insert_primary(
+            &mut invalid_utf8_store,
+            [0x11; 32],
+            file_size,
+            Some(gram_count),
+            Some(bloom_hashes),
+            filter_bytes,
+            &invalid_utf8_bloom.into_bytes(),
+            Some("ok".to_owned()),
+        )
+        .expect("insert invalid utf8 root");
         fs::write(external_ids_path(&invalid_utf8_root), [0xFF, 0xFE]).expect("write bad utf8");
         fs::write(
             meta_path(&invalid_utf8_root),
