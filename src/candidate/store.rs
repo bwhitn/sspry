@@ -93,11 +93,6 @@ impl DfCountsSegment {
         self.mmap.len() as u64
     }
 
-    #[cfg(test)]
-    fn get_delta(&self, gram: u64, gram_bytes: usize) -> i64 {
-        self.get_delta_profiled(gram, gram_bytes, &mut DfLookupProfile::default())
-    }
-
     fn get_delta_profiled(
         &self,
         gram: u64,
@@ -145,16 +140,6 @@ impl DfCountsSegment {
             self.rows
         };
         (left.min(self.rows), right.max(left).min(self.rows))
-    }
-
-    #[cfg(test)]
-    fn add_many_sorted_counts(&self, grams: &[u64], counts: &mut [i64], gram_bytes: usize) {
-        self.add_many_sorted_counts_profiled(
-            grams,
-            counts,
-            gram_bytes,
-            &mut DfLookupProfile::default(),
-        );
     }
 
     fn add_many_sorted_counts_profiled(

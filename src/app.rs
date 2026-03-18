@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -2988,34 +2990,11 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
         } else {
             let client = search_rpc_client(&args.connection);
             let server_policy = server_scan_policy(&args.connection)?;
-            let initial_plan = compile_query_plan_from_file_with_gram_sizes(
-                &args.rule,
-                server_policy.gram_sizes,
-                None,
-                args.max_anchors_per_pattern.saturating_mul(4).max(1),
-                args.force_tier1_only,
-                !args.no_tier2_fallback,
-                args.max_candidates,
-            )?;
-            let df_counts = if args.no_df_lookup {
-                None
-            } else {
-                let mut grams = HashSet::<u64>::new();
-                for pattern in &initial_plan.patterns {
-                    for alternative in &pattern.alternatives {
-                        grams.extend(alternative.iter().copied());
-                    }
-                }
-                if grams.is_empty() {
-                    None
-                } else {
-                    Some(client.candidate_df(&grams.into_iter().collect::<Vec<_>>())?)
-                }
-            };
+            // Bloom-only search no longer does a remote DF replanning round-trip here.
             let plan = compile_query_plan_from_file_with_gram_sizes(
                 &args.rule,
                 server_policy.gram_sizes,
-                df_counts.as_ref(),
+                None,
                 args.max_anchors_per_pattern,
                 args.force_tier1_only,
                 !args.no_tier2_fallback,
@@ -3143,7 +3122,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
         let mut plan_time = Duration::ZERO;
-        let mut df_lookup_time = Duration::ZERO;
+        let df_lookup_time = Duration::ZERO;
         let mut query_time = Duration::ZERO;
         let mut verify_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
@@ -3152,37 +3131,11 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let server_policy = server_scan_policy(&args.connection)?;
 
         let started_plan = Instant::now();
-        let initial_plan = compile_query_plan_from_file_with_gram_sizes(
-            &args.rule,
-            server_policy.gram_sizes,
-            None,
-            args.max_anchors_per_pattern.saturating_mul(4).max(1),
-            false,
-            true,
-            args.max_candidates,
-        )?;
-        plan_time += started_plan.elapsed();
-
-        let mut grams = HashSet::<u64>::new();
-        for pattern in &initial_plan.patterns {
-            for alternative in &pattern.alternatives {
-                grams.extend(alternative.iter().copied());
-            }
-        }
-        let df_counts = if grams.is_empty() {
-            None
-        } else {
-            let started_df = Instant::now();
-            let result = client.candidate_df(&grams.into_iter().collect::<Vec<_>>())?;
-            df_lookup_time += started_df.elapsed();
-            Some(result)
-        };
-
-        let started_plan = Instant::now();
+        // The default search path now plans directly from the restricted rule shape.
         let plan = compile_query_plan_from_file_with_gram_sizes(
             &args.rule,
             server_policy.gram_sizes,
-            df_counts.as_ref(),
+            None,
             args.max_anchors_per_pattern,
             false,
             true,

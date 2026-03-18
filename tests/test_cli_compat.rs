@@ -932,7 +932,7 @@ rule q {
     assert!(stdout.contains("verified_checked: 1"));
     assert!(stdout.contains("verified_matched: 1"));
     assert!(stderr.contains("verbose.search.total_ms:"));
-    assert!(stderr.contains("verbose.search.df_lookup_ms:"));
+    assert!(stderr.contains("verbose.search.df_lookup_ms: 0.000"));
     assert!(stderr.contains("verbose.search.query_ms:"));
     assert!(stderr.contains("verbose.search.verify_ms:"));
     assert!(stderr.contains("verbose.search.verify_enabled: true"));

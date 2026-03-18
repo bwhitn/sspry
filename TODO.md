@@ -226,6 +226,7 @@ Immediate matrix:
 - bloom-only `50k`: `--no-grams` with the default `4 KiB` summary cap
 - bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 8`
 - bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 16`
+- bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 32`
 
 Record for each run:
 - index wall time
@@ -242,6 +243,83 @@ Search set for the matrix:
 Interpretation target:
 - if bloom-only materially improves ingest while search timings/candidate counts stay acceptable, revisit whether exact grams and DF should remain in the default path
 - if bloom-only hurts search too much, keep exact grams and spend any extra budget on stronger block/superblock summaries before touching per-file bloom size
+
+Current read after the `8/16/32 KiB` matrix:
+- bloom-only is the current direction
+- `32 KiB` is the best point so far on the `50k` matrix
+- the DB growth from `8 KiB -> 32 KiB` is small enough to keep
+- the remaining search problems are concentrated in a few heavy rules, not the whole search path
+
+`50k` bloom-only matrix summary:
+- `8 KiB`
+  - index wall: `1900.58 s`
+  - DB bytes: `39,725,199,651`
+  - supported searches:
+    - `01`: timed out at about `183.59 s`
+    - `08`: `172.79 s`
+    - `09`: `21.51 s`
+    - `10`: `2.34 s`
+    - `11`: `2.26 s`
+    - `12`: `2.26 s`
+- `16 KiB`
+  - index wall: `1892.48 s`
+  - DB bytes: `39,803,460,859`
+  - supported searches:
+    - `01`: timed out at about `183.71 s`
+    - `08`: `193.53 s`
+    - `09`: `5.62 s`
+    - `10`: `2.28 s`
+    - `11`: `2.23 s`
+    - `12`: `2.21 s`
+- `32 KiB`
+  - index wall: `1614.96 s`
+  - DB bytes: `39,928,655,219`
+  - supported searches:
+    - `01`: timed out at about `182.46 s`
+    - `08`: `141.97 s`
+    - `09`: `2.01 s`
+    - `10`: `2.16 s`
+    - `11`: `2.06 s`
+    - `12`: `2.08 s`
+
+Immediate search improvements on the bloom-only baseline:
+1. keep `32 KiB` as the current coarse-summary baseline
+2. remove search-side dependence on the remote DF planning round-trip
+3. raise or tune the search RPC timeout so heavy rules finish instead of truncating at `~180 s`
+4. profile why:
+   - `01` still times out
+   - `08` is still heavy
+   - `09` improved sharply with larger superblock summaries
+5. after that, test `64 KiB` only if `32 KiB` still leaves too much block-level false-positive pressure
+
+### 0a. Bloom-only cutover and dead-code removal
+
+Accepted direction:
+- bloom-only is now the working default direction
+- exact grams and DF are being treated as legacy code pending removal
+
+Removal phases:
+1. Search-side cutover
+   - stop using remote `candidate_df` planning in the default search path
+   - keep verbose timing and candidate behavior covered by tests
+2. CLI/test cutover
+   - make bloom-only the documented/default ingest posture
+   - remove dual-mode tests that only exist to preserve the exact-gram path
+3. Query-planner/RPC cleanup
+   - remove client/server DF query usage from normal search flows
+   - then remove the now-dead `candidate_df` transport and planner wiring
+4. Store cleanup
+   - remove `grams_received.bin`
+   - remove `grams_indexed.bin`
+   - remove DF deltas, segments, compaction, and related stats once no remaining path depends on them
+5. Final cleanup
+   - remove `--no-grams` once bloom-only is the only ingest mode
+   - remove dead docs, counters, and benchmark branches tied only to exact grams/DF
+
+Required tests while cutting over:
+- search verbose output still reports timing fields
+- remote search and verify continue to work on the bloom-only path
+- candidate paging/counting does not regress when DF lookup is removed from the default search flow
 
 ### 1. Server insert `classify_df_lookup` on large ingests
 
