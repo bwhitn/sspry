@@ -930,8 +930,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            metadata_field_matches_eq(&macho_bytes, "macho.devicetype", 0x25)
-                .expect("device type"),
+            metadata_field_matches_eq(&macho_bytes, "macho.devicetype", 0x25).expect("device type"),
             Some(true)
         );
         assert_eq!(

@@ -1545,7 +1545,6 @@ fn fixed_literal_plan_from_rule(rule_path: &Path) -> Option<FixedLiteralMatchPla
             crate::candidate::DEFAULT_TIER1_GRAM_SIZE,
         )
         .ok()?,
-        None,
         16,
         false,
         true,
@@ -2218,30 +2217,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         "tier2_superblock_docs",
                         "verbose.index.server_tier2_superblock_docs_per_block",
                     ),
-                    (
-                        "df_counts_delta_bytes",
-                        "verbose.index.server_df_counts_delta_bytes",
-                    ),
-                    (
-                        "df_counts_delta_entries",
-                        "verbose.index.server_df_counts_delta_entries",
-                    ),
-                    (
-                        "df_counts_segment_count",
-                        "verbose.index.server_df_counts_segment_count",
-                    ),
-                    (
-                        "df_counts_segment_bytes",
-                        "verbose.index.server_df_counts_segment_bytes",
-                    ),
-                    (
-                        "df_counts_delta_estimated_memory_bytes",
-                        "verbose.index.server_df_counts_delta_estimated_memory_bytes",
-                    ),
-                    (
-                        "df_counts_delta_compact_threshold_bytes",
-                        "verbose.index.server_df_counts_delta_compact_threshold_bytes",
-                    ),
                 ] {
                     if let Some(value) = stats_scope.get(key).and_then(|value| value.as_u64()) {
                         eprintln!("{label}: {value}");
@@ -2290,10 +2265,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         (
                             "adaptive_recent_publishes_in_window",
                             "verbose.index.server_publish_adaptive_recent_publishes_in_window",
-                        ),
-                        (
-                            "adaptive_df_pending_shards",
-                            "verbose.index.server_publish_adaptive_df_pending_shards",
                         ),
                         (
                             "adaptive_tier2_pending_shards",
@@ -2349,10 +2320,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_promote_work_import_classify_ms",
                         ),
                         (
-                            "last_publish_promote_work_import_apply_df_counts_ms",
-                            "verbose.index.server_last_publish_promote_work_import_apply_df_counts_ms",
-                        ),
-                        (
                             "last_publish_promote_work_import_build_payloads_ms",
                             "verbose.index.server_last_publish_promote_work_import_build_payloads_ms",
                         ),
@@ -2373,14 +2340,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_promote_work_import_persist_meta_ms",
                         ),
                         (
-                            "last_publish_promote_work_import_append_df_delta_ms",
-                            "verbose.index.server_last_publish_promote_work_import_append_df_delta_ms",
-                        ),
-                        (
-                            "last_publish_promote_work_import_compact_df_counts_ms",
-                            "verbose.index.server_last_publish_promote_work_import_compact_df_counts_ms",
-                        ),
-                        (
                             "last_publish_promote_work_import_rebalance_tier2_ms",
                             "verbose.index.server_last_publish_promote_work_import_rebalance_tier2_ms",
                         ),
@@ -2399,14 +2358,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         (
                             "last_publish_promote_work_imported_shards",
                             "verbose.index.server_last_publish_promote_work_imported_shards",
-                        ),
-                        (
-                            "last_publish_persist_df_counts_ms",
-                            "verbose.index.server_last_publish_persist_df_counts_ms",
-                        ),
-                        (
-                            "last_publish_df_snapshot_persist_failures",
-                            "verbose.index.server_last_publish_df_snapshot_persist_failures",
                         ),
                         (
                             "last_publish_init_work_ms",
@@ -2593,10 +2544,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_store_classify_finalize_us",
                             ),
                             (
-                                "store_apply_df_counts_us",
-                                "verbose.index.server_index_insert_batch_store_apply_df_counts_us",
-                            ),
-                            (
                                 "store_append_sidecars_us",
                                 "verbose.index.server_index_insert_batch_store_append_sidecars_us",
                             ),
@@ -2615,22 +2562,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             (
                                 "store_append_bloom_payload_bytes",
                                 "verbose.index.server_index_insert_batch_store_append_bloom_payload_bytes",
-                            ),
-                            (
-                                "store_append_grams_received_payload_us",
-                                "verbose.index.server_index_insert_batch_store_append_grams_received_payload_us",
-                            ),
-                            (
-                                "store_append_grams_received_payload_bytes",
-                                "verbose.index.server_index_insert_batch_store_append_grams_received_payload_bytes",
-                            ),
-                            (
-                                "store_append_grams_indexed_payload_us",
-                                "verbose.index.server_index_insert_batch_store_append_grams_indexed_payload_us",
-                            ),
-                            (
-                                "store_append_grams_indexed_payload_bytes",
-                                "verbose.index.server_index_insert_batch_store_append_grams_indexed_payload_bytes",
                             ),
                             (
                                 "store_append_metadata_payload_us",
@@ -2681,66 +2612,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_store_persist_meta_us",
                             ),
                             (
-                                "store_append_df_delta_us",
-                                "verbose.index.server_index_insert_batch_store_append_df_delta_us",
-                            ),
-                            (
-                                "store_compact_df_counts_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_us",
-                            ),
-                            (
-                                "store_compact_df_counts_check_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_check_us",
-                            ),
-                            (
-                                "store_compact_df_counts_checked_delta_bytes",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_checked_delta_bytes",
-                            ),
-                            (
-                                "store_compact_df_counts_checked_delta_estimated_memory_bytes",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_collect_delta_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_sort_delta_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_merge_write_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_flush_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_flush_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_rename_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_rename_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_close_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_close_us",
-                            ),
-                            (
-                                "store_compact_df_counts_persist_snapshot_clear_delta_files_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us",
-                            ),
-                            (
-                                "store_compact_df_counts_refresh_snapshot_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_refresh_snapshot_us",
-                            ),
-                            (
-                                "store_compact_df_counts_reopen_writers_us",
-                                "verbose.index.server_index_insert_batch_store_compact_df_counts_reopen_writers_us",
-                            ),
-                            (
                                 "store_rebalance_tier2_us",
                                 "verbose.index.server_index_insert_batch_store_rebalance_tier2_us",
                             ),
@@ -2751,44 +2622,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             {
                                 eprintln!("{label}: {value}");
                             }
-                        }
-                    }
-                }
-                if let Some(seal) = stats
-                    .get("published_df_snapshot_seal")
-                    .and_then(serde_json::Value::as_object)
-                {
-                    if let Some(value) = seal
-                        .get("pending_shards")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        eprintln!(
-                            "verbose.index.server_published_df_snapshot_seal_pending_shards: {value}"
-                        );
-                    }
-                    if let Some(value) =
-                        seal.get("in_progress").and_then(serde_json::Value::as_bool)
-                    {
-                        eprintln!(
-                            "verbose.index.server_published_df_snapshot_seal_in_progress: {value}"
-                        );
-                    }
-                    for (key, label) in [
-                        (
-                            "last_duration_ms",
-                            "verbose.index.server_published_df_snapshot_seal_last_duration_ms",
-                        ),
-                        (
-                            "last_persisted_shards",
-                            "verbose.index.server_published_df_snapshot_seal_last_persisted_shards",
-                        ),
-                        (
-                            "last_failures",
-                            "verbose.index.server_published_df_snapshot_seal_last_failures",
-                        ),
-                    ] {
-                        if let Some(value) = seal.get(key).and_then(serde_json::Value::as_u64) {
-                            eprintln!("{label}: {value}");
                         }
                     }
                 }
@@ -2922,7 +2755,6 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             let plan = compile_query_plan_from_file_with_gram_sizes(
                 &args.rule,
                 gram_sizes,
-                None,
                 args.max_anchors_per_pattern,
                 args.force_tier1_only,
                 !args.no_tier2_fallback,
@@ -2980,7 +2812,6 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             let plan = compile_query_plan_from_file_with_gram_sizes(
                 &args.rule,
                 server_policy.gram_sizes,
-                None,
                 args.max_anchors_per_pattern,
                 args.force_tier1_only,
                 !args.no_tier2_fallback,
@@ -3121,7 +2952,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let plan = compile_query_plan_from_file_with_gram_sizes(
             &args.rule,
             server_policy.gram_sizes,
-            None,
             args.max_anchors_per_pattern,
             false,
             true,

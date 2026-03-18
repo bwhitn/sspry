@@ -3,14 +3,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use hashbrown::HashMap as HbHashMap;
 use memmap2::{Mmap, MmapOptions};
-use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::bloom::{bloom_byte_masks, raw_filter_matches_masks};
@@ -37,509 +35,6 @@ const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 128;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
-
-type FastHashMap<K, V> = HbHashMap<K, V, FxBuildHasher>;
-type FastEntry<'a, K, V> = hashbrown::hash_map::Entry<'a, K, V, FxBuildHasher>;
-
-#[derive(Debug)]
-struct DfCountsSegment {
-    path: PathBuf,
-    mmap: Mmap,
-    rows: usize,
-    fence: Box<[DfCountsSegmentFenceEntry]>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DfCountsSegmentFenceEntry {
-    gram: u64,
-    row: u32,
-}
-
-impl DfCountsSegment {
-    fn load(path: PathBuf, gram_bytes: usize) -> Result<Self> {
-        let file = fs::File::open(&path)?;
-        let len = file.metadata()?.len() as usize;
-        let row_bytes = gram_bytes + 8;
-        if len % row_bytes != 0 {
-            return Err(SspryError::from(format!(
-                "Invalid df_counts segment at {}",
-                path.display()
-            )));
-        }
-        let mmap = if len == 0 {
-            return Err(SspryError::from(format!(
-                "Empty df_counts segment at {}",
-                path.display()
-            )));
-        } else {
-            unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-                SspryError::from(format!("Failed to mmap {}: {err}", path.display()))
-            })?
-        };
-        let rows = len / row_bytes;
-        let fence = build_df_counts_segment_fence(&mmap, gram_bytes, row_bytes, rows);
-        Ok(Self {
-            path,
-            mmap,
-            rows,
-            fence,
-        })
-    }
-
-    fn bytes(&self) -> u64 {
-        self.mmap.len() as u64
-    }
-
-    fn get_delta_profiled(
-        &self,
-        gram: u64,
-        gram_bytes: usize,
-        profile: &mut DfLookupProfile,
-    ) -> i64 {
-        profile.segment_point_lookups = profile.segment_point_lookups.saturating_add(1);
-        let row_bytes = gram_bytes + 8;
-        let (mut left, mut right) = self.fence_bounds(gram);
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let start = mid * row_bytes;
-            let candidate = decode_packed_exact_gram(&self.mmap[start..start + gram_bytes]);
-            if candidate == gram {
-                return i64::from_le_bytes(
-                    self.mmap[start + gram_bytes..start + row_bytes]
-                        .try_into()
-                        .expect("df segment delta"),
-                );
-            }
-            if candidate < gram {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        0
-    }
-
-    fn fence_bounds(&self, gram: u64) -> (usize, usize) {
-        if self.fence.is_empty() {
-            return (0, self.rows);
-        }
-        let idx = self.fence.partition_point(|entry| entry.gram < gram);
-        let left = if idx == 0 {
-            0
-        } else {
-            self.fence[idx - 1].row as usize
-        };
-        let right = if idx < self.fence.len() {
-            (self.fence[idx].row as usize)
-                .saturating_add(DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS)
-                .min(self.rows)
-        } else {
-            self.rows
-        };
-        (left.min(self.rows), right.max(left).min(self.rows))
-    }
-
-    fn add_many_sorted_counts_profiled(
-        &self,
-        grams: &[u64],
-        counts: &mut [i64],
-        gram_bytes: usize,
-        profile: &mut DfLookupProfile,
-    ) {
-        if grams.is_empty() || counts.is_empty() {
-            return;
-        }
-        let row_bytes = gram_bytes + 8;
-        if self.rows <= grams.len().saturating_mul(32).max(1) {
-            let mut segment_idx = 0usize;
-            for (idx, gram) in grams.iter().enumerate() {
-                while segment_idx < self.rows {
-                    let start = segment_idx * row_bytes;
-                    profile.segment_rows_examined = profile.segment_rows_examined.saturating_add(1);
-                    let candidate = decode_packed_exact_gram(&self.mmap[start..start + gram_bytes]);
-                    if candidate < *gram {
-                        segment_idx += 1;
-                        continue;
-                    }
-                    if candidate == *gram {
-                        counts[idx] += i64::from_le_bytes(
-                            self.mmap[start + gram_bytes..start + row_bytes]
-                                .try_into()
-                                .expect("df segment delta"),
-                        );
-                    }
-                    break;
-                }
-            }
-            return;
-        }
-        for (idx, gram) in grams.iter().enumerate() {
-            counts[idx] += self.get_delta_profiled(*gram, gram_bytes, profile);
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct DfCountsState {
-    gram_bytes: usize,
-    snapshot: Option<Mmap>,
-    snapshot_rows: usize,
-    segments: Vec<DfCountsSegment>,
-    delta: FastHashMap<u64, i64>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DfLookupProfile {
-    snapshot_rows_examined: u64,
-    snapshot_point_lookups: u64,
-    segment_visits: u64,
-    segment_rows_examined: u64,
-    segment_point_lookups: u64,
-    delta_lookups: u64,
-}
-
-impl DfCountsState {
-    fn load(root: &Path, gram_bytes: usize) -> Result<Self> {
-        let snapshot_path = df_counts_path(root);
-        let snapshot = if snapshot_path.exists() {
-            let file = fs::File::open(&snapshot_path)?;
-            let len = file.metadata()?.len() as usize;
-            let row_bytes = gram_bytes + 4;
-            if len % row_bytes != 0 {
-                return Err(SspryError::from(format!(
-                    "Invalid df_counts snapshot at {}",
-                    snapshot_path.display()
-                )));
-            }
-            if len == 0 {
-                None
-            } else {
-                Some(unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-                    SspryError::from(format!("Failed to mmap {}: {err}", snapshot_path.display()))
-                })?)
-            }
-        } else {
-            None
-        };
-
-        let mut state = Self {
-            gram_bytes,
-            snapshot_rows: snapshot
-                .as_ref()
-                .map(|mmap| mmap.len() / (gram_bytes + 4))
-                .unwrap_or(0),
-            snapshot,
-            segments: load_df_counts_segments(root, gram_bytes)?,
-            delta: FastHashMap::with_hasher(FxBuildHasher),
-        };
-        state.load_delta(root)?;
-        Ok(state)
-    }
-
-    fn load_delta(&mut self, root: &Path) -> Result<()> {
-        let delta_path = df_counts_delta_path(root);
-        if delta_path.exists() {
-            let bytes = fs::read(&delta_path)?;
-            let row_bytes = self.gram_bytes + 4;
-            if bytes.len() % row_bytes != 0 {
-                return Err(SspryError::from(format!(
-                    "Invalid df_counts delta at {}",
-                    delta_path.display()
-                )));
-            }
-            for chunk in bytes.chunks_exact(row_bytes) {
-                let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
-                let change = i32::from_le_bytes(
-                    chunk[self.gram_bytes..self.gram_bytes + 4]
-                        .try_into()
-                        .expect("df delta value"),
-                );
-                *self.delta.entry(gram).or_insert(0) += i64::from(change);
-            }
-        }
-        let unit_delta_path = df_counts_unit_delta_path(root);
-        if unit_delta_path.exists() {
-            let bytes = fs::read(&unit_delta_path)?;
-            if self.gram_bytes == 0 || bytes.len() % self.gram_bytes != 0 {
-                return Err(SspryError::from(format!(
-                    "Invalid df_counts unit delta at {}",
-                    unit_delta_path.display()
-                )));
-            }
-            self.delta.reserve(bytes.len() / self.gram_bytes);
-            for chunk in bytes.chunks_exact(self.gram_bytes) {
-                match self.delta.entry(decode_packed_exact_gram(chunk)) {
-                    FastEntry::Occupied(mut entry) => {
-                        let next = *entry.get() + 1;
-                        if next == 0 {
-                            entry.remove();
-                        } else {
-                            *entry.get_mut() = next;
-                        }
-                    }
-                    FastEntry::Vacant(entry) => {
-                        entry.insert(1);
-                    }
-                }
-            }
-        }
-        self.delta.retain(|_, value| *value != 0);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn snapshot_count(&self, gram: u64) -> usize {
-        self.snapshot_count_profiled(gram, &mut DfLookupProfile::default())
-    }
-
-    fn snapshot_count_profiled(&self, gram: u64, profile: &mut DfLookupProfile) -> usize {
-        let Some(snapshot) = &self.snapshot else {
-            return 0;
-        };
-        profile.snapshot_point_lookups = profile.snapshot_point_lookups.saturating_add(1);
-        let row_bytes = self.gram_bytes + 4;
-        let mut left = 0usize;
-        let mut right = self.snapshot_rows;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let start = mid * row_bytes;
-            let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
-            if candidate == gram {
-                return u32::from_le_bytes(
-                    snapshot[start + self.gram_bytes..start + row_bytes]
-                        .try_into()
-                        .expect("df count"),
-                ) as usize;
-            }
-            if candidate < gram {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        0
-    }
-
-    fn get(&self, gram: u64) -> usize {
-        self.get_profiled(gram, &mut DfLookupProfile::default())
-    }
-
-    fn get_profiled(&self, gram: u64, profile: &mut DfLookupProfile) -> usize {
-        let base = self.snapshot_count_profiled(gram, profile) as i64;
-        profile.segment_visits = profile
-            .segment_visits
-            .saturating_add(self.segments.len() as u64);
-        let segment_delta = self
-            .segments
-            .iter()
-            .map(|segment| segment.get_delta_profiled(gram, self.gram_bytes, profile))
-            .sum::<i64>();
-        profile.delta_lookups = profile.delta_lookups.saturating_add(1);
-        let delta = self.delta.get(&gram).copied().unwrap_or(0);
-        (base + segment_delta + delta).max(0) as usize
-    }
-
-    fn get_many(&self, grams: &[u64]) -> HashMap<u64, usize> {
-        let mut out = HashMap::with_capacity(grams.len());
-        for gram in grams {
-            let count = self.get(*gram);
-            if count > 0 {
-                out.insert(*gram, count);
-            }
-        }
-        out
-    }
-
-    #[cfg(test)]
-    fn get_many_sorted_counts(&self, grams: &[u64]) -> Vec<usize> {
-        self.get_many_sorted_counts_profiled(grams).0
-    }
-
-    fn get_many_sorted_counts_profiled(&self, grams: &[u64]) -> (Vec<usize>, DfLookupProfile) {
-        if grams.is_empty() {
-            return (Vec::new(), DfLookupProfile::default());
-        }
-        let mut profile = DfLookupProfile::default();
-        let mut counts = Vec::with_capacity(grams.len());
-        let row_bytes = self.gram_bytes + 4;
-        let mut snapshot_idx = 0usize;
-        let snapshot = self.snapshot.as_deref().unwrap_or(&[]);
-        for gram in grams {
-            while snapshot_idx < self.snapshot_rows {
-                let start = snapshot_idx * row_bytes;
-                profile.snapshot_rows_examined = profile.snapshot_rows_examined.saturating_add(1);
-                let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
-                if candidate < *gram {
-                    snapshot_idx += 1;
-                    continue;
-                }
-                break;
-            }
-            let base = if snapshot_idx < self.snapshot_rows {
-                let start = snapshot_idx * row_bytes;
-                profile.snapshot_rows_examined = profile.snapshot_rows_examined.saturating_add(1);
-                let candidate = decode_packed_exact_gram(&snapshot[start..start + self.gram_bytes]);
-                if candidate == *gram {
-                    u32::from_le_bytes(
-                        snapshot[start + self.gram_bytes..start + row_bytes]
-                            .try_into()
-                            .expect("df count"),
-                    ) as usize
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            counts.push(base as i64);
-        }
-        profile.segment_visits = profile
-            .segment_visits
-            .saturating_add(self.segments.len() as u64);
-        for segment in &self.segments {
-            segment.add_many_sorted_counts_profiled(
-                grams,
-                &mut counts,
-                self.gram_bytes,
-                &mut profile,
-            );
-        }
-        profile.delta_lookups = profile.delta_lookups.saturating_add(grams.len() as u64);
-        for (idx, gram) in grams.iter().enumerate() {
-            counts[idx] += self.delta.get(gram).copied().unwrap_or(0);
-        }
-        (
-            counts
-                .into_iter()
-                .map(|count| count.max(0) as usize)
-                .collect(),
-            profile,
-        )
-    }
-
-    fn materialize(&self) -> HashMap<u64, usize> {
-        let mut counts = HashMap::<u64, usize>::with_capacity(
-            self.snapshot_rows + self.segment_rows() + self.delta.len(),
-        );
-        if let Some(snapshot) = &self.snapshot {
-            let row_bytes = self.gram_bytes + 4;
-            for chunk in snapshot.chunks_exact(row_bytes) {
-                let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
-                let count = u32::from_le_bytes(
-                    chunk[self.gram_bytes..row_bytes]
-                        .try_into()
-                        .expect("df count"),
-                ) as usize;
-                if count > 0 {
-                    counts.insert(gram, count);
-                }
-            }
-        }
-        for segment in &self.segments {
-            let row_bytes = self.gram_bytes + 8;
-            for chunk in segment.mmap.chunks_exact(row_bytes) {
-                let gram = decode_packed_exact_gram(&chunk[..self.gram_bytes]);
-                let change = i64::from_le_bytes(
-                    chunk[self.gram_bytes..row_bytes]
-                        .try_into()
-                        .expect("df segment delta"),
-                );
-                let next = counts.get(&gram).copied().unwrap_or(0) as i64 + change;
-                if next > 0 {
-                    counts.insert(gram, next as usize);
-                } else {
-                    counts.remove(&gram);
-                }
-            }
-        }
-        for (gram, delta) in &self.delta {
-            let next = counts.get(gram).copied().unwrap_or(0) as i64 + *delta;
-            if next > 0 {
-                counts.insert(*gram, next as usize);
-            } else {
-                counts.remove(gram);
-            }
-        }
-        counts
-    }
-
-    fn apply_deltas(&mut self, deltas: &[(u64, i32)]) {
-        self.delta.reserve(deltas.len());
-        for (gram, delta) in deltas {
-            let delta = i64::from(*delta);
-            if delta == 0 {
-                continue;
-            }
-            match self.delta.entry(*gram) {
-                FastEntry::Occupied(mut entry) => {
-                    let next = *entry.get() + delta;
-                    if next == 0 {
-                        entry.remove();
-                    } else {
-                        *entry.get_mut() = next;
-                    }
-                }
-                FastEntry::Vacant(entry) => {
-                    entry.insert(delta);
-                }
-            }
-        }
-    }
-
-    fn apply_unit_deltas(&mut self, grams: &[u64]) {
-        self.delta.reserve(grams.len());
-        for gram in grams {
-            match self.delta.entry(*gram) {
-                FastEntry::Occupied(mut entry) => {
-                    *entry.get_mut() += 1;
-                }
-                FastEntry::Vacant(entry) => {
-                    entry.insert(1);
-                }
-            }
-        }
-    }
-
-    fn refresh_snapshot(&mut self, root: &Path) -> Result<()> {
-        let fresh = Self::load(root, self.gram_bytes)?;
-        self.snapshot = fresh.snapshot;
-        self.snapshot_rows = fresh.snapshot_rows;
-        self.segments = fresh.segments;
-        self.delta = fresh.delta;
-        Ok(())
-    }
-
-    fn unique_count_hint(&self) -> usize {
-        self.snapshot_rows + self.segment_rows() + self.delta.len()
-    }
-
-    fn segment_rows(&self) -> usize {
-        self.segments.iter().map(|segment| segment.rows).sum()
-    }
-
-    fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
-
-    fn segment_bytes(&self) -> u64 {
-        self.segments.iter().map(DfCountsSegment::bytes).sum()
-    }
-
-    fn estimated_delta_memory_bytes(&self) -> u64 {
-        (self.delta.len() as u64).saturating_mul(DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES)
-    }
-}
-
-fn is_strictly_sorted_unique(values: &[u64]) -> bool {
-    let mut prev = None;
-    for value in values {
-        if prev.is_some_and(|prior| *value <= prior) {
-            return false;
-        }
-        prev = Some(*value);
-    }
-    true
-}
 
 #[derive(Clone, Debug)]
 pub struct CandidateConfig {
@@ -597,20 +92,15 @@ pub struct CandidateInsertBatchProfile {
     pub classify_budget_us: u64,
     pub classify_binning_us: u64,
     pub classify_finalize_us: u64,
-    pub apply_df_counts_us: u64,
     pub append_sidecars_us: u64,
     pub append_sidecar_payloads_us: u64,
     pub append_bloom_payload_assemble_us: u64,
     pub append_bloom_payload_us: u64,
-    pub append_grams_received_payload_us: u64,
-    pub append_grams_indexed_payload_us: u64,
     pub append_metadata_payload_us: u64,
     pub append_external_id_payload_us: u64,
     pub append_tier2_bloom_payload_us: u64,
     pub append_doc_row_build_us: u64,
     pub append_bloom_payload_bytes: u64,
-    pub append_grams_received_payload_bytes: u64,
-    pub append_grams_indexed_payload_bytes: u64,
     pub append_metadata_payload_bytes: u64,
     pub append_external_id_payload_bytes: u64,
     pub append_tier2_bloom_payload_bytes: u64,
@@ -619,28 +109,12 @@ pub struct CandidateInsertBatchProfile {
     pub install_docs_us: u64,
     pub tier2_update_us: u64,
     pub persist_meta_us: u64,
-    pub append_df_delta_us: u64,
-    pub compact_df_counts_us: u64,
-    pub compact_df_counts_check_us: u64,
-    pub compact_df_counts_checked_delta_bytes: u64,
-    pub compact_df_counts_checked_delta_estimated_memory_bytes: u64,
-    pub compact_df_counts_persist_snapshot_us: u64,
-    pub compact_df_counts_persist_snapshot_collect_delta_us: u64,
-    pub compact_df_counts_persist_snapshot_sort_delta_us: u64,
-    pub compact_df_counts_persist_snapshot_merge_write_us: u64,
-    pub compact_df_counts_persist_snapshot_flush_us: u64,
-    pub compact_df_counts_persist_snapshot_rename_us: u64,
-    pub compact_df_counts_persist_snapshot_close_us: u64,
-    pub compact_df_counts_persist_snapshot_clear_delta_files_us: u64,
-    pub compact_df_counts_refresh_snapshot_us: u64,
-    pub compact_df_counts_reopen_writers_us: u64,
     pub rebalance_tier2_us: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateImportBatchProfile {
     pub classify_ms: u64,
-    pub apply_df_counts_ms: u64,
     pub build_payloads_ms: u64,
     pub append_sidecars_ms: u64,
     pub append_sidecar_payloads_ms: u64,
@@ -648,53 +122,19 @@ pub struct CandidateImportBatchProfile {
     pub install_docs_ms: u64,
     pub tier2_update_ms: u64,
     pub persist_meta_ms: u64,
-    pub append_df_delta_ms: u64,
-    pub compact_df_counts_ms: u64,
     pub rebalance_tier2_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CandidateDocRowPayloadProfile {
     bloom_us: u64,
-    grams_received_us: u64,
-    grams_indexed_us: u64,
     metadata_us: u64,
     external_id_us: u64,
     tier2_bloom_us: u64,
     bloom_bytes: u64,
-    grams_received_bytes: u64,
-    grams_indexed_bytes: u64,
     metadata_bytes: u64,
     external_id_bytes: u64,
     tier2_bloom_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DfCountsCompactionProfile {
-    check_us: u64,
-    checked_delta_bytes: u64,
-    checked_delta_estimated_memory_bytes: u64,
-    persist_snapshot_us: u64,
-    persist_snapshot_collect_delta_us: u64,
-    persist_snapshot_sort_delta_us: u64,
-    persist_snapshot_merge_write_us: u64,
-    persist_snapshot_flush_us: u64,
-    persist_snapshot_rename_us: u64,
-    persist_snapshot_close_us: u64,
-    persist_snapshot_clear_delta_files_us: u64,
-    refresh_snapshot_us: u64,
-    reopen_writers_us: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DfCountsSnapshotPersistProfile {
-    collect_delta_us: u64,
-    sort_delta_us: u64,
-    merge_write_us: u64,
-    flush_us: u64,
-    close_us: u64,
-    rename_us: u64,
-    clear_delta_files_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -712,7 +152,6 @@ pub struct CandidateStoreOpenProfile {
     pub load_state_ms: u64,
     pub sidecars_ms: u64,
     pub rebuild_indexes_ms: u64,
-    pub rebuild_df_counts_ms: u64,
     pub rebuild_sha_index_ms: u64,
     pub load_tier2_superblocks_ms: u64,
     pub rebuild_tier2_superblocks_ms: u64,
@@ -722,7 +161,6 @@ pub struct CandidateStoreOpenProfile {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CandidateStoreRebuildProfile {
-    df_counts_ms: u64,
     sha_index_ms: u64,
     load_tier2_superblocks_ms: u64,
     tier2_superblocks_ms: u64,
@@ -783,12 +221,6 @@ pub struct CandidateStats {
     pub tier2_superblock_docs: usize,
     pub tier2_superblock_summary_bytes: u64,
     pub tier2_superblock_memory_budget_bytes: u64,
-    pub df_counts_delta_bytes: u64,
-    pub df_counts_delta_entries: usize,
-    pub df_counts_segment_count: usize,
-    pub df_counts_segment_bytes: u64,
-    pub df_counts_delta_estimated_memory_bytes: u64,
-    pub df_counts_delta_compact_threshold_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -884,14 +316,6 @@ struct LegacyCandidateDoc {
 
 const DOC_META_ROW_BYTES: usize = 80;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
-const DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
-const MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
-const DF_COUNTS_DELTA_MEMORY_BUDGET_DIVISOR: u64 = 16;
-const DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES: u64 = 64;
-const DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER: u64 = 2;
-const DF_COUNTS_SEGMENT_MAX_FILES_PER_SHARD: usize = 2;
-const DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS: usize = 512;
 const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_GRAMS_COMPLETE: u8 = 0x01;
@@ -1077,8 +501,6 @@ impl BlobSidecar {
 struct StoreSidecars {
     blooms: BlobSidecar,
     tier2_blooms: BlobSidecar,
-    grams_received: BlobSidecar,
-    grams_indexed: BlobSidecar,
     metadata: BlobSidecar,
     external_ids: BlobSidecar,
 }
@@ -1088,8 +510,6 @@ impl StoreSidecars {
         Self {
             blooms: BlobSidecar::new(blooms_path(root)),
             tier2_blooms: BlobSidecar::new(tier2_blooms_path(root)),
-            grams_received: BlobSidecar::new(grams_received_path(root)),
-            grams_indexed: BlobSidecar::new(grams_indexed_path(root)),
             metadata: BlobSidecar::new(doc_metadata_path(root)),
             external_ids: BlobSidecar::new(external_ids_path(root)),
         }
@@ -1104,8 +524,6 @@ impl StoreSidecars {
     fn refresh_maps(&mut self) -> Result<()> {
         self.blooms.map_if_exists()?;
         self.tier2_blooms.map_if_exists()?;
-        self.grams_received.map_if_exists()?;
-        self.grams_indexed.map_if_exists()?;
         self.metadata.map_if_exists()?;
         self.external_ids.map_if_exists()?;
         Ok(())
@@ -1114,8 +532,6 @@ impl StoreSidecars {
     fn invalidate_all(&mut self) {
         self.blooms.invalidate();
         self.tier2_blooms.invalidate();
-        self.grams_received.invalidate();
-        self.grams_indexed.invalidate();
         self.metadata.invalidate();
         self.external_ids.invalidate();
     }
@@ -1123,8 +539,6 @@ impl StoreSidecars {
     fn retarget_root(&mut self, root: &Path) {
         self.blooms.retarget(blooms_path(root));
         self.tier2_blooms.retarget(tier2_blooms_path(root));
-        self.grams_received.retarget(grams_received_path(root));
-        self.grams_indexed.retarget(grams_indexed_path(root));
         self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
     }
@@ -1183,15 +597,11 @@ impl AppendFile {
 struct StoreAppendWriters {
     blooms: AppendFile,
     tier2_blooms: AppendFile,
-    grams_received: AppendFile,
-    grams_indexed: AppendFile,
     metadata: AppendFile,
     external_ids: AppendFile,
     sha_by_docid: AppendFile,
     doc_meta: AppendFile,
     tier2_doc_meta: AppendFile,
-    df_counts_delta: AppendFile,
-    df_counts_unit_delta: AppendFile,
 }
 
 impl StoreAppendWriters {
@@ -1199,31 +609,22 @@ impl StoreAppendWriters {
         Ok(Self {
             blooms: AppendFile::new(blooms_path(root))?,
             tier2_blooms: AppendFile::new(tier2_blooms_path(root))?,
-            grams_received: AppendFile::new(grams_received_path(root))?,
-            grams_indexed: AppendFile::new(grams_indexed_path(root))?,
             metadata: AppendFile::new(doc_metadata_path(root))?,
             external_ids: AppendFile::new(external_ids_path(root))?,
             sha_by_docid: AppendFile::new(sha_by_docid_path(root))?,
             doc_meta: AppendFile::new(doc_meta_path(root))?,
             tier2_doc_meta: AppendFile::new(tier2_doc_meta_path(root))?,
-            df_counts_delta: AppendFile::new(df_counts_delta_path(root))?,
-            df_counts_unit_delta: AppendFile::new(df_counts_unit_delta_path(root))?,
         })
     }
 
     fn retarget_root(&mut self, root: &Path) {
         self.blooms.retarget(blooms_path(root));
         self.tier2_blooms.retarget(tier2_blooms_path(root));
-        self.grams_received.retarget(grams_received_path(root));
-        self.grams_indexed.retarget(grams_indexed_path(root));
         self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
         self.sha_by_docid.retarget(sha_by_docid_path(root));
         self.doc_meta.retarget(doc_meta_path(root));
         self.tier2_doc_meta.retarget(tier2_doc_meta_path(root));
-        self.df_counts_delta.retarget(df_counts_delta_path(root));
-        self.df_counts_unit_delta
-            .retarget(df_counts_unit_delta_path(root));
     }
 }
 
@@ -1254,7 +655,6 @@ impl Default for Tier2SuperblockIndex {
 pub(crate) struct CandidateCompactionSnapshot {
     root: PathBuf,
     meta: StoreMeta,
-    exact_gram_bytes: usize,
     mutation_counter: u64,
     current_generation: u64,
     live_docs: Vec<CompactionDocRef>,
@@ -1362,7 +762,6 @@ pub struct CandidateStore {
     sidecars: StoreSidecars,
     append_writers: StoreAppendWriters,
     sha_to_pos: HashMap<String, usize>,
-    df_counts: DfCountsState,
     mutation_counter: u64,
     compaction_generation: u64,
     retired_generation_roots: Vec<String>,
@@ -1374,7 +773,6 @@ pub struct CandidateStore {
     total_shards: usize,
     tier2_superblock_memory_budget_divisor: u64,
     tier2_superblock_memory_budget_bytes: u64,
-    df_counts_delta_compact_threshold_bytes: u64,
     meta_persist_dirty: bool,
     last_insert_batch_profile: CandidateInsertBatchProfile,
     last_import_batch_profile: CandidateImportBatchProfile,
@@ -1442,18 +840,6 @@ fn paginate_query_hits(
     (page, page_scores, total, start, end, next_cursor)
 }
 
-fn df_counts_delta_compact_threshold_bytes(memory_budget_bytes: u64, total_shards: usize) -> u64 {
-    if memory_budget_bytes == 0 || total_shards == 0 {
-        return DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES;
-    }
-    let aggregate_budget = memory_budget_bytes / DF_COUNTS_DELTA_MEMORY_BUDGET_DIVISOR;
-    let per_shard_budget = aggregate_budget / total_shards as u64;
-    per_shard_budget.clamp(
-        MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
-        MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
-    )
-}
-
 fn tier2_superblock_memory_budget_bytes(
     memory_budget_bytes: u64,
     total_shards: usize,
@@ -1495,13 +881,9 @@ impl CandidateStore {
         let doc_metadata_path = doc_metadata_path(&config.root);
         let blooms_path = blooms_path(&config.root);
         let tier2_blooms_path = tier2_blooms_path(&config.root);
-        let grams_received_path = grams_received_path(&config.root);
-        let grams_indexed_path = grams_indexed_path(&config.root);
+        let legacy_grams_received_path = config.root.join("grams_received.bin");
+        let legacy_grams_indexed_path = config.root.join("grams_indexed.bin");
         let external_ids_path = external_ids_path(&config.root);
-        let df_counts_path = df_counts_path(&config.root);
-        let df_segments_path = df_counts_segments_dir(&config.root);
-        let df_delta_path = df_counts_delta_path(&config.root);
-        let df_unit_delta_path = df_counts_unit_delta_path(&config.root);
         if !force
             && (meta_path.exists()
                 || docs_path.exists()
@@ -1512,13 +894,9 @@ impl CandidateStore {
                 || doc_metadata_path.exists()
                 || blooms_path.exists()
                 || tier2_blooms_path.exists()
-                || grams_received_path.exists()
-                || grams_indexed_path.exists()
-                || external_ids_path.exists()
-                || df_counts_path.exists()
-                || df_segments_path.exists()
-                || df_delta_path.exists()
-                || df_unit_delta_path.exists())
+                || legacy_grams_received_path.exists()
+                || legacy_grams_indexed_path.exists()
+                || external_ids_path.exists())
         {
             return Err(SspryError::from(format!(
                 "Candidate store already exists at {}. Use --force to overwrite.",
@@ -1546,13 +924,9 @@ impl CandidateStore {
             let _ = fs::remove_file(&doc_metadata_path);
             let _ = fs::remove_file(&blooms_path);
             let _ = fs::remove_file(&tier2_blooms_path);
-            let _ = fs::remove_file(&grams_received_path);
-            let _ = fs::remove_file(&grams_indexed_path);
+            let _ = fs::remove_file(&legacy_grams_received_path);
+            let _ = fs::remove_file(&legacy_grams_indexed_path);
             let _ = fs::remove_file(&external_ids_path);
-            let _ = fs::remove_file(&df_counts_path);
-            let _ = fs::remove_dir_all(&df_segments_path);
-            let _ = fs::remove_file(&df_delta_path);
-            let _ = fs::remove_file(&df_unit_delta_path);
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
         }
 
@@ -1579,7 +953,6 @@ impl CandidateStore {
             sidecars: StoreSidecars::new(&config.root),
             append_writers: StoreAppendWriters::new(&config.root)?,
             sha_to_pos: HashMap::new(),
-            df_counts: DfCountsState::default(),
             mutation_counter: 0,
             compaction_generation: 1,
             retired_generation_roots: Vec::new(),
@@ -1591,15 +964,11 @@ impl CandidateStore {
             total_shards: 1,
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
-            df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
             meta_persist_dirty: false,
             last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
         };
-        store.df_counts = DfCountsState::load(&config.root, store.meta.exact_gram_bytes())?;
         store.persist_meta()?;
-        store.persist_df_counts_snapshot()?;
-        store.df_counts.refresh_snapshot(&config.root)?;
         write_shard_compaction_manifest(&config.root, &ShardCompactionManifest::default())?;
         Ok(store)
     }
@@ -1651,7 +1020,6 @@ impl CandidateStore {
             sidecars: StoreSidecars::map_existing(root.as_path())?,
             append_writers: StoreAppendWriters::new(root.as_path())?,
             sha_to_pos: HashMap::new(),
-            df_counts: DfCountsState::default(),
             mutation_counter: 0,
             compaction_generation: compaction_manifest.current_generation,
             retired_generation_roots: compaction_manifest.retired_roots,
@@ -1663,7 +1031,6 @@ impl CandidateStore {
             total_shards: 1,
             tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
             tier2_superblock_memory_budget_bytes: 0,
-            df_counts_delta_compact_threshold_bytes: DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES,
             meta_persist_dirty: false,
             last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
@@ -1686,7 +1053,6 @@ impl CandidateStore {
             load_state_ms,
             sidecars_ms,
             rebuild_indexes_ms: rebuild_profile.total_ms,
-            rebuild_df_counts_ms: rebuild_profile.df_counts_ms,
             rebuild_sha_index_ms: rebuild_profile.sha_index_ms,
             load_tier2_superblocks_ms: rebuild_profile.load_tier2_superblocks_ms,
             rebuild_tier2_superblocks_ms: rebuild_profile.tier2_superblocks_ms,
@@ -1715,9 +1081,6 @@ impl CandidateStore {
             self.total_shards,
             self.tier2_superblock_memory_budget_divisor,
         );
-        self.df_counts_delta_compact_threshold_bytes =
-            df_counts_delta_compact_threshold_bytes(memory_budget_bytes, self.total_shards);
-        let _ = self.maybe_compact_df_counts()?;
         self.maybe_rebalance_tier2_superblocks()
     }
 
@@ -1741,20 +1104,6 @@ impl CandidateStore {
         self.root = root.to_path_buf();
         self.sidecars.retarget_root(root);
         self.append_writers.retarget_root(root);
-    }
-
-    pub fn df_counts(&self) -> HashMap<u64, usize> {
-        let _scope = scope("candidate.df_counts");
-        record_counter("candidate.df_counts_docs_total", self.docs.len() as u64);
-        record_counter(
-            "candidate.df_counts_unique_grams_total",
-            self.df_counts.unique_count_hint() as u64,
-        );
-        self.df_counts.materialize()
-    }
-
-    pub fn df_counts_for(&self, grams: &[u64]) -> HashMap<u64, usize> {
-        self.df_counts.get_many(grams)
     }
 
     fn mark_write_activity(&mut self) {
@@ -1829,7 +1178,6 @@ impl CandidateStore {
         Ok(Some(CandidateCompactionSnapshot {
             root: self.root.clone(),
             meta: self.meta.clone(),
-            exact_gram_bytes: self.meta.exact_gram_bytes(),
             mutation_counter: self.mutation_counter,
             current_generation: self.compaction_generation,
             live_docs,
@@ -2086,7 +1434,6 @@ impl CandidateStore {
 
         let status;
         let doc_id;
-        let df_unit_delta_payload = Vec::<u8>::new();
         if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
             if !self.docs[existing_pos].deleted {
                 let existing = &self.docs[existing_pos];
@@ -2193,13 +1540,6 @@ impl CandidateStore {
             status = "inserted".to_owned();
         }
 
-        if !df_unit_delta_payload.is_empty() {
-            append_df_count_unit_payload_with_writer(
-                &mut self.append_writers.df_counts_unit_delta,
-                &df_unit_delta_payload,
-            )?;
-            let _ = self.maybe_compact_df_counts()?;
-        }
         self.sidecars.invalidate_all();
 
         self.mark_write_activity();
@@ -2269,7 +1609,6 @@ impl CandidateStore {
 
         let mut total_scope = scope("candidate.insert_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
-        let aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut modified = false;
         let mut meta_dirty = false;
         let mut insert_profile = CandidateInsertBatchProfile::default();
@@ -2562,18 +1901,6 @@ impl CandidateStore {
                         bloom_len: pending.tier2_bloom_filter.len() as u32,
                     }
                 };
-                insert_profile.append_grams_received_payload_us = insert_profile
-                    .append_grams_received_payload_us
-                    .saturating_add(row_profile.grams_received_us);
-                insert_profile.append_grams_received_payload_bytes = insert_profile
-                    .append_grams_received_payload_bytes
-                    .saturating_add(row_profile.grams_received_bytes);
-                insert_profile.append_grams_indexed_payload_us = insert_profile
-                    .append_grams_indexed_payload_us
-                    .saturating_add(row_profile.grams_indexed_us);
-                insert_profile.append_grams_indexed_payload_bytes = insert_profile
-                    .append_grams_indexed_payload_bytes
-                    .saturating_add(row_profile.grams_indexed_bytes);
                 insert_profile.append_metadata_payload_us = insert_profile
                     .append_metadata_payload_us
                     .saturating_add(row_profile.metadata_us);
@@ -2611,8 +1938,6 @@ impl CandidateStore {
                 insert_profile.append_sidecar_payloads_us.saturating_add(
                     insert_profile
                         .append_bloom_payload_us
-                        .saturating_add(insert_profile.append_grams_received_payload_us)
-                        .saturating_add(insert_profile.append_grams_indexed_payload_us)
                         .saturating_add(insert_profile.append_external_id_payload_us)
                         .saturating_add(insert_profile.append_tier2_bloom_payload_us),
                 );
@@ -2629,66 +1954,6 @@ impl CandidateStore {
                 .saturating_add(elapsed_us(tier2_update_started));
             if meta_dirty {
                 self.mark_meta_dirty();
-            }
-            if !aggregate_df_unit_delta_payload.is_empty() {
-                let append_df_delta_started = Instant::now();
-                append_df_count_unit_payload_with_writer(
-                    &mut self.append_writers.df_counts_unit_delta,
-                    &aggregate_df_unit_delta_payload,
-                )?;
-                insert_profile.append_df_delta_us = insert_profile
-                    .append_df_delta_us
-                    .saturating_add(elapsed_us(append_df_delta_started));
-                let compact_df_counts_started = Instant::now();
-                let compact_df_counts_profile = self.maybe_compact_df_counts()?;
-                insert_profile.compact_df_counts_us = insert_profile
-                    .compact_df_counts_us
-                    .saturating_add(elapsed_us(compact_df_counts_started));
-                insert_profile.compact_df_counts_check_us = insert_profile
-                    .compact_df_counts_check_us
-                    .saturating_add(compact_df_counts_profile.check_us);
-                insert_profile.compact_df_counts_checked_delta_bytes = insert_profile
-                    .compact_df_counts_checked_delta_bytes
-                    .max(compact_df_counts_profile.checked_delta_bytes);
-                insert_profile.compact_df_counts_checked_delta_estimated_memory_bytes =
-                    insert_profile
-                        .compact_df_counts_checked_delta_estimated_memory_bytes
-                        .max(compact_df_counts_profile.checked_delta_estimated_memory_bytes);
-                insert_profile.compact_df_counts_persist_snapshot_us = insert_profile
-                    .compact_df_counts_persist_snapshot_us
-                    .saturating_add(compact_df_counts_profile.persist_snapshot_us);
-                insert_profile.compact_df_counts_persist_snapshot_collect_delta_us =
-                    insert_profile
-                        .compact_df_counts_persist_snapshot_collect_delta_us
-                        .saturating_add(compact_df_counts_profile.persist_snapshot_collect_delta_us);
-                insert_profile.compact_df_counts_persist_snapshot_sort_delta_us = insert_profile
-                    .compact_df_counts_persist_snapshot_sort_delta_us
-                    .saturating_add(compact_df_counts_profile.persist_snapshot_sort_delta_us);
-                insert_profile.compact_df_counts_persist_snapshot_merge_write_us =
-                    insert_profile
-                        .compact_df_counts_persist_snapshot_merge_write_us
-                        .saturating_add(compact_df_counts_profile.persist_snapshot_merge_write_us);
-                insert_profile.compact_df_counts_persist_snapshot_flush_us = insert_profile
-                    .compact_df_counts_persist_snapshot_flush_us
-                    .saturating_add(compact_df_counts_profile.persist_snapshot_flush_us);
-                insert_profile.compact_df_counts_persist_snapshot_rename_us = insert_profile
-                    .compact_df_counts_persist_snapshot_rename_us
-                    .saturating_add(compact_df_counts_profile.persist_snapshot_rename_us);
-                insert_profile.compact_df_counts_persist_snapshot_close_us = insert_profile
-                    .compact_df_counts_persist_snapshot_close_us
-                    .saturating_add(compact_df_counts_profile.persist_snapshot_close_us);
-                insert_profile.compact_df_counts_persist_snapshot_clear_delta_files_us =
-                    insert_profile
-                        .compact_df_counts_persist_snapshot_clear_delta_files_us
-                        .saturating_add(
-                            compact_df_counts_profile.persist_snapshot_clear_delta_files_us,
-                        );
-                insert_profile.compact_df_counts_refresh_snapshot_us = insert_profile
-                    .compact_df_counts_refresh_snapshot_us
-                    .saturating_add(compact_df_counts_profile.refresh_snapshot_us);
-                insert_profile.compact_df_counts_reopen_writers_us = insert_profile
-                    .compact_df_counts_reopen_writers_us
-                    .saturating_add(compact_df_counts_profile.reopen_writers_us);
             }
             let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
@@ -2730,17 +1995,6 @@ impl CandidateStore {
                     doc_id: None,
                 });
             }
-            let df_deltas = if self.doc_rows[pos].grams_received_count == 0 {
-                Vec::new()
-            } else {
-                let grams_received = self.doc_grams_received(pos)?;
-                let df_deltas = grams_received
-                    .iter()
-                    .map(|gram| (*gram, -1))
-                    .collect::<Vec<_>>();
-                self.df_counts.apply_deltas(&df_deltas);
-                df_deltas
-            };
             let snapshot = {
                 let doc = &mut self.docs[pos];
                 doc.deleted = true;
@@ -2756,14 +2010,6 @@ impl CandidateStore {
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
             self.rebuild_tier2_superblocks()?;
-            if !df_deltas.is_empty() {
-                append_df_count_deltas_with_writer(
-                    &mut self.append_writers.df_counts_delta,
-                    self.meta.exact_gram_bytes(),
-                    &df_deltas,
-                )?;
-                let _ = self.maybe_compact_df_counts()?;
-            }
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
             return Ok(result);
@@ -2851,7 +2097,6 @@ impl CandidateStore {
         } else {
             Vec::new()
         };
-        let aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
         let mut meta_dirty = false;
@@ -2928,14 +2173,14 @@ impl CandidateStore {
                     )?;
                     modified = true;
                     if collect_results {
-                            results.push(CandidateInsertResult {
-                                status: "restored".to_owned(),
-                                doc_id: snapshot.doc_id,
-                                sha256: sha256_hex,
-                                grams_received: 0,
-                                grams_indexed: 0,
-                                grams_complete: document.grams_complete,
-                            });
+                        results.push(CandidateInsertResult {
+                            status: "restored".to_owned(),
+                            doc_id: snapshot.doc_id,
+                            sha256: sha256_hex,
+                            grams_received: 0,
+                            grams_indexed: 0,
+                            grams_complete: document.grams_complete,
+                        });
                     }
                     continue;
                 }
@@ -3143,18 +2388,6 @@ impl CandidateStore {
         if modified {
             if meta_dirty {
                 self.mark_meta_dirty();
-            }
-            if !aggregate_df_unit_delta_payload.is_empty() {
-                let append_df_delta_started = Instant::now();
-                append_df_count_unit_payload_with_writer(
-                    &mut self.append_writers.df_counts_unit_delta,
-                    &aggregate_df_unit_delta_payload,
-                )?;
-                import_profile.append_df_delta_ms = append_df_delta_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
             }
             let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
@@ -3397,12 +2630,6 @@ impl CandidateStore {
             tier2_superblock_docs: self.tier2_superblocks.docs_per_block,
             tier2_superblock_summary_bytes: self.tier2_superblocks.summary_memory_bytes,
             tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
-            df_counts_delta_bytes: current_df_counts_delta_bytes(&self.root),
-            df_counts_delta_entries: self.df_counts.delta.len(),
-            df_counts_segment_count: self.df_counts.segment_count(),
-            df_counts_segment_bytes: self.df_counts.segment_bytes(),
-            df_counts_delta_estimated_memory_bytes: self.df_counts.estimated_delta_memory_bytes(),
-            df_counts_delta_compact_threshold_bytes: self.df_counts_delta_compact_threshold_bytes,
         }
     }
 
@@ -3477,19 +2704,6 @@ impl CandidateStore {
         )
     }
 
-    fn doc_grams_received(&self, pos: usize) -> Result<Vec<u64>> {
-        let doc = &self.docs[pos];
-        let row = self.doc_rows[pos];
-        read_exact_gram_vec_from_sidecar(
-            &self.sidecars.grams_received,
-            row.grams_received_offset,
-            row.grams_received_count,
-            self.meta.exact_gram_bytes(),
-            "grams_received",
-            doc.doc_id,
-        )
-    }
-
     fn doc_external_id(&self, pos: usize) -> Result<Option<String>> {
         let doc = &self.docs[pos];
         let row = self.doc_rows[pos];
@@ -3542,97 +2756,6 @@ impl CandidateStore {
         Ok(true)
     }
 
-    pub(crate) fn persist_df_counts_snapshot(&self) -> Result<()> {
-        persist_df_counts_state_snapshot_to_root(&self.root, &self.df_counts)
-    }
-
-    pub(crate) fn seal_df_counts_snapshot_from_disk(&mut self) -> Result<()> {
-        self.df_counts.refresh_snapshot(&self.root)?;
-        self.persist_df_counts_snapshot()?;
-        self.df_counts.refresh_snapshot(&self.root)?;
-        self.append_writers.df_counts_delta = AppendFile::new(df_counts_delta_path(&self.root))?;
-        self.append_writers.df_counts_unit_delta =
-            AppendFile::new(df_counts_unit_delta_path(&self.root))?;
-        Ok(())
-    }
-
-    fn maybe_compact_df_counts(&mut self) -> Result<DfCountsCompactionProfile> {
-        fn elapsed_us(started: Instant) -> u64 {
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-        }
-
-        let mut profile = DfCountsCompactionProfile::default();
-        let check_started = Instant::now();
-        let len = current_df_counts_delta_bytes(&self.root);
-        let estimated_delta_memory_bytes = self.df_counts.estimated_delta_memory_bytes();
-        profile.check_us = elapsed_us(check_started);
-        profile.checked_delta_bytes = len;
-        profile.checked_delta_estimated_memory_bytes = estimated_delta_memory_bytes;
-        if len >= self.df_counts_delta_compact_threshold_bytes
-            || estimated_delta_memory_bytes
-                >= self
-                    .df_counts_delta_compact_threshold_bytes
-                    .saturating_mul(DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER)
-        {
-            let persist_snapshot_started = Instant::now();
-            let (segment, persist_profile) =
-                flush_df_counts_delta_to_segment_profiled(&self.root, &self.df_counts)?;
-            profile.persist_snapshot_us = elapsed_us(persist_snapshot_started);
-            profile.persist_snapshot_collect_delta_us = persist_profile.collect_delta_us;
-            profile.persist_snapshot_sort_delta_us = persist_profile.sort_delta_us;
-            profile.persist_snapshot_merge_write_us = persist_profile.merge_write_us;
-            profile.persist_snapshot_flush_us = persist_profile.flush_us;
-            profile.persist_snapshot_close_us = persist_profile.close_us;
-            profile.persist_snapshot_rename_us = persist_profile.rename_us;
-            profile.persist_snapshot_clear_delta_files_us = persist_profile.clear_delta_files_us;
-            self.df_counts.delta.clear();
-            self.df_counts.segments.push(segment);
-            while self.df_counts.segments.len() > DF_COUNTS_SEGMENT_MAX_FILES_PER_SHARD {
-                let mut indices = (0..self.df_counts.segments.len()).collect::<Vec<_>>();
-                indices.sort_unstable_by_key(|index| self.df_counts.segments[*index].bytes());
-                let left_idx = indices[0];
-                let right_idx = indices[1];
-                let merge_started = Instant::now();
-                let merged_profile = merge_df_counts_segments_profiled(
-                    &self.root,
-                    self.meta.exact_gram_bytes(),
-                    &self.df_counts.segments[left_idx],
-                    &self.df_counts.segments[right_idx],
-                )?;
-                profile.persist_snapshot_us = profile
-                    .persist_snapshot_us
-                    .saturating_add(elapsed_us(merge_started));
-                profile.persist_snapshot_merge_write_us = profile
-                    .persist_snapshot_merge_write_us
-                    .saturating_add(merged_profile.1.merge_write_us);
-                profile.persist_snapshot_flush_us = profile
-                    .persist_snapshot_flush_us
-                    .saturating_add(merged_profile.1.flush_us);
-                profile.persist_snapshot_close_us = profile
-                    .persist_snapshot_close_us
-                    .saturating_add(merged_profile.1.close_us);
-                profile.persist_snapshot_rename_us = profile
-                    .persist_snapshot_rename_us
-                    .saturating_add(merged_profile.1.rename_us);
-                let (high_idx, low_idx) = if left_idx > right_idx {
-                    (left_idx, right_idx)
-                } else {
-                    (right_idx, left_idx)
-                };
-                self.df_counts.segments.swap_remove(high_idx);
-                self.df_counts.segments.swap_remove(low_idx);
-                self.df_counts.segments.push(merged_profile.0);
-            }
-            let reopen_writers_started = Instant::now();
-            self.append_writers.df_counts_delta =
-                AppendFile::new(df_counts_delta_path(&self.root))?;
-            self.append_writers.df_counts_unit_delta =
-                AppendFile::new(df_counts_unit_delta_path(&self.root))?;
-            profile.reopen_writers_us = elapsed_us(reopen_writers_started);
-        }
-        Ok(profile)
-    }
-
     fn build_doc_row(
         &mut self,
         file_size: u64,
@@ -3680,34 +2803,8 @@ impl CandidateStore {
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
         }
 
-        let gram_bytes = self.meta.exact_gram_bytes();
         let mut profile = CandidateDocRowPayloadProfile::default();
-        let (grams_received_offset, grams_received_count) = if grams_received.is_empty() {
-            (0, 0)
-        } else {
-            let grams_received_started = Instant::now();
-            let offset = append_exact_gram_slice_with_writer(
-                &mut self.append_writers.grams_received,
-                grams_received,
-                gram_bytes,
-            )?;
-            profile.grams_received_us = elapsed_us(grams_received_started);
-            profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
-            (offset, grams_received.len() as u32)
-        };
-        let (grams_indexed_offset, grams_indexed_count) = if grams_indexed.is_empty() {
-            (0, 0)
-        } else {
-            let grams_indexed_started = Instant::now();
-            let offset = append_exact_gram_slice_with_writer(
-                &mut self.append_writers.grams_indexed,
-                grams_indexed,
-                gram_bytes,
-            )?;
-            profile.grams_indexed_us = elapsed_us(grams_indexed_started);
-            profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
-            (offset, grams_indexed.len() as u32)
-        };
+        let _ = (grams_received, grams_indexed);
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
@@ -3739,10 +2836,10 @@ impl CandidateStore {
                 bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
                 bloom_offset,
                 bloom_len: bloom_len as u32,
-                grams_received_offset,
-                grams_received_count,
-                grams_indexed_offset,
-                grams_indexed_count,
+                grams_received_offset: 0,
+                grams_received_count: 0,
+                grams_indexed_offset: 0,
+                grams_indexed_count: 0,
                 external_id_offset,
                 external_id_len,
                 metadata_offset,
@@ -3769,38 +2866,12 @@ impl CandidateStore {
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
         }
 
-        let gram_bytes = self.meta.exact_gram_bytes();
         let mut profile = CandidateDocRowPayloadProfile::default();
         let bloom_started = Instant::now();
         let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
         profile.bloom_us = elapsed_us(bloom_started);
         profile.bloom_bytes = bloom_filter.len() as u64;
-        let (grams_received_offset, grams_received_count) = if grams_received.is_empty() {
-            (0, 0)
-        } else {
-            let grams_received_started = Instant::now();
-            let offset = append_exact_gram_slice_with_writer(
-                &mut self.append_writers.grams_received,
-                grams_received,
-                gram_bytes,
-            )?;
-            profile.grams_received_us = elapsed_us(grams_received_started);
-            profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
-            (offset, grams_received.len() as u32)
-        };
-        let (grams_indexed_offset, grams_indexed_count) = if grams_indexed.is_empty() {
-            (0, 0)
-        } else {
-            let grams_indexed_started = Instant::now();
-            let offset = append_exact_gram_slice_with_writer(
-                &mut self.append_writers.grams_indexed,
-                grams_indexed,
-                gram_bytes,
-            )?;
-            profile.grams_indexed_us = elapsed_us(grams_indexed_started);
-            profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
-            (offset, grams_indexed.len() as u32)
-        };
+        let _ = (grams_received, grams_indexed);
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
@@ -3831,10 +2902,10 @@ impl CandidateStore {
             bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset,
             bloom_len: bloom_filter.len() as u32,
-            grams_received_offset,
-            grams_received_count,
-            grams_indexed_offset,
-            grams_indexed_count,
+            grams_received_offset: 0,
+            grams_received_count: 0,
+            grams_indexed_offset: 0,
+            grams_indexed_count: 0,
             external_id_offset,
             external_id_len,
             metadata_offset,
@@ -4157,13 +3228,6 @@ impl CandidateStore {
     fn rebuild_indexes_profiled(&mut self) -> Result<CandidateStoreRebuildProfile> {
         let started_total = Instant::now();
         self.sha_to_pos.clear();
-        let df_started = Instant::now();
-        self.df_counts = DfCountsState::load(&self.root, self.meta.exact_gram_bytes())?;
-        let df_counts_ms = df_started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
         let sha_started = Instant::now();
         for (index, doc) in self.docs.iter_mut().enumerate() {
             if doc.bloom_hashes == 0 {
@@ -4205,7 +3269,6 @@ impl CandidateStore {
                 (false, tier2_superblocks_ms)
             };
         Ok(CandidateStoreRebuildProfile {
-            df_counts_ms,
             sha_index_ms,
             load_tier2_superblocks_ms,
             tier2_superblocks_ms,
@@ -4399,15 +3462,12 @@ pub(crate) fn write_compacted_snapshot(
         doc_metadata_path(compacted_root),
         blooms_path(compacted_root),
         tier2_blooms_path(compacted_root),
-        grams_received_path(compacted_root),
-        grams_indexed_path(compacted_root),
         external_ids_path(compacted_root),
     ];
     for path in &paths {
         let _ = fs::remove_file(path);
     }
 
-    let mut counts = HashMap::<u64, usize>::new();
     for doc in &snapshot.live_docs {
         let bloom_bytes = read_blob_from_path(
             &blooms_path(&snapshot.root),
@@ -4427,22 +3487,6 @@ pub(crate) fn write_compacted_snapshot(
                 0,
             )?
         };
-        let grams_received = read_exact_gram_vec_from_path(
-            &grams_received_path(&snapshot.root),
-            doc.row.grams_received_offset,
-            doc.row.grams_received_count,
-            snapshot.exact_gram_bytes,
-            "grams_received",
-            0,
-        )?;
-        let grams_indexed = read_exact_gram_vec_from_path(
-            &grams_indexed_path(&snapshot.root),
-            doc.row.grams_indexed_offset,
-            doc.row.grams_indexed_count,
-            snapshot.exact_gram_bytes,
-            "grams_indexed",
-            0,
-        )?;
         let external_id = if doc.row.external_id_len == 0 {
             None
         } else {
@@ -4469,10 +3513,6 @@ pub(crate) fn write_compacted_snapshot(
             )?
         };
 
-        for gram in &grams_received {
-            *counts.entry(*gram).or_insert(0) += 1;
-        }
-
         let row = DocMetaRow {
             file_size: doc.file_size,
             filter_bytes: doc.filter_bytes as u32,
@@ -4480,18 +3520,10 @@ pub(crate) fn write_compacted_snapshot(
             bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset: append_blob(blooms_path(compacted_root), &bloom_bytes)?,
             bloom_len: bloom_bytes.len() as u32,
-            grams_received_offset: append_exact_gram_slice(
-                grams_received_path(compacted_root),
-                &grams_received,
-                snapshot.exact_gram_bytes,
-            )?,
-            grams_received_count: grams_received.len() as u32,
-            grams_indexed_offset: append_exact_gram_slice(
-                grams_indexed_path(compacted_root),
-                &grams_indexed,
-                snapshot.exact_gram_bytes,
-            )?,
-            grams_indexed_count: grams_indexed.len() as u32,
+            grams_received_offset: 0,
+            grams_received_count: 0,
+            grams_indexed_offset: 0,
+            grams_indexed_count: 0,
             external_id_offset: if let Some(external_id) = &external_id {
                 append_blob(external_ids_path(compacted_root), external_id.as_bytes())?
             } else {
@@ -4526,7 +3558,6 @@ pub(crate) fn write_compacted_snapshot(
     let mut meta = snapshot.meta.clone();
     meta.next_doc_id = snapshot.live_docs.len() as u64 + 1;
     write_json(meta_path(compacted_root), &meta)?;
-    persist_df_counts_snapshot_to_root(compacted_root, &counts, snapshot.exact_gram_bytes)?;
     Ok(())
 }
 
@@ -4566,100 +3597,12 @@ fn tier2_blooms_path(root: &Path) -> PathBuf {
     root.join("tier2_blooms.bin")
 }
 
-fn grams_received_path(root: &Path) -> PathBuf {
-    root.join("grams_received.bin")
-}
-
-fn grams_indexed_path(root: &Path) -> PathBuf {
-    root.join("grams_indexed.bin")
-}
-
 fn external_ids_path(root: &Path) -> PathBuf {
     root.join("external_ids.dat")
 }
 
 fn tier2_superblocks_path(root: &Path) -> PathBuf {
     root.join("tier2_superblocks.bin")
-}
-
-fn df_counts_path(root: &Path) -> PathBuf {
-    root.join("df_counts.bin")
-}
-
-fn df_counts_segments_dir(root: &Path) -> PathBuf {
-    root.join("df_counts_segments")
-}
-
-fn df_counts_segment_path(root: &Path, generation: u64) -> PathBuf {
-    df_counts_segments_dir(root).join(format!("{generation:016x}.bin"))
-}
-
-fn parse_df_counts_segment_generation(path: &Path) -> Option<u64> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".bin")?;
-    u64::from_str_radix(stem, 16).ok()
-}
-
-fn load_df_counts_segments(root: &Path, gram_bytes: usize) -> Result<Vec<DfCountsSegment>> {
-    let dir = df_counts_segments_dir(root);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = fs::read_dir(&dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|extension| extension == "bin"))
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-    let mut segments = Vec::with_capacity(paths.len());
-    for path in paths {
-        segments.push(DfCountsSegment::load(path, gram_bytes)?);
-    }
-    Ok(segments)
-}
-
-fn build_df_counts_segment_fence(
-    mmap: &Mmap,
-    gram_bytes: usize,
-    row_bytes: usize,
-    rows: usize,
-) -> Box<[DfCountsSegmentFenceEntry]> {
-    if rows == 0 {
-        return Box::default();
-    }
-    let mut fence = Vec::with_capacity(rows.div_ceil(DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS));
-    let mut row = 0usize;
-    while row < rows {
-        let start = row * row_bytes;
-        fence.push(DfCountsSegmentFenceEntry {
-            gram: decode_packed_exact_gram(&mmap[start..start + gram_bytes]),
-            row: row.try_into().unwrap_or(u32::MAX),
-        });
-        row = row.saturating_add(DF_COUNTS_SEGMENT_FENCE_STRIDE_ROWS);
-    }
-    fence.into_boxed_slice()
-}
-
-fn next_df_counts_segment_generation(root: &Path) -> Result<u64> {
-    let dir = df_counts_segments_dir(root);
-    if !dir.exists() {
-        return Ok(1);
-    }
-    let mut next_generation = 1u64;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if let Some(generation) = parse_df_counts_segment_generation(&entry.path()) {
-            next_generation = next_generation.max(generation.saturating_add(1));
-        }
-    }
-    Ok(next_generation)
-}
-
-fn df_counts_delta_path(root: &Path) -> PathBuf {
-    root.join("df_counts.delta.bin")
-}
-
-fn df_counts_unit_delta_path(root: &Path) -> PathBuf {
-    root.join("df_counts.unit.delta.bin")
 }
 
 pub fn candidate_shard_manifest_path(root: &Path) -> PathBuf {
@@ -4793,34 +3736,6 @@ fn read_blob_from_path(
     Ok(bytes)
 }
 
-fn append_exact_gram_slice(path: PathBuf, values: &[u64], gram_bytes: usize) -> Result<u64> {
-    if values.is_empty() {
-        return Ok(0);
-    }
-    let mut payload = Vec::with_capacity(values.len() * gram_bytes);
-    for value in values {
-        let encoded = value.to_le_bytes();
-        payload.extend_from_slice(&encoded[..gram_bytes]);
-    }
-    append_blob(path, &payload)
-}
-
-fn append_exact_gram_slice_with_writer(
-    writer: &mut AppendFile,
-    values: &[u64],
-    gram_bytes: usize,
-) -> Result<u64> {
-    if values.is_empty() {
-        return Ok(0);
-    }
-    let mut payload = Vec::with_capacity(values.len() * gram_bytes);
-    for value in values {
-        let encoded = value.to_le_bytes();
-        payload.extend_from_slice(&encoded[..gram_bytes]);
-    }
-    writer.append(&payload)
-}
-
 fn write_at(path: PathBuf, offset: u64, bytes: &[u8]) -> Result<()> {
     let mut handle = OpenOptions::new()
         .create(true)
@@ -4890,298 +3805,6 @@ fn legacy_docs_to_docs(docs: &[LegacyCandidateDoc]) -> Vec<CandidateDoc> {
     out
 }
 
-fn persist_df_counts_snapshot_for_docs(
-    root: &Path,
-    docs: &[CandidateDoc],
-    legacy_docs: &[LegacyCandidateDoc],
-    gram_bytes: usize,
-) -> Result<()> {
-    let mut counts = HashMap::<u64, usize>::new();
-    for (doc, legacy) in docs.iter().zip(legacy_docs.iter()) {
-        if doc.deleted {
-            continue;
-        }
-        for gram in &legacy.grams_received {
-            *counts.entry(u64::from(*gram)).or_insert(0) += 1;
-        }
-    }
-    persist_df_counts_snapshot_to_root(root, &counts, gram_bytes)
-}
-
-fn persist_df_counts_snapshot_to_root(
-    root: &Path,
-    counts: &HashMap<u64, usize>,
-    gram_bytes: usize,
-) -> Result<()> {
-    fs::create_dir_all(root)?;
-    let mut ordered = counts
-        .iter()
-        .filter(|(_, count)| **count > 0)
-        .map(|(gram, count)| (*gram, *count))
-        .collect::<Vec<_>>();
-    ordered.sort_unstable_by_key(|(gram, _)| *gram);
-
-    let snapshot_path = df_counts_path(root);
-    let tmp_path = PathBuf::from(format!("{}.tmp", snapshot_path.display()));
-    let file = fs::File::create(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
-    for (gram, count) in ordered {
-        write_df_count_row(&mut writer, gram, count, gram_bytes)?;
-    }
-    writer.flush()?;
-    fs::rename(tmp_path, snapshot_path)?;
-    let _ = fs::remove_dir_all(df_counts_segments_dir(root));
-    fs::write(df_counts_delta_path(root), [])?;
-    fs::write(df_counts_unit_delta_path(root), [])?;
-    Ok(())
-}
-
-fn persist_df_counts_state_snapshot_to_root(root: &Path, state: &DfCountsState) -> Result<()> {
-    persist_df_counts_state_snapshot_to_root_profiled(root, state).map(|_| ())
-}
-
-fn persist_df_counts_state_snapshot_to_root_profiled(
-    root: &Path,
-    state: &DfCountsState,
-) -> Result<DfCountsSnapshotPersistProfile> {
-    fn elapsed_us(started: Instant) -> u64 {
-        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-    }
-
-    fs::create_dir_all(root)?;
-    let mut profile = DfCountsSnapshotPersistProfile::default();
-    let collect_delta_started = Instant::now();
-    let counts = state.materialize();
-    profile.collect_delta_us = elapsed_us(collect_delta_started);
-    let sort_delta_started = Instant::now();
-    let mut ordered = counts
-        .iter()
-        .filter(|(_, count)| **count > 0)
-        .map(|(gram, count)| (*gram, *count))
-        .collect::<Vec<_>>();
-    ordered.sort_unstable_by_key(|(gram, _)| *gram);
-    profile.sort_delta_us = elapsed_us(sort_delta_started);
-
-    let snapshot_path = df_counts_path(root);
-    let tmp_path = PathBuf::from(format!("{}.tmp", snapshot_path.display()));
-    {
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-
-        let merge_write_started = Instant::now();
-        for (gram, count) in ordered {
-            write_df_count_row(&mut writer, gram, count, state.gram_bytes)?;
-        }
-        profile.merge_write_us = elapsed_us(merge_write_started);
-
-        let flush_started = Instant::now();
-        writer.flush()?;
-        profile.flush_us = elapsed_us(flush_started);
-        let close_started = Instant::now();
-        let file = writer.into_inner().map_err(|err| {
-            SspryError::from(format!("Failed to finalize df_counts snapshot: {err}"))
-        })?;
-        drop(file);
-        profile.close_us = elapsed_us(close_started);
-    }
-    let rename_started = Instant::now();
-    fs::rename(&tmp_path, &snapshot_path)?;
-    profile.rename_us = elapsed_us(rename_started);
-    let clear_delta_files_started = Instant::now();
-    let _ = fs::remove_dir_all(df_counts_segments_dir(root));
-    fs::write(df_counts_delta_path(root), [])?;
-    fs::write(df_counts_unit_delta_path(root), [])?;
-    profile.clear_delta_files_us = elapsed_us(clear_delta_files_started);
-    Ok(profile)
-}
-
-fn flush_df_counts_delta_to_segment_profiled(
-    root: &Path,
-    state: &DfCountsState,
-) -> Result<(DfCountsSegment, DfCountsSnapshotPersistProfile)> {
-    fn elapsed_us(started: Instant) -> u64 {
-        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-    }
-
-    fs::create_dir_all(df_counts_segments_dir(root))?;
-    let mut profile = DfCountsSnapshotPersistProfile::default();
-    let collect_delta_started = Instant::now();
-    let mut delta = state
-        .delta
-        .iter()
-        .filter_map(|(gram, change)| (*change != 0).then_some((*gram, *change)))
-        .collect::<Vec<_>>();
-    profile.collect_delta_us = elapsed_us(collect_delta_started);
-    let sort_delta_started = Instant::now();
-    delta.sort_unstable_by_key(|(gram, _)| *gram);
-    profile.sort_delta_us = elapsed_us(sort_delta_started);
-
-    let generation = next_df_counts_segment_generation(root)?;
-    let segment_path = df_counts_segment_path(root, generation);
-    let tmp_path = PathBuf::from(format!("{}.tmp", segment_path.display()));
-    {
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-        let merge_write_started = Instant::now();
-        for (gram, change) in &delta {
-            write_df_count_delta_row(&mut writer, *gram, *change, state.gram_bytes)?;
-        }
-        profile.merge_write_us = elapsed_us(merge_write_started);
-        let flush_started = Instant::now();
-        writer.flush()?;
-        profile.flush_us = elapsed_us(flush_started);
-        let close_started = Instant::now();
-        let file = writer.into_inner().map_err(|err| {
-            SspryError::from(format!("Failed to finalize df_counts segment: {err}"))
-        })?;
-        drop(file);
-        profile.close_us = elapsed_us(close_started);
-    }
-    let rename_started = Instant::now();
-    fs::rename(&tmp_path, &segment_path)?;
-    profile.rename_us = elapsed_us(rename_started);
-    let clear_delta_files_started = Instant::now();
-    fs::write(df_counts_delta_path(root), [])?;
-    fs::write(df_counts_unit_delta_path(root), [])?;
-    profile.clear_delta_files_us = elapsed_us(clear_delta_files_started);
-    Ok((
-        DfCountsSegment::load(segment_path, state.gram_bytes)?,
-        profile,
-    ))
-}
-
-fn merge_df_counts_segments_profiled(
-    root: &Path,
-    gram_bytes: usize,
-    left: &DfCountsSegment,
-    right: &DfCountsSegment,
-) -> Result<(DfCountsSegment, DfCountsSnapshotPersistProfile)> {
-    fn elapsed_us(started: Instant) -> u64 {
-        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-    }
-
-    let generation = next_df_counts_segment_generation(root)?;
-    let segment_path = df_counts_segment_path(root, generation);
-    let tmp_path = PathBuf::from(format!("{}.tmp", segment_path.display()));
-    let mut profile = DfCountsSnapshotPersistProfile::default();
-    let left_row_bytes = gram_bytes + 8;
-    let right_row_bytes = gram_bytes + 8;
-    let mut left_idx = 0usize;
-    let mut right_idx = 0usize;
-
-    {
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-        let merge_write_started = Instant::now();
-        while left_idx < left.rows || right_idx < right.rows {
-            let next_left = if left_idx < left.rows {
-                Some(read_df_count_delta_row(
-                    &left.mmap,
-                    left_idx,
-                    gram_bytes,
-                    left_row_bytes,
-                ))
-            } else {
-                None
-            };
-            let next_right = if right_idx < right.rows {
-                Some(read_df_count_delta_row(
-                    &right.mmap,
-                    right_idx,
-                    gram_bytes,
-                    right_row_bytes,
-                ))
-            } else {
-                None
-            };
-            match (next_left, next_right) {
-                (Some((left_gram, left_delta)), Some((right_gram, right_delta))) => {
-                    if left_gram == right_gram {
-                        let merged = left_delta + right_delta;
-                        if merged != 0 {
-                            write_df_count_delta_row(&mut writer, left_gram, merged, gram_bytes)?;
-                        }
-                        left_idx += 1;
-                        right_idx += 1;
-                    } else if left_gram < right_gram {
-                        write_df_count_delta_row(&mut writer, left_gram, left_delta, gram_bytes)?;
-                        left_idx += 1;
-                    } else {
-                        write_df_count_delta_row(&mut writer, right_gram, right_delta, gram_bytes)?;
-                        right_idx += 1;
-                    }
-                }
-                (Some((left_gram, left_delta)), None) => {
-                    write_df_count_delta_row(&mut writer, left_gram, left_delta, gram_bytes)?;
-                    left_idx += 1;
-                }
-                (None, Some((right_gram, right_delta))) => {
-                    write_df_count_delta_row(&mut writer, right_gram, right_delta, gram_bytes)?;
-                    right_idx += 1;
-                }
-                (None, None) => break,
-            }
-        }
-        profile.merge_write_us = elapsed_us(merge_write_started);
-        let flush_started = Instant::now();
-        writer.flush()?;
-        profile.flush_us = elapsed_us(flush_started);
-        let close_started = Instant::now();
-        let file = writer.into_inner().map_err(|err| {
-            SspryError::from(format!(
-                "Failed to finalize merged df_counts segment: {err}"
-            ))
-        })?;
-        drop(file);
-        profile.close_us = elapsed_us(close_started);
-    }
-
-    let rename_started = Instant::now();
-    fs::rename(&tmp_path, &segment_path)?;
-    profile.rename_us = elapsed_us(rename_started);
-    fs::remove_file(&left.path)?;
-    fs::remove_file(&right.path)?;
-    Ok((DfCountsSegment::load(segment_path, gram_bytes)?, profile))
-}
-
-fn write_df_count_row(
-    writer: &mut impl Write,
-    gram: u64,
-    count: usize,
-    gram_bytes: usize,
-) -> Result<()> {
-    writer.write_all(&gram.to_le_bytes()[..gram_bytes])?;
-    writer.write_all(&(count.min(u32::MAX as usize) as u32).to_le_bytes())?;
-    Ok(())
-}
-
-fn write_df_count_delta_row(
-    writer: &mut impl Write,
-    gram: u64,
-    change: i64,
-    gram_bytes: usize,
-) -> Result<()> {
-    writer.write_all(&gram.to_le_bytes()[..gram_bytes])?;
-    writer.write_all(&change.to_le_bytes())?;
-    Ok(())
-}
-
-fn read_df_count_delta_row(
-    bytes: &[u8],
-    row_idx: usize,
-    gram_bytes: usize,
-    row_bytes: usize,
-) -> (u64, i64) {
-    let start = row_idx * row_bytes;
-    let gram = decode_packed_exact_gram(&bytes[start..start + gram_bytes]);
-    let delta = i64::from_le_bytes(
-        bytes[start + gram_bytes..start + row_bytes]
-            .try_into()
-            .expect("df segment delta"),
-    );
-    (gram, delta)
-}
-
 fn append_u32(payload: &mut Vec<u8>, value: u32) {
     payload.extend_from_slice(&value.to_le_bytes());
 }
@@ -5210,61 +3833,21 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
     Ok(value)
 }
 
-fn current_df_counts_delta_bytes(root: &Path) -> u64 {
-    fs::metadata(df_counts_delta_path(root))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
-        .saturating_add(
-            fs::metadata(df_counts_unit_delta_path(root))
-                .map(|metadata| metadata.len())
-                .unwrap_or(0),
-        )
-}
-
-fn append_df_count_deltas_with_writer(
-    writer: &mut AppendFile,
-    gram_bytes: usize,
-    deltas: &[(u64, i32)],
-) -> Result<()> {
-    if deltas.is_empty() {
-        return Ok(());
-    }
-    let mut payload = Vec::with_capacity(deltas.len() * (gram_bytes + 4));
-    for (gram, delta) in deltas {
-        payload.extend_from_slice(&gram.to_le_bytes()[..gram_bytes]);
-        payload.extend_from_slice(&delta.to_le_bytes());
-    }
-    writer.append(&payload)?;
-    Ok(())
-}
-
-fn append_df_count_unit_payload_with_writer(writer: &mut AppendFile, payload: &[u8]) -> Result<()> {
-    if payload.is_empty() {
-        return Ok(());
-    }
-    writer.append(payload)?;
-    Ok(())
-}
-
-fn extend_unit_df_payload_from_values(payload: &mut Vec<u8>, grams: &[u64], gram_bytes: usize) {
-    payload.reserve(grams.len() * gram_bytes);
-    for gram in grams {
-        payload.extend_from_slice(&gram.to_le_bytes()[..gram_bytes]);
-    }
-}
-
 #[cfg(test)]
 fn append_u32_slice(path: PathBuf, values: &[u32]) -> Result<u64> {
-    let widened = values
-        .iter()
-        .map(|value| u64::from(*value))
-        .collect::<Vec<_>>();
-    append_exact_gram_slice(path, &widened, 4)
+    if values.is_empty() {
+        return Ok(0);
+    }
+    let mut payload = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    append_blob(path, &payload)
 }
 
 fn load_candidate_store_state(
     root: &Path,
-    meta: &StoreMeta,
+    _meta: &StoreMeta,
 ) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
     if binary_store_exists(root) {
         return load_candidate_binary_store(root);
@@ -5272,7 +3855,7 @@ fn load_candidate_store_state(
     let log_path = docs_log_path(root);
     if log_path.exists() {
         let docs = load_candidate_docs_log(&log_path)?;
-        let (rows, tier2_rows) = persist_docs_as_binary(root, &docs, meta.exact_gram_bytes())?;
+        let (rows, tier2_rows) = persist_docs_as_binary(root, &docs)?;
         let _ = fs::remove_file(log_path);
         let _ = fs::remove_file(docs_path(root));
         return Ok((legacy_docs_to_docs(&docs), rows, tier2_rows));
@@ -5288,7 +3871,7 @@ fn load_candidate_store_state(
                 root.display()
             ))
         })?;
-    let (rows, tier2_rows) = persist_docs_as_binary(root, &docs, meta.exact_gram_bytes())?;
+    let (rows, tier2_rows) = persist_docs_as_binary(root, &docs)?;
     let _ = fs::remove_file(legacy_path);
     Ok((legacy_docs_to_docs(&docs), rows, tier2_rows))
 }
@@ -5324,7 +3907,6 @@ fn binary_store_exists(root: &Path) -> bool {
 fn persist_docs_as_binary(
     root: &Path,
     docs: &[LegacyCandidateDoc],
-    gram_bytes: usize,
 ) -> Result<(Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
     fs::create_dir_all(root)?;
     let paths = [
@@ -5334,8 +3916,6 @@ fn persist_docs_as_binary(
         doc_metadata_path(root),
         blooms_path(root),
         tier2_blooms_path(root),
-        grams_received_path(root),
-        grams_indexed_path(root),
         external_ids_path(root),
     ];
     for path in &paths {
@@ -5367,24 +3947,10 @@ fn persist_docs_as_binary(
             bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset: append_blob(blooms_path(root), &bloom_bytes)?,
             bloom_len: bloom_bytes.len() as u32,
-            grams_received_offset: append_exact_gram_slice(
-                grams_received_path(root),
-                &doc.grams_received
-                    .iter()
-                    .map(|value| u64::from(*value))
-                    .collect::<Vec<_>>(),
-                gram_bytes,
-            )?,
-            grams_received_count: doc.grams_received.len() as u32,
-            grams_indexed_offset: append_exact_gram_slice(
-                grams_indexed_path(root),
-                &doc.grams_indexed
-                    .iter()
-                    .map(|value| u64::from(*value))
-                    .collect::<Vec<_>>(),
-                gram_bytes,
-            )?,
-            grams_indexed_count: doc.grams_indexed.len() as u32,
+            grams_received_offset: 0,
+            grams_received_count: 0,
+            grams_indexed_offset: 0,
+            grams_indexed_count: 0,
             external_id_offset: if let Some(external_id) = &doc.external_id {
                 append_blob(external_ids_path(root), external_id.as_bytes())?
             } else {
@@ -5414,8 +3980,6 @@ fn persist_docs_as_binary(
         rows.push(row);
         tier2_rows.push(tier2_row);
     }
-    let docs_view = legacy_docs_to_docs(docs);
-    persist_df_counts_snapshot_for_docs(root, &docs_view, docs, gram_bytes)?;
     Ok((rows, tier2_rows))
 }
 
@@ -5504,44 +4068,6 @@ fn read_u32_vec(
         out.push(u32::from_le_bytes(chunk.try_into().expect("u32 chunk")));
     }
     Ok(out)
-}
-
-fn read_exact_gram_vec_from_sidecar(
-    sidecar: &BlobSidecar,
-    offset: u64,
-    count: u32,
-    gram_bytes: usize,
-    label: &str,
-    doc_id: u64,
-) -> Result<Vec<u64>> {
-    let bytes = sidecar.read_bytes(offset, count as usize * gram_bytes, label, doc_id)?;
-    let mut out = Vec::with_capacity(count as usize);
-    for chunk in bytes.chunks_exact(gram_bytes) {
-        out.push(decode_packed_exact_gram(chunk));
-    }
-    Ok(out)
-}
-
-fn read_exact_gram_vec_from_path(
-    path: &Path,
-    offset: u64,
-    count: u32,
-    gram_bytes: usize,
-    label: &str,
-    doc_id: u64,
-) -> Result<Vec<u64>> {
-    let bytes = read_blob_from_path(path, offset, count as usize * gram_bytes, label, doc_id)?;
-    let mut out = Vec::with_capacity(count as usize);
-    for chunk in bytes.chunks_exact(gram_bytes) {
-        out.push(decode_packed_exact_gram(chunk));
-    }
-    Ok(out)
-}
-
-fn decode_packed_exact_gram(bytes: &[u8]) -> u64 {
-    let mut out = [0u8; 8];
-    out[..bytes.len()].copy_from_slice(bytes);
-    u64::from_le_bytes(out)
 }
 
 fn validate_config(config: &CandidateConfig) -> Result<()> {
@@ -6247,7 +4773,6 @@ rule q {
     $a
 }
 "#,
-            Some(&store.df_counts()),
             8,
             false,
             true,
@@ -7004,7 +5529,7 @@ rule q {
 
         let binary_root = tmp.path().join("binary_root");
         let (rows, tier2_rows) =
-            persist_docs_as_binary(&binary_root, &docs, 4).expect("persist binary");
+            persist_docs_as_binary(&binary_root, &docs).expect("persist binary");
         assert_eq!(rows.len(), 2);
         assert_eq!(tier2_rows.len(), 2);
         assert!(binary_store_exists(&binary_root));
@@ -7101,7 +5626,7 @@ rule q {
         )];
 
         let invalid_len_root = tmp.path().join("invalid_len_root");
-        persist_docs_as_binary(&invalid_len_root, &docs, 4).expect("persist invalid len root");
+        persist_docs_as_binary(&invalid_len_root, &docs).expect("persist invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
         assert!(
             load_candidate_binary_store(&invalid_len_root)
@@ -7111,7 +5636,7 @@ rule q {
         );
 
         let mismatch_root = tmp.path().join("mismatch_root");
-        persist_docs_as_binary(&mismatch_root, &docs, 4).expect("persist mismatch root");
+        persist_docs_as_binary(&mismatch_root, &docs).expect("persist mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
         assert!(
             load_candidate_binary_store(&mismatch_root)
@@ -7121,7 +5646,7 @@ rule q {
         );
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
-        persist_docs_as_binary(&invalid_bloom_root, &docs, 4).expect("persist invalid bloom root");
+        persist_docs_as_binary(&invalid_bloom_root, &docs).expect("persist invalid bloom root");
         let mut row =
             DocMetaRow::decode(&fs::read(doc_meta_path(&invalid_bloom_root)).expect("row"))
                 .expect("decode row");
@@ -7140,7 +5665,7 @@ rule q {
         );
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
-        persist_docs_as_binary(&invalid_utf8_root, &docs, 4).expect("persist invalid utf8 root");
+        persist_docs_as_binary(&invalid_utf8_root, &docs).expect("persist invalid utf8 root");
         fs::write(external_ids_path(&invalid_utf8_root), [0xFF, 0xFE]).expect("write bad utf8");
         fs::write(
             meta_path(&invalid_utf8_root),
@@ -7232,164 +5757,35 @@ rule q {
     }
 
     #[test]
-    fn df_counts_state_loads_snapshot_and_delta_variants() {
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path();
-        let gram_bytes = 4usize;
-        let gram_a = pack_exact_gram(&[1, 2, 3, 4]);
-        let gram_b = pack_exact_gram(&[5, 6, 7, 8]);
-        let gram_c = pack_exact_gram(&[9, 10, 11, 12]);
-
-        let packed = |gram: u64| gram.to_le_bytes()[..gram_bytes].to_vec();
-        let mut snapshot = Vec::new();
-        for (gram, count) in [(gram_a, 5u32), (gram_b, 2u32)] {
-            snapshot.extend_from_slice(&packed(gram));
-            snapshot.extend_from_slice(&count.to_le_bytes());
-        }
-        fs::write(df_counts_path(root), snapshot).expect("write snapshot");
-
-        let mut counted_delta = Vec::new();
-        for (gram, delta) in [(gram_a, -2i32), (gram_b, 4i32)] {
-            counted_delta.extend_from_slice(&packed(gram));
-            counted_delta.extend_from_slice(&delta.to_le_bytes());
-        }
-        fs::write(df_counts_delta_path(root), counted_delta).expect("write counted delta");
-
-        let mut unit_delta = Vec::new();
-        unit_delta.extend_from_slice(&packed(gram_b));
-        unit_delta.extend_from_slice(&packed(gram_c));
-        fs::write(df_counts_unit_delta_path(root), unit_delta).expect("write unit delta");
-
-        let mut state = DfCountsState::load(root, gram_bytes).expect("load state");
-        assert_eq!(state.snapshot_count(gram_a), 5);
-        assert_eq!(state.snapshot_count(gram_c), 0);
-        assert_eq!(state.get(gram_a), 3);
-        assert_eq!(state.get(gram_b), 7);
-        assert_eq!(state.get(gram_c), 1);
-        assert_eq!(
-            state.get_many(&[gram_a, gram_b, gram_c]),
-            HashMap::from([(gram_a, 3usize), (gram_b, 7usize), (gram_c, 1usize)])
-        );
-        assert_eq!(
-            state.get_many_sorted_counts(&[gram_a, gram_b, gram_c]),
-            vec![3, 7, 1]
-        );
-        let (profiled_counts, profiled) =
-            state.get_many_sorted_counts_profiled(&[gram_a, gram_b, gram_c]);
-        assert_eq!(profiled_counts, vec![3, 7, 1]);
-        assert!(profiled.snapshot_rows_examined > 0);
-        assert_eq!(profiled.snapshot_point_lookups, 0);
-        assert_eq!(profiled.segment_visits, 0);
-        assert_eq!(profiled.segment_point_lookups, 0);
-        assert_eq!(profiled.delta_lookups, 3);
-        assert_eq!(
-            state.materialize(),
-            HashMap::from([(gram_a, 3usize), (gram_b, 7usize), (gram_c, 1usize)])
-        );
-        assert_eq!(state.unique_count_hint(), 5);
-
-        state.apply_deltas(&[(gram_a, -3), (gram_c, -1), (gram_b, 0)]);
-        state.apply_unit_deltas(&[gram_b, gram_b]);
-        assert_eq!(state.get(gram_a), 0);
-        assert_eq!(state.get(gram_b), 9);
-        assert_eq!(state.get(gram_c), 0);
-        assert_eq!(state.materialize(), HashMap::from([(gram_b, 9usize)]));
-        assert!(is_strictly_sorted_unique(&[gram_a, gram_b, gram_c]));
-        assert!(!is_strictly_sorted_unique(&[gram_a, gram_a]));
-        assert!(!is_strictly_sorted_unique(&[gram_b, gram_a]));
-
-        let mut refreshed_snapshot = Vec::new();
-        refreshed_snapshot.extend_from_slice(&packed(gram_c));
-        refreshed_snapshot.extend_from_slice(&11u32.to_le_bytes());
-        fs::write(df_counts_path(root), refreshed_snapshot).expect("rewrite snapshot");
-        fs::write(df_counts_delta_path(root), Vec::new()).expect("clear counted delta");
-        fs::write(df_counts_unit_delta_path(root), Vec::new()).expect("clear unit delta");
-        state.refresh_snapshot(root).expect("refresh snapshot");
-        assert_eq!(state.get(gram_a), 0);
-        assert_eq!(state.get(gram_b), 0);
-        assert_eq!(state.get(gram_c), 11);
-        assert_eq!(state.unique_count_hint(), 1);
-
-        state.apply_deltas(&[(gram_a, 2), (gram_b, 1), (gram_c, -5)]);
-        persist_df_counts_state_snapshot_to_root(root, &state).expect("persist state snapshot");
-        let roundtrip = DfCountsState::load(root, gram_bytes).expect("reload roundtrip");
-        assert_eq!(roundtrip.get(gram_a), 2);
-        assert_eq!(roundtrip.get(gram_b), 1);
-        assert_eq!(roundtrip.get(gram_c), 6);
-        assert_eq!(roundtrip.delta.len(), 0);
-    }
-
-    #[test]
-    fn df_counts_profile_reports_segment_scan_and_point_lookup_modes() {
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path();
-        let gram_bytes = 4usize;
-        let mut state = DfCountsState {
-            gram_bytes,
-            snapshot: None,
-            snapshot_rows: 0,
-            segments: Vec::new(),
-            delta: FastHashMap::with_hasher(FxBuildHasher),
-        };
-
-        let small_a = pack_exact_gram(&[1, 0, 0, 0]);
-        let small_b = pack_exact_gram(&[2, 0, 0, 0]);
-        state.delta.insert(small_a, 1);
-        state.delta.insert(small_b, 1);
-        let (small_segment, _) =
-            flush_df_counts_delta_to_segment_profiled(root, &state).expect("flush small segment");
-        state.segments.push(small_segment);
-        state.delta.clear();
-
-        for idx in 0..64u8 {
-            state
-                .delta
-                .insert(pack_exact_gram(&[128 + idx, 0, 0, 0]), 1);
-        }
-        let query = pack_exact_gram(&[160, 0, 0, 0]);
-        let (large_segment, _) =
-            flush_df_counts_delta_to_segment_profiled(root, &state).expect("flush large segment");
-        state.segments.push(large_segment);
-        state.delta.clear();
-        state.delta.insert(query, 1);
-
-        let (counts, profile) = state.get_many_sorted_counts_profiled(&[query]);
-        assert_eq!(counts, vec![2]);
-        assert_eq!(profile.segment_visits, 2);
-        assert!(profile.segment_rows_examined > 0);
-        assert!(profile.segment_point_lookups > 0);
-        assert_eq!(profile.delta_lookups, 1);
-    }
-
-    #[test]
     fn sidecar_and_append_helper_paths_work() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("root");
         fs::create_dir_all(&root).expect("create root");
 
-        fs::write(grams_received_path(&root), b"abcdef").expect("write grams_received");
+        let first_blob_path = tmp.path().join("blob_first.bin");
+        fs::write(&first_blob_path, b"abcdef").expect("write first blob");
         fs::write(doc_metadata_path(&root), b"meta").expect("write metadata");
 
-        let mut sidecar = BlobSidecar::new(grams_received_path(&root));
+        let mut sidecar = BlobSidecar::new(first_blob_path.clone());
         sidecar.map_if_exists().expect("map sidecar");
         assert_eq!(
             sidecar
-                .read_bytes(1, 3, "grams", 7)
+                .read_bytes(1, 3, "blob", 7)
                 .expect("mmap read")
                 .as_ref(),
             b"bcd"
         );
         assert!(
             sidecar
-                .read_bytes(99, 1, "grams", 7)
+                .read_bytes(99, 1, "blob", 7)
                 .expect_err("invalid range")
                 .to_string()
-                .contains("Invalid grams payload stored")
+                .contains("Invalid blob payload stored")
         );
         sidecar.invalidate();
         assert_eq!(
             sidecar
-                .read_bytes(0, 2, "grams", 7)
+                .read_bytes(0, 2, "blob", 7)
                 .expect("file read")
                 .as_ref(),
             b"ab"
@@ -7397,12 +5793,14 @@ rule q {
 
         let other_root = tmp.path().join("other");
         fs::create_dir_all(&other_root).expect("create other root");
-        fs::write(grams_received_path(&other_root), b"xyz").expect("write retarget grams");
-        sidecar.retarget(grams_received_path(&other_root));
+        fs::write(doc_metadata_path(&other_root), b"xyz").expect("write other metadata");
+        let second_blob_path = tmp.path().join("blob_second.bin");
+        fs::write(&second_blob_path, b"xyz").expect("write second blob");
+        sidecar.retarget(second_blob_path.clone());
         sidecar.map_if_exists().expect("remap sidecar");
         assert_eq!(
             sidecar
-                .read_bytes(0, 3, "grams", 8)
+                .read_bytes(0, 3, "blob", 8)
                 .expect("retarget read")
                 .as_ref(),
             b"xyz"
@@ -7422,9 +5820,9 @@ rule q {
         sidecars.refresh_maps().expect("refresh retargeted maps");
         assert_eq!(
             sidecars
-                .grams_received
-                .read_bytes(0, 3, "grams", 10)
-                .expect("retargeted store sidecar")
+                .metadata
+                .read_bytes(0, 3, "metadata", 10)
+                .expect("retargeted store metadata sidecar")
                 .as_ref(),
             b"xyz"
         );
@@ -7451,42 +5849,7 @@ rule q {
         let mut writers = StoreAppendWriters::new(&root).expect("append writers");
         writers.retarget_root(&other_root);
         assert_eq!(writers.metadata.path, doc_metadata_path(&other_root));
-        assert_eq!(
-            writers.df_counts_unit_delta.path,
-            df_counts_unit_delta_path(&other_root)
-        );
-    }
-
-    #[test]
-    fn df_counts_state_rejects_invalid_snapshot_and_delta_shapes() {
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path();
-
-        fs::write(df_counts_path(root), [1u8, 2, 3]).expect("write invalid snapshot");
-        assert!(
-            DfCountsState::load(root, 4)
-                .expect_err("invalid snapshot size")
-                .to_string()
-                .contains("Invalid df_counts snapshot")
-        );
-
-        fs::write(df_counts_path(root), Vec::<u8>::new()).expect("clear snapshot");
-        fs::write(df_counts_delta_path(root), [1u8, 2, 3]).expect("write invalid delta");
-        assert!(
-            DfCountsState::load(root, 4)
-                .expect_err("invalid delta size")
-                .to_string()
-                .contains("Invalid df_counts delta")
-        );
-
-        fs::write(df_counts_delta_path(root), Vec::<u8>::new()).expect("clear delta");
-        fs::write(df_counts_unit_delta_path(root), [1u8, 2, 3]).expect("write invalid unit");
-        assert!(
-            DfCountsState::load(root, 4)
-                .expect_err("invalid unit delta size")
-                .to_string()
-                .contains("Invalid df_counts unit delta")
-        );
+        assert_eq!(writers.external_ids.path, external_ids_path(&other_root));
     }
 
     #[test]
@@ -8416,26 +6779,6 @@ rule q {
     }
 
     #[test]
-    fn df_counts_delta_compaction_threshold_respects_memory_budget_and_shards() {
-        assert_eq!(
-            df_counts_delta_compact_threshold_bytes(16 * 1024 * 1024 * 1024, 256),
-            4 * 1024 * 1024
-        );
-        assert_eq!(
-            df_counts_delta_compact_threshold_bytes(0, 0),
-            DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES
-        );
-        assert_eq!(
-            df_counts_delta_compact_threshold_bytes(1024 * 1024 * 1024, 256),
-            MIN_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES
-        );
-        assert_eq!(
-            df_counts_delta_compact_threshold_bytes(512 * 1024 * 1024 * 1024, 1),
-            MAX_DF_COUNTS_DELTA_COMPACT_THRESHOLD_BYTES
-        );
-    }
-
-    #[test]
     fn tier2_superblock_memory_budget_respects_memory_budget_and_divisor() {
         assert_eq!(
             tier2_superblock_memory_budget_bytes(16 * 1024 * 1024 * 1024, 256, 4),
@@ -8469,7 +6812,7 @@ rule q {
     }
 
     #[test]
-    fn apply_runtime_limits_updates_df_counts_threshold_and_stats() {
+    fn apply_runtime_limits_updates_tier2_budget_stats() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let mut store = CandidateStore::init(
@@ -8486,150 +6829,8 @@ rule q {
             .expect("apply runtime limits");
 
         let stats = store.stats();
-        assert_eq!(stats.df_counts_delta_entries, 0);
-        assert_eq!(stats.df_counts_delta_bytes, 0);
-        assert_eq!(stats.df_counts_segment_count, 0);
-        assert_eq!(stats.df_counts_segment_bytes, 0);
-        assert_eq!(stats.df_counts_delta_estimated_memory_bytes, 0);
-        assert_eq!(
-            stats.df_counts_delta_compact_threshold_bytes,
-            4 * 1024 * 1024
-        );
         assert_eq!(stats.tier2_superblock_memory_budget_bytes, 16 * 1024 * 1024);
         assert_eq!(stats.tier2_superblock_summary_bytes, 0);
-    }
-
-    #[test]
-    fn maybe_compact_df_counts_reports_checked_bytes_and_clears_delta_files() {
-        fn make_doc(
-            store: &CandidateStore,
-            file_size: u64,
-            sha_byte: u8,
-            gram: u64,
-        ) -> ([u8; 32], Vec<u64>, usize, usize, Vec<u8>) {
-            let grams = vec![gram];
-            let filter_bytes = store
-                .resolve_filter_bytes_for_file_size(file_size, Some(grams.len()))
-                .expect("filter bytes");
-            let bloom_hashes =
-                store.resolve_bloom_hashes_for_document(filter_bytes, Some(grams.len()), None);
-            let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
-            for value in &grams {
-                bloom.add(*value).expect("add gram");
-            }
-            (
-                [sha_byte; 32],
-                grams,
-                filter_bytes,
-                bloom_hashes,
-                bloom.into_bytes(),
-            )
-        }
-
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path().join("store");
-        let mut store = CandidateStore::init(
-            CandidateConfig {
-                root: root.clone(),
-                ..CandidateConfig::default()
-            },
-            true,
-        )
-        .expect("init");
-
-        let file_size = 4096u64;
-        let (_sha256, grams, _filter_bytes, _bloom_hashes, _bloom_bytes) =
-            make_doc(&store, file_size, 0x41, pack_exact_gram(&[1, 2, 3, 4]));
-        let mut payload = Vec::new();
-        extend_unit_df_payload_from_values(&mut payload, &grams, store.meta.exact_gram_bytes());
-        append_df_count_unit_payload_with_writer(&mut store.append_writers.df_counts_unit_delta, &payload)
-            .expect("append df payload");
-        store.df_counts.apply_unit_deltas(&grams);
-
-        let bytes_before = current_df_counts_delta_bytes(&root);
-        assert!(bytes_before > 0);
-
-        store.df_counts_delta_compact_threshold_bytes = 1;
-        let profile = store.maybe_compact_df_counts().expect("compact df counts");
-        assert_eq!(profile.checked_delta_bytes, bytes_before);
-        assert_eq!(current_df_counts_delta_bytes(&root), 0);
-        assert_eq!(store.df_counts.segment_count(), 1);
-        assert!(store.df_counts.segment_bytes() > 0);
-        assert_eq!(store.df_counts.get(pack_exact_gram(&[1, 2, 3, 4])), 1);
-    }
-
-    #[test]
-    fn maybe_compact_df_counts_uses_estimated_delta_memory_budget() {
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path().join("store");
-        let mut store = CandidateStore::init(
-            CandidateConfig {
-                root: root.clone(),
-                ..CandidateConfig::default()
-            },
-            true,
-        )
-        .expect("init");
-
-        let gram = pack_exact_gram(&[1, 2, 3, 4]);
-        store.df_counts.apply_unit_deltas(&[gram]);
-        let packed = gram.to_le_bytes()[..4].to_vec();
-        fs::write(df_counts_unit_delta_path(&root), packed).expect("write unit delta");
-        let bytes_before = current_df_counts_delta_bytes(&root);
-        assert!(bytes_before < DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES);
-
-        store.df_counts_delta_compact_threshold_bytes = (DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES
-            / DF_COUNTS_DELTA_ESTIMATED_MEMORY_COMPACT_MULTIPLIER)
-            .max(1)
-            - 1;
-        let profile = store.maybe_compact_df_counts().expect("compact by memory");
-        assert_eq!(profile.checked_delta_bytes, bytes_before);
-        assert_eq!(
-            profile.checked_delta_estimated_memory_bytes,
-            DF_COUNTS_DELTA_ENTRY_ESTIMATED_BYTES
-        );
-        assert_eq!(current_df_counts_delta_bytes(&root), 0);
-        assert_eq!(store.df_counts.delta.len(), 0);
-        assert_eq!(store.df_counts.segment_count(), 1);
-        assert_eq!(store.df_counts.get(gram), 1);
-    }
-
-    #[test]
-    fn persist_df_counts_snapshot_merges_segments_back_into_snapshot() {
-        let tmp = tempdir().expect("tmp");
-        let root = tmp.path().join("store");
-        let mut store = CandidateStore::init(
-            CandidateConfig {
-                root: root.clone(),
-                ..CandidateConfig::default()
-            },
-            true,
-        )
-        .expect("init");
-
-        let gram = pack_exact_gram(&[1, 2, 3, 4]);
-        store.df_counts.apply_unit_deltas(&[gram, gram]);
-        let packed = [
-            gram.to_le_bytes()[..4].to_vec(),
-            gram.to_le_bytes()[..4].to_vec(),
-        ]
-        .concat();
-        fs::write(df_counts_unit_delta_path(&root), packed).expect("write unit delta");
-        store.df_counts_delta_compact_threshold_bytes = 1;
-        store.maybe_compact_df_counts().expect("flush to segment");
-        assert_eq!(store.df_counts.segment_count(), 1);
-        store
-            .persist_df_counts_snapshot()
-            .expect("persist merged snapshot");
-        store
-            .df_counts
-            .refresh_snapshot(&root)
-            .expect("refresh state");
-        assert_eq!(store.df_counts.segment_count(), 0);
-        assert_eq!(store.df_counts.delta.len(), 0);
-        assert_eq!(store.df_counts.get(gram), 2);
-        assert!(!df_counts_segments_dir(&root).exists());
-        assert!(df_counts_path(&root).exists());
     }
 
     #[test]

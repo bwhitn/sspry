@@ -419,20 +419,15 @@ struct ServerState {
     index_session_server_insert_batch_store_classify_budget_us: AtomicU64,
     index_session_server_insert_batch_store_classify_binning_us: AtomicU64,
     index_session_server_insert_batch_store_classify_finalize_us: AtomicU64,
-    index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_assemble_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_us: AtomicU64,
-    index_session_server_insert_batch_store_append_grams_received_payload_us: AtomicU64,
-    index_session_server_insert_batch_store_append_grams_indexed_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_metadata_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_external_id_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_tier2_bloom_payload_us: AtomicU64,
     index_session_server_insert_batch_store_append_doc_row_build_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_bytes: AtomicU64,
-    index_session_server_insert_batch_store_append_grams_received_payload_bytes: AtomicU64,
-    index_session_server_insert_batch_store_append_grams_indexed_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_metadata_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_external_id_payload_bytes: AtomicU64,
     index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes: AtomicU64,
@@ -441,26 +436,6 @@ struct ServerState {
     index_session_server_insert_batch_store_install_docs_us: AtomicU64,
     index_session_server_insert_batch_store_tier2_update_us: AtomicU64,
     index_session_server_insert_batch_store_persist_meta_us: AtomicU64,
-    index_session_server_insert_batch_store_append_df_delta_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_check_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_checked_delta_bytes: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes:
-        AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us:
-        AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us:
-        AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us:
-        AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_flush_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_rename_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_close_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us:
-        AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_refresh_snapshot_us: AtomicU64,
-    index_session_server_insert_batch_store_compact_df_counts_reopen_writers_us: AtomicU64,
     index_session_server_insert_batch_store_rebalance_tier2_us: AtomicU64,
     last_publish_started_unix_ms: AtomicU64,
     last_publish_completed_unix_ms: AtomicU64,
@@ -470,34 +445,22 @@ struct ServerState {
     last_publish_promote_work_export_ms: AtomicU64,
     last_publish_promote_work_import_ms: AtomicU64,
     last_publish_promote_work_import_classify_ms: AtomicU64,
-    last_publish_promote_work_import_apply_df_counts_ms: AtomicU64,
     last_publish_promote_work_import_build_payloads_ms: AtomicU64,
     last_publish_promote_work_import_append_sidecars_ms: AtomicU64,
     last_publish_promote_work_import_install_docs_ms: AtomicU64,
     last_publish_promote_work_import_tier2_update_ms: AtomicU64,
     last_publish_promote_work_import_persist_meta_ms: AtomicU64,
-    last_publish_promote_work_import_append_df_delta_ms: AtomicU64,
-    last_publish_promote_work_import_compact_df_counts_ms: AtomicU64,
     last_publish_promote_work_import_rebalance_tier2_ms: AtomicU64,
     last_publish_promote_work_remove_work_root_ms: AtomicU64,
     last_publish_promote_work_other_ms: AtomicU64,
     last_publish_promote_work_imported_docs: AtomicU64,
     last_publish_promote_work_imported_shards: AtomicU64,
-    last_publish_persist_df_counts_ms: AtomicU64,
-    last_publish_df_snapshot_persist_failures: AtomicU64,
     last_publish_init_work_ms: AtomicU64,
     last_publish_persist_tier2_superblocks_ms: AtomicU64,
     last_publish_tier2_snapshot_persist_failures: AtomicU64,
     last_publish_persisted_snapshot_shards: AtomicU64,
     last_publish_reused_work_stores: AtomicBool,
     publish_runs_total: AtomicU64,
-    pending_published_df_snapshot_shards: Mutex<HashSet<usize>>,
-    published_df_snapshot_seal_in_progress: AtomicBool,
-    published_df_snapshot_seal_runs_total: AtomicU64,
-    last_published_df_snapshot_seal_duration_ms: AtomicU64,
-    last_published_df_snapshot_seal_persisted_shards: AtomicU64,
-    last_published_df_snapshot_seal_failures: AtomicU64,
-    last_published_df_snapshot_seal_completed_unix_ms: AtomicU64,
     pending_published_tier2_snapshot_shards: Mutex<HashSet<usize>>,
     published_tier2_snapshot_seal_in_progress: AtomicBool,
     published_tier2_snapshot_seal_runs_total: AtomicU64,
@@ -545,7 +508,6 @@ struct StoreRootStartupProfile {
     store_open_load_state_ms: u64,
     store_open_sidecars_ms: u64,
     store_open_rebuild_indexes_ms: u64,
-    store_open_rebuild_df_counts_ms: u64,
     store_open_rebuild_sha_index_ms: u64,
     store_open_load_tier2_superblocks_ms: u64,
     store_open_loaded_tier2_superblocks_from_snapshot_shards: u64,
@@ -579,7 +541,6 @@ struct PublishReadiness {
     work_buffer_rss_threshold_bytes: u64,
     current_rss_bytes: u64,
     pressure_publish_blocked_by_seal_backlog: bool,
-    pending_df_snapshot_shards: u64,
     pending_tier2_snapshot_shards: u64,
     index_backpressure_delay_ms: u64,
 }
@@ -595,7 +556,6 @@ struct WorkBufferPressure {
     pressure_triggered: bool,
     trigger_reason: &'static str,
     pressure_publish_blocked_by_seal_backlog: bool,
-    pending_df_snapshot_shards: u64,
     pending_tier2_snapshot_shards: u64,
     index_backpressure_delay_ms: u64,
 }
@@ -636,7 +596,6 @@ struct AdaptivePublishSnapshot {
     recent_submit_p95_ms: u64,
     recent_store_p95_ms: u64,
     recent_publishes_in_window: u64,
-    df_pending_shards: u64,
     tier2_pending_shards: u64,
     healthy_cycles: u64,
 }
@@ -650,7 +609,6 @@ struct AdaptivePublishState {
     recent_submit_ms: VecDeque<u64>,
     recent_store_ms: VecDeque<u64>,
     recent_publish_completed_unix_ms: VecDeque<u64>,
-    last_df_pending_shards: usize,
     last_tier2_pending_shards: usize,
     healthy_cycles: u64,
     mode: &'static str,
@@ -669,7 +627,6 @@ impl AdaptivePublishState {
             recent_publish_completed_unix_ms: VecDeque::with_capacity(
                 ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW,
             ),
-            last_df_pending_shards: 0,
             last_tier2_pending_shards: 0,
             healthy_cycles: 0,
             mode: "moderate",
@@ -726,7 +683,6 @@ impl AdaptivePublishState {
         &mut self,
         now_unix_ms: u64,
         visible_publish_ms: u64,
-        df_pending_shards: usize,
         tier2_pending_shards: usize,
     ) {
         Self::push_recent(
@@ -739,36 +695,23 @@ impl AdaptivePublishState {
             now_unix_ms,
             ADAPTIVE_PUBLISH_RECENT_PUBLISH_WINDOW,
         );
-        self.recompute(now_unix_ms, df_pending_shards, tier2_pending_shards);
+        self.recompute(now_unix_ms, tier2_pending_shards);
     }
 
-    fn update_seal_backlog(
-        &mut self,
-        now_unix_ms: u64,
-        df_pending_shards: usize,
-        tier2_pending_shards: usize,
-    ) {
-        self.recompute(now_unix_ms, df_pending_shards, tier2_pending_shards);
+    fn update_seal_backlog(&mut self, now_unix_ms: u64, tier2_pending_shards: usize) {
+        self.recompute(now_unix_ms, tier2_pending_shards);
     }
 
-    fn recompute(
-        &mut self,
-        now_unix_ms: u64,
-        df_pending_shards: usize,
-        tier2_pending_shards: usize,
-    ) {
+    fn recompute(&mut self, now_unix_ms: u64, tier2_pending_shards: usize) {
         let publish_p95_ms = Self::p95(&self.recent_publish_ms);
         let submit_p95_ms = Self::p95(&self.recent_submit_ms);
         let store_p95_ms = Self::p95(&self.recent_store_ms);
         let publish_rate = self.recent_publishes_in_window(now_unix_ms);
-        let backlog_rising = df_pending_shards > self.last_df_pending_shards
-            || tier2_pending_shards > self.last_tier2_pending_shards;
-        let backlog_present = df_pending_shards > 0 || tier2_pending_shards > 0;
-        let backlog_drained = !backlog_present
-            && (self.last_df_pending_shards > 0 || self.last_tier2_pending_shards > 0);
+        let backlog_rising = tier2_pending_shards > self.last_tier2_pending_shards;
+        let backlog_present = tier2_pending_shards > 0;
+        let backlog_drained = !backlog_present && self.last_tier2_pending_shards > 0;
         let one_shard_set = self.candidate_shards.max(1);
-        let backlog_high =
-            df_pending_shards >= one_shard_set || tier2_pending_shards >= one_shard_set;
+        let backlog_high = tier2_pending_shards >= one_shard_set;
 
         let (target_idle_ms, mode, reason) = if publish_p95_ms > ADAPTIVE_PUBLISH_BACKOFF_P95_MS
             || backlog_high
@@ -856,16 +799,10 @@ impl AdaptivePublishState {
         self.current_idle_ms = new_idle_ms.min(DEFAULT_AUTO_PUBLISH_IDLE_MS);
         self.mode = mode;
         self.reason = reason;
-        self.last_df_pending_shards = df_pending_shards;
         self.last_tier2_pending_shards = tier2_pending_shards;
     }
 
-    fn snapshot(
-        &self,
-        now_unix_ms: u64,
-        df_pending_shards: usize,
-        tier2_pending_shards: usize,
-    ) -> AdaptivePublishSnapshot {
+    fn snapshot(&self, now_unix_ms: u64, tier2_pending_shards: usize) -> AdaptivePublishSnapshot {
         AdaptivePublishSnapshot {
             storage_class: self.storage_class.clone(),
             current_idle_ms: self.current_idle_ms,
@@ -875,7 +812,6 @@ impl AdaptivePublishState {
             recent_submit_p95_ms: Self::p95(&self.recent_submit_ms),
             recent_store_p95_ms: Self::p95(&self.recent_store_ms),
             recent_publishes_in_window: self.recent_publishes_in_window(now_unix_ms),
-            df_pending_shards: df_pending_shards.try_into().unwrap_or(u64::MAX),
             tier2_pending_shards: tier2_pending_shards.try_into().unwrap_or(u64::MAX),
             healthy_cycles: self.healthy_cycles,
         }
@@ -1308,7 +1244,6 @@ pub fn serve_with_signal_flags(
     let state = Arc::new(ServerState::new(config, shutdown)?);
     let compaction_worker = start_compaction_worker(state.clone());
     let auto_publish_worker = start_auto_publish_worker(state.clone());
-    let published_df_snapshot_seal_worker = start_published_df_snapshot_seal_worker(state.clone());
     let published_tier2_snapshot_seal_worker =
         start_published_tier2_snapshot_seal_worker(state.clone());
     let status_worker = start_status_dump_worker(state.clone(), status_dump);
@@ -1354,7 +1289,6 @@ pub fn serve_with_signal_flags(
     }
     let _ = compaction_worker.join();
     let _ = auto_publish_worker.join();
-    let _ = published_df_snapshot_seal_worker.join();
     let _ = published_tier2_snapshot_seal_worker.join();
     let mut last_reported_connections = usize::MAX;
     while state.active_connections.load(Ordering::Acquire) > 0 {
@@ -1418,30 +1352,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.retired_generation_count)
         .sum::<usize>();
-    let df_counts_delta_bytes = stats_rows
-        .iter()
-        .map(|item| item.df_counts_delta_bytes)
-        .sum::<u64>();
-    let df_counts_delta_entries = stats_rows
-        .iter()
-        .map(|item| item.df_counts_delta_entries)
-        .sum::<usize>();
-    let df_counts_segment_count = stats_rows
-        .iter()
-        .map(|item| item.df_counts_segment_count)
-        .sum::<usize>();
-    let df_counts_segment_bytes = stats_rows
-        .iter()
-        .map(|item| item.df_counts_segment_bytes)
-        .sum::<u64>();
-    let df_counts_delta_estimated_memory_bytes = stats_rows
-        .iter()
-        .map(|item| item.df_counts_delta_estimated_memory_bytes)
-        .sum::<u64>();
-    let df_counts_delta_compact_threshold_bytes = stats_rows
-        .iter()
-        .map(|item| item.df_counts_delta_compact_threshold_bytes)
-        .sum::<u64>();
     let tier2_superblock_summary_bytes = stats_rows
         .iter()
         .map(|item| item.tier2_superblock_summary_bytes)
@@ -1470,32 +1380,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert("id_source".to_owned(), json!(stats.id_source));
     out.insert("store_path".to_owned(), json!(stats.store_path));
     out.insert("deleted_doc_count".to_owned(), json!(deleted_doc_count));
-    out.insert("df_max".to_owned(), json!(stats.df_max));
-    out.insert("df_min".to_owned(), json!(stats.df_min));
-    out.insert(
-        "df_counts_delta_bytes".to_owned(),
-        json!(df_counts_delta_bytes),
-    );
-    out.insert(
-        "df_counts_delta_entries".to_owned(),
-        json!(df_counts_delta_entries),
-    );
-    out.insert(
-        "df_counts_segment_count".to_owned(),
-        json!(df_counts_segment_count),
-    );
-    out.insert(
-        "df_counts_segment_bytes".to_owned(),
-        json!(df_counts_segment_bytes),
-    );
-    out.insert(
-        "df_counts_delta_estimated_memory_bytes".to_owned(),
-        json!(df_counts_delta_estimated_memory_bytes),
-    );
-    out.insert(
-        "df_counts_delta_compact_threshold_bytes".to_owned(),
-        json!(df_counts_delta_compact_threshold_bytes),
-    );
     out.insert(
         "tier2_superblock_summary_bytes".to_owned(),
         json!(tier2_superblock_summary_bytes),
@@ -1638,23 +1522,6 @@ fn start_auto_publish_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> 
             }
             let _ = state.run_auto_publish_cycle();
             let _ = state.run_retired_root_prune_cycle();
-        }
-    })
-}
-
-fn start_published_df_snapshot_seal_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        loop {
-            if state.is_shutting_down()
-                && state
-                    .pending_published_df_snapshot_shard_count()
-                    .unwrap_or(0)
-                    == 0
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-            let _ = state.run_published_df_snapshot_seal_cycle();
         }
     })
 }
@@ -1812,16 +1679,11 @@ impl ServerState {
             index_session_server_insert_batch_store_classify_budget_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_binning_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_classify_finalize_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_apply_df_counts_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_bloom_payload_assemble_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_bloom_payload_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_grams_received_payload_us:
+            index_session_server_insert_batch_store_append_bloom_payload_assemble_us:
                 AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_grams_indexed_payload_us: AtomicU64::new(
-                0,
-            ),
+            index_session_server_insert_batch_store_append_bloom_payload_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_metadata_payload_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_external_id_payload_us: AtomicU64::new(
                 0,
@@ -1831,11 +1693,9 @@ impl ServerState {
             ),
             index_session_server_insert_batch_store_append_doc_row_build_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_bloom_payload_bytes: AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_grams_received_payload_bytes:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_grams_indexed_payload_bytes:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_metadata_payload_bytes: AtomicU64::new(0),
+            index_session_server_insert_batch_store_append_metadata_payload_bytes: AtomicU64::new(
+                0,
+            ),
             index_session_server_insert_batch_store_append_external_id_payload_bytes:
                 AtomicU64::new(0),
             index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes:
@@ -1845,33 +1705,6 @@ impl ServerState {
             index_session_server_insert_batch_store_install_docs_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_tier2_update_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_persist_meta_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_append_df_delta_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_check_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_checked_delta_bytes:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_flush_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_rename_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_close_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_refresh_snapshot_us:
-                AtomicU64::new(0),
-            index_session_server_insert_batch_store_compact_df_counts_reopen_writers_us:
-                AtomicU64::new(0),
             index_session_server_insert_batch_store_rebalance_tier2_us: AtomicU64::new(0),
             last_publish_started_unix_ms: AtomicU64::new(0),
             last_publish_completed_unix_ms: AtomicU64::new(0),
@@ -1881,34 +1714,22 @@ impl ServerState {
             last_publish_promote_work_export_ms: AtomicU64::new(0),
             last_publish_promote_work_import_ms: AtomicU64::new(0),
             last_publish_promote_work_import_classify_ms: AtomicU64::new(0),
-            last_publish_promote_work_import_apply_df_counts_ms: AtomicU64::new(0),
             last_publish_promote_work_import_build_payloads_ms: AtomicU64::new(0),
             last_publish_promote_work_import_append_sidecars_ms: AtomicU64::new(0),
             last_publish_promote_work_import_install_docs_ms: AtomicU64::new(0),
             last_publish_promote_work_import_tier2_update_ms: AtomicU64::new(0),
             last_publish_promote_work_import_persist_meta_ms: AtomicU64::new(0),
-            last_publish_promote_work_import_append_df_delta_ms: AtomicU64::new(0),
-            last_publish_promote_work_import_compact_df_counts_ms: AtomicU64::new(0),
             last_publish_promote_work_import_rebalance_tier2_ms: AtomicU64::new(0),
             last_publish_promote_work_remove_work_root_ms: AtomicU64::new(0),
             last_publish_promote_work_other_ms: AtomicU64::new(0),
             last_publish_promote_work_imported_docs: AtomicU64::new(0),
             last_publish_promote_work_imported_shards: AtomicU64::new(0),
-            last_publish_persist_df_counts_ms: AtomicU64::new(0),
-            last_publish_df_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_init_work_ms: AtomicU64::new(0),
             last_publish_persist_tier2_superblocks_ms: AtomicU64::new(0),
             last_publish_tier2_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_persisted_snapshot_shards: AtomicU64::new(0),
             last_publish_reused_work_stores: AtomicBool::new(false),
             publish_runs_total: AtomicU64::new(0),
-            pending_published_df_snapshot_shards: Mutex::new(HashSet::new()),
-            published_df_snapshot_seal_in_progress: AtomicBool::new(false),
-            published_df_snapshot_seal_runs_total: AtomicU64::new(0),
-            last_published_df_snapshot_seal_duration_ms: AtomicU64::new(0),
-            last_published_df_snapshot_seal_persisted_shards: AtomicU64::new(0),
-            last_published_df_snapshot_seal_failures: AtomicU64::new(0),
-            last_published_df_snapshot_seal_completed_unix_ms: AtomicU64::new(0),
             pending_published_tier2_snapshot_shards: Mutex::new(HashSet::new()),
             published_tier2_snapshot_seal_in_progress: AtomicBool::new(false),
             published_tier2_snapshot_seal_runs_total: AtomicU64::new(0),
@@ -2088,7 +1909,6 @@ impl ServerState {
     fn work_buffer_pressure_snapshot(
         &self,
         current_rss_bytes: u64,
-        pending_df_snapshot_shards: u64,
         pending_tier2_snapshot_shards: u64,
     ) -> WorkBufferPressure {
         let estimated_documents = self.work_active_estimated_documents.load(Ordering::Acquire);
@@ -2112,8 +1932,7 @@ impl ServerState {
             );
         }
         let rss_threshold_bytes = self.work_buffer_rss_threshold_bytes();
-        let pressure_publish_blocked_by_seal_backlog =
-            pending_df_snapshot_shards > 0 || pending_tier2_snapshot_shards > 0;
+        let pressure_publish_blocked_by_seal_backlog = pending_tier2_snapshot_shards > 0;
         let pressure_triggered = estimated_documents >= document_threshold
             || estimated_input_bytes >= input_bytes_threshold
             || current_rss_bytes >= rss_threshold_bytes;
@@ -2155,7 +1974,6 @@ impl ServerState {
             pressure_triggered,
             trigger_reason,
             pressure_publish_blocked_by_seal_backlog,
-            pending_df_snapshot_shards,
             pending_tier2_snapshot_shards,
             index_backpressure_delay_ms,
         }
@@ -2195,7 +2013,6 @@ impl ServerState {
                 .saturating_mul(1024)
                 .try_into()
                 .unwrap_or(u64::MAX),
-            adaptive.df_pending_shards,
             adaptive.tier2_pending_shards,
         );
         pressure.estimated_documents = pressure
@@ -2234,28 +2051,6 @@ impl ServerState {
         thread::sleep(Duration::from_millis(delay_ms));
     }
 
-    fn enqueue_published_df_snapshot_shards<I>(&self, shard_indexes: I) -> Result<()>
-    where
-        I: IntoIterator<Item = usize>,
-    {
-        let mut pending = self
-            .pending_published_df_snapshot_shards
-            .lock()
-            .map_err(|_| SspryError::from("Published DF snapshot queue lock poisoned."))?;
-        for shard_idx in shard_indexes {
-            pending.insert(shard_idx);
-        }
-        Ok(())
-    }
-
-    fn pending_published_df_snapshot_shard_count(&self) -> Result<usize> {
-        let pending = self
-            .pending_published_df_snapshot_shards
-            .lock()
-            .map_err(|_| SspryError::from("Published DF snapshot queue lock poisoned."))?;
-        Ok(pending.len())
-    }
-
     fn enqueue_published_tier2_snapshot_shards<I>(&self, shard_indexes: I) -> Result<()>
     where
         I: IntoIterator<Item = usize>,
@@ -2279,13 +2074,12 @@ impl ServerState {
     }
 
     fn adaptive_publish_snapshot(&self, now_unix_ms: u64) -> Result<AdaptivePublishSnapshot> {
-        let df_pending_shards = self.pending_published_df_snapshot_shard_count()?;
         let tier2_pending_shards = self.pending_published_tier2_snapshot_shard_count()?;
         let adaptive = self
             .adaptive_publish
             .lock()
             .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
-        Ok(adaptive.snapshot(now_unix_ms, df_pending_shards, tier2_pending_shards))
+        Ok(adaptive.snapshot(now_unix_ms, tier2_pending_shards))
     }
 
     fn adaptive_publish_snapshot_or_default(&self, now_unix_ms: u64) -> AdaptivePublishSnapshot {
@@ -2299,7 +2093,6 @@ impl ServerState {
                 recent_submit_p95_ms: 0,
                 recent_store_p95_ms: 0,
                 recent_publishes_in_window: 0,
-                df_pending_shards: 0,
                 tier2_pending_shards: 0,
                 healthy_cycles: 0,
             })
@@ -2323,96 +2116,23 @@ impl ServerState {
     }
 
     fn update_adaptive_publish_from_publish(&self, now_unix_ms: u64) -> Result<()> {
-        let df_pending_shards = self.pending_published_df_snapshot_shard_count()?;
         let tier2_pending_shards = self.pending_published_tier2_snapshot_shard_count()?;
         let visible_publish_ms = self.last_publish_duration_ms.load(Ordering::Acquire);
         let mut adaptive = self
             .adaptive_publish
             .lock()
             .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
-        adaptive.update_completed_publish(
-            now_unix_ms,
-            visible_publish_ms,
-            df_pending_shards,
-            tier2_pending_shards,
-        );
+        adaptive.update_completed_publish(now_unix_ms, visible_publish_ms, tier2_pending_shards);
         Ok(())
     }
 
     fn update_adaptive_publish_from_seal_backlog(&self, now_unix_ms: u64) -> Result<()> {
-        let df_pending_shards = self.pending_published_df_snapshot_shard_count()?;
         let tier2_pending_shards = self.pending_published_tier2_snapshot_shard_count()?;
         let mut adaptive = self
             .adaptive_publish
             .lock()
             .map_err(|_| SspryError::from("Adaptive publish state lock poisoned."))?;
-        adaptive.update_seal_backlog(now_unix_ms, df_pending_shards, tier2_pending_shards);
-        Ok(())
-    }
-
-    fn run_published_df_snapshot_seal_cycle(&self) -> Result<()> {
-        if self.publish_in_progress.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let shard_idx = {
-            let mut pending = self
-                .pending_published_df_snapshot_shards
-                .lock()
-                .map_err(|_| SspryError::from("Published DF snapshot queue lock poisoned."))?;
-            let Some(shard_idx) = pending.iter().next().copied() else {
-                return Ok(());
-            };
-            pending.remove(&shard_idx);
-            shard_idx
-        };
-
-        self.published_df_snapshot_seal_in_progress
-            .store(true, Ordering::SeqCst);
-        let started = Instant::now();
-        let result = (|| -> Result<(u64, u64)> {
-            let published = self.published_store_set()?;
-            let Some(store_lock) = published.stores.get(shard_idx) else {
-                return Ok((0, 0));
-            };
-            match store_lock.try_lock() {
-                Ok(mut store) => {
-                    store.seal_df_counts_snapshot_from_disk()?;
-                    Ok((1, 0))
-                }
-                Err(TryLockError::WouldBlock) => {
-                    self.enqueue_published_df_snapshot_shards([shard_idx])?;
-                    Ok((0, 0))
-                }
-                Err(TryLockError::Poisoned(_)) => {
-                    Err(SspryError::from("Candidate store lock poisoned."))
-                }
-            }
-        })();
-        self.published_df_snapshot_seal_in_progress
-            .store(false, Ordering::SeqCst);
-
-        let (persisted_shards, failures) = match result {
-            Ok(values) => values,
-            Err(_) => {
-                let _ = self.enqueue_published_df_snapshot_shards([shard_idx]);
-                (0, 1)
-            }
-        };
-        self.last_published_df_snapshot_seal_duration_ms.store(
-            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            Ordering::SeqCst,
-        );
-        self.last_published_df_snapshot_seal_persisted_shards
-            .store(persisted_shards, Ordering::SeqCst);
-        self.last_published_df_snapshot_seal_failures
-            .store(failures, Ordering::SeqCst);
-        if persisted_shards > 0 || failures > 0 {
-            self.published_df_snapshot_seal_runs_total
-                .fetch_add(1, Ordering::SeqCst);
-            self.last_published_df_snapshot_seal_completed_unix_ms
-                .store(current_unix_ms(), Ordering::SeqCst);
-        }
-        let _ = self.update_adaptive_publish_from_seal_backlog(current_unix_ms());
+        adaptive.update_seal_backlog(now_unix_ms, tier2_pending_shards);
         Ok(())
     }
 
@@ -2551,8 +2271,6 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_classify_finalize_us
                     .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_apply_df_counts_us
-                    .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecars_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecar_payloads_us
@@ -2560,10 +2278,6 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_append_bloom_payload_assemble_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_bloom_payload_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_append_grams_received_payload_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_append_grams_indexed_payload_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_metadata_payload_us
                     .store(0, Ordering::SeqCst);
@@ -2574,10 +2288,6 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_append_doc_row_build_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_bloom_payload_bytes
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_append_grams_received_payload_bytes
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_append_grams_indexed_payload_bytes
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_metadata_payload_bytes
                     .store(0, Ordering::SeqCst);
@@ -2594,36 +2304,6 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_tier2_update_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_persist_meta_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_append_df_delta_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_check_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_bytes
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_flush_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_rename_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_close_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_refresh_snapshot_us
-                    .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_compact_df_counts_reopen_writers_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_rebalance_tier2_us
                     .store(0, Ordering::SeqCst);
@@ -2764,8 +2444,6 @@ impl ServerState {
             .fetch_add(store_profile.classify_binning_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_classify_finalize_us
             .fetch_add(store_profile.classify_finalize_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_apply_df_counts_us
-            .fetch_add(store_profile.apply_df_counts_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecars_us
             .fetch_add(store_profile.append_sidecars_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecar_payloads_us
@@ -2777,16 +2455,6 @@ impl ServerState {
             );
         self.index_session_server_insert_batch_store_append_bloom_payload_us
             .fetch_add(store_profile.append_bloom_payload_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_append_grams_received_payload_us
-            .fetch_add(
-                store_profile.append_grams_received_payload_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_append_grams_indexed_payload_us
-            .fetch_add(
-                store_profile.append_grams_indexed_payload_us,
-                Ordering::SeqCst,
-            );
         self.index_session_server_insert_batch_store_append_metadata_payload_us
             .fetch_add(store_profile.append_metadata_payload_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_external_id_payload_us
@@ -2803,16 +2471,6 @@ impl ServerState {
             .fetch_add(store_profile.append_doc_row_build_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_bloom_payload_bytes
             .fetch_add(store_profile.append_bloom_payload_bytes, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_append_grams_received_payload_bytes
-            .fetch_add(
-                store_profile.append_grams_received_payload_bytes,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_append_grams_indexed_payload_bytes
-            .fetch_add(
-                store_profile.append_grams_indexed_payload_bytes,
-                Ordering::SeqCst,
-            );
         self.index_session_server_insert_batch_store_append_metadata_payload_bytes
             .fetch_add(
                 store_profile.append_metadata_payload_bytes,
@@ -2838,72 +2496,6 @@ impl ServerState {
             .fetch_add(store_profile.tier2_update_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_persist_meta_us
             .fetch_add(store_profile.persist_meta_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_append_df_delta_us
-            .fetch_add(store_profile.append_df_delta_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_compact_df_counts_us
-            .fetch_add(store_profile.compact_df_counts_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_compact_df_counts_check_us
-            .fetch_add(store_profile.compact_df_counts_check_us, Ordering::SeqCst);
-        self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_bytes
-            .fetch_max(
-                store_profile.compact_df_counts_checked_delta_bytes,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes
-            .fetch_max(
-                store_profile.compact_df_counts_checked_delta_estimated_memory_bytes,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_collect_delta_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_sort_delta_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_merge_write_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_flush_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_flush_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_rename_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_rename_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_close_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_close_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us
-            .fetch_add(
-                store_profile.compact_df_counts_persist_snapshot_clear_delta_files_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_refresh_snapshot_us
-            .fetch_add(
-                store_profile.compact_df_counts_refresh_snapshot_us,
-                Ordering::SeqCst,
-            );
-        self.index_session_server_insert_batch_store_compact_df_counts_reopen_writers_us
-            .fetch_add(
-                store_profile.compact_df_counts_reopen_writers_us,
-                Ordering::SeqCst,
-            );
         self.index_session_server_insert_batch_store_rebalance_tier2_us
             .fetch_add(store_profile.rebalance_tier2_us, Ordering::SeqCst);
     }
@@ -2997,10 +2589,6 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_classify_finalize_us.load(Ordering::Acquire),
             ),
             (
-                "store_apply_df_counts_us",
-                self.index_session_server_insert_batch_store_apply_df_counts_us.load(Ordering::Acquire),
-            ),
-            (
                 "store_append_sidecars_us",
                 self.index_session_server_insert_batch_store_append_sidecars_us.load(Ordering::Acquire),
             ),
@@ -3015,14 +2603,6 @@ impl ServerState {
             (
                 "store_append_bloom_payload_us",
                 self.index_session_server_insert_batch_store_append_bloom_payload_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_append_grams_received_payload_us",
-                self.index_session_server_insert_batch_store_append_grams_received_payload_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_append_grams_indexed_payload_us",
-                self.index_session_server_insert_batch_store_append_grams_indexed_payload_us.load(Ordering::Acquire),
             ),
             (
                 "store_append_metadata_payload_us",
@@ -3043,14 +2623,6 @@ impl ServerState {
             (
                 "store_append_bloom_payload_bytes",
                 self.index_session_server_insert_batch_store_append_bloom_payload_bytes.load(Ordering::Acquire),
-            ),
-            (
-                "store_append_grams_received_payload_bytes",
-                self.index_session_server_insert_batch_store_append_grams_received_payload_bytes.load(Ordering::Acquire),
-            ),
-            (
-                "store_append_grams_indexed_payload_bytes",
-                self.index_session_server_insert_batch_store_append_grams_indexed_payload_bytes.load(Ordering::Acquire),
             ),
             (
                 "store_append_metadata_payload_bytes",
@@ -3085,66 +2657,6 @@ impl ServerState {
                 self.index_session_server_insert_batch_store_persist_meta_us.load(Ordering::Acquire),
             ),
             (
-                "store_append_df_delta_us",
-                self.index_session_server_insert_batch_store_append_df_delta_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_check_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_check_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_checked_delta_bytes",
-                self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_bytes.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_checked_delta_estimated_memory_bytes",
-                self.index_session_server_insert_batch_store_compact_df_counts_checked_delta_estimated_memory_bytes.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_collect_delta_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_collect_delta_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_sort_delta_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_sort_delta_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_merge_write_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_merge_write_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_flush_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_flush_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_rename_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_rename_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_close_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_close_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_persist_snapshot_clear_delta_files_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_persist_snapshot_clear_delta_files_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_refresh_snapshot_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_refresh_snapshot_us.load(Ordering::Acquire),
-            ),
-            (
-                "store_compact_df_counts_reopen_writers_us",
-                self.index_session_server_insert_batch_store_compact_df_counts_reopen_writers_us.load(Ordering::Acquire),
-            ),
-            (
                 "store_rebalance_tier2_us",
                 self.index_session_server_insert_batch_store_rebalance_tier2_us.load(Ordering::Acquire),
             ),
@@ -3176,7 +2688,6 @@ impl ServerState {
                 .saturating_mul(1024)
                 .try_into()
                 .unwrap_or(u64::MAX),
-            adaptive.df_pending_shards,
             adaptive.tier2_pending_shards,
         );
         let pressure_eligible = ENABLE_PRESSURE_PUBLISH
@@ -3256,7 +2767,6 @@ impl ServerState {
             current_rss_bytes: pressure.current_rss_bytes,
             pressure_publish_blocked_by_seal_backlog: pressure
                 .pressure_publish_blocked_by_seal_backlog,
-            pending_df_snapshot_shards: pressure.pending_df_snapshot_shards,
             pending_tier2_snapshot_shards: pressure.pending_tier2_snapshot_shards,
             index_backpressure_delay_ms: pressure.index_backpressure_delay_ms,
         }
@@ -3408,7 +2918,6 @@ impl ServerState {
                 "recent_submit_p95_ms": adaptive.recent_submit_p95_ms,
                 "recent_store_p95_ms": adaptive.recent_store_p95_ms,
                 "recent_publishes_in_window": adaptive.recent_publishes_in_window,
-                "df_pending_shards": adaptive.df_pending_shards,
                 "tier2_pending_shards": adaptive.tier2_pending_shards,
                 "healthy_cycles": adaptive.healthy_cycles,
             }),
@@ -3538,7 +3047,6 @@ impl ServerState {
                 "store_open_load_state_ms": profile.store_open_load_state_ms,
                 "store_open_sidecars_ms": profile.store_open_sidecars_ms,
                 "store_open_rebuild_indexes_ms": profile.store_open_rebuild_indexes_ms,
-                "store_open_rebuild_df_counts_ms": profile.store_open_rebuild_df_counts_ms,
                 "store_open_rebuild_sha_index_ms": profile.store_open_rebuild_sha_index_ms,
                 "store_open_load_tier2_superblocks_ms": profile.store_open_load_tier2_superblocks_ms,
                 "store_open_loaded_tier2_superblocks_from_snapshot_shards": profile.store_open_loaded_tier2_superblocks_from_snapshot_shards,
@@ -3681,10 +3189,6 @@ impl ServerState {
                 json!(readiness.pressure_publish_blocked_by_seal_backlog),
             );
             publish.insert(
-                "pending_df_snapshot_shards".to_owned(),
-                json!(readiness.pending_df_snapshot_shards),
-            );
-            publish.insert(
                 "pending_tier2_snapshot_shards".to_owned(),
                 json!(readiness.pending_tier2_snapshot_shards),
             );
@@ -3718,10 +3222,6 @@ impl ServerState {
             publish.insert(
                 "adaptive_recent_publishes_in_window".to_owned(),
                 json!(adaptive.recent_publishes_in_window),
-            );
-            publish.insert(
-                "adaptive_df_pending_shards".to_owned(),
-                json!(adaptive.df_pending_shards),
             );
             publish.insert(
                 "adaptive_tier2_pending_shards".to_owned(),
@@ -3821,13 +3321,6 @@ impl ServerState {
                 ),
             );
             publish.insert(
-                "last_publish_promote_work_import_apply_df_counts_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_apply_df_counts_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
                 "last_publish_promote_work_import_build_payloads_ms".to_owned(),
                 json!(
                     self.last_publish_promote_work_import_build_payloads_ms
@@ -3859,20 +3352,6 @@ impl ServerState {
                 "last_publish_promote_work_import_persist_meta_ms".to_owned(),
                 json!(
                     self.last_publish_promote_work_import_persist_meta_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
-                "last_publish_promote_work_import_append_df_delta_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_append_df_delta_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
-                "last_publish_promote_work_import_compact_df_counts_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_compact_df_counts_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -3912,20 +3391,6 @@ impl ServerState {
                 ),
             );
             publish.insert(
-                "last_publish_persist_df_counts_ms".to_owned(),
-                json!(
-                    self.last_publish_persist_df_counts_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
-                "last_publish_df_snapshot_persist_failures".to_owned(),
-                json!(
-                    self.last_publish_df_snapshot_persist_failures
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
                 "last_publish_init_work_ms".to_owned(),
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
             );
@@ -3961,18 +3426,6 @@ impl ServerState {
             publish.insert("observed_at_unix_ms".to_owned(), json!(now_unix_ms));
             stats.insert("work".to_owned(), Value::Object(work_stats));
             stats.insert("publish".to_owned(), Value::Object(publish));
-            stats.insert(
-                "published_df_snapshot_seal".to_owned(),
-                json!({
-                    "pending_shards": self.pending_published_df_snapshot_shard_count().unwrap_or(0),
-                    "in_progress": self.published_df_snapshot_seal_in_progress.load(Ordering::Acquire),
-                    "runs_total": self.published_df_snapshot_seal_runs_total.load(Ordering::Acquire),
-                    "last_duration_ms": self.last_published_df_snapshot_seal_duration_ms.load(Ordering::Acquire),
-                    "last_persisted_shards": self.last_published_df_snapshot_seal_persisted_shards.load(Ordering::Acquire),
-                    "last_failures": self.last_published_df_snapshot_seal_failures.load(Ordering::Acquire),
-                    "last_completed_unix_ms": self.last_published_df_snapshot_seal_completed_unix_ms.load(Ordering::Acquire),
-                }),
-            );
             stats.insert(
                 "published_tier2_snapshot_seal".to_owned(),
                 json!({
@@ -4056,7 +3509,6 @@ impl ServerState {
                 "recent_submit_p95_ms": adaptive.recent_submit_p95_ms,
                 "recent_store_p95_ms": adaptive.recent_store_p95_ms,
                 "recent_publishes_in_window": adaptive.recent_publishes_in_window,
-                "df_pending_shards": adaptive.df_pending_shards,
                 "tier2_pending_shards": adaptive.tier2_pending_shards,
                 "healthy_cycles": adaptive.healthy_cycles,
             }),
@@ -4201,10 +3653,6 @@ impl ServerState {
                 json!(readiness.pressure_publish_blocked_by_seal_backlog),
             );
             publish.insert(
-                "pending_df_snapshot_shards".to_owned(),
-                json!(readiness.pending_df_snapshot_shards),
-            );
-            publish.insert(
                 "pending_tier2_snapshot_shards".to_owned(),
                 json!(readiness.pending_tier2_snapshot_shards),
             );
@@ -4277,13 +3725,6 @@ impl ServerState {
                 ),
             );
             publish.insert(
-                "last_publish_promote_work_import_apply_df_counts_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_apply_df_counts_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
                 "last_publish_promote_work_import_build_payloads_ms".to_owned(),
                 json!(
                     self.last_publish_promote_work_import_build_payloads_ms
@@ -4315,20 +3756,6 @@ impl ServerState {
                 "last_publish_promote_work_import_persist_meta_ms".to_owned(),
                 json!(
                     self.last_publish_promote_work_import_persist_meta_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
-                "last_publish_promote_work_import_append_df_delta_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_append_df_delta_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
-                "last_publish_promote_work_import_compact_df_counts_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_compact_df_counts_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -4368,20 +3795,6 @@ impl ServerState {
                 ),
             );
             publish.insert(
-                "last_publish_persist_df_counts_ms".to_owned(),
-                json!(
-                    self.last_publish_persist_df_counts_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
-                "last_publish_df_snapshot_persist_failures".to_owned(),
-                json!(
-                    self.last_publish_df_snapshot_persist_failures
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
                 "last_publish_init_work_ms".to_owned(),
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
             );
@@ -4416,18 +3829,6 @@ impl ServerState {
             );
             publish.insert("observed_at_unix_ms".to_owned(), json!(now_unix_ms));
             stats.insert("publish".to_owned(), Value::Object(publish));
-            stats.insert(
-                "published_df_snapshot_seal".to_owned(),
-                json!({
-                    "pending_shards": self.pending_published_df_snapshot_shard_count().unwrap_or(0),
-                    "in_progress": self.published_df_snapshot_seal_in_progress.load(Ordering::Acquire),
-                    "runs_total": self.published_df_snapshot_seal_runs_total.load(Ordering::Acquire),
-                    "last_duration_ms": self.last_published_df_snapshot_seal_duration_ms.load(Ordering::Acquire),
-                    "last_persisted_shards": self.last_published_df_snapshot_seal_persisted_shards.load(Ordering::Acquire),
-                    "last_failures": self.last_published_df_snapshot_seal_failures.load(Ordering::Acquire),
-                    "last_completed_unix_ms": self.last_published_df_snapshot_seal_completed_unix_ms.load(Ordering::Acquire),
-                }),
-            );
             stats.insert(
                 "published_tier2_snapshot_seal".to_owned(),
                 json!({
@@ -5133,9 +4534,6 @@ impl ServerState {
             store_profile_total.classify_finalize_us = store_profile_total
                 .classify_finalize_us
                 .saturating_add(store_profile.classify_finalize_us);
-            store_profile_total.apply_df_counts_us = store_profile_total
-                .apply_df_counts_us
-                .saturating_add(store_profile.apply_df_counts_us);
             store_profile_total.append_sidecars_us = store_profile_total
                 .append_sidecars_us
                 .saturating_add(store_profile.append_sidecars_us);
@@ -5148,12 +4546,6 @@ impl ServerState {
             store_profile_total.append_bloom_payload_us = store_profile_total
                 .append_bloom_payload_us
                 .saturating_add(store_profile.append_bloom_payload_us);
-            store_profile_total.append_grams_received_payload_us = store_profile_total
-                .append_grams_received_payload_us
-                .saturating_add(store_profile.append_grams_received_payload_us);
-            store_profile_total.append_grams_indexed_payload_us = store_profile_total
-                .append_grams_indexed_payload_us
-                .saturating_add(store_profile.append_grams_indexed_payload_us);
             store_profile_total.append_metadata_payload_us = store_profile_total
                 .append_metadata_payload_us
                 .saturating_add(store_profile.append_metadata_payload_us);
@@ -5169,12 +4561,6 @@ impl ServerState {
             store_profile_total.append_bloom_payload_bytes = store_profile_total
                 .append_bloom_payload_bytes
                 .saturating_add(store_profile.append_bloom_payload_bytes);
-            store_profile_total.append_grams_received_payload_bytes = store_profile_total
-                .append_grams_received_payload_bytes
-                .saturating_add(store_profile.append_grams_received_payload_bytes);
-            store_profile_total.append_grams_indexed_payload_bytes = store_profile_total
-                .append_grams_indexed_payload_bytes
-                .saturating_add(store_profile.append_grams_indexed_payload_bytes);
             store_profile_total.append_metadata_payload_bytes = store_profile_total
                 .append_metadata_payload_bytes
                 .saturating_add(store_profile.append_metadata_payload_bytes);
@@ -5199,62 +4585,6 @@ impl ServerState {
             store_profile_total.persist_meta_us = store_profile_total
                 .persist_meta_us
                 .saturating_add(store_profile.persist_meta_us);
-            store_profile_total.append_df_delta_us = store_profile_total
-                .append_df_delta_us
-                .saturating_add(store_profile.append_df_delta_us);
-            store_profile_total.compact_df_counts_us = store_profile_total
-                .compact_df_counts_us
-                .saturating_add(store_profile.compact_df_counts_us);
-            store_profile_total.compact_df_counts_check_us = store_profile_total
-                .compact_df_counts_check_us
-                .saturating_add(store_profile.compact_df_counts_check_us);
-            store_profile_total.compact_df_counts_checked_delta_bytes = store_profile_total
-                .compact_df_counts_checked_delta_bytes
-                .max(store_profile.compact_df_counts_checked_delta_bytes);
-            store_profile_total.compact_df_counts_checked_delta_estimated_memory_bytes =
-                store_profile_total
-                    .compact_df_counts_checked_delta_estimated_memory_bytes
-                    .max(store_profile.compact_df_counts_checked_delta_estimated_memory_bytes);
-            store_profile_total.compact_df_counts_persist_snapshot_us = store_profile_total
-                .compact_df_counts_persist_snapshot_us
-                .saturating_add(store_profile.compact_df_counts_persist_snapshot_us);
-            store_profile_total.compact_df_counts_persist_snapshot_collect_delta_us =
-                store_profile_total
-                    .compact_df_counts_persist_snapshot_collect_delta_us
-                    .saturating_add(
-                        store_profile.compact_df_counts_persist_snapshot_collect_delta_us,
-                    );
-            store_profile_total.compact_df_counts_persist_snapshot_sort_delta_us =
-                store_profile_total
-                    .compact_df_counts_persist_snapshot_sort_delta_us
-                    .saturating_add(store_profile.compact_df_counts_persist_snapshot_sort_delta_us);
-            store_profile_total.compact_df_counts_persist_snapshot_merge_write_us =
-                store_profile_total
-                    .compact_df_counts_persist_snapshot_merge_write_us
-                    .saturating_add(
-                        store_profile.compact_df_counts_persist_snapshot_merge_write_us,
-                    );
-            store_profile_total.compact_df_counts_persist_snapshot_flush_us = store_profile_total
-                .compact_df_counts_persist_snapshot_flush_us
-                .saturating_add(store_profile.compact_df_counts_persist_snapshot_flush_us);
-            store_profile_total.compact_df_counts_persist_snapshot_rename_us = store_profile_total
-                .compact_df_counts_persist_snapshot_rename_us
-                .saturating_add(store_profile.compact_df_counts_persist_snapshot_rename_us);
-            store_profile_total.compact_df_counts_persist_snapshot_close_us = store_profile_total
-                .compact_df_counts_persist_snapshot_close_us
-                .saturating_add(store_profile.compact_df_counts_persist_snapshot_close_us);
-            store_profile_total.compact_df_counts_persist_snapshot_clear_delta_files_us =
-                store_profile_total
-                    .compact_df_counts_persist_snapshot_clear_delta_files_us
-                    .saturating_add(
-                        store_profile.compact_df_counts_persist_snapshot_clear_delta_files_us,
-                    );
-            store_profile_total.compact_df_counts_refresh_snapshot_us = store_profile_total
-                .compact_df_counts_refresh_snapshot_us
-                .saturating_add(store_profile.compact_df_counts_refresh_snapshot_us);
-            store_profile_total.compact_df_counts_reopen_writers_us = store_profile_total
-                .compact_df_counts_reopen_writers_us
-                .saturating_add(store_profile.compact_df_counts_reopen_writers_us);
             store_profile_total.rebalance_tier2_us = store_profile_total
                 .rebalance_tier2_us
                 .saturating_add(store_profile.rebalance_tier2_us);
@@ -5346,9 +4676,6 @@ impl ServerState {
                 store_profile_total.classify_finalize_us = store_profile_total
                     .classify_finalize_us
                     .saturating_add(store_profile.classify_finalize_us);
-                store_profile_total.apply_df_counts_us = store_profile_total
-                    .apply_df_counts_us
-                    .saturating_add(store_profile.apply_df_counts_us);
                 store_profile_total.append_sidecars_us = store_profile_total
                     .append_sidecars_us
                     .saturating_add(store_profile.append_sidecars_us);
@@ -5361,12 +4688,6 @@ impl ServerState {
                 store_profile_total.append_bloom_payload_us = store_profile_total
                     .append_bloom_payload_us
                     .saturating_add(store_profile.append_bloom_payload_us);
-                store_profile_total.append_grams_received_payload_us = store_profile_total
-                    .append_grams_received_payload_us
-                    .saturating_add(store_profile.append_grams_received_payload_us);
-                store_profile_total.append_grams_indexed_payload_us = store_profile_total
-                    .append_grams_indexed_payload_us
-                    .saturating_add(store_profile.append_grams_indexed_payload_us);
                 store_profile_total.append_metadata_payload_us = store_profile_total
                     .append_metadata_payload_us
                     .saturating_add(store_profile.append_metadata_payload_us);
@@ -5382,12 +4703,6 @@ impl ServerState {
                 store_profile_total.append_bloom_payload_bytes = store_profile_total
                     .append_bloom_payload_bytes
                     .saturating_add(store_profile.append_bloom_payload_bytes);
-                store_profile_total.append_grams_received_payload_bytes = store_profile_total
-                    .append_grams_received_payload_bytes
-                    .saturating_add(store_profile.append_grams_received_payload_bytes);
-                store_profile_total.append_grams_indexed_payload_bytes = store_profile_total
-                    .append_grams_indexed_payload_bytes
-                    .saturating_add(store_profile.append_grams_indexed_payload_bytes);
                 store_profile_total.append_metadata_payload_bytes = store_profile_total
                     .append_metadata_payload_bytes
                     .saturating_add(store_profile.append_metadata_payload_bytes);
@@ -5412,67 +4727,6 @@ impl ServerState {
                 store_profile_total.persist_meta_us = store_profile_total
                     .persist_meta_us
                     .saturating_add(store_profile.persist_meta_us);
-                store_profile_total.append_df_delta_us = store_profile_total
-                    .append_df_delta_us
-                    .saturating_add(store_profile.append_df_delta_us);
-                store_profile_total.compact_df_counts_us = store_profile_total
-                    .compact_df_counts_us
-                    .saturating_add(store_profile.compact_df_counts_us);
-                store_profile_total.compact_df_counts_check_us = store_profile_total
-                    .compact_df_counts_check_us
-                    .saturating_add(store_profile.compact_df_counts_check_us);
-                store_profile_total.compact_df_counts_checked_delta_bytes = store_profile_total
-                    .compact_df_counts_checked_delta_bytes
-                    .max(store_profile.compact_df_counts_checked_delta_bytes);
-                store_profile_total.compact_df_counts_checked_delta_estimated_memory_bytes =
-                    store_profile_total
-                        .compact_df_counts_checked_delta_estimated_memory_bytes
-                        .max(store_profile.compact_df_counts_checked_delta_estimated_memory_bytes);
-                store_profile_total.compact_df_counts_persist_snapshot_us = store_profile_total
-                    .compact_df_counts_persist_snapshot_us
-                    .saturating_add(store_profile.compact_df_counts_persist_snapshot_us);
-                store_profile_total.compact_df_counts_persist_snapshot_collect_delta_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_collect_delta_us
-                        .saturating_add(
-                            store_profile.compact_df_counts_persist_snapshot_collect_delta_us,
-                        );
-                store_profile_total.compact_df_counts_persist_snapshot_sort_delta_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_sort_delta_us
-                        .saturating_add(
-                            store_profile.compact_df_counts_persist_snapshot_sort_delta_us,
-                        );
-                store_profile_total.compact_df_counts_persist_snapshot_merge_write_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_merge_write_us
-                        .saturating_add(
-                            store_profile.compact_df_counts_persist_snapshot_merge_write_us,
-                        );
-                store_profile_total.compact_df_counts_persist_snapshot_flush_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_flush_us
-                        .saturating_add(store_profile.compact_df_counts_persist_snapshot_flush_us);
-                store_profile_total.compact_df_counts_persist_snapshot_rename_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_rename_us
-                        .saturating_add(store_profile.compact_df_counts_persist_snapshot_rename_us);
-                store_profile_total.compact_df_counts_persist_snapshot_close_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_close_us
-                        .saturating_add(store_profile.compact_df_counts_persist_snapshot_close_us);
-                store_profile_total.compact_df_counts_persist_snapshot_clear_delta_files_us =
-                    store_profile_total
-                        .compact_df_counts_persist_snapshot_clear_delta_files_us
-                        .saturating_add(
-                            store_profile.compact_df_counts_persist_snapshot_clear_delta_files_us,
-                        );
-                store_profile_total.compact_df_counts_refresh_snapshot_us = store_profile_total
-                    .compact_df_counts_refresh_snapshot_us
-                    .saturating_add(store_profile.compact_df_counts_refresh_snapshot_us);
-                store_profile_total.compact_df_counts_reopen_writers_us = store_profile_total
-                    .compact_df_counts_reopen_writers_us
-                    .saturating_add(store_profile.compact_df_counts_reopen_writers_us);
                 store_profile_total.rebalance_tier2_us = store_profile_total
                     .rebalance_tier2_us
                     .saturating_add(store_profile.rebalance_tier2_us);
@@ -5525,7 +4779,6 @@ impl ServerState {
         let published_result = published_store.delete_document(sha256)?;
         drop(published_store);
         if published_result.status == "deleted" {
-            let _ = self.enqueue_published_df_snapshot_shards([shard_idx]);
             let _ = self.enqueue_published_tier2_snapshot_shards([shard_idx]);
         }
 
@@ -5685,10 +4938,6 @@ impl ServerState {
                 .store(0, Ordering::SeqCst);
             self.last_publish_promote_work_imported_shards
                 .store(0, Ordering::SeqCst);
-            self.last_publish_persist_df_counts_ms
-                .store(0, Ordering::SeqCst);
-            self.last_publish_df_snapshot_persist_failures
-                .store(0, Ordering::SeqCst);
             self.last_publish_persist_tier2_superblocks_ms
                 .store(0, Ordering::SeqCst);
             self.last_publish_tier2_snapshot_persist_failures
@@ -5790,8 +5039,6 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_classify_ms
                     .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_apply_df_counts_ms
-                    .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_build_payloads_ms
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_append_sidecars_ms
@@ -5801,10 +5048,6 @@ impl ServerState {
                 self.last_publish_promote_work_import_tier2_update_ms
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_persist_meta_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_append_df_delta_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_compact_df_counts_ms
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_rebalance_tier2_ms
                     .store(0, Ordering::SeqCst);
@@ -5876,9 +5119,6 @@ impl ServerState {
                     import_profile_total.classify_ms = import_profile_total
                         .classify_ms
                         .saturating_add(import_profile.classify_ms);
-                    import_profile_total.apply_df_counts_ms = import_profile_total
-                        .apply_df_counts_ms
-                        .saturating_add(import_profile.apply_df_counts_ms);
                     import_profile_total.build_payloads_ms = import_profile_total
                         .build_payloads_ms
                         .saturating_add(import_profile.build_payloads_ms);
@@ -5894,12 +5134,6 @@ impl ServerState {
                     import_profile_total.persist_meta_ms = import_profile_total
                         .persist_meta_ms
                         .saturating_add(import_profile.persist_meta_ms);
-                    import_profile_total.append_df_delta_ms = import_profile_total
-                        .append_df_delta_ms
-                        .saturating_add(import_profile.append_df_delta_ms);
-                    import_profile_total.compact_df_counts_ms = import_profile_total
-                        .compact_df_counts_ms
-                        .saturating_add(import_profile.compact_df_counts_ms);
                     import_profile_total.rebalance_tier2_ms = import_profile_total
                         .rebalance_tier2_ms
                         .saturating_add(import_profile.rebalance_tier2_ms);
@@ -5924,8 +5158,6 @@ impl ServerState {
                 );
                 self.last_publish_promote_work_import_classify_ms
                     .store(import_profile_total.classify_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_apply_df_counts_ms
-                    .store(import_profile_total.apply_df_counts_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_import_build_payloads_ms
                     .store(import_profile_total.build_payloads_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_import_append_sidecars_ms
@@ -5936,10 +5168,6 @@ impl ServerState {
                     .store(import_profile_total.tier2_update_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_import_persist_meta_ms
                     .store(import_profile_total.persist_meta_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_append_df_delta_ms
-                    .store(import_profile_total.append_df_delta_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_compact_df_counts_ms
-                    .store(import_profile_total.compact_df_counts_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_import_rebalance_tier2_ms
                     .store(import_profile_total.rebalance_tier2_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_remove_work_root_ms
@@ -5959,25 +5187,8 @@ impl ServerState {
                     .store(imported_shards_total, Ordering::SeqCst);
                 published_store_set
             };
-            let persist_df_started = Instant::now();
             let persisted_snapshot_shards =
                 changed_shards.iter().filter(|changed| **changed).count();
-            self.enqueue_published_df_snapshot_shards(
-                changed_shards
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(shard_idx, changed)| changed.then_some(shard_idx)),
-            )?;
-            self.last_publish_persist_df_counts_ms.store(
-                persist_df_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                Ordering::SeqCst,
-            );
-            self.last_publish_df_snapshot_persist_failures
-                .store(0, Ordering::SeqCst);
             self.last_publish_persisted_snapshot_shards.store(
                 persisted_snapshot_shards.try_into().unwrap_or(u64::MAX),
                 Ordering::SeqCst,
@@ -6614,9 +5825,6 @@ fn apply_store_open_profile(
     aggregate.store_open_rebuild_indexes_ms = aggregate
         .store_open_rebuild_indexes_ms
         .saturating_add(profile.rebuild_indexes_ms);
-    aggregate.store_open_rebuild_df_counts_ms = aggregate
-        .store_open_rebuild_df_counts_ms
-        .saturating_add(profile.rebuild_df_counts_ms);
     aggregate.store_open_rebuild_sha_index_ms = aggregate
         .store_open_rebuild_sha_index_ms
         .saturating_add(profile.rebuild_sha_index_ms);
@@ -7385,12 +6593,6 @@ mod tests {
         );
         assert!(
             server_insert_batch_profile
-                .get("store_apply_df_counts_us")
-                .and_then(Value::as_u64)
-                .is_some()
-        );
-        assert!(
-            server_insert_batch_profile
                 .get("store_append_sidecars_us")
                 .and_then(Value::as_u64)
                 .is_some()
@@ -7532,22 +6734,22 @@ mod tests {
     #[test]
     fn adaptive_publish_backs_off_when_seal_backlog_starts_rising() {
         let mut adaptive = AdaptivePublishState::new("solid-state".to_owned(), 0, 4);
-        adaptive.update_seal_backlog(1_000, 1, 0);
+        adaptive.update_seal_backlog(1_000, 1);
 
-        let snapshot = adaptive.snapshot(1_000, 1, 0);
+        let snapshot = adaptive.snapshot(1_000, 1);
         assert_eq!(snapshot.mode, "backoff");
         assert_eq!(snapshot.reason, "seal_backlog_rising");
         assert_eq!(snapshot.current_idle_ms, 2_000);
-        assert_eq!(snapshot.df_pending_shards, 1);
+        assert_eq!(snapshot.tier2_pending_shards, 1);
     }
 
     #[test]
     fn adaptive_publish_drops_back_to_fast_when_backlog_drains() {
         let mut adaptive = AdaptivePublishState::new("solid-state".to_owned(), 2_000, 4);
-        adaptive.update_seal_backlog(1_000, 1, 0);
-        adaptive.update_seal_backlog(2_000, 0, 0);
+        adaptive.update_seal_backlog(1_000, 1);
+        adaptive.update_seal_backlog(2_000, 0);
 
-        let snapshot = adaptive.snapshot(2_000, 0, 0);
+        let snapshot = adaptive.snapshot(2_000, 0);
         assert_eq!(snapshot.mode, "fast");
         assert_eq!(snapshot.reason, "healthy");
         assert_eq!(snapshot.current_idle_ms, 0);
@@ -7558,9 +6760,9 @@ mod tests {
     fn adaptive_publish_backs_off_on_submit_pressure() {
         let mut adaptive = AdaptivePublishState::new("unknown".to_owned(), 0, 8);
         adaptive.update_completed_index_session(ADAPTIVE_PUBLISH_BACKOFF_SUBMIT_MS + 1, 0);
-        adaptive.update_seal_backlog(5_000, 0, 0);
+        adaptive.update_seal_backlog(5_000, 0);
 
-        let snapshot = adaptive.snapshot(5_000, 0, 0);
+        let snapshot = adaptive.snapshot(5_000, 0);
         assert_eq!(snapshot.mode, "backoff");
         assert_eq!(snapshot.reason, "submit_pressure_high");
         assert_eq!(snapshot.current_idle_ms, 2_500);
@@ -8016,7 +7218,7 @@ mod tests {
         state
             .work_active_estimated_documents
             .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
-        let pressure = state.work_buffer_pressure_snapshot(0, 0, 0);
+        let pressure = state.work_buffer_pressure_snapshot(0, 0);
         assert_eq!(
             pressure.index_backpressure_delay_ms,
             INDEX_BACKPRESSURE_HEAVY_DELAY_MS
@@ -8036,14 +7238,14 @@ mod tests {
             .last_work_mutation_unix_ms
             .store(current_unix_ms(), Ordering::SeqCst);
         state
-            .enqueue_published_df_snapshot_shards([0usize])
-            .expect("enqueue df shard");
+            .enqueue_published_tier2_snapshot_shards([0usize])
+            .expect("enqueue tier2 shard");
 
         let readiness = state.publish_readiness(current_unix_ms());
         assert!(!readiness.eligible);
         assert_eq!(readiness.blocked_reason, "active_index_sessions");
         assert!(readiness.pressure_publish_blocked_by_seal_backlog);
-        assert_eq!(readiness.pending_df_snapshot_shards, 1);
+        assert_eq!(readiness.pending_tier2_snapshot_shards, 1);
     }
 
     #[test]
@@ -8055,10 +7257,10 @@ mod tests {
             .work_active_estimated_documents
             .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
         state
-            .enqueue_published_df_snapshot_shards([0usize])
-            .expect("enqueue df shard");
+            .enqueue_published_tier2_snapshot_shards([0usize])
+            .expect("enqueue tier2 shard");
 
-        let pressure = state.work_buffer_pressure_snapshot(0, 1, 0);
+        let pressure = state.work_buffer_pressure_snapshot(0, 1);
         assert!(pressure.pressure_publish_blocked_by_seal_backlog);
         assert_eq!(pressure.index_backpressure_delay_ms, 0);
     }
@@ -8070,7 +7272,7 @@ mod tests {
         state.active_index_sessions.store(1, Ordering::SeqCst);
         state.publish_runs_total.store(1, Ordering::SeqCst);
 
-        let pressure = state.work_buffer_pressure_snapshot(0, 0, 0);
+        let pressure = state.work_buffer_pressure_snapshot(0, 0);
         assert_eq!(
             pressure.document_threshold,
             WORK_BUFFER_REPUBLISH_MAX_DOCUMENT_THRESHOLD
@@ -9406,9 +8608,8 @@ rule q {
         .expect("decode candidate batch");
         assert_eq!(inserted_docs.inserted_count, 1);
 
-        let plan =
-            crate::candidate::compile_query_plan_from_file(&rule, None, 8, false, true, 100_000)
-                .expect("plan");
+        let plan = crate::candidate::compile_query_plan_from_file(&rule, 8, false, true, 100_000)
+            .expect("plan");
         let query_with_ids: CandidateQueryResponse = json_from_bytes(
             &state
                 .dispatch(
@@ -9782,9 +8983,8 @@ rule q {
         assert_eq!(batch.inserted_count, 1);
         assert_eq!(batch.results.len(), 1);
 
-        let plan =
-            crate::candidate::compile_query_plan_from_file(&rule, None, 8, false, true, 100_000)
-                .expect("plan");
+        let plan = crate::candidate::compile_query_plan_from_file(&rule, 8, false, true, 100_000)
+            .expect("plan");
         let query = client
             .candidate_query_plan_with_options(&plan, 0, Some(1), true)
             .expect("query");

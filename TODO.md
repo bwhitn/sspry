@@ -310,24 +310,54 @@ Removal phases:
 2. Query-planner/RPC cleanup
    - done:
      - removed the dead `candidate_df` client/server transport and tests
-   - next:
-     - remove any remaining planner/cache code that only existed for DF-assisted normal search
+     - removed the remaining default-path `df_counts` planner wiring
+     - query-plan compilation now uses one bloom-only anchor-ordering path
 3. Store persistence cleanup
    - done:
      - live bloom-only ingest no longer persists exact grams
-     - empty `grams_received.bin` / `grams_indexed.bin` files are no longer materialized during compaction/import
-     - publish/import structs no longer carry gram payload bytes/counts through the live bloom-only path
-     - dead tier1 exact-gram selection code has been removed
-   - next:
-     - remove the gram sidecar plumbing entirely once no compatibility path still needs it
+      - empty `grams_received.bin` / `grams_indexed.bin` files are no longer materialized during compaction/import
+      - publish/import structs no longer carry gram payload bytes/counts through the live bloom-only path
+      - dead tier1 exact-gram selection code has been removed
+     - removed the gram sidecar plumbing entirely from the live store path
+     - removed dead exact-gram sidecar helpers and related sidecar retarget tests
 4. CLI/test cutover
-   - make bloom-only the documented/default ingest posture
-   - remove dual-mode tests that only exist to preserve the exact-gram path
+   - done:
+     - added coverage for the planner cutover and store cleanup slices
+   - next:
+     - remove dual-mode compatibility tests and fixtures that only exist to preserve exact-gram wire behavior
 5. Final cleanup
    - remove `--no-grams` once bloom-only is the only ingest mode
    - remove dead docs, counters, and benchmark branches tied only to exact grams/DF
 6. DF storage removal
-   - remove DF deltas, segments, compaction, seal paths, RPC stats, and related tests once no remaining path depends on them
+   - done:
+     - removed DF deltas, segments, compaction/seal paths, RPC stats, and related tests from the normal bloom-only path
+   - next:
+     - remove any remaining compatibility-only field names/counters that still mention grams or DF externally
+
+`features.rs` read after the bloom-only cutover:
+- the main app index path already calls `scan_file_features_with_gram_sizes(..., false, ...)`
+- normal ingest is no longer collecting `unique_grams`
+- the remaining `unique_grams` collection is mostly in RPC/test compatibility helpers and fixtures
+- next cleanup there should target compatibility wire/test paths, not the default scanner
+
+Current local `26k` verification on the bloom-only cleanup tree:
+- artifact:
+  - `/root/pertest/results/sspry_verify_26000_bloomcut_20260318_r1`
+- result:
+  - completed successfully
+  - `index_return_ms = 787,709`
+  - `files_per_minute = 1,980.43`
+  - `current_rss_kb = 333,160`
+  - `peak_rss_kb = 397,792`
+  - `last_publish_duration_ms = 88`
+- insert-store read:
+  - `store_us = 53,005,196`
+  - `store_classify_df_lookup_us = 0`
+  - `store_append_sidecars_us = 51,513,044`
+  - `store_tier2_update_us = 1,326,464`
+- read:
+  - the bloom-only cutover survived a real deterministic ingest after the store/planner cleanup
+  - default ingest is now overwhelmingly dominated by bloom sidecar append work, not DF/classify
 
 Required tests while cutting over:
 - search verbose output still reports timing fields

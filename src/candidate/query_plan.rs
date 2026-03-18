@@ -686,21 +686,15 @@ fn optimize_grams(
     grams: &[u64],
     fixed_literal: &[u8],
     gram_size: usize,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
 ) -> Vec<u64> {
     if grams.is_empty() || max_anchors_per_alt == 0 || grams.len() <= max_anchors_per_alt {
         return grams.to_vec();
     }
-    let df_for = |gram: &u64| {
-        df_counts
-            .and_then(|counts| counts.get(gram).copied())
-            .unwrap_or(usize::MAX / 2)
-    };
     let has_positions = !fixed_literal.is_empty() && fixed_literal.len() >= gram_size;
     if !has_positions {
         let mut ranked = grams.to_vec();
-        ranked.sort_unstable_by_key(|gram| (df_for(gram), *gram));
+        ranked.sort_unstable();
         ranked.truncate(max_anchors_per_alt);
         return ranked;
     }
@@ -712,17 +706,15 @@ fn optimize_grams(
     }
 
     let mut remaining = grams.to_vec();
-    remaining.sort_unstable_by_key(|gram| (df_for(gram), *gram));
+    remaining.sort_unstable();
     let mut selected = Vec::<u64>::new();
     let mut selected_positions = Vec::<usize>::new();
     let max_start = fixed_literal.len().saturating_sub(gram_size);
     while selected.len() < max_anchors_per_alt && !remaining.is_empty() {
         let mut best_idx = 0usize;
-        let mut best_df = usize::MAX;
         let mut best_spread = 0usize;
         let mut best_gram = u64::MAX;
         for (idx, gram) in remaining.iter().enumerate() {
-            let df = df_for(gram);
             let spread = positions_by_gram
                 .get(gram)
                 .map(|positions| {
@@ -747,11 +739,9 @@ fn optimize_grams(
                     }
                 })
                 .unwrap_or(0);
-            let better =
-                (df, usize::MAX - spread, *gram) < (best_df, usize::MAX - best_spread, best_gram);
+            let better = (usize::MAX - spread, *gram) < (usize::MAX - best_spread, best_gram);
             if better {
                 best_idx = idx;
-                best_df = df;
                 best_spread = spread;
                 best_gram = *gram;
             }
@@ -769,11 +759,7 @@ fn optimize_grams(
     selected
 }
 
-fn pattern_selectivity_score(
-    pattern_id: &str,
-    patterns: &BTreeMap<String, Vec<Vec<u64>>>,
-    df_counts: Option<&HashMap<u64, usize>>,
-) -> u128 {
+fn pattern_selectivity_score(pattern_id: &str, patterns: &BTreeMap<String, Vec<Vec<u64>>>) -> u128 {
     let Some(alternatives) = patterns.get(pattern_id) else {
         return u128::MAX;
     };
@@ -783,12 +769,7 @@ fn pattern_selectivity_score(
             if alternative.is_empty() {
                 return u128::MAX / 4;
             }
-            alternative.iter().fold(0u128, |acc, gram| {
-                let df = df_counts
-                    .and_then(|counts| counts.get(gram).copied())
-                    .unwrap_or(usize::MAX / 2);
-                acc.saturating_add(df as u128)
-            })
+            alternative.len() as u128
         })
         .min()
         .unwrap_or(u128::MAX)
@@ -797,16 +778,15 @@ fn pattern_selectivity_score(
 fn reorder_or_nodes_for_selectivity(
     node: &mut QueryNode,
     patterns: &BTreeMap<String, Vec<Vec<u64>>>,
-    df_counts: Option<&HashMap<u64, usize>>,
 ) {
     for child in &mut node.children {
-        reorder_or_nodes_for_selectivity(child, patterns, df_counts);
+        reorder_or_nodes_for_selectivity(child, patterns);
     }
     if node.kind != "or" {
         return;
     }
     node.children
-        .sort_by_key(|child| node_selectivity_score(child, patterns, df_counts));
+        .sort_by_key(|child| node_selectivity_score(child, patterns));
 }
 
 fn collect_patterns(node: &QueryNode, out: &mut HashSet<String>) {
@@ -1112,34 +1092,30 @@ pub fn evaluate_fixed_literal_match(
     }
 }
 
-fn node_selectivity_score(
-    node: &QueryNode,
-    patterns: &BTreeMap<String, Vec<Vec<u64>>>,
-    df_counts: Option<&HashMap<u64, usize>>,
-) -> u128 {
+fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<u64>>>) -> u128 {
     match node.kind.as_str() {
         "pattern" => node
             .pattern_id
             .as_deref()
-            .map(|pattern_id| pattern_selectivity_score(pattern_id, patterns, df_counts))
+            .map(|pattern_id| pattern_selectivity_score(pattern_id, patterns))
             .unwrap_or(u128::MAX),
         "and" => node
             .children
             .iter()
-            .map(|child| node_selectivity_score(child, patterns, df_counts))
+            .map(|child| node_selectivity_score(child, patterns))
             .min()
             .unwrap_or(u128::MAX),
         "filesize_eq" | "metadata_eq" | "time_now_eq" | "verifier_only_eq" => u128::MAX / 2,
         "or" => node
             .children
             .iter()
-            .map(|child| node_selectivity_score(child, patterns, df_counts))
+            .map(|child| node_selectivity_score(child, patterns))
             .min()
             .unwrap_or(u128::MAX),
         "n_of" => node
             .children
             .iter()
-            .map(|child| node_selectivity_score(child, patterns, df_counts))
+            .map(|child| node_selectivity_score(child, patterns))
             .min()
             .unwrap_or(u128::MAX),
         _ => u128::MAX,
@@ -1148,7 +1124,6 @@ fn node_selectivity_score(
 
 pub fn compile_query_plan(
     rule_text: &str,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -1157,7 +1132,6 @@ pub fn compile_query_plan(
     compile_query_plan_with_gram_sizes(
         rule_text,
         GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
-        df_counts,
         max_anchors_per_alt,
         force_tier1_only,
         allow_tier2_fallback,
@@ -1168,7 +1142,6 @@ pub fn compile_query_plan(
 pub fn compile_query_plan_with_gram_sizes(
     rule_text: &str,
     gram_sizes: GramSizes,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -1230,7 +1203,7 @@ pub fn compile_query_plan_with_gram_sizes(
             "Numeric read equality in indexed search requires an anchorable literal for the current gram sizes or another string/hex anchor.",
         ));
     }
-    reorder_or_nodes_for_selectivity(&mut root, &pattern_alternatives, df_counts);
+    reorder_or_nodes_for_selectivity(&mut root, &pattern_alternatives);
     dedupe_or_nodes(&mut root);
     let mut branch_budgets = HashMap::<String, usize>::new();
     collect_or_branch_budgets(&root, max_anchors_per_alt, &mut branch_budgets);
@@ -1253,13 +1226,7 @@ pub fn compile_query_plan_with_gram_sizes(
             .iter()
             .zip(fixed_literals.iter())
             .map(|(alt, fixed_literal)| {
-                optimize_grams(
-                    alt,
-                    fixed_literal,
-                    gram_sizes.tier1,
-                    df_counts,
-                    per_pattern_budget,
-                )
+                optimize_grams(alt, fixed_literal, gram_sizes.tier1, per_pattern_budget)
             })
             .collect();
         patterns.push(PatternPlan {
@@ -1283,7 +1250,6 @@ pub fn compile_query_plan_with_gram_sizes(
 
 pub fn compile_query_plan_from_file(
     rule_path: impl AsRef<Path>,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -1292,7 +1258,6 @@ pub fn compile_query_plan_from_file(
     compile_query_plan_from_file_with_gram_sizes(
         rule_path,
         GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
-        df_counts,
         max_anchors_per_alt,
         force_tier1_only,
         allow_tier2_fallback,
@@ -1303,7 +1268,6 @@ pub fn compile_query_plan_from_file(
 pub fn compile_query_plan_from_file_with_gram_sizes(
     rule_path: impl AsRef<Path>,
     gram_sizes: GramSizes,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -1313,7 +1277,6 @@ pub fn compile_query_plan_from_file_with_gram_sizes(
     compile_query_plan_with_gram_sizes(
         &text,
         gram_sizes,
-        df_counts,
         max_anchors_per_alt,
         force_tier1_only,
         allow_tier2_fallback,
@@ -1324,7 +1287,6 @@ pub fn compile_query_plan_from_file_with_gram_sizes(
 pub fn compile_query_plan_with_tier2_gram_size(
     rule_text: &str,
     tier2_gram_size: usize,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -1333,7 +1295,6 @@ pub fn compile_query_plan_with_tier2_gram_size(
     compile_query_plan_with_gram_sizes(
         rule_text,
         GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
-        df_counts,
         max_anchors_per_alt,
         force_tier1_only,
         allow_tier2_fallback,
@@ -1344,7 +1305,6 @@ pub fn compile_query_plan_with_tier2_gram_size(
 pub fn compile_query_plan_from_file_with_tier2_gram_size(
     rule_path: impl AsRef<Path>,
     tier2_gram_size: usize,
-    df_counts: Option<&HashMap<u64, usize>>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -1353,7 +1313,6 @@ pub fn compile_query_plan_from_file_with_tier2_gram_size(
     compile_query_plan_from_file_with_gram_sizes(
         rule_path,
         GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
-        df_counts,
         max_anchors_per_alt,
         force_tier1_only,
         allow_tier2_fallback,
@@ -1382,7 +1341,7 @@ rule sample {
     $a and ($b or 1 of ($a, $c))
 }
 "#;
-        let plan = compile_query_plan(rule, None, 16, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 16, false, true, 100_000).expect("plan");
         assert!(matches!(plan, CompiledQueryPlan { .. }));
         let patterns = plan
             .patterns
@@ -1406,7 +1365,7 @@ rule bad {
     $a
 }
 "#;
-        assert!(compile_query_plan(rule, None, 8, false, true, 100_000).is_err());
+        assert!(compile_query_plan(rule, 8, false, true, 100_000).is_err());
     }
 
     #[test]
@@ -1419,7 +1378,7 @@ rule sized {
     $a and filesize == 8
 }
 "#;
-        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 1);
         assert_eq!(plan.root.kind, "and");
         assert_eq!(plan.root.children.len(), 2);
@@ -1443,7 +1402,7 @@ rule module_meta {
     $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true and ELF.OSABI == 3 and time.now == 42
 }
 "#;
-        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 1);
         assert_eq!(plan.root.kind, "and");
         assert_eq!(plan.root.children.len(), 6);
@@ -1484,7 +1443,7 @@ rule numeric_reads {
     $a and uint32(0) == 0x14c and float32be(4) == 2.5
 }
 "#;
-        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 3);
         assert_eq!(plan.root.kind, "and");
         assert!(plan.patterns.iter().any(|pattern| {
@@ -1532,7 +1491,7 @@ rule numeric_only {
     uint32(0) == 0x4000
 }
 "#;
-        let plan = compile_query_plan(rule, None, 8, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.patterns.len(), 2);
         assert_eq!(plan.root.kind, "and");
         assert!(plan.patterns.iter().any(|pattern| {
@@ -1573,7 +1532,6 @@ rule numeric_only_unanchorable {
         let err = compile_query_plan_with_gram_sizes(
             rule,
             GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, 5).expect("gram sizes"),
-            None,
             8,
             false,
             true,
@@ -1820,16 +1778,9 @@ rule empty {
 
         let grams = grams_from_bytes(b"ABCDEABCDE", 4);
         assert_eq!(grams.len(), 5);
-        let ranked = optimize_grams(
-            &grams,
-            b"ABCDEABCDE",
-            4,
-            Some(&HashMap::from([(grams[1], 1usize)])),
-            2,
-        );
+        let ranked = optimize_grams(&grams, b"ABCDEABCDE", 4, 2);
         assert_eq!(ranked.len(), 2);
-        assert!(ranked.contains(&grams[1]));
-        assert_eq!(optimize_grams(&grams, b"", 4, None, 0), grams);
+        assert_eq!(optimize_grams(&grams, b"", 4, 0), grams);
     }
 
     #[test]
@@ -1844,11 +1795,7 @@ rule sample {
     ($a or $b) and 1 of ($a, $c)
 }
 "#;
-        let df = HashMap::from([
-            (u64::from(u32::from_le_bytes(*b"ABCD")), 9usize),
-            (u64::from(u32::from_le_bytes([1, 2, 3, 4])), 1usize),
-        ]);
-        let plan = compile_query_plan(rule, Some(&df), 1, true, false, 9).expect("compile");
+        let plan = compile_query_plan(rule, 1, true, false, 9).expect("compile");
         assert!(plan.force_tier1_only);
         assert!(!plan.allow_tier2_fallback);
         assert_eq!(plan.max_candidates, 9);
@@ -1862,7 +1809,7 @@ rule sample {
         }));
 
         assert_eq!(
-            compile_query_plan(rule, None, 1, false, true, 0)
+            compile_query_plan(rule, 1, false, true, 0)
                 .expect("zero means unlimited")
                 .max_candidates,
             usize::MAX
@@ -1877,7 +1824,6 @@ rule bad {
     1 of ($a, $missing)
 }
 "#,
-                None,
                 8,
                 false,
                 true,
@@ -1897,7 +1843,6 @@ rule numeric_only {
     uint32(0) == 1
 }
 "#,
-            None,
             8,
             false,
             true,
@@ -1923,7 +1868,6 @@ rule numeric_too_short_for_gram_sizes {
 }
 "#,
                 GramSizes::new(5, 6).expect("gram sizes"),
-                None,
                 8,
                 false,
                 true,
@@ -1944,7 +1888,6 @@ rule numeric_rhs {
     $a and uint32(0) == filesize
 }
 "#,
-                None,
                 8,
                 false,
                 true,
@@ -1967,7 +1910,7 @@ rule sample {
     $a or $b
 }
 "#;
-        let plan = compile_query_plan(rule, None, 16, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 16, false, true, 100_000).expect("plan");
         let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
         assert_eq!(literal_plan.literals["$a"], vec![b"ABCD".to_vec()]);
         let mut matches = HashMap::new();
@@ -1986,7 +1929,7 @@ rule sample {
     $a
 }
 "#;
-        let plan = compile_query_plan(rule, None, 16, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 16, false, true, 100_000).expect("plan");
         let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
         let literals = literal_plan.literals.get("$a").expect("literals");
         assert_eq!(literals.len(), 2);
@@ -2006,7 +1949,7 @@ rule sample {
     $a or $b or $c
 }
 "#;
-        let plan = compile_query_plan(rule, None, 4, false, true, 100_000).expect("plan");
+        let plan = compile_query_plan(rule, 4, false, true, 100_000).expect("plan");
         for pattern in &plan.patterns {
             assert!(pattern.alternatives[0].len() <= 2);
         }
@@ -2028,8 +1971,8 @@ rule disk_rule {
 "#,
         )
         .expect("write rule");
-        let plan = compile_query_plan_from_file(&rule_path, None, 8, false, true, 100)
-            .expect("plan from file");
+        let plan =
+            compile_query_plan_from_file(&rule_path, 8, false, true, 100).expect("plan from file");
         assert_eq!(plan.patterns.len(), 1);
     }
 
@@ -2144,7 +2087,6 @@ rule disk_rule {
             ("$a".to_owned(), vec![vec![1u64, 2u64]]),
             ("$b".to_owned(), vec![vec![3u64]]),
         ]);
-        let df_counts = HashMap::from([(1u64, 100usize), (2u64, 50usize), (3u64, 1usize)]);
         let mut root = QueryNode {
             kind: "or".to_owned(),
             pattern_id: None,
@@ -2164,12 +2106,9 @@ rule disk_rule {
                 },
             ],
         };
-        reorder_or_nodes_for_selectivity(&mut root, &patterns, Some(&df_counts));
+        reorder_or_nodes_for_selectivity(&mut root, &patterns);
         assert_eq!(root.children[0].pattern_id.as_deref(), Some("$b"));
-        assert_eq!(
-            pattern_selectivity_score("$missing", &patterns, Some(&df_counts)),
-            u128::MAX
-        );
+        assert_eq!(pattern_selectivity_score("$missing", &patterns), u128::MAX);
         assert_eq!(
             node_selectivity_score(
                 &QueryNode {
@@ -2178,8 +2117,7 @@ rule disk_rule {
                     threshold: None,
                     children: Vec::new(),
                 },
-                &patterns,
-                Some(&df_counts)
+                &patterns
             ),
             u128::MAX
         );
@@ -2195,18 +2133,17 @@ rule q {
     $a
 }
 "#;
-        let plan = compile_query_plan_with_tier2_gram_size(rule, 3, None, 8, false, true, 50)
-            .expect("plan");
+        let plan =
+            compile_query_plan_with_tier2_gram_size(rule, 3, 8, false, true, 50).expect("plan");
         assert_eq!(plan.tier2_gram_size, 3);
         assert_eq!(plan.tier1_gram_size, DEFAULT_TIER1_GRAM_SIZE);
 
         let tmp = tempdir().expect("tmp");
         let rule_path = tmp.path().join("rule.yar");
         fs::write(&rule_path, rule).expect("rule");
-        let plan = compile_query_plan_from_file_with_tier2_gram_size(
-            &rule_path, 3, None, 8, false, true, 50,
-        )
-        .expect("plan from file");
+        let plan =
+            compile_query_plan_from_file_with_tier2_gram_size(&rule_path, 3, 8, false, true, 50)
+                .expect("plan from file");
         assert_eq!(plan.tier2_gram_size, 3);
         assert_eq!(plan.max_candidates, 50);
     }
@@ -2216,14 +2153,6 @@ rule q {
         let mut patterns = BTreeMap::new();
         patterns.insert("$a".to_owned(), vec![vec![1_u64, 2, 3]]);
         patterns.insert("$b".to_owned(), vec![vec![4_u64, 5]]);
-        let df_counts = HashMap::from([
-            (1_u64, 10_usize),
-            (2_u64, 9_usize),
-            (3_u64, 8_usize),
-            (4_u64, 3_usize),
-            (5_u64, 4_usize),
-        ]);
-
         assert_eq!(
             node_selectivity_score(
                 &QueryNode {
@@ -2233,11 +2162,10 @@ rule q {
                     children: Vec::new(),
                 },
                 &patterns,
-                Some(&df_counts),
             ),
             u128::MAX
         );
-        let pattern_b_score = pattern_selectivity_score("$b", &patterns, Some(&df_counts));
+        let pattern_b_score = pattern_selectivity_score("$b", &patterns);
         assert_eq!(
             node_selectivity_score(
                 &QueryNode {
@@ -2260,7 +2188,6 @@ rule q {
                     ],
                 },
                 &patterns,
-                Some(&df_counts),
             ),
             pattern_b_score
         );
@@ -2286,7 +2213,6 @@ rule q {
                     ],
                 },
                 &patterns,
-                Some(&df_counts),
             ),
             pattern_b_score
         );
@@ -2304,7 +2230,6 @@ rule q {
                     }],
                 },
                 &patterns,
-                Some(&df_counts),
             ),
             pattern_b_score
         );

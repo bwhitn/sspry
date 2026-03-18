@@ -175,7 +175,7 @@ rule q {
     let publish = client.publish().expect("publish");
     assert!(publish.contains("published work root"));
 
-    let plan = compile_query_plan_from_file(&rule, None, 8, false, true, 100_000).expect("plan");
+    let plan = compile_query_plan_from_file(&rule, 8, false, true, 100_000).expect("plan");
     let result = client
         .candidate_query_plan_with_options(&plan, 0, Some(32), true)
         .expect("candidate query");

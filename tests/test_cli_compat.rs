@@ -440,12 +440,6 @@ fn info_light_exposes_adaptive_publish_status() {
     assert!(adaptive_publish.contains_key("storage_class"));
     assert!(
         parsed
-            .get("published_df_snapshot_seal")
-            .and_then(Value::as_object)
-            .is_some()
-    );
-    assert!(
-        parsed
             .get("published_tier2_snapshot_seal")
             .and_then(Value::as_object)
             .is_some()
@@ -873,7 +867,6 @@ fn index_verbose_emits_server_telemetry() {
     assert!(stderr.contains("verbose.index.submit_ms:"));
     assert!(stderr.contains("verbose.index.server_disk_usage_bytes:"));
     assert!(stderr.contains("verbose.index.server_publish_adaptive_idle_ms:"));
-    assert!(stderr.contains("verbose.index.server_published_df_snapshot_seal_pending_shards:"));
 
     let _ = child.kill();
     let _ = child.wait();
