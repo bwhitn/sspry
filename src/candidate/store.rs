@@ -1333,11 +1333,7 @@ impl CandidateStore {
         bloom_filter: &[u8],
         tier2_filter_bytes: usize,
         tier2_bloom_filter: &[u8],
-        grams_received: &[u64],
-        grams_complete: bool,
-        effective_diversity: Option<f64>,
         external_id: Option<String>,
-        grams_sorted_unique: bool,
     ) -> Result<CandidateInsertResult> {
         self.insert_document_with_metadata(
             sha256,
@@ -1350,12 +1346,8 @@ impl CandidateStore {
             bloom_filter,
             tier2_filter_bytes,
             tier2_bloom_filter,
-            grams_received,
-            grams_complete,
-            effective_diversity,
             &[],
             external_id,
-            grams_sorted_unique,
         )
     }
 
@@ -1371,12 +1363,8 @@ impl CandidateStore {
         bloom_filter: &[u8],
         tier2_filter_bytes: usize,
         tier2_bloom_filter: &[u8],
-        grams_received: &[u64],
-        grams_complete: bool,
-        effective_diversity: Option<f64>,
         metadata: &[u8],
         external_id: Option<String>,
-        grams_sorted_unique: bool,
     ) -> Result<CandidateInsertResult> {
         let mut total_scope = scope("candidate.insert_document");
         total_scope.add_bytes(file_size);
@@ -1421,12 +1409,6 @@ impl CandidateStore {
         }
         let sha256_hex = hex::encode(sha256);
 
-        let _ = (
-            grams_received,
-            grams_complete,
-            effective_diversity,
-            grams_sorted_unique,
-        );
         // Bloom-only ingest no longer persists or ranks exact grams.
         let dedup_received = Vec::<u64>::new();
         let indexed = Vec::<u64>::new();
@@ -1583,12 +1565,8 @@ impl CandidateStore {
             Vec<u8>,
             usize,
             Vec<u8>,
-            Vec<u64>,
-            bool,
-            Option<f64>,
             Vec<u8>,
             Option<String>,
-            bool,
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
         fn elapsed_us(started: Instant) -> u64 {
@@ -1616,7 +1594,6 @@ impl CandidateStore {
         let mut indexed_grams_total = 0u64;
         let mut max_received_grams = 0u64;
         let mut max_indexed_grams = 0u64;
-        let mut active_docs = self.docs.iter().filter(|doc| !doc.deleted).count();
         let mut tier2_updates = Vec::<(usize, usize, usize, &[u8])>::with_capacity(documents.len());
         let mut pending_new_inserts = Vec::<PendingNewInsert<'_>>::new();
 
@@ -1632,12 +1609,8 @@ impl CandidateStore {
                 bloom_filter,
                 tier2_filter_bytes,
                 tier2_bloom_filter,
-                grams_received,
-                grams_complete,
-                effective_diversity,
                 metadata,
                 external_id,
-                grams_sorted_unique,
             ) = document;
             total_scope.add_bytes(*file_size);
             if *filter_bytes == 0 {
@@ -1686,14 +1659,7 @@ impl CandidateStore {
 
             let classify_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
-            let _ = (
-                gram_count_estimate,
-                grams_received,
-                grams_complete,
-                effective_diversity,
-                grams_sorted_unique,
-                active_docs,
-            );
+            let _ = gram_count_estimate;
             let dedup_received = Vec::<u64>::new();
             let indexed = Vec::<u64>::new();
             let complete = false;
@@ -1780,7 +1746,6 @@ impl CandidateStore {
                     grams_indexed: indexed.len(),
                     grams_complete: complete,
                 });
-                active_docs = active_docs.saturating_add(1);
                 continue;
             }
 
@@ -1825,7 +1790,6 @@ impl CandidateStore {
                 dedup_received,
                 indexed,
             });
-            active_docs = active_docs.saturating_add(1);
         }
 
         if !pending_new_inserts.is_empty() {
@@ -4681,10 +4645,7 @@ mod tests {
         bloom_hashes: Option<usize>,
         filter_bytes: usize,
         bloom_filter: &[u8],
-        grams_received: &[u64],
-        grams_complete: bool,
         external_id: Option<String>,
-        grams_sorted_unique: bool,
     ) -> Result<CandidateInsertResult> {
         store.insert_document(
             sha256,
@@ -4697,11 +4658,7 @@ mod tests {
             bloom_filter,
             0,
             &[],
-            grams_received,
-            grams_complete,
-            None,
             external_id,
-            grams_sorted_unique,
         )
     }
 
@@ -4756,10 +4713,7 @@ mod tests {
                 bloom.add(0x4443_4241).expect("add gram");
                 bloom.into_bytes()
             },
-            &[0x4443_4241],
-            true,
             Some("doc-1".to_owned()),
-            true,
         )
         .expect("insert");
         assert_eq!(result.status, "inserted");
@@ -4822,10 +4776,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             Some("live".to_owned()),
-            true,
         )
         .expect("insert live");
         insert_primary(
@@ -4836,10 +4787,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             Some("deleted".to_owned()),
-            true,
         )
         .expect("insert deleted");
         store
@@ -4908,11 +4856,7 @@ rule q {
                 &bloom_a.into_bytes(),
                 filter_bytes,
                 &[],
-                &[0x4443_4241],
-                true,
                 None,
-                None,
-                true,
             )
             .expect("insert a");
         assert_eq!(inserted_a.doc_id, 1);
@@ -4932,11 +4876,7 @@ rule q {
                 &bloom_b.into_bytes(),
                 filter_bytes,
                 &[],
-                &[0x5A59_5857],
-                true,
                 None,
-                None,
-                true,
             )
             .expect("insert b");
         assert_eq!(inserted_b.doc_id, 2);
@@ -4970,10 +4910,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             Some("live".to_owned()),
-            true,
         )
         .expect("insert live");
         insert_primary(
@@ -4984,10 +4921,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             Some("deleted".to_owned()),
-            true,
         )
         .expect("insert deleted");
         store
@@ -5106,10 +5040,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             None,
-            true,
         )
         .expect("insert one");
         insert_primary(
@@ -5120,10 +5051,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             None,
-            true,
         )
         .expect("insert two");
         store
@@ -5145,10 +5073,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             None,
-            true,
         )
         .expect("insert third");
 
@@ -5198,10 +5123,7 @@ rule q {
             None,
             filter_bytes,
             &bloom_bytes,
-            &[0x4443_4241],
-            true,
             None,
-            true,
         )
         .expect("insert");
         store
@@ -5237,37 +5159,13 @@ rule q {
         )
         .expect("init");
 
-        let first = insert_primary(
-            &mut store,
-            [0xAA; 32],
-            32,
-            None,
-            None,
-            32,
-            &[0u8; 32],
-            &[0x0102_0304],
-            true,
-            None,
-            true,
-        )
-        .expect("insert");
+        let first = insert_primary(&mut store, [0xAA; 32], 32, None, None, 32, &[0u8; 32], None)
+            .expect("insert");
         assert_eq!(first.grams_indexed, 0);
         assert!(!first.grams_complete);
 
-        let second = insert_primary(
-            &mut store,
-            [0xBB; 32],
-            32,
-            None,
-            None,
-            32,
-            &[0u8; 32],
-            &[0x0102_0304],
-            true,
-            None,
-            true,
-        )
-        .expect("insert");
+        let second = insert_primary(&mut store, [0xBB; 32], 32, None, None, 32, &[0u8; 32], None)
+            .expect("insert");
         assert_eq!(second.grams_indexed, 0);
     }
 
@@ -5322,10 +5220,7 @@ rule q {
             None,
             small_filter_bytes,
             &small.clone().into_bytes(),
-            &[],
-            false,
             Some("doc-small".to_owned()),
-            true,
         )
         .expect("insert one");
         insert_primary(
@@ -5336,10 +5231,7 @@ rule q {
             None,
             large_filter_bytes,
             &large.clone().into_bytes(),
-            &[],
-            false,
             Some("doc-large".to_owned()),
-            true,
         )
         .expect("insert two");
         insert_primary(
@@ -5350,10 +5242,7 @@ rule q {
             None,
             large_filter_bytes,
             &large.into_bytes(),
-            &[],
-            false,
             Some("doc-deleted".to_owned()),
-            true,
         )
         .expect("insert three");
         store
@@ -5868,23 +5757,7 @@ rule q {
 
         assert!(
             store
-                .insert_document(
-                    [0x10; 32],
-                    8,
-                    None,
-                    None,
-                    None,
-                    None,
-                    0,
-                    &[],
-                    0,
-                    &[],
-                    &[],
-                    true,
-                    None,
-                    None,
-                    true,
-                )
+                .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
                 .expect_err("zero filter bytes")
                 .to_string()
                 .contains("filter_bytes must be > 0")
@@ -5902,11 +5775,7 @@ rule q {
                     &vec![0u8; 32],
                     0,
                     &[],
-                    &[],
-                    true,
                     None,
-                    None,
-                    true,
                 )
                 .expect_err("length mismatch")
                 .to_string()
@@ -5921,10 +5790,7 @@ rule q {
             None,
             1024,
             &vec![0u8; 1024],
-            &[5, 6, 6],
-            true,
             Some("first".to_owned()),
-            false,
         )
         .expect("insert");
         assert_eq!(inserted.status, "inserted");
@@ -5938,10 +5804,7 @@ rule q {
             None,
             1024,
             &vec![0u8; 1024],
-            &[99],
-            false,
             Some("ignored".to_owned()),
-            true,
         )
         .expect("duplicate");
         assert_eq!(duplicate.status, "already_exists");
@@ -5967,10 +5830,7 @@ rule q {
             None,
             1024,
             &vec![0xFF; 1024],
-            &[7],
-            false,
             Some("restored".to_owned()),
-            true,
         )
         .expect("restore");
         assert_eq!(restored.status, "restored");
@@ -6018,10 +5878,7 @@ rule q {
             Some(2),
             filter_bytes,
             &bloom_one.into_bytes(),
-            &[1],
-            true,
             None,
-            true,
         )
         .expect("insert doc one");
         insert_primary(
@@ -6032,10 +5889,7 @@ rule q {
             Some(2),
             filter_bytes,
             &bloom_two.into_bytes(),
-            &[2],
-            false,
             None,
-            true,
         )
         .expect("insert doc two");
         insert_primary(
@@ -6046,10 +5900,7 @@ rule q {
             Some(2),
             filter_bytes,
             &bloom_one_two.into_bytes(),
-            &[1],
-            false,
             None,
-            true,
         )
         .expect("insert doc three");
 
@@ -6573,11 +6424,7 @@ rule q {
                 &primary_bloom.into_bytes(),
                 tier2_filter_bytes,
                 &tier2_bloom.into_bytes(),
-                &[pack_exact_gram(&[1, 2, 3, 4])],
-                false,
                 None,
-                None,
-                true,
             )
             .expect("write tier2 sidecars");
 
@@ -6679,11 +6526,7 @@ rule q {
                 &primary_bloom.into_bytes(),
                 tier2_filter_bytes,
                 &tier2_bloom.into_bytes(),
-                &[pack_exact_gram(&[1, 2, 3, 4])],
-                false,
                 None,
-                None,
-                true,
             )
             .expect("insert");
 
@@ -6759,11 +6602,7 @@ rule q {
                 &primary_bloom.into_bytes(),
                 tier2_filter_bytes,
                 &tier2_bloom.into_bytes(),
-                &[pack_exact_gram(&[9, 8, 7, 6])],
-                false,
                 None,
-                None,
-                true,
             )
             .expect("insert");
 
@@ -6881,11 +6720,7 @@ rule q {
                 &primary_bloom.into_bytes(),
                 tier2_filter_bytes,
                 &tier2_bloom.into_bytes(),
-                &grams_received,
-                true,
                 None,
-                None,
-                true,
             )
             .expect("insert");
         let expected_summary_bytes = store.tier2_superblocks.summary_memory_bytes;
@@ -6955,11 +6790,7 @@ rule q {
                 &bloom_one,
                 filter_bytes,
                 &bloom_one,
-                &grams_one,
-                true,
                 None,
-                None,
-                true,
             )
             .expect("insert first");
         store
@@ -6980,11 +6811,7 @@ rule q {
                 &bloom_two,
                 filter_bytes,
                 &bloom_two,
-                &grams_two,
-                true,
                 None,
-                None,
-                true,
             )
             .expect("insert second");
 

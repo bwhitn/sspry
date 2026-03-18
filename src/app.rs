@@ -1053,12 +1053,8 @@ fn flush_local_pending_rows(
             &row.bloom_filter,
             row.tier2_filter_bytes,
             &row.tier2_bloom_filter,
-            &[],
-            false,
-            None,
             &row.metadata,
             row.external_id,
-            true,
         )?;
         *submit_time += started_submit.elapsed();
         *processed += 1;
@@ -1257,8 +1253,6 @@ struct ScanPolicy {
     filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
     chunk_size: usize,
-    max_unique_grams: Option<usize>,
-    _no_grams: bool,
     store_path: bool,
     id_source: CandidateIdSource,
 }
@@ -1336,7 +1330,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_bloom_hashes,
         policy.chunk_size,
         false,
-        policy.max_unique_grams,
+        None,
         gram_count_estimate,
         INTERNAL_TIER1_GRAM_BUDGET,
         INTERNAL_TIER1_GRAM_SAMPLE_MOD,
@@ -1761,8 +1755,6 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                     filter_target_fp: config.filter_target_fp,
                     gram_sizes,
                     chunk_size: args.chunk_size,
-                    max_unique_grams: args.max_unique_grams,
-                    _no_grams: args.no_grams,
                     store_path: false,
                     id_source,
                 },
@@ -1780,12 +1772,8 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 &row.bloom_filter,
                 row.tier2_filter_bytes,
                 &row.tier2_bloom_filter,
-                &[],
-                false,
-                None,
                 &row.metadata,
                 row.external_id,
-                true,
             )?;
             rpc::CandidateInsertResponse {
                 status: result.status,
@@ -1801,8 +1789,6 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                     filter_target_fp: server_policy.filter_target_fp,
                     gram_sizes: server_policy.gram_sizes,
                     chunk_size: args.chunk_size,
-                    max_unique_grams: args.max_unique_grams,
-                    _no_grams: args.no_grams,
                     store_path: server_policy.store_path,
                     id_source: server_policy.id_source,
                 },
@@ -1864,8 +1850,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 filter_target_fp: config.filter_target_fp,
                 gram_sizes,
                 chunk_size: args.chunk_size,
-                max_unique_grams: args.max_unique_grams,
-                _no_grams: args.no_grams,
                 store_path: args.external_id_from_path,
                 id_source,
             };
@@ -1992,8 +1976,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 filter_target_fp: server_policy.filter_target_fp,
                 gram_sizes: server_policy.gram_sizes,
                 chunk_size: args.chunk_size,
-                max_unique_grams: args.max_unique_grams,
-                _no_grams: args.no_grams,
                 store_path: server_policy.store_path,
                 id_source: server_policy.id_source,
             };
@@ -2863,8 +2845,6 @@ fn cmd_index(args: &IndexArgs) -> i32 {
         batch_size: args.batch_size,
         workers: args.workers.unwrap_or(0),
         chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
-        max_unique_grams: None,
-        no_grams: args.no_grams,
         external_id_from_path: server_policy.store_path,
         verbose: args.verbose,
     })
@@ -3190,12 +3170,6 @@ struct IndexArgs {
         help = "Process workers for recursive file scan/feature extraction before batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
     )]
     workers: Option<usize>,
-    #[arg(
-        long = "no-grams",
-        action = ArgAction::SetTrue,
-        help = "Do not send exact grams to Tier1 postings; use only bloom coverage."
-    )]
-    no_grams: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
 }
@@ -3412,13 +3386,6 @@ struct InternalIndexArgs {
     external_id: Option<String>,
     #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "File read chunk size in bytes.")]
     chunk_size: usize,
-    #[arg(
-        long = "max-unique-grams",
-        help = "Optional hard cap on unique grams collected before sampling."
-    )]
-    max_unique_grams: Option<usize>,
-    #[arg(long = "no-grams", action = ArgAction::SetTrue, help = "Store only tier2 bloom data for this document.")]
-    no_grams: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -3442,13 +3409,6 @@ struct InternalIndexBatchArgs {
     workers: usize,
     #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "Client read chunk size in bytes.")]
     chunk_size: usize,
-    #[arg(
-        long = "max-unique-grams",
-        help = "Optional cap for unique grams sent to the store."
-    )]
-    max_unique_grams: Option<usize>,
-    #[arg(long = "no-grams", action = ArgAction::SetTrue, help = "Do not send grams to Tier1 postings; only bloom coverage is sent.")]
-    no_grams: bool,
     #[arg(long = "external-id-from-path", action = ArgAction::SetTrue, help = "Set external_id=<file path> for each inserted document.")]
     external_id_from_path: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
@@ -3921,8 +3881,6 @@ mod tests {
                 filter_target_fp: None,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
-                max_unique_grams: None,
-                _no_grams: false,
                 store_path: true,
                 id_source: CandidateIdSource::Sha256,
             },
@@ -3946,8 +3904,6 @@ mod tests {
                 filter_target_fp: None,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
-                max_unique_grams: Some(2),
-                _no_grams: true,
                 store_path: false,
                 id_source: CandidateIdSource::Md5,
             },
@@ -4140,8 +4096,6 @@ rule q {
             root: Some(candidate_root.display().to_string()),
             external_id: Some("manual-a".to_owned()),
             chunk_size: 1024,
-            max_unique_grams: None,
-            no_grams: false,
         };
         assert_eq!(cmd_internal_index(&ingest_one), 0);
 
@@ -4152,8 +4106,6 @@ rule q {
             batch_size: 1,
             workers: 2,
             chunk_size: 1024,
-            max_unique_grams: None,
-            no_grams: false,
             external_id_from_path: true,
             verbose: false,
         };
@@ -4292,8 +4244,6 @@ rule q {
                 batch_size: 1,
                 workers: 1,
                 chunk_size: 1024,
-                max_unique_grams: Some(128),
-                no_grams: false,
                 external_id_from_path: true,
                 verbose: false,
             }),
@@ -4307,8 +4257,6 @@ rule q {
                 batch_size: 1,
                 workers: 1,
                 chunk_size: 1024,
-                max_unique_grams: None,
-                no_grams: false,
                 external_id_from_path: false,
                 verbose: false,
             }),
@@ -4321,8 +4269,6 @@ rule q {
                 root: Some(candidate_root.display().to_string()),
                 external_id: Some("manual-root-id".to_owned()),
                 chunk_size: 1024,
-                max_unique_grams: Some(64),
-                no_grams: false,
             }),
             0
         );
@@ -4416,8 +4362,6 @@ rule remote_q {
                 root: None,
                 external_id: Some(base.join("missing-match.bin").display().to_string()),
                 chunk_size: 1024,
-                max_unique_grams: Some(64),
-                no_grams: false,
             }),
             0
         );
@@ -4430,7 +4374,6 @@ rule remote_q {
                 ],
                 batch_size: 1,
                 workers: Some(2),
-                no_grams: false,
                 verbose: false,
             }),
             0
@@ -4580,8 +4523,6 @@ rule remote_q {
                 root: Some(missing_root.display().to_string()),
                 external_id: None,
                 chunk_size: 1024,
-                max_unique_grams: None,
-                no_grams: false,
             }),
             1
         );
@@ -4647,7 +4588,6 @@ rule remote_q {
                 paths: vec![sample.display().to_string()],
                 batch_size: 1,
                 workers: Some(1),
-                no_grams: false,
                 verbose: false,
             }),
             0

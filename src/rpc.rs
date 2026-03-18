@@ -241,12 +241,8 @@ type ParsedCandidateInsertDocument = (
     Option<usize>,
     Option<usize>,
     Vec<u8>,
-    Vec<u64>,
-    bool,
-    Option<f64>,
     Vec<u8>,
     Option<String>,
-    bool,
 );
 
 #[derive(Debug)]
@@ -4302,7 +4298,6 @@ impl ServerState {
                 }
             })
             .transpose()?;
-        let selected_grams = Vec::new();
         let bloom_hashes = document.bloom_hashes.filter(|value| *value > 0);
         let metadata = if let Some(payload) = &document.metadata_b64 {
             base64::engine::general_purpose::STANDARD
@@ -4335,12 +4330,8 @@ impl ServerState {
             tier2_gram_count_estimate,
             tier2_bloom_hashes,
             tier2_bloom_filter,
-            selected_grams,
-            false,
-            None,
             metadata,
             document.external_id.clone(),
-            true,
         ))
     }
 
@@ -4386,12 +4377,8 @@ impl ServerState {
             &parsed.4,
             parsed.7.len(),
             &parsed.7,
-            &parsed.8,
+            parsed.8.as_slice(),
             parsed.9,
-            parsed.10,
-            parsed.11.as_slice(),
-            parsed.12,
-            parsed.13,
         )?;
         drop(store);
         self.mark_work_mutation();
@@ -4460,11 +4447,7 @@ impl ServerState {
                         row.7.len(),
                         row.7.clone(),
                         row.8.clone(),
-                        row.9,
-                        row.10,
-                        row.11.clone(),
-                        row.12.clone(),
-                        row.13,
+                        row.9.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4603,11 +4586,7 @@ impl ServerState {
                             row.7.len(),
                             row.7.clone(),
                             row.8.clone(),
-                            row.9,
-                            row.10,
-                            row.11.clone(),
-                            row.12.clone(),
-                            row.13,
+                            row.9.clone(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -7624,11 +7603,7 @@ mod tests {
                     &bloom_filter,
                     0,
                     &[],
-                    &[gram],
-                    true,
-                    None,
                     Some(format!("doc-{byte:02x}")),
-                    true,
                 )
                 .expect("insert");
         }
