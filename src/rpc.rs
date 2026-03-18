@@ -91,6 +91,14 @@ fn lock_candidate_store_with_timeout<'a>(
     }
 }
 
+fn lock_candidate_store_blocking<'a>(
+    store_lock: &'a Mutex<CandidateStore>,
+) -> Result<MutexGuard<'a, CandidateStore>> {
+    store_lock
+        .lock()
+        .map_err(|_| SspryError::from("Candidate store lock poisoned."))
+}
+
 fn current_process_memory_kb() -> (usize, usize) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let mut current_rss_kb = 0usize;
@@ -4697,8 +4705,8 @@ impl ServerState {
         let mut tier2_doc_filter_keys = HashSet::<(usize, usize)>::new();
         let published = self.published_store_set()?;
         let mut summary_cap_bytes = None::<usize>;
-        for (shard_idx, store_lock) in published.stores.iter().enumerate() {
-            let store = lock_candidate_store_with_timeout(store_lock, shard_idx, "query prepare")?;
+        for store_lock in &published.stores {
+            let store = lock_candidate_store_blocking(store_lock)?;
             let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
             if let Some(existing) = summary_cap_bytes {
                 if existing != shard_summary_cap {
@@ -4762,8 +4770,7 @@ impl ServerState {
         let prepared = self.shared_prepared_query_artifacts(plan)?;
         let published = self.published_store_set()?;
         if self.candidate_shard_count() == 1 {
-            let mut store =
-                lock_candidate_store_with_timeout(&published.stores[0], 0, "query scan")?;
+            let mut store = lock_candidate_store_blocking(&published.stores[0])?;
             let (mut hits, tier_used) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
             hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -4783,9 +4790,8 @@ impl ServerState {
         if worker_count <= 1 {
             let mut hits = Vec::<(String, u32)>::new();
             let mut tier_used = Vec::<String>::new();
-            for (shard_idx, store_lock) in published.stores.iter().enumerate() {
-                let mut store =
-                    lock_candidate_store_with_timeout(store_lock, shard_idx, "query scan")?;
+            for store_lock in &published.stores {
+                let mut store = lock_candidate_store_blocking(store_lock)?;
                 let (local_hits, local_tiers) =
                     Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
                 hits.extend(local_hits);
@@ -4816,11 +4822,8 @@ impl ServerState {
                             if shard_idx >= stores.stores.len() {
                                 break;
                             }
-                            let mut store = lock_candidate_store_with_timeout(
-                                &stores.stores[shard_idx],
-                                shard_idx,
-                                "query scan",
-                            )?;
+                            let mut store =
+                                lock_candidate_store_blocking(&stores.stores[shard_idx])?;
                             let (hits, tiers) = Self::collect_query_matches_single_store(
                                 &mut store, plan, &prepared,
                             )?;
@@ -5752,12 +5755,8 @@ impl ServerState {
             for gram in &key {
                 merged.insert(*gram, 0);
             }
-            for (shard_idx, store_lock) in published.stores.iter().enumerate() {
-                let store = lock_candidate_store_with_timeout(
-                    store_lock,
-                    shard_idx,
-                    "document frequency lookup",
-                )?;
+            for store_lock in &published.stores {
+                let store = lock_candidate_store_blocking(store_lock)?;
                 for (gram, count) in store.df_counts_for(&key) {
                     *merged.entry(gram).or_insert(0) += count;
                 }
@@ -6372,11 +6371,21 @@ fn read_frame_optional<R: Read>(reader: &mut R) -> Result<Option<(u8, u8, Vec<u8
 fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
     let mut offset = 0usize;
     while offset < buf.len() {
-        let n = reader.read(&mut buf[offset..])?;
-        if n == 0 {
-            return Err(SspryError::from("Connection closed while reading frame."));
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) => {
+                return Err(SspryError::from("Connection closed while reading frame."));
+            }
+            Ok(n) => {
+                offset += n;
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(SspryError::from(
+                    "RPC read timed out while waiting for a server response. Increase --timeout for long-running requests.",
+                ));
+            }
+            Err(err) => return Err(SspryError::from(err)),
         }
-        offset += n;
     }
     Ok(())
 }
@@ -7153,6 +7162,126 @@ mod tests {
         assert!(
             err.to_string().contains("busy during stats"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn published_df_lookup_waits_for_locked_shard() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+
+        state
+            .handle_candidate_insert(&candidate_document_wire_from_bytes(
+                &tmp.path().join("published-df-wait.bin"),
+                b"xxABCDyy",
+            ))
+            .expect("insert");
+        state.handle_publish().expect("publish");
+
+        let published = state.published_store_set().expect("published stores");
+        let waited = thread::scope(|scope| {
+            let store_lock = &published.stores[0];
+            let holder = scope.spawn(move || {
+                let _guard = store_lock.lock().expect("lock published shard");
+                thread::sleep(Duration::from_millis(150));
+            });
+            thread::sleep(Duration::from_millis(25));
+
+            let started = Instant::now();
+            let df = state.handle_candidate_df(&[gram]).expect("df after wait");
+            let waited = started.elapsed();
+            holder.join().expect("join holder");
+            assert_eq!(df.df.get(&gram.to_string()).copied(), Some(1));
+            waited
+        });
+
+        assert!(
+            waited >= Duration::from_millis(100),
+            "expected df lookup to wait for shard lock, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn published_query_waits_for_locked_shard() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let bloom_filter_b64 = {
+            let mut bloom = crate::candidate::BloomFilter::new(1024, 7).expect("bloom");
+            bloom.add(gram).expect("add gram");
+            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
+        };
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "$a".to_owned(),
+                alternatives: vec![vec![gram]],
+                tier2_alternatives: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: "11".repeat(32),
+                file_size: 16,
+                bloom_filter_b64,
+                gram_count_estimate: None,
+                bloom_hashes: None,
+                tier2_bloom_filter_b64: None,
+                tier2_gram_count_estimate: None,
+                tier2_bloom_hashes: None,
+                grams_delta_b64: None,
+                grams: vec![gram],
+                grams_complete: true,
+                effective_diversity: None,
+                metadata_b64: None,
+                external_id: None,
+            })
+            .expect("insert");
+        state.handle_publish().expect("publish");
+
+        let published = state.published_store_set().expect("published stores");
+        let waited = thread::scope(|scope| {
+            let store_lock = &published.stores[0];
+            let holder = scope.spawn(move || {
+                let _guard = store_lock.lock().expect("lock published shard");
+                thread::sleep(Duration::from_millis(150));
+            });
+            thread::sleep(Duration::from_millis(25));
+
+            let started = Instant::now();
+            let query = state
+                .handle_candidate_query(
+                    CandidateQueryRequest {
+                        plan: Value::Null,
+                        cursor: 0,
+                        chunk_size: Some(8),
+                        include_external_ids: false,
+                    },
+                    &plan,
+                )
+                .expect("query after wait");
+            let waited = started.elapsed();
+            holder.join().expect("join holder");
+            assert_eq!(query.total_candidates, 1);
+            waited
+        });
+
+        assert!(
+            waited >= Duration::from_millis(100),
+            "expected query to wait for shard lock, waited {waited:?}"
         );
     }
 
@@ -8513,6 +8642,20 @@ mod tests {
         }
     }
 
+    struct WouldBlockReader {
+        emitted: bool,
+    }
+
+    impl Read for WouldBlockReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.emitted {
+                self.emitted = true;
+                return Err(std::io::Error::from(ErrorKind::WouldBlock));
+            }
+            Ok(0)
+        }
+    }
+
     #[test]
     fn candidate_stats_json_contains_python_compat_fields() {
         let tmp = tempdir().expect("tmp");
@@ -8655,6 +8798,16 @@ mod tests {
 
         let parsed: Map<String, Value> = json_from_bytes(&[]).expect("empty object payload");
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn frame_helpers_report_timeout_inputs() {
+        let err = read_frame(&mut WouldBlockReader { emitted: false })
+            .expect_err("would-block header must fail");
+        assert!(
+            err.to_string()
+                .contains("RPC read timed out while waiting for a server response.")
+        );
     }
 
     #[test]

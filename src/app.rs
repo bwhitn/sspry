@@ -41,6 +41,7 @@ pub const DEFAULT_RPC_HOST: &str = "127.0.0.1";
 pub const DEFAULT_RPC_PORT: u16 = 17653;
 pub const DEFAULT_RPC_ADDR: &str = "127.0.0.1:17653";
 pub const DEFAULT_RPC_TIMEOUT: f64 = 30.0;
+pub const DEFAULT_SEARCH_RPC_TIMEOUT: f64 = 180.0;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SEARCH_RESULT_CHUNK_SIZE: usize = 1024;
 pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
@@ -733,15 +734,26 @@ fn maybe_report_index_progress(
 }
 
 fn rpc_client(connection: &ClientConnectionArgs) -> SspryClient {
+    rpc_client_with_timeout(connection, connection.timeout)
+}
+
+fn rpc_client_with_timeout(connection: &ClientConnectionArgs, timeout_secs: f64) -> SspryClient {
     let (host, port) = connection
         .host_port()
         .expect("client connection addr should parse");
     SspryClient::new(RpcClientConfig::new(
         host,
         port,
-        Duration::from_secs_f64(connection.timeout.max(0.0)),
+        Duration::from_secs_f64(timeout_secs.max(0.0)),
         None,
     ))
+}
+
+fn search_rpc_client(connection: &ClientConnectionArgs) -> SspryClient {
+    rpc_client_with_timeout(
+        connection,
+        connection.timeout.max(DEFAULT_SEARCH_RPC_TIMEOUT),
+    )
 }
 
 struct ScannedIndexBatchRow {
@@ -2974,7 +2986,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 }
             }
         } else {
-            let client = rpc_client(&args.connection);
+            let client = search_rpc_client(&args.connection);
             let server_policy = server_scan_policy(&args.connection)?;
             let initial_plan = compile_query_plan_from_file_with_gram_sizes(
                 &args.rule,
@@ -3135,7 +3147,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut query_time = Duration::ZERO;
         let mut verify_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
-        let client = rpc_client(&args.connection);
+        let client = search_rpc_client(&args.connection);
         let verify_yara_files = args.verify_yara_files;
         let server_policy = server_scan_policy(&args.connection)?;
 
