@@ -627,9 +627,9 @@ const WORK_BUFFER_REPUBLISH_INPUT_BYTES_DIVISOR: u64 = 4;
 const WORK_BUFFER_REPUBLISH_MIN_INPUT_BYTES_THRESHOLD: u64 = 4 << 30;
 const WORK_BUFFER_RSS_TRIGGER_NUMERATOR: u64 = 3;
 const WORK_BUFFER_RSS_TRIGGER_DENOMINATOR: u64 = 4;
+const ENABLE_PRESSURE_PUBLISH: bool = false;
 const INDEX_BACKPRESSURE_PUBLISH_DELAY_MS: u64 = 10;
 const INDEX_BACKPRESSURE_HEAVY_DELAY_MS: u64 = 50;
-const INDEX_BACKPRESSURE_BACKLOG_DELAY_MS: u64 = 100;
 
 #[derive(Clone, Debug)]
 struct AdaptivePublishSnapshot {
@@ -2151,8 +2151,6 @@ impl ServerState {
         let index_backpressure_delay_ms = if self.active_index_sessions.load(Ordering::Acquire) == 0
         {
             0
-        } else if pressure_triggered && pressure_publish_blocked_by_seal_backlog {
-            INDEX_BACKPRESSURE_BACKLOG_DELAY_MS
         } else if self.publish_in_progress.load(Ordering::Acquire) {
             if estimated_documents >= document_threshold
                 || estimated_input_bytes >= input_bytes_threshold
@@ -2164,7 +2162,6 @@ impl ServerState {
             }
         } else if self.publish_requested.load(Ordering::Acquire)
             || self.mutations_paused.load(Ordering::Acquire)
-            || pressure_triggered
         {
             INDEX_BACKPRESSURE_PUBLISH_DELAY_MS
         } else {
@@ -2231,11 +2228,6 @@ impl ServerState {
             .saturating_add(batch_input_bytes);
         let delay_ms = if self.active_index_sessions.load(Ordering::Acquire) == 0 {
             0
-        } else if pressure.pressure_publish_blocked_by_seal_backlog
-            && (pressure.estimated_documents >= pressure.document_threshold
-                || pressure.estimated_input_bytes >= pressure.input_bytes_threshold)
-        {
-            INDEX_BACKPRESSURE_BACKLOG_DELAY_MS
         } else if self.publish_in_progress.load(Ordering::Acquire) {
             if pressure.estimated_documents >= pressure.document_threshold
                 || pressure.estimated_input_bytes >= pressure.input_bytes_threshold
@@ -2247,9 +2239,6 @@ impl ServerState {
             }
         } else if self.publish_requested.load(Ordering::Acquire)
             || self.mutations_paused.load(Ordering::Acquire)
-            || pressure.estimated_documents >= pressure.document_threshold
-            || pressure.estimated_input_bytes >= pressure.input_bytes_threshold
-            || pressure.current_rss_bytes >= pressure.rss_threshold_bytes
         {
             INDEX_BACKPRESSURE_PUBLISH_DELAY_MS
         } else {
@@ -3215,7 +3204,8 @@ impl ServerState {
             adaptive.df_pending_shards,
             adaptive.tier2_pending_shards,
         );
-        let pressure_eligible = self.config.workspace_mode
+        let pressure_eligible = ENABLE_PRESSURE_PUBLISH
+            && self.config.workspace_mode
             && work_dirty
             && active_mutations == 0
             && !publish_requested
@@ -3245,11 +3235,14 @@ impl ServerState {
             "publish_in_progress"
         } else if mutations_paused {
             "mutations_paused"
-        } else if pressure.pressure_triggered && pressure.pressure_publish_blocked_by_seal_backlog {
+        } else if ENABLE_PRESSURE_PUBLISH
+            && pressure.pressure_triggered
+            && pressure.pressure_publish_blocked_by_seal_backlog
+        {
             "seal_backlog_present"
-        } else if pressure.pressure_triggered && active_mutations > 0 {
+        } else if ENABLE_PRESSURE_PUBLISH && pressure.pressure_triggered && active_mutations > 0 {
             "active_mutations"
-        } else if pressure.pressure_triggered {
+        } else if ENABLE_PRESSURE_PUBLISH && pressure.pressure_triggered {
             "pressure_threshold"
         } else if active_index_sessions > 0 {
             "active_index_sessions"
@@ -3272,7 +3265,7 @@ impl ServerState {
             } else {
                 "blocked"
             },
-            trigger_reason: if pressure.pressure_triggered {
+            trigger_reason: if pressure_eligible {
                 pressure.trigger_reason
             } else {
                 adaptive.reason
@@ -7959,7 +7952,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_readiness_switches_to_pressure_mode_with_active_index_session() {
+    fn publish_readiness_stays_blocked_with_active_index_session_under_pressure() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         state.work_dirty.store(true, Ordering::SeqCst);
@@ -7972,14 +7965,13 @@ mod tests {
             .store(current_unix_ms(), Ordering::SeqCst);
 
         let readiness = state.publish_readiness(current_unix_ms());
-        assert!(readiness.eligible);
-        assert_eq!(readiness.blocked_reason, "ready");
-        assert_eq!(readiness.trigger_mode, "pressure");
-        assert_eq!(readiness.trigger_reason, "work_document_threshold");
+        assert!(!readiness.eligible);
+        assert_eq!(readiness.blocked_reason, "active_index_sessions");
+        assert_eq!(readiness.trigger_mode, "blocked");
     }
 
     #[test]
-    fn auto_publish_pressure_mode_rotates_work_even_with_active_index_session() {
+    fn auto_publish_does_not_rotate_work_while_index_session_is_active_under_pressure() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         let sample = tmp.path().join("pressure-publish.bin");
@@ -8011,17 +8003,17 @@ mod tests {
         state
             .work_active_estimated_documents
             .store(state.work_buffer_document_threshold(), Ordering::SeqCst);
-        state.run_auto_publish_cycle().expect("pressure publish");
+        state.run_auto_publish_cycle().expect("auto publish cycle");
 
         let stats = state.current_stats_json().expect("stats");
-        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(1),);
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(0),);
         assert_eq!(
             stats
                 .get("publish")
                 .and_then(Value::as_object)
                 .and_then(|publish| publish.get("publish_runs_total"))
                 .and_then(Value::as_u64),
-            Some(1)
+            Some(0)
         );
         assert_eq!(
             stats
@@ -8029,7 +8021,7 @@ mod tests {
                 .and_then(Value::as_object)
                 .and_then(|work| work.get("doc_count"))
                 .and_then(Value::as_u64),
-            Some(0)
+            Some(1)
         );
     }
 
@@ -8050,7 +8042,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_readiness_blocks_pressure_publish_when_seal_backlog_exists() {
+    fn publish_readiness_reports_seal_backlog_without_enabling_pressure_publish() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         state.work_dirty.store(true, Ordering::SeqCst);
@@ -8067,13 +8059,13 @@ mod tests {
 
         let readiness = state.publish_readiness(current_unix_ms());
         assert!(!readiness.eligible);
-        assert_eq!(readiness.blocked_reason, "seal_backlog_present");
+        assert_eq!(readiness.blocked_reason, "active_index_sessions");
         assert!(readiness.pressure_publish_blocked_by_seal_backlog);
         assert_eq!(readiness.pending_df_snapshot_shards, 1);
     }
 
     #[test]
-    fn seal_backlog_pressure_enables_stronger_insert_backpressure() {
+    fn seal_backlog_pressure_does_not_add_backpressure_when_pressure_publish_is_disabled() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state_with_budget(tmp.path(), 1, 32 * 1024 * 1024);
         state.active_index_sessions.store(1, Ordering::SeqCst);
@@ -8086,10 +8078,7 @@ mod tests {
 
         let pressure = state.work_buffer_pressure_snapshot(0, 1, 0);
         assert!(pressure.pressure_publish_blocked_by_seal_backlog);
-        assert_eq!(
-            pressure.index_backpressure_delay_ms,
-            INDEX_BACKPRESSURE_BACKLOG_DELAY_MS
-        );
+        assert_eq!(pressure.index_backpressure_delay_ms, 0);
     }
 
     #[test]
@@ -9003,7 +8992,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_auto_publish_rotates_work_buffers_under_pressure() {
+    fn workspace_does_not_auto_publish_under_pressure_while_index_active() {
         let tmp = tempdir().expect("tmp");
         let config = start_tcp_workspace_server_with_budget(tmp.path(), 1, 32 * 1024 * 1024);
         let client = SspryClient::new(config.clone());
@@ -9033,31 +9022,16 @@ mod tests {
         assert_eq!(inserted.inserted_count, 40);
 
         let status_client = SspryClient::new(config.clone());
-        let wait_started = Instant::now();
-        loop {
-            let status = status_client.candidate_status().expect("candidate status");
-            if status
+        thread::sleep(Duration::from_millis(250));
+        let status = status_client.candidate_status().expect("candidate status");
+        assert_eq!(
+            status
                 .get("publish")
                 .and_then(Value::as_object)
                 .and_then(|publish| publish.get("publish_runs_total"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                >= 1
-            {
-                let trigger_mode = status
-                    .get("publish")
-                    .and_then(Value::as_object)
-                    .and_then(|publish| publish.get("trigger_mode"))
-                    .and_then(Value::as_str);
-                assert!(matches!(trigger_mode, Some("pressure") | Some("blocked")));
-                break;
-            }
-            assert!(
-                wait_started.elapsed() < Duration::from_secs(10),
-                "pressure-triggered publish did not complete"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+                .and_then(Value::as_u64),
+            Some(0)
+        );
 
         let extra = candidate_document_wire_from_bytes(
             &tmp.path().join("pressure-extra.bin"),
