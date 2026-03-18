@@ -72,9 +72,6 @@ pub struct CandidateInsertResult {
     pub status: String,
     pub doc_id: u64,
     pub sha256: String,
-    pub grams_received: usize,
-    pub grams_indexed: usize,
-    pub grams_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -179,7 +176,6 @@ pub struct ImportedCandidateDocument {
     pub tier2_bloom_hashes: usize,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
-    pub grams_complete: bool,
     pub metadata_bytes: Vec<u8>,
     pub external_id: Option<String>,
 }
@@ -199,7 +195,6 @@ pub struct CandidateQueryResult {
 pub struct CandidateStats {
     pub doc_count: usize,
     pub deleted_doc_count: usize,
-    pub tier1_incomplete_doc_count: usize,
     pub id_source: String,
     pub store_path: bool,
     pub filter_target_fp: Option<f64>,
@@ -273,12 +268,6 @@ impl Default for StoreMeta {
     }
 }
 
-impl StoreMeta {
-    fn exact_gram_bytes(&self) -> usize {
-        if self.tier1_gram_size <= 4 { 4 } else { 8 }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct CandidateDoc {
     doc_id: u64,
@@ -288,7 +277,6 @@ struct CandidateDoc {
     bloom_hashes: usize,
     tier2_filter_bytes: usize,
     tier2_bloom_hashes: usize,
-    grams_complete: bool,
     deleted: bool,
 }
 
@@ -318,7 +306,6 @@ const DOC_META_ROW_BYTES: usize = 80;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
-const DOC_FLAG_GRAMS_COMPLETE: u8 = 0x01;
 const DOC_FLAG_DELETED: u8 = 0x02;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -670,7 +657,6 @@ struct CompactionDocRef {
     bloom_hashes: usize,
     tier2_filter_bytes: usize,
     tier2_bloom_hashes: usize,
-    grams_complete: bool,
     row: DocMetaRow,
     tier2_row: Tier2DocMetaRow,
 }
@@ -1113,7 +1099,6 @@ impl CandidateStore {
     }
 
     pub fn deleted_storage_bytes(&self) -> u64 {
-        let gram_bytes = self.meta.exact_gram_bytes() as u64;
         let mut total = 0u64;
         for ((row, tier2_row), doc) in self
             .doc_rows
@@ -1130,8 +1115,6 @@ impl CandidateStore {
                 .saturating_add(TIER2_DOC_META_ROW_BYTES as u64)
                 .saturating_add(row.bloom_len as u64)
                 .saturating_add(tier2_row.bloom_len as u64)
-                .saturating_add(row.grams_received_count as u64 * gram_bytes)
-                .saturating_add(row.grams_indexed_count as u64 * gram_bytes)
                 .saturating_add(row.metadata_len as u64)
                 .saturating_add(row.external_id_len as u64);
         }
@@ -1169,7 +1152,6 @@ impl CandidateStore {
                 bloom_hashes: doc.bloom_hashes,
                 tier2_filter_bytes: doc.tier2_filter_bytes,
                 tier2_bloom_hashes: doc.tier2_bloom_hashes,
-                grams_complete: doc.grams_complete,
                 row: *row,
                 tier2_row: *tier2_row,
             });
@@ -1410,23 +1392,15 @@ impl CandidateStore {
         let sha256_hex = hex::encode(sha256);
 
         // Bloom-only ingest no longer persists or ranks exact grams.
-        let dedup_received = Vec::<u64>::new();
-        let indexed = Vec::<u64>::new();
-        let complete = false;
-
         let status;
         let doc_id;
         if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
             if !self.docs[existing_pos].deleted {
                 let existing = &self.docs[existing_pos];
-                let existing_row = self.doc_rows[existing_pos];
                 return Ok(CandidateInsertResult {
                     status: "already_exists".to_owned(),
                     doc_id: existing.doc_id,
                     sha256: existing.sha256.clone(),
-                    grams_received: existing_row.grams_received_count as usize,
-                    grams_indexed: existing_row.grams_indexed_count as usize,
-                    grams_complete: existing.grams_complete,
                 });
             }
             let snapshot = {
@@ -1440,7 +1414,6 @@ impl CandidateStore {
                 } else {
                     expected_tier2_bloom_hashes
                 };
-                existing.grams_complete = complete;
                 existing.deleted = false;
                 existing.clone()
             };
@@ -1448,13 +1421,10 @@ impl CandidateStore {
                 snapshot.file_size,
                 snapshot.filter_bytes,
                 snapshot.bloom_hashes,
-                snapshot.grams_complete,
                 snapshot.deleted,
                 metadata,
                 external_id.as_deref(),
                 bloom_filter,
-                &dedup_received,
-                &indexed,
             )?;
             let tier2_row = self.build_tier2_doc_row(
                 snapshot.tier2_filter_bytes,
@@ -1487,7 +1457,6 @@ impl CandidateStore {
                 } else {
                     expected_tier2_bloom_hashes
                 },
-                grams_complete: complete,
                 deleted: false,
             };
             {
@@ -1496,13 +1465,10 @@ impl CandidateStore {
                     doc.file_size,
                     doc.filter_bytes,
                     doc.bloom_hashes,
-                    doc.grams_complete,
                     doc.deleted,
                     metadata,
                     external_id.as_deref(),
                     bloom_filter,
-                    &dedup_received,
-                    &indexed,
                 )?;
                 let tier2_row = self.build_tier2_doc_row(
                     doc.tier2_filter_bytes,
@@ -1525,30 +1491,10 @@ impl CandidateStore {
         self.sidecars.invalidate_all();
 
         self.mark_write_activity();
-        total_scope.add_items(dedup_received.len() as u64);
-        record_counter(
-            "candidate.insert_document_received_grams_total",
-            dedup_received.len() as u64,
-        );
-        record_counter(
-            "candidate.insert_document_indexed_grams_total",
-            indexed.len() as u64,
-        );
-        record_max(
-            "candidate.insert_document_max_received_grams",
-            dedup_received.len() as u64,
-        );
-        record_max(
-            "candidate.insert_document_max_indexed_grams",
-            indexed.len() as u64,
-        );
         Ok(CandidateInsertResult {
             status,
             doc_id,
             sha256: sha256_hex,
-            grams_received: dedup_received.len(),
-            grams_indexed: indexed.len(),
-            grams_complete: complete,
         })
     }
 
@@ -1581,8 +1527,6 @@ impl CandidateStore {
             external_id: Option<&'a str>,
             bloom_filter: &'a [u8],
             tier2_bloom_filter: &'a [u8],
-            dedup_received: Vec<u64>,
-            indexed: Vec<u64>,
         }
 
         let mut total_scope = scope("candidate.insert_documents_batch");
@@ -1590,10 +1534,6 @@ impl CandidateStore {
         let mut modified = false;
         let mut meta_dirty = false;
         let mut insert_profile = CandidateInsertBatchProfile::default();
-        let mut received_grams_total = 0u64;
-        let mut indexed_grams_total = 0u64;
-        let mut max_received_grams = 0u64;
-        let mut max_indexed_grams = 0u64;
         let mut tier2_updates = Vec::<(usize, usize, usize, &[u8])>::with_capacity(documents.len());
         let mut pending_new_inserts = Vec::<PendingNewInsert<'_>>::new();
 
@@ -1660,27 +1600,14 @@ impl CandidateStore {
             let classify_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
             let _ = gram_count_estimate;
-            let dedup_received = Vec::<u64>::new();
-            let indexed = Vec::<u64>::new();
-            let complete = false;
-            let received_len = dedup_received.len() as u64;
-            let indexed_len = indexed.len() as u64;
-            received_grams_total = received_grams_total.saturating_add(received_len);
-            indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
-            max_received_grams = max_received_grams.max(received_len);
-            max_indexed_grams = max_indexed_grams.max(indexed_len);
 
             if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
                 if !self.docs[existing_pos].deleted {
                     let existing = &self.docs[existing_pos];
-                    let existing_row = self.doc_rows[existing_pos];
                     results.push(CandidateInsertResult {
                         status: "already_exists".to_owned(),
                         doc_id: existing.doc_id,
                         sha256: existing.sha256.clone(),
-                        grams_received: existing_row.grams_received_count as usize,
-                        grams_indexed: existing_row.grams_indexed_count as usize,
-                        grams_complete: existing.grams_complete,
                     });
                     insert_profile.classify_us = insert_profile
                         .classify_us
@@ -1703,7 +1630,6 @@ impl CandidateStore {
                     } else {
                         expected_tier2_bloom_hashes
                     };
-                    existing.grams_complete = complete;
                     existing.deleted = false;
                     existing.clone()
                 };
@@ -1711,13 +1637,10 @@ impl CandidateStore {
                     snapshot.file_size,
                     snapshot.filter_bytes,
                     snapshot.bloom_hashes,
-                    snapshot.grams_complete,
                     snapshot.deleted,
                     metadata,
                     external_id.as_deref(),
                     bloom_filter,
-                    &dedup_received,
-                    &indexed,
                 )?;
                 let tier2_row = self.build_tier2_doc_row(
                     snapshot.tier2_filter_bytes,
@@ -1742,9 +1665,6 @@ impl CandidateStore {
                     status: "restored".to_owned(),
                     doc_id: snapshot.doc_id,
                     sha256: sha256_hex,
-                    grams_received: dedup_received.len(),
-                    grams_indexed: indexed.len(),
-                    grams_complete: complete,
                 });
                 continue;
             }
@@ -1766,7 +1686,6 @@ impl CandidateStore {
                 } else {
                     expected_tier2_bloom_hashes
                 },
-                grams_complete: complete,
                 deleted: false,
             };
             modified = true;
@@ -1775,9 +1694,6 @@ impl CandidateStore {
                 status: "inserted".to_owned(),
                 doc_id,
                 sha256: sha256_hex,
-                grams_received: dedup_received.len(),
-                grams_indexed: indexed.len(),
-                grams_complete: complete,
             });
             pending_new_inserts.push(PendingNewInsert {
                 sha256: *sha256,
@@ -1787,8 +1703,6 @@ impl CandidateStore {
                 external_id: external_id.as_deref(),
                 bloom_filter,
                 tier2_bloom_filter,
-                dedup_received,
-                indexed,
             });
         }
 
@@ -1843,14 +1757,11 @@ impl CandidateStore {
                     pending.doc.file_size,
                     pending.doc.filter_bytes,
                     pending.doc.bloom_hashes,
-                    pending.doc.grams_complete,
                     pending.doc.deleted,
                     pending.metadata,
                     pending.external_id,
                     bloom_offset,
                     pending.bloom_filter.len(),
-                    &pending.dedup_received,
-                    &pending.indexed,
                 )?;
                 insert_profile.append_doc_row_build_us = insert_profile
                     .append_doc_row_build_us
@@ -1926,23 +1837,6 @@ impl CandidateStore {
                 .saturating_add(elapsed_us(rebalance_tier2_started));
             self.sidecars.invalidate_all();
             self.mark_write_activity();
-            total_scope.add_items(received_grams_total);
-            record_counter(
-                "candidate.insert_document_received_grams_total",
-                received_grams_total,
-            );
-            record_counter(
-                "candidate.insert_document_indexed_grams_total",
-                indexed_grams_total,
-            );
-            record_max(
-                "candidate.insert_document_max_received_grams",
-                max_received_grams,
-            );
-            record_max(
-                "candidate.insert_document_max_indexed_grams",
-                max_indexed_grams,
-            );
         }
         self.last_insert_batch_profile = insert_profile;
         Ok(results)
@@ -2005,7 +1899,6 @@ impl CandidateStore {
                 tier2_bloom_hashes: doc.tier2_bloom_hashes,
                 bloom_filter: self.doc_bloom_bytes(pos)?.into_owned(),
                 tier2_bloom_filter: self.doc_tier2_bloom_bytes(pos)?.into_owned(),
-                grams_complete: doc.grams_complete,
                 metadata_bytes: self.doc_metadata_bytes(pos)?.into_owned(),
                 external_id: self.doc_external_id(pos)?,
             });
@@ -2064,36 +1957,22 @@ impl CandidateStore {
         let mut pending_inserts = Vec::<PendingImportedInsert<'_>>::new();
         let mut modified = false;
         let mut meta_dirty = false;
-        let mut received_grams_total = 0u64;
-        let mut indexed_grams_total = 0u64;
-        let mut max_received_grams = 0u64;
-        let mut max_indexed_grams = 0u64;
         let mut import_profile = CandidateImportBatchProfile::default();
 
         let classify_started = Instant::now();
         for document in documents {
             total_scope.add_bytes(document.file_size);
             let sha256_hex = document.sha256_hex.clone();
-            let received_len = 0u64;
-            let indexed_len = 0u64;
-            received_grams_total = received_grams_total.saturating_add(received_len);
-            indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
-            max_received_grams = max_received_grams.max(received_len);
-            max_indexed_grams = max_indexed_grams.max(indexed_len);
 
             if !assume_new {
                 if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
                     if !self.docs[existing_pos].deleted {
                         let existing = &self.docs[existing_pos];
-                        let existing_row = self.doc_rows[existing_pos];
                         if collect_results {
                             results.push(CandidateInsertResult {
                                 status: "already_exists".to_owned(),
                                 doc_id: existing.doc_id,
                                 sha256: existing.sha256.clone(),
-                                grams_received: existing_row.grams_received_count as usize,
-                                grams_indexed: existing_row.grams_indexed_count as usize,
-                                grams_complete: existing.grams_complete,
                             });
                         }
                         continue;
@@ -2106,7 +1985,6 @@ impl CandidateStore {
                         existing.bloom_hashes = document.bloom_hashes;
                         existing.tier2_filter_bytes = document.tier2_filter_bytes;
                         existing.tier2_bloom_hashes = document.tier2_bloom_hashes;
-                        existing.grams_complete = document.grams_complete;
                         existing.deleted = false;
                         existing.clone()
                     };
@@ -2114,13 +1992,10 @@ impl CandidateStore {
                         snapshot.file_size,
                         snapshot.filter_bytes,
                         snapshot.bloom_hashes,
-                        snapshot.grams_complete,
                         snapshot.deleted,
                         &document.metadata_bytes,
                         document.external_id.as_deref(),
                         &document.bloom_filter,
-                        &[],
-                        &[],
                     )?;
                     let tier2_row = self.build_tier2_doc_row(
                         snapshot.tier2_filter_bytes,
@@ -2141,9 +2016,6 @@ impl CandidateStore {
                             status: "restored".to_owned(),
                             doc_id: snapshot.doc_id,
                             sha256: sha256_hex,
-                            grams_received: 0,
-                            grams_indexed: 0,
-                            grams_complete: document.grams_complete,
                         });
                     }
                     continue;
@@ -2188,9 +2060,6 @@ impl CandidateStore {
                 usize,
                 usize,
                 &'_ [u8],
-                usize,
-                usize,
-                bool,
             )>::with_capacity(pending_inserts.len());
 
             let build_payloads_started = Instant::now();
@@ -2232,7 +2101,7 @@ impl CandidateStore {
                 let row = DocMetaRow {
                     file_size: document.file_size,
                     filter_bytes: document.filter_bytes as u32,
-                    flags: u8::from(document.grams_complete) * DOC_FLAG_GRAMS_COMPLETE,
+                    flags: 0,
                     bloom_hashes: document.bloom_hashes.min(u8::MAX as usize) as u8,
                     bloom_offset,
                     bloom_len: document.bloom_filter.len() as u32,
@@ -2254,7 +2123,6 @@ impl CandidateStore {
                     bloom_hashes: document.bloom_hashes,
                     tier2_filter_bytes: document.tier2_filter_bytes,
                     tier2_bloom_hashes: document.tier2_bloom_hashes,
-                    grams_complete: document.grams_complete,
                     deleted: false,
                 };
 
@@ -2269,9 +2137,6 @@ impl CandidateStore {
                     document.filter_bytes,
                     document.bloom_hashes,
                     document.bloom_filter.as_slice(),
-                    0,
-                    0,
-                    document.grams_complete,
                 ));
             }
             import_profile.build_payloads_ms = build_payloads_started
@@ -2305,18 +2170,8 @@ impl CandidateStore {
             let mut tier2_updates =
                 Vec::<(usize, usize, usize, &'_ [u8])>::with_capacity(prepared.len());
             let install_docs_started = Instant::now();
-            for (
-                doc,
-                row,
-                tier2_row,
-                sha256_hex,
-                filter_bytes,
-                bloom_hashes,
-                bloom_filter,
-                grams_received_len,
-                grams_indexed_len,
-                grams_complete,
-            ) in prepared
+            for (doc, row, tier2_row, sha256_hex, filter_bytes, bloom_hashes, bloom_filter) in
+                prepared
             {
                 self.doc_rows.push(row);
                 self.tier2_doc_rows.push(tier2_row);
@@ -2329,9 +2184,6 @@ impl CandidateStore {
                         status: "inserted".to_owned(),
                         doc_id: doc.doc_id,
                         sha256: sha256_hex,
-                        grams_received: grams_received_len,
-                        grams_indexed: grams_indexed_len,
-                        grams_complete,
                     });
                 }
             }
@@ -2362,23 +2214,6 @@ impl CandidateStore {
                 .unwrap_or(u64::MAX);
             self.sidecars.invalidate_all();
             self.mark_write_activity();
-            total_scope.add_items(received_grams_total);
-            record_counter(
-                "candidate.insert_document_received_grams_total",
-                received_grams_total,
-            );
-            record_counter(
-                "candidate.insert_document_indexed_grams_total",
-                indexed_grams_total,
-            );
-            record_max(
-                "candidate.insert_document_max_received_grams",
-                max_received_grams,
-            );
-            record_max(
-                "candidate.insert_document_max_indexed_grams",
-                max_indexed_grams,
-            );
         }
 
         self.last_import_batch_profile = import_profile;
@@ -2535,7 +2370,6 @@ impl CandidateStore {
                     &plan.root,
                     doc,
                     metadata_bytes.as_ref(),
-                    &[],
                     tier1_bloom_bytes.as_ref(),
                     tier2_bloom_bytes.as_ref(),
                     &prepared.patterns,
@@ -2557,11 +2391,6 @@ impl CandidateStore {
     pub fn stats(&self) -> CandidateStats {
         let doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
         let deleted_doc_count = self.docs.iter().filter(|doc| doc.deleted).count();
-        let tier1_incomplete_doc_count = self
-            .docs
-            .iter()
-            .filter(|doc| !doc.deleted && !doc.grams_complete)
-            .count();
         let cooldown_remaining = self.compaction_cooldown_remaining_s();
         let tier2_match_ratio = if self.tier2_telemetry.tier2_scanned_docs_total > 0 {
             self.tier2_telemetry.tier2_docs_matched_total as f64
@@ -2572,7 +2401,6 @@ impl CandidateStore {
         CandidateStats {
             doc_count,
             deleted_doc_count,
-            tier1_incomplete_doc_count,
             id_source: self.meta.id_source.clone(),
             store_path: self.meta.store_path,
             filter_target_fp: self.meta.filter_target_fp,
@@ -2725,26 +2553,20 @@ impl CandidateStore {
         file_size: u64,
         filter_bytes: usize,
         bloom_hashes: usize,
-        grams_complete: bool,
         deleted: bool,
         metadata: &[u8],
         external_id: Option<&str>,
         bloom_filter: &[u8],
-        grams_received: &[u64],
-        grams_indexed: &[u64],
     ) -> Result<DocMetaRow> {
         Ok(self
             .build_doc_row_profile(
                 file_size,
                 filter_bytes,
                 bloom_hashes,
-                grams_complete,
                 deleted,
                 metadata,
                 external_id,
                 bloom_filter,
-                grams_received,
-                grams_indexed,
             )?
             .0)
     }
@@ -2754,21 +2576,17 @@ impl CandidateStore {
         file_size: u64,
         filter_bytes: usize,
         bloom_hashes: usize,
-        grams_complete: bool,
         deleted: bool,
         metadata: &[u8],
         external_id: Option<&str>,
         bloom_offset: u64,
         bloom_len: usize,
-        grams_received: &[u64],
-        grams_indexed: &[u64],
     ) -> Result<(DocMetaRow, CandidateDocRowPayloadProfile)> {
         fn elapsed_us(started: Instant) -> u64 {
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
         }
 
         let mut profile = CandidateDocRowPayloadProfile::default();
-        let _ = (grams_received, grams_indexed);
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
@@ -2795,8 +2613,7 @@ impl CandidateStore {
             DocMetaRow {
                 file_size,
                 filter_bytes: filter_bytes as u32,
-                flags: (u8::from(grams_complete) * DOC_FLAG_GRAMS_COMPLETE)
-                    | (u8::from(deleted) * DOC_FLAG_DELETED),
+                flags: u8::from(deleted) * DOC_FLAG_DELETED,
                 bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
                 bloom_offset,
                 bloom_len: bloom_len as u32,
@@ -2818,13 +2635,10 @@ impl CandidateStore {
         file_size: u64,
         filter_bytes: usize,
         bloom_hashes: usize,
-        grams_complete: bool,
         deleted: bool,
         metadata: &[u8],
         external_id: Option<&str>,
         bloom_filter: &[u8],
-        grams_received: &[u64],
-        grams_indexed: &[u64],
     ) -> Result<(DocMetaRow, CandidateDocRowPayloadProfile)> {
         fn elapsed_us(started: Instant) -> u64 {
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -2835,7 +2649,6 @@ impl CandidateStore {
         let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
         profile.bloom_us = elapsed_us(bloom_started);
         profile.bloom_bytes = bloom_filter.len() as u64;
-        let _ = (grams_received, grams_indexed);
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
@@ -2861,8 +2674,7 @@ impl CandidateStore {
         let row = DocMetaRow {
             file_size,
             filter_bytes: filter_bytes as u32,
-            flags: (u8::from(grams_complete) * DOC_FLAG_GRAMS_COMPLETE)
-                | (u8::from(deleted) * DOC_FLAG_DELETED),
+            flags: u8::from(deleted) * DOC_FLAG_DELETED,
             bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset,
             bloom_len: bloom_filter.len() as u32,
@@ -3480,7 +3292,7 @@ pub(crate) fn write_compacted_snapshot(
         let row = DocMetaRow {
             file_size: doc.file_size,
             filter_bytes: doc.filter_bytes as u32,
-            flags: u8::from(doc.grams_complete) * DOC_FLAG_GRAMS_COMPLETE,
+            flags: 0,
             bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset: append_blob(blooms_path(compacted_root), &bloom_bytes)?,
             bloom_len: bloom_bytes.len() as u32,
@@ -3762,7 +3574,6 @@ fn legacy_docs_to_docs(docs: &[LegacyCandidateDoc]) -> Vec<CandidateDoc> {
             bloom_hashes: doc.bloom_hashes.max(1),
             tier2_filter_bytes: doc.tier2_filter_bytes,
             tier2_bloom_hashes: doc.tier2_bloom_hashes,
-            grams_complete: doc.grams_complete,
             deleted: doc.deleted,
         });
     }
@@ -3906,8 +3717,7 @@ fn persist_docs_as_binary(
         let row = DocMetaRow {
             file_size: doc.file_size,
             filter_bytes: doc.filter_bytes as u32,
-            flags: (u8::from(doc.grams_complete) * DOC_FLAG_GRAMS_COMPLETE)
-                | (u8::from(doc.deleted) * DOC_FLAG_DELETED),
+            flags: u8::from(doc.deleted) * DOC_FLAG_DELETED,
             bloom_hashes: doc.bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset: append_blob(blooms_path(root), &bloom_bytes)?,
             bloom_len: bloom_bytes.len() as u32,
@@ -3991,7 +3801,6 @@ fn load_candidate_binary_store(
             bloom_hashes: usize::from(row.bloom_hashes.max(1)),
             tier2_filter_bytes: tier2_row.filter_bytes as usize,
             tier2_bloom_hashes: usize::from(tier2_row.bloom_hashes),
-            grams_complete: (row.flags & DOC_FLAG_GRAMS_COMPLETE) != 0,
             deleted: (row.flags & DOC_FLAG_DELETED) != 0,
         });
         rows.push(row);
@@ -4327,7 +4136,6 @@ fn evaluate_pattern(
     pattern: &PatternPlan,
     pattern_masks: &PreparedPatternMasks,
     doc: &CandidateDoc,
-    _indexed_bytes: &[u8],
     bloom_bytes: &[u8],
     tier2_bloom_bytes: &[u8],
     plan: &CompiledQueryPlan,
@@ -4398,7 +4206,6 @@ fn evaluate_node(
     node: &QueryNode,
     doc: &CandidateDoc,
     metadata_bytes: &[u8],
-    indexed_bytes: &[u8],
     bloom_bytes: &[u8],
     tier2_bloom_bytes: &[u8],
     patterns: &HashMap<String, PatternPlan>,
@@ -4426,7 +4233,6 @@ fn evaluate_node(
                 pattern,
                 pattern_masks,
                 doc,
-                indexed_bytes,
                 bloom_bytes,
                 tier2_bloom_bytes,
                 plan,
@@ -4488,7 +4294,6 @@ fn evaluate_node(
                     child,
                     doc,
                     metadata_bytes,
-                    indexed_bytes,
                     bloom_bytes,
                     tier2_bloom_bytes,
                     patterns,
@@ -4515,7 +4320,6 @@ fn evaluate_node(
                     child,
                     doc,
                     metadata_bytes,
-                    indexed_bytes,
                     bloom_bytes,
                     tier2_bloom_bytes,
                     patterns,
@@ -4542,7 +4346,6 @@ fn evaluate_node(
                     child,
                     doc,
                     metadata_bytes,
-                    indexed_bytes,
                     bloom_bytes,
                     tier2_bloom_bytes,
                     patterns,
@@ -4627,14 +4430,6 @@ mod tests {
             deleted,
             external_id: external_id.map(str::to_owned),
         }
-    }
-
-    fn u32_bytes(values: &[u32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(values.len() * 4);
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out
     }
 
     fn insert_primary(
@@ -5161,12 +4956,11 @@ rule q {
 
         let first = insert_primary(&mut store, [0xAA; 32], 32, None, None, 32, &[0u8; 32], None)
             .expect("insert");
-        assert_eq!(first.grams_indexed, 0);
-        assert!(!first.grams_complete);
+        assert_eq!(first.status, "inserted");
 
         let second = insert_primary(&mut store, [0xBB; 32], 32, None, None, 32, &[0u8; 32], None)
             .expect("insert");
-        assert_eq!(second.grams_indexed, 0);
+        assert_eq!(second.status, "inserted");
     }
 
     #[test]
@@ -5576,7 +5370,7 @@ rule q {
         let row = DocMetaRow {
             file_size: 123,
             filter_bytes: 64,
-            flags: DOC_FLAG_GRAMS_COMPLETE | DOC_FLAG_DELETED,
+            flags: DOC_FLAG_DELETED,
             bloom_hashes: 7,
             bloom_offset: 7,
             bloom_len: 8,
@@ -5794,7 +5588,6 @@ rule q {
         )
         .expect("insert");
         assert_eq!(inserted.status, "inserted");
-        assert_eq!(inserted.grams_received, 0);
 
         let duplicate = insert_primary(
             &mut store,
@@ -5809,7 +5602,6 @@ rule q {
         .expect("duplicate");
         assert_eq!(duplicate.status, "already_exists");
         assert_eq!(duplicate.doc_id, inserted.doc_id);
-        assert_eq!(duplicate.grams_received, 0);
 
         let missing = store
             .delete_document(&hex::encode([0x33; 32]))
@@ -5835,12 +5627,10 @@ rule q {
         .expect("restore");
         assert_eq!(restored.status, "restored");
         assert_eq!(restored.doc_id, inserted.doc_id);
-        assert!(!restored.grams_complete);
 
         let stats = store.stats();
         assert_eq!(stats.doc_count, 1);
         assert_eq!(stats.deleted_doc_count, 0);
-        assert_eq!(stats.tier1_incomplete_doc_count, 1);
         assert_eq!(
             store.external_ids_for_sha256(&[hex::encode([0x10; 32])]),
             vec![Some("restored".to_owned())]
@@ -5962,10 +5752,8 @@ rule q {
             bloom_hashes: 2,
             tier2_filter_bytes: 0,
             tier2_bloom_hashes: 0,
-            grams_complete: false,
             deleted: false,
         };
-        let indexed = u32_bytes(&[1]);
         let patterns_vec = vec![
             PatternPlan {
                 pattern_id: "empty".to_owned(),
@@ -6025,7 +5813,6 @@ rule q {
             patterns.get("empty").expect("empty"),
             mask_cache.get("empty").expect("empty masks"),
             &doc,
-            &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &eval_plan,
@@ -6040,16 +5827,11 @@ rule q {
             allow_tier2_fallback: false,
             ..eval_plan.clone()
         };
-        let complete_doc = CandidateDoc {
-            grams_complete: true,
-            ..doc.clone()
-        };
-        let empty_indexed = Vec::new();
+        let complete_doc = doc.clone();
         let outcome = evaluate_pattern(
             patterns.get("missing").expect("missing"),
             mask_cache.get("missing").expect("missing masks"),
             &complete_doc,
-            &empty_indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &no_fallback_plan,
@@ -6068,7 +5850,6 @@ rule q {
             patterns.get("tier2").expect("tier2"),
             mask_cache.get("tier2").expect("tier2 masks"),
             &complete_doc,
-            &empty_indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &allow_fallback_plan,
@@ -6078,16 +5859,11 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
-        let no_overlap_doc = CandidateDoc {
-            grams_complete: false,
-            ..doc.clone()
-        };
-        let no_overlap_indexed = u32_bytes(&[3]);
+        let no_overlap_doc = doc.clone();
         let outcome = evaluate_pattern(
             patterns.get("tier2").expect("tier2"),
             mask_cache.get("tier2").expect("tier2 masks"),
             &no_overlap_doc,
-            &no_overlap_indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &allow_fallback_plan,
@@ -6119,7 +5895,6 @@ rule q {
             },
             &doc,
             &[],
-            &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &patterns,
@@ -6155,7 +5930,6 @@ rule q {
             },
             &doc,
             &[],
-            &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &patterns,
@@ -6191,7 +5965,6 @@ rule q {
             },
             &doc,
             &[],
-            &indexed,
             &bloom_bytes,
             tier2_bloom_bytes,
             &patterns,
@@ -6215,7 +5988,6 @@ rule q {
                 },
                 &doc,
                 &[],
-                &indexed,
                 &bloom_bytes,
                 tier2_bloom_bytes,
                 &patterns,
@@ -6238,7 +6010,6 @@ rule q {
                 },
                 &doc,
                 &[],
-                &indexed,
                 &bloom_bytes,
                 tier2_bloom_bytes,
                 &patterns,
@@ -6278,7 +6049,6 @@ rule q {
             bloom_hashes: 2,
             tier2_filter_bytes: 8,
             tier2_bloom_hashes: 2,
-            grams_complete: true,
             deleted: false,
         };
         let patterns = HashMap::<String, PatternPlan>::new();
@@ -6304,7 +6074,6 @@ rule q {
             &metadata_bytes,
             &[],
             &[],
-            &[],
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -6322,7 +6091,6 @@ rule q {
                 children: Vec::new(),
             },
             &doc,
-            &[],
             &[],
             &[],
             &[],
@@ -6346,7 +6114,6 @@ rule q {
             &metadata_bytes,
             &[],
             &[],
-            &[],
             &patterns,
             &mask_cache,
             &eval_plan,
@@ -6365,7 +6132,6 @@ rule q {
             },
             &doc,
             &metadata_bytes,
-            &[],
             &[],
             &[],
             &patterns,

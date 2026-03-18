@@ -2899,7 +2899,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
         let mut plan_time = Duration::ZERO;
-        let df_lookup_time = Duration::ZERO;
         let mut query_time = Duration::ZERO;
         let mut verify_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
@@ -3054,12 +3053,10 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         if args.verbose {
             let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
             let plan_ms = plan_time.as_secs_f64() * 1000.0;
-            let df_ms = df_lookup_time.as_secs_f64() * 1000.0;
             let query_ms = query_time.as_secs_f64() * 1000.0;
             let verify_ms = verify_time.as_secs_f64() * 1000.0;
             eprintln!("verbose.search.total_ms: {total_ms:.3}");
             eprintln!("verbose.search.plan_ms: {plan_ms:.3}");
-            eprintln!("verbose.search.df_lookup_ms: {df_ms:.3}");
             eprintln!("verbose.search.query_ms: {query_ms:.3}");
             eprintln!("verbose.search.verify_ms: {verify_ms:.3}");
             eprintln!("verbose.search.max_candidates: {}", args.max_candidates);
@@ -3455,8 +3452,6 @@ struct InternalQueryArgs {
         help = "Maximum candidate hashes returned before paging; 0 means unlimited."
     )]
     max_candidates: usize,
-    #[arg(long = "no-df-lookup", action = ArgAction::SetTrue, help = "Skip DF lookup when selecting rare anchors.")]
-    no_df_lookup: bool,
 }
 
 #[cfg(test)]
@@ -4121,7 +4116,6 @@ rule q {
             force_tier1_only: false,
             no_tier2_fallback: false,
             max_candidates: 100,
-            no_df_lookup: false,
         };
         assert_eq!(cmd_internal_query(&query_args), 0);
 
@@ -4283,7 +4277,6 @@ rule q {
                 force_tier1_only: false,
                 no_tier2_fallback: false,
                 max_candidates: 2,
-                no_df_lookup: false,
             }),
             0
         );
@@ -4298,7 +4291,6 @@ rule q {
                 force_tier1_only: true,
                 no_tier2_fallback: true,
                 max_candidates: 8,
-                no_df_lookup: true,
             }),
             0
         );
@@ -4389,7 +4381,6 @@ rule remote_q {
                 force_tier1_only: false,
                 no_tier2_fallback: false,
                 max_candidates: 4,
-                no_df_lookup: false,
             }),
             0
         );
@@ -4404,7 +4395,6 @@ rule remote_q {
                 force_tier1_only: true,
                 no_tier2_fallback: true,
                 max_candidates: 4,
-                no_df_lookup: true,
             }),
             0
         );
@@ -4544,7 +4534,6 @@ rule remote_q {
                 force_tier1_only: false,
                 no_tier2_fallback: false,
                 max_candidates: 1,
-                no_df_lookup: false,
             }),
             1
         );

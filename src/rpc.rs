@@ -1324,10 +1324,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.deleted_doc_count)
         .sum::<usize>();
-    let tier1_incomplete_doc_count = stats_rows
-        .iter()
-        .map(|item| item.tier1_incomplete_doc_count)
-        .sum::<usize>();
     let compaction_generation = stats_rows
         .iter()
         .map(|item| item.compaction_generation)
@@ -1406,14 +1402,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "retired_generation_count".to_owned(),
         json!(retired_generation_count),
-    );
-    out.insert(
-        "tier1_complete".to_owned(),
-        json!(tier1_incomplete_doc_count == 0),
-    );
-    out.insert(
-        "tier1_incomplete_doc_count".to_owned(),
-        json!(tier1_incomplete_doc_count),
     );
     out.insert(
         "tier2_docs_matched_total".to_owned(),
