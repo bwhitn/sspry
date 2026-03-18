@@ -1345,7 +1345,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_filter_bytes,
         tier2_bloom_hashes,
         policy.chunk_size,
-        !policy._no_grams,
+        false,
         policy.max_unique_grams,
         gram_count_estimate,
         INTERNAL_TIER1_GRAM_BUDGET,
@@ -1374,12 +1374,9 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_gram_count_estimate,
         tier2_bloom_hashes,
         tier2_bloom_filter: features.tier2_bloom_filter,
-        grams: if policy._no_grams {
-            Vec::new()
-        } else {
-            features.unique_grams
-        },
-        grams_complete: !policy._no_grams && !features.unique_grams_truncated,
+        // Bloom-only ingest no longer persists exact grams.
+        grams: Vec::new(),
+        grams_complete: false,
         effective_diversity: features.effective_diversity,
         metadata: extract_compact_document_metadata(scan_path)?,
         external_id: resolved_path.map(|path| path.display().to_string()),
@@ -2922,21 +2919,10 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 })
                 .transpose()?
                 .unwrap_or(GramSizes::new(3, 4)?);
-            let df_counts = if args.no_df_lookup {
-                None
-            } else {
-                let mut merged = HashMap::<u64, usize>::new();
-                for store in &stores {
-                    for (gram, count) in store.df_counts() {
-                        *merged.entry(gram).or_insert(0) += count;
-                    }
-                }
-                Some(merged)
-            };
             let plan = compile_query_plan_from_file_with_gram_sizes(
                 &args.rule,
                 gram_sizes,
-                df_counts.as_ref(),
+                None,
                 args.max_anchors_per_pattern,
                 args.force_tier1_only,
                 !args.no_tier2_fallback,
@@ -4165,8 +4151,8 @@ mod tests {
                     .as_ref()
             )
         );
-        assert!(!row.grams.is_empty());
-        assert!(row.grams_complete);
+        assert!(row.grams.is_empty());
+        assert!(!row.grams_complete);
 
         let md5_row = scan_index_batch_row(
             &sample,

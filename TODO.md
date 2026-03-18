@@ -249,6 +249,9 @@ Current read after the `8/16/32 KiB` matrix:
 - `32 KiB` is the best point so far on the `50k` matrix
 - the DB growth from `8 KiB -> 32 KiB` is small enough to keep
 - the remaining search problems are concentrated in a few heavy rules, not the whole search path
+- `32 KiB` Tier2 superblock summaries consumed:
+  - `301,526,016` bytes (`287.56 MiB`)
+  - about `0.76%` of the whole `50k` DB
 
 `50k` bloom-only matrix summary:
 - `8 KiB`
@@ -300,21 +303,31 @@ Accepted direction:
 
 Removal phases:
 1. Search-side cutover
-   - stop using remote `candidate_df` planning in the default search path
-   - keep verbose timing and candidate behavior covered by tests
-2. CLI/test cutover
+   - done:
+     - default search no longer uses remote `candidate_df`
+     - local query path also no longer replans with DF
+     - verbose timing still reports `df_lookup_ms = 0.000`
+2. Query-planner/RPC cleanup
+   - done:
+     - removed the dead `candidate_df` client/server transport and tests
+   - next:
+     - remove any remaining planner/cache code that only existed for DF-assisted normal search
+3. Store persistence cleanup
+   - done:
+     - live bloom-only ingest no longer persists exact grams
+     - empty `grams_received.bin` / `grams_indexed.bin` files are no longer materialized during compaction/import
+     - dead tier1 exact-gram selection code has been removed
+   - next:
+     - stop carrying gram payload fields through import/export paths when the row counts are zero
+     - remove the gram sidecar plumbing entirely once no compatibility path still needs it
+4. CLI/test cutover
    - make bloom-only the documented/default ingest posture
    - remove dual-mode tests that only exist to preserve the exact-gram path
-3. Query-planner/RPC cleanup
-   - remove client/server DF query usage from normal search flows
-   - then remove the now-dead `candidate_df` transport and planner wiring
-4. Store cleanup
-   - remove `grams_received.bin`
-   - remove `grams_indexed.bin`
-   - remove DF deltas, segments, compaction, and related stats once no remaining path depends on them
 5. Final cleanup
    - remove `--no-grams` once bloom-only is the only ingest mode
    - remove dead docs, counters, and benchmark branches tied only to exact grams/DF
+6. DF storage removal
+   - remove DF deltas, segments, compaction, seal paths, RPC stats, and related tests once no remaining path depends on them
 
 Required tests while cutting over:
 - search verbose output still reports timing fields

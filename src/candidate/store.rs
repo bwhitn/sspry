@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::candidate::bloom::{bloom_byte_masks, raw_filter_matches_masks};
 use crate::candidate::cache::BoundedCache;
-use crate::candidate::features::scale_tier1_gram_budget;
 use crate::candidate::filter_policy::{
     choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
@@ -34,8 +33,6 @@ const DEFAULT_FILTER_MAX_BYTES: usize = 0;
 const DEFAULT_FILTER_SIZE_DIVISOR: usize = 1;
 const DEFAULT_DF_MIN: usize = 1;
 const DEFAULT_DF_MAX: usize = 0;
-const DEFAULT_TIER1_GRAM_BUDGET: usize = 4096;
-const DEFAULT_TIER1_GRAM_HASH_SEED: u64 = 1337;
 const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 128;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
@@ -1295,60 +1292,6 @@ pub(crate) struct PreparedQueryArtifacts {
     impossible_query: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Tier1DfEntry {
-    gram: u64,
-    projected_df: usize,
-    commonness: f64,
-    tie_breaker: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Tier1SelectionProfile {
-    df_lookup_us: u64,
-    df_lookup_snapshot_rows_examined: u64,
-    df_lookup_snapshot_point_lookups: u64,
-    df_lookup_segment_visits: u64,
-    df_lookup_segment_rows_examined: u64,
-    df_lookup_segment_point_lookups: u64,
-    df_lookup_delta_lookups: u64,
-    eligibility_us: u64,
-    budget_us: u64,
-    binning_us: u64,
-    finalize_us: u64,
-}
-
-fn elapsed_us(started: Instant) -> u64 {
-    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-fn stable_tier1_tie_breaker(gram: u64, hash_seed: u64) -> u64 {
-    let mixed = gram.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    mixed.rotate_left(17) ^ hash_seed.rotate_right(7)
-}
-
-fn split_weighted_quota(total: usize, weights: &[usize]) -> Vec<usize> {
-    if total == 0 {
-        return vec![0; weights.len()];
-    }
-    let weight_total: usize = weights.iter().sum();
-    let mut quotas = vec![0usize; weights.len()];
-    let mut remainders = Vec::<(usize, usize)>::with_capacity(weights.len());
-    let mut assigned = 0usize;
-    for (index, weight) in weights.iter().copied().enumerate() {
-        let numerator = total.saturating_mul(weight);
-        let quota = numerator / weight_total.max(1);
-        quotas[index] = quota;
-        assigned = assigned.saturating_add(quota);
-        remainders.push((numerator % weight_total.max(1), index));
-    }
-    remainders.sort_unstable_by(|left, right| right.cmp(left));
-    for (_, index) in remainders.into_iter().take(total.saturating_sub(assigned)) {
-        quotas[index] = quotas[index].saturating_add(1);
-    }
-    quotas
-}
-
 fn tier2_superblock_summary_bytes(filter_bytes: usize, summary_cap_bytes: usize) -> usize {
     filter_bytes.max(1).min(summary_cap_bytes.max(1))
 }
@@ -1411,67 +1354,6 @@ fn fold_bloom_masks(required_masks: &[(usize, u8)], summary_bytes: usize) -> Vec
         *folded.entry(*byte_idx % summary_bytes).or_insert(0) |= *mask;
     }
     folded.into_iter().collect()
-}
-
-fn median_value(values: &mut [f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let middle = values.len() / 2;
-    let cmp =
-        |left: &f64, right: &f64| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal);
-    if values.len() % 2 == 0 {
-        let (left, right) = values.split_at_mut(middle);
-        let (_, upper, _) = right.select_nth_unstable_by(0, cmp);
-        let upper_value = *upper;
-        let lower_value = left.iter().copied().max_by(cmp).unwrap_or(upper_value);
-        (lower_value + upper_value) / 2.0
-    } else {
-        let (_, median, _) = values.select_nth_unstable_by(middle, cmp);
-        *median
-    }
-}
-
-fn tier1_budget_multiplier(effective_diversity: f64, commonness: f64) -> f64 {
-    let diversity = effective_diversity.clamp(0.0, 1.0);
-    let df = commonness.clamp(0.0, 1.0);
-    if diversity >= 0.67 && df < 0.33 {
-        0.80
-    } else if diversity >= 0.67 && df >= 0.67 {
-        0.90
-    } else if diversity < 0.33 && df >= 0.67 {
-        1.25
-    } else if diversity < 0.33 && df < 0.33 {
-        1.00
-    } else {
-        (1.0 + (df - 0.5) * 0.25 - (diversity - 0.5) * 0.15).clamp(0.85, 1.15)
-    }
-}
-
-fn tier1_df_bin(commonness: f64) -> usize {
-    if commonness < 0.25 {
-        0
-    } else if commonness < 0.50 {
-        1
-    } else if commonness < 0.75 {
-        2
-    } else {
-        3
-    }
-}
-
-fn tier1_df_bin_weights(effective_diversity: f64, commonness: f64) -> [usize; 4] {
-    let diversity = effective_diversity.clamp(0.0, 1.0);
-    let df = commonness.clamp(0.0, 1.0);
-    if diversity >= 0.67 && df < 0.33 {
-        [55, 28, 14, 3]
-    } else if diversity >= 0.67 && df >= 0.67 {
-        [48, 30, 17, 5]
-    } else if diversity < 0.33 && df >= 0.67 {
-        [35, 30, 20, 15]
-    } else {
-        [45, 30, 20, 5]
-    }
 }
 
 #[derive(Debug)]
@@ -2095,195 +1977,6 @@ impl CandidateStore {
         )
     }
 
-    fn select_indexed_grams(
-        &self,
-        dedup_received: &[u64],
-        gram_count_estimate: Option<usize>,
-        effective_diversity: Option<f64>,
-    ) -> (Vec<u64>, bool) {
-        let (grams, complete, _) = self.select_indexed_grams_with_active_docs_profiled(
-            dedup_received,
-            gram_count_estimate,
-            effective_diversity,
-            self.docs.iter().filter(|doc| !doc.deleted).count(),
-        );
-        (grams, complete)
-    }
-
-    fn select_indexed_grams_with_active_docs_profiled(
-        &self,
-        dedup_received: &[u64],
-        gram_count_estimate: Option<usize>,
-        effective_diversity: Option<f64>,
-        active_docs: usize,
-    ) -> (Vec<u64>, bool, Tier1SelectionProfile) {
-        let mut profile = Tier1SelectionProfile::default();
-        if dedup_received.is_empty() {
-            return (Vec::new(), false, profile);
-        }
-
-        let active_docs = active_docs.max(1);
-        let df_lookup_started = Instant::now();
-        let (projected, lookup_profile) = if is_strictly_sorted_unique(dedup_received) {
-            self.df_counts
-                .get_many_sorted_counts_profiled(dedup_received)
-        } else {
-            let mut lookup_profile = DfLookupProfile::default();
-            let projected = dedup_received
-                .iter()
-                .map(|gram| self.df_counts.get_profiled(*gram, &mut lookup_profile))
-                .collect();
-            (projected, lookup_profile)
-        };
-        profile.df_lookup_us = elapsed_us(df_lookup_started);
-        profile.df_lookup_snapshot_rows_examined = lookup_profile.snapshot_rows_examined;
-        profile.df_lookup_snapshot_point_lookups = lookup_profile.snapshot_point_lookups;
-        profile.df_lookup_segment_visits = lookup_profile.segment_visits;
-        profile.df_lookup_segment_rows_examined = lookup_profile.segment_rows_examined;
-        profile.df_lookup_segment_point_lookups = lookup_profile.segment_point_lookups;
-        profile.df_lookup_delta_lookups = lookup_profile.delta_lookups;
-        let (grams, complete) = self.select_indexed_grams_from_projected_counts_profiled(
-            dedup_received,
-            &projected,
-            gram_count_estimate,
-            effective_diversity,
-            active_docs,
-            &mut profile,
-        );
-        (grams, complete, profile)
-    }
-
-    fn select_indexed_grams_from_projected_counts_profiled(
-        &self,
-        dedup_received: &[u64],
-        projected: &[usize],
-        gram_count_estimate: Option<usize>,
-        effective_diversity: Option<f64>,
-        active_docs: usize,
-        profile: &mut Tier1SelectionProfile,
-    ) -> (Vec<u64>, bool) {
-        let base_budget = match gram_count_estimate {
-            Some(estimate) if DEFAULT_TIER1_GRAM_BUDGET > 0 => {
-                scale_tier1_gram_budget(DEFAULT_TIER1_GRAM_BUDGET, estimate)
-            }
-            _ => DEFAULT_TIER1_GRAM_BUDGET,
-        };
-        let mut eligible = Vec::<Tier1DfEntry>::new();
-        let mut commonness_values = Vec::<f64>::new();
-        let mut complete = true;
-        let df_log_denominator = ((active_docs as f64) + 1.0).ln().max(1.0);
-        let eligibility_started = Instant::now();
-        for (gram, current_df) in dedup_received.iter().zip(projected.iter().copied()) {
-            let projected_df = current_df + 1;
-            if projected_df < self.meta.df_min
-                || (self.meta.df_max != 0 && projected_df > self.meta.df_max)
-            {
-                complete = false;
-                continue;
-            }
-            let commonness =
-                ((((projected_df as f64) + 1.0).ln()) / df_log_denominator).clamp(0.0, 1.0);
-            commonness_values.push(commonness);
-            eligible.push(Tier1DfEntry {
-                gram: *gram,
-                projected_df,
-                commonness,
-                tie_breaker: stable_tier1_tie_breaker(*gram, DEFAULT_TIER1_GRAM_HASH_SEED),
-            });
-        }
-        profile.eligibility_us = profile
-            .eligibility_us
-            .saturating_add(elapsed_us(eligibility_started));
-        if eligible.len() == dedup_received.len() && DEFAULT_TIER1_GRAM_BUDGET == 0 {
-            let mut grams = eligible
-                .into_iter()
-                .map(|entry| entry.gram)
-                .collect::<Vec<_>>();
-            grams.sort_unstable();
-            return (grams, complete);
-        }
-        if eligible.is_empty() {
-            return (Vec::new(), false);
-        }
-
-        let budget_started = Instant::now();
-        let doc_diversity = effective_diversity.unwrap_or(0.5).clamp(0.0, 1.0);
-        let min_adjusted_budget = if base_budget == 0 {
-            eligible.len()
-        } else {
-            ((base_budget as f64) * 0.80).floor() as usize
-        };
-        if min_adjusted_budget >= eligible.len() {
-            profile.budget_us = profile.budget_us.saturating_add(elapsed_us(budget_started));
-            let mut grams = eligible
-                .into_iter()
-                .map(|entry| entry.gram)
-                .collect::<Vec<_>>();
-            grams.sort_unstable();
-            return (grams, complete);
-        }
-        let doc_commonness = median_value(&mut commonness_values);
-        let adjusted_budget = if base_budget == 0 {
-            eligible.len()
-        } else {
-            ((base_budget as f64) * tier1_budget_multiplier(doc_diversity, doc_commonness))
-                .round()
-                .max(1.0) as usize
-        };
-        if adjusted_budget >= eligible.len() {
-            profile.budget_us = profile.budget_us.saturating_add(elapsed_us(budget_started));
-            let mut grams = eligible
-                .into_iter()
-                .map(|entry| entry.gram)
-                .collect::<Vec<_>>();
-            grams.sort_unstable();
-            return (grams, complete);
-        }
-
-        let weights = tier1_df_bin_weights(doc_diversity, doc_commonness);
-        let quotas = split_weighted_quota(adjusted_budget, &weights);
-        profile.budget_us = profile.budget_us.saturating_add(elapsed_us(budget_started));
-        let mut bins = [
-            Vec::<Tier1DfEntry>::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ];
-        let binning_started = Instant::now();
-        for entry in eligible {
-            bins[tier1_df_bin(entry.commonness)].push(entry);
-        }
-        for bin in &mut bins {
-            bin.sort_unstable_by_key(|entry| (entry.projected_df, entry.tie_breaker, entry.gram));
-        }
-        profile.binning_us = profile
-            .binning_us
-            .saturating_add(elapsed_us(binning_started));
-
-        let finalize_started = Instant::now();
-        let mut selected = Vec::<u64>::new();
-        let mut leftovers = Vec::<Tier1DfEntry>::new();
-        for (bin, quota) in bins.iter_mut().zip(quotas.into_iter()) {
-            let take = quota.min(bin.len());
-            for entry in bin.drain(..take) {
-                selected.push(entry.gram);
-            }
-            leftovers.extend(bin.drain(..));
-        }
-        if selected.len() < adjusted_budget && !leftovers.is_empty() {
-            leftovers
-                .sort_unstable_by_key(|entry| (entry.projected_df, entry.tie_breaker, entry.gram));
-            for entry in leftovers.into_iter().take(adjusted_budget - selected.len()) {
-                selected.push(entry.gram);
-            }
-        }
-        selected.sort_unstable();
-        profile.finalize_us = profile
-            .finalize_us
-            .saturating_add(elapsed_us(finalize_started));
-        (selected, false)
-    }
-
     pub fn insert_document(
         &mut self,
         sha256: [u8; 32],
@@ -2384,55 +2077,20 @@ impl CandidateStore {
         }
         let sha256_hex = hex::encode(sha256);
 
-        let dedup_received = if grams_sorted_unique {
-            let mut ordered = Vec::with_capacity(grams_received.len());
-            let mut prev = None;
-            let mut valid = true;
-            for gram in grams_received {
-                if prev.is_some_and(|value| *gram <= value) {
-                    valid = false;
-                    break;
-                }
-                ordered.push(*gram);
-                prev = Some(*gram);
-            }
-            if valid {
-                ordered
-            } else {
-                let mut dedup: Vec<u64> = grams_received
-                    .iter()
-                    .copied()
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                dedup.sort_unstable();
-                dedup
-            }
-        } else {
-            let mut dedup: Vec<u64> = grams_received
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            dedup.sort_unstable();
-            dedup
-        };
-
-        let (indexed, selection_complete) =
-            self.select_indexed_grams(&dedup_received, gram_count_estimate, effective_diversity);
-        let complete =
-            grams_complete && selection_complete && indexed.len() == dedup_received.len();
+        let _ = (
+            grams_received,
+            grams_complete,
+            effective_diversity,
+            grams_sorted_unique,
+        );
+        // Bloom-only ingest no longer persists or ranks exact grams.
+        let dedup_received = Vec::<u64>::new();
+        let indexed = Vec::<u64>::new();
+        let complete = false;
 
         let status;
         let doc_id;
-        let mut df_unit_delta_payload =
-            Vec::with_capacity(dedup_received.len() * self.meta.exact_gram_bytes());
-        extend_unit_df_payload_from_values(
-            &mut df_unit_delta_payload,
-            &dedup_received,
-            self.meta.exact_gram_bytes(),
-        );
+        let df_unit_delta_payload = Vec::<u8>::new();
         if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
             if !self.docs[existing_pos].deleted {
                 let existing = &self.docs[existing_pos];
@@ -2446,7 +2104,6 @@ impl CandidateStore {
                     grams_complete: existing.grams_complete,
                 });
             }
-            self.df_counts.apply_unit_deltas(&dedup_received);
             let snapshot = {
                 let existing = &mut self.docs[existing_pos];
                 existing.file_size = file_size;
@@ -2508,7 +2165,6 @@ impl CandidateStore {
                 grams_complete: complete,
                 deleted: false,
             };
-            self.df_counts.apply_unit_deltas(&dedup_received);
             {
                 let _scope = scope("candidate.insert_document.persist");
                 let row = self.build_doc_row(
@@ -2541,11 +2197,13 @@ impl CandidateStore {
             status = "inserted".to_owned();
         }
 
-        append_df_count_unit_payload_with_writer(
-            &mut self.append_writers.df_counts_unit_delta,
-            &df_unit_delta_payload,
-        )?;
-        let _ = self.maybe_compact_df_counts()?;
+        if !df_unit_delta_payload.is_empty() {
+            append_df_count_unit_payload_with_writer(
+                &mut self.append_writers.df_counts_unit_delta,
+                &df_unit_delta_payload,
+            )?;
+            let _ = self.maybe_compact_df_counts()?;
+        }
         self.sidecars.invalidate_all();
 
         self.mark_write_activity();
@@ -2615,7 +2273,7 @@ impl CandidateStore {
 
         let mut total_scope = scope("candidate.insert_documents_batch");
         let mut results = Vec::with_capacity(documents.len());
-        let mut aggregate_df_unit_delta_payload = Vec::<u8>::new();
+        let aggregate_df_unit_delta_payload = Vec::<u8>::new();
         let mut modified = false;
         let mut meta_dirty = false;
         let mut insert_profile = CandidateInsertBatchProfile::default();
@@ -2693,98 +2351,23 @@ impl CandidateStore {
 
             let classify_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
-            let dedup_started = Instant::now();
-            let dedup_received = if *grams_sorted_unique {
-                let mut ordered = Vec::with_capacity(grams_received.len());
-                let mut prev = None;
-                let mut valid = true;
-                for gram in grams_received {
-                    if prev.is_some_and(|value| *gram <= value) {
-                        valid = false;
-                        break;
-                    }
-                    ordered.push(*gram);
-                    prev = Some(*gram);
-                }
-                if valid {
-                    ordered
-                } else {
-                    let mut dedup: Vec<u64> = grams_received
-                        .iter()
-                        .copied()
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    dedup.sort_unstable();
-                    dedup
-                }
-            } else {
-                let mut dedup: Vec<u64> = grams_received
-                    .iter()
-                    .copied()
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                dedup.sort_unstable();
-                dedup
-            };
-            insert_profile.classify_dedup_us = insert_profile
-                .classify_dedup_us
-                .saturating_add(elapsed_us(dedup_started));
-
-            let (indexed, selection_complete, selection_profile) = self
-                .select_indexed_grams_with_active_docs_profiled(
-                    &dedup_received,
-                    *gram_count_estimate,
-                    *effective_diversity,
-                    active_docs,
-                );
-            insert_profile.classify_df_lookup_us = insert_profile
-                .classify_df_lookup_us
-                .saturating_add(selection_profile.df_lookup_us);
-            insert_profile.classify_df_lookup_snapshot_rows_examined = insert_profile
-                .classify_df_lookup_snapshot_rows_examined
-                .saturating_add(selection_profile.df_lookup_snapshot_rows_examined);
-            insert_profile.classify_df_lookup_snapshot_point_lookups = insert_profile
-                .classify_df_lookup_snapshot_point_lookups
-                .saturating_add(selection_profile.df_lookup_snapshot_point_lookups);
-            insert_profile.classify_df_lookup_segment_visits = insert_profile
-                .classify_df_lookup_segment_visits
-                .saturating_add(selection_profile.df_lookup_segment_visits);
-            insert_profile.classify_df_lookup_segment_rows_examined = insert_profile
-                .classify_df_lookup_segment_rows_examined
-                .saturating_add(selection_profile.df_lookup_segment_rows_examined);
-            insert_profile.classify_df_lookup_segment_point_lookups = insert_profile
-                .classify_df_lookup_segment_point_lookups
-                .saturating_add(selection_profile.df_lookup_segment_point_lookups);
-            insert_profile.classify_df_lookup_delta_lookups = insert_profile
-                .classify_df_lookup_delta_lookups
-                .saturating_add(selection_profile.df_lookup_delta_lookups);
-            insert_profile.classify_eligibility_us = insert_profile
-                .classify_eligibility_us
-                .saturating_add(selection_profile.eligibility_us);
-            insert_profile.classify_budget_us = insert_profile
-                .classify_budget_us
-                .saturating_add(selection_profile.budget_us);
-            insert_profile.classify_binning_us = insert_profile
-                .classify_binning_us
-                .saturating_add(selection_profile.binning_us);
-            insert_profile.classify_finalize_us = insert_profile
-                .classify_finalize_us
-                .saturating_add(selection_profile.finalize_us);
-            let complete =
-                *grams_complete && selection_complete && indexed.len() == dedup_received.len();
+            let _ = (
+                gram_count_estimate,
+                grams_received,
+                grams_complete,
+                effective_diversity,
+                grams_sorted_unique,
+                active_docs,
+            );
+            let dedup_received = Vec::<u64>::new();
+            let indexed = Vec::<u64>::new();
+            let complete = false;
             let received_len = dedup_received.len() as u64;
             let indexed_len = indexed.len() as u64;
             received_grams_total = received_grams_total.saturating_add(received_len);
             indexed_grams_total = indexed_grams_total.saturating_add(indexed_len);
             max_received_grams = max_received_grams.max(received_len);
             max_indexed_grams = max_indexed_grams.max(indexed_len);
-            extend_unit_df_payload_from_values(
-                &mut aggregate_df_unit_delta_payload,
-                &dedup_received,
-                self.meta.exact_gram_bytes(),
-            );
 
             if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
                 if !self.docs[existing_pos].deleted {
@@ -2807,11 +2390,6 @@ impl CandidateStore {
                 insert_profile.classify_us = insert_profile
                     .classify_us
                     .saturating_add(elapsed_us(classify_started));
-                let apply_df_counts_started = Instant::now();
-                self.df_counts.apply_unit_deltas(&dedup_received);
-                insert_profile.apply_df_counts_us = insert_profile
-                    .apply_df_counts_us
-                    .saturating_add(elapsed_us(apply_df_counts_started));
                 let write_existing_started = Instant::now();
                 let snapshot = {
                     let existing = &mut self.docs[existing_pos];
@@ -2891,11 +2469,6 @@ impl CandidateStore {
                 grams_complete: complete,
                 deleted: false,
             };
-            let apply_df_counts_started = Instant::now();
-            self.df_counts.apply_unit_deltas(&dedup_received);
-            insert_profile.apply_df_counts_us = insert_profile
-                .apply_df_counts_us
-                .saturating_add(elapsed_us(apply_df_counts_started));
             modified = true;
             meta_dirty = true;
             results.push(CandidateInsertResult {
@@ -3061,58 +2634,66 @@ impl CandidateStore {
             if meta_dirty {
                 self.mark_meta_dirty();
             }
-            let append_df_delta_started = Instant::now();
-            append_df_count_unit_payload_with_writer(
-                &mut self.append_writers.df_counts_unit_delta,
-                &aggregate_df_unit_delta_payload,
-            )?;
-            insert_profile.append_df_delta_us = insert_profile
-                .append_df_delta_us
-                .saturating_add(elapsed_us(append_df_delta_started));
-            let compact_df_counts_started = Instant::now();
-            let compact_df_counts_profile = self.maybe_compact_df_counts()?;
-            insert_profile.compact_df_counts_us = insert_profile
-                .compact_df_counts_us
-                .saturating_add(elapsed_us(compact_df_counts_started));
-            insert_profile.compact_df_counts_check_us = insert_profile
-                .compact_df_counts_check_us
-                .saturating_add(compact_df_counts_profile.check_us);
-            insert_profile.compact_df_counts_checked_delta_bytes = insert_profile
-                .compact_df_counts_checked_delta_bytes
-                .max(compact_df_counts_profile.checked_delta_bytes);
-            insert_profile.compact_df_counts_checked_delta_estimated_memory_bytes = insert_profile
-                .compact_df_counts_checked_delta_estimated_memory_bytes
-                .max(compact_df_counts_profile.checked_delta_estimated_memory_bytes);
-            insert_profile.compact_df_counts_persist_snapshot_us = insert_profile
-                .compact_df_counts_persist_snapshot_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_us);
-            insert_profile.compact_df_counts_persist_snapshot_collect_delta_us = insert_profile
-                .compact_df_counts_persist_snapshot_collect_delta_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_collect_delta_us);
-            insert_profile.compact_df_counts_persist_snapshot_sort_delta_us = insert_profile
-                .compact_df_counts_persist_snapshot_sort_delta_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_sort_delta_us);
-            insert_profile.compact_df_counts_persist_snapshot_merge_write_us = insert_profile
-                .compact_df_counts_persist_snapshot_merge_write_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_merge_write_us);
-            insert_profile.compact_df_counts_persist_snapshot_flush_us = insert_profile
-                .compact_df_counts_persist_snapshot_flush_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_flush_us);
-            insert_profile.compact_df_counts_persist_snapshot_rename_us = insert_profile
-                .compact_df_counts_persist_snapshot_rename_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_rename_us);
-            insert_profile.compact_df_counts_persist_snapshot_close_us = insert_profile
-                .compact_df_counts_persist_snapshot_close_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_close_us);
-            insert_profile.compact_df_counts_persist_snapshot_clear_delta_files_us = insert_profile
-                .compact_df_counts_persist_snapshot_clear_delta_files_us
-                .saturating_add(compact_df_counts_profile.persist_snapshot_clear_delta_files_us);
-            insert_profile.compact_df_counts_refresh_snapshot_us = insert_profile
-                .compact_df_counts_refresh_snapshot_us
-                .saturating_add(compact_df_counts_profile.refresh_snapshot_us);
-            insert_profile.compact_df_counts_reopen_writers_us = insert_profile
-                .compact_df_counts_reopen_writers_us
-                .saturating_add(compact_df_counts_profile.reopen_writers_us);
+            if !aggregate_df_unit_delta_payload.is_empty() {
+                let append_df_delta_started = Instant::now();
+                append_df_count_unit_payload_with_writer(
+                    &mut self.append_writers.df_counts_unit_delta,
+                    &aggregate_df_unit_delta_payload,
+                )?;
+                insert_profile.append_df_delta_us = insert_profile
+                    .append_df_delta_us
+                    .saturating_add(elapsed_us(append_df_delta_started));
+                let compact_df_counts_started = Instant::now();
+                let compact_df_counts_profile = self.maybe_compact_df_counts()?;
+                insert_profile.compact_df_counts_us = insert_profile
+                    .compact_df_counts_us
+                    .saturating_add(elapsed_us(compact_df_counts_started));
+                insert_profile.compact_df_counts_check_us = insert_profile
+                    .compact_df_counts_check_us
+                    .saturating_add(compact_df_counts_profile.check_us);
+                insert_profile.compact_df_counts_checked_delta_bytes = insert_profile
+                    .compact_df_counts_checked_delta_bytes
+                    .max(compact_df_counts_profile.checked_delta_bytes);
+                insert_profile.compact_df_counts_checked_delta_estimated_memory_bytes =
+                    insert_profile
+                        .compact_df_counts_checked_delta_estimated_memory_bytes
+                        .max(compact_df_counts_profile.checked_delta_estimated_memory_bytes);
+                insert_profile.compact_df_counts_persist_snapshot_us = insert_profile
+                    .compact_df_counts_persist_snapshot_us
+                    .saturating_add(compact_df_counts_profile.persist_snapshot_us);
+                insert_profile.compact_df_counts_persist_snapshot_collect_delta_us =
+                    insert_profile
+                        .compact_df_counts_persist_snapshot_collect_delta_us
+                        .saturating_add(compact_df_counts_profile.persist_snapshot_collect_delta_us);
+                insert_profile.compact_df_counts_persist_snapshot_sort_delta_us = insert_profile
+                    .compact_df_counts_persist_snapshot_sort_delta_us
+                    .saturating_add(compact_df_counts_profile.persist_snapshot_sort_delta_us);
+                insert_profile.compact_df_counts_persist_snapshot_merge_write_us =
+                    insert_profile
+                        .compact_df_counts_persist_snapshot_merge_write_us
+                        .saturating_add(compact_df_counts_profile.persist_snapshot_merge_write_us);
+                insert_profile.compact_df_counts_persist_snapshot_flush_us = insert_profile
+                    .compact_df_counts_persist_snapshot_flush_us
+                    .saturating_add(compact_df_counts_profile.persist_snapshot_flush_us);
+                insert_profile.compact_df_counts_persist_snapshot_rename_us = insert_profile
+                    .compact_df_counts_persist_snapshot_rename_us
+                    .saturating_add(compact_df_counts_profile.persist_snapshot_rename_us);
+                insert_profile.compact_df_counts_persist_snapshot_close_us = insert_profile
+                    .compact_df_counts_persist_snapshot_close_us
+                    .saturating_add(compact_df_counts_profile.persist_snapshot_close_us);
+                insert_profile.compact_df_counts_persist_snapshot_clear_delta_files_us =
+                    insert_profile
+                        .compact_df_counts_persist_snapshot_clear_delta_files_us
+                        .saturating_add(
+                            compact_df_counts_profile.persist_snapshot_clear_delta_files_us,
+                        );
+                insert_profile.compact_df_counts_refresh_snapshot_us = insert_profile
+                    .compact_df_counts_refresh_snapshot_us
+                    .saturating_add(compact_df_counts_profile.refresh_snapshot_us);
+                insert_profile.compact_df_counts_reopen_writers_us = insert_profile
+                    .compact_df_counts_reopen_writers_us
+                    .saturating_add(compact_df_counts_profile.reopen_writers_us);
+            }
             let rebalance_tier2_started = Instant::now();
             self.maybe_rebalance_tier2_superblocks()?;
             insert_profile.rebalance_tier2_us = insert_profile
@@ -3772,7 +3353,6 @@ impl CandidateStore {
                 }
                 docs_scanned += 1;
                 let metadata_bytes = self.doc_metadata_bytes(pos)?;
-                let indexed_bytes = self.doc_indexed_bytes(pos)?;
                 let tier1_bloom_bytes = self.doc_bloom_bytes(pos)?;
                 let tier2_bloom_bytes = self.doc_tier2_bloom_bytes(pos)?;
                 let mut eval_cache = QueryEvalCache::default();
@@ -3780,7 +3360,7 @@ impl CandidateStore {
                     &plan.root,
                     doc,
                     metadata_bytes.as_ref(),
-                    indexed_bytes.as_ref(),
+                    &[],
                     tier1_bloom_bytes.as_ref(),
                     tier2_bloom_bytes.as_ref(),
                     &prepared.patterns,
@@ -4146,22 +3726,32 @@ impl CandidateStore {
 
         let gram_bytes = self.meta.exact_gram_bytes();
         let mut profile = CandidateDocRowPayloadProfile::default();
-        let grams_received_started = Instant::now();
-        let grams_received_offset = append_exact_gram_slice_with_writer(
-            &mut self.append_writers.grams_received,
-            grams_received,
-            gram_bytes,
-        )?;
-        profile.grams_received_us = elapsed_us(grams_received_started);
-        profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
-        let grams_indexed_started = Instant::now();
-        let grams_indexed_offset = append_exact_gram_slice_with_writer(
-            &mut self.append_writers.grams_indexed,
-            grams_indexed,
-            gram_bytes,
-        )?;
-        profile.grams_indexed_us = elapsed_us(grams_indexed_started);
-        profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+        let (grams_received_offset, grams_received_count) = if grams_received.is_empty() {
+            (0, 0)
+        } else {
+            let grams_received_started = Instant::now();
+            let offset = append_exact_gram_slice_with_writer(
+                &mut self.append_writers.grams_received,
+                grams_received,
+                gram_bytes,
+            )?;
+            profile.grams_received_us = elapsed_us(grams_received_started);
+            profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
+            (offset, grams_received.len() as u32)
+        };
+        let (grams_indexed_offset, grams_indexed_count) = if grams_indexed.is_empty() {
+            (0, 0)
+        } else {
+            let grams_indexed_started = Instant::now();
+            let offset = append_exact_gram_slice_with_writer(
+                &mut self.append_writers.grams_indexed,
+                grams_indexed,
+                gram_bytes,
+            )?;
+            profile.grams_indexed_us = elapsed_us(grams_indexed_started);
+            profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+            (offset, grams_indexed.len() as u32)
+        };
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
@@ -4194,9 +3784,9 @@ impl CandidateStore {
                 bloom_offset,
                 bloom_len: bloom_len as u32,
                 grams_received_offset,
-                grams_received_count: grams_received.len() as u32,
+                grams_received_count,
                 grams_indexed_offset,
-                grams_indexed_count: grams_indexed.len() as u32,
+                grams_indexed_count,
                 external_id_offset,
                 external_id_len,
                 metadata_offset,
@@ -4229,22 +3819,32 @@ impl CandidateStore {
         let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
         profile.bloom_us = elapsed_us(bloom_started);
         profile.bloom_bytes = bloom_filter.len() as u64;
-        let grams_received_started = Instant::now();
-        let grams_received_offset = append_exact_gram_slice_with_writer(
-            &mut self.append_writers.grams_received,
-            grams_received,
-            gram_bytes,
-        )?;
-        profile.grams_received_us = elapsed_us(grams_received_started);
-        profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
-        let grams_indexed_started = Instant::now();
-        let grams_indexed_offset = append_exact_gram_slice_with_writer(
-            &mut self.append_writers.grams_indexed,
-            grams_indexed,
-            gram_bytes,
-        )?;
-        profile.grams_indexed_us = elapsed_us(grams_indexed_started);
-        profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+        let (grams_received_offset, grams_received_count) = if grams_received.is_empty() {
+            (0, 0)
+        } else {
+            let grams_received_started = Instant::now();
+            let offset = append_exact_gram_slice_with_writer(
+                &mut self.append_writers.grams_received,
+                grams_received,
+                gram_bytes,
+            )?;
+            profile.grams_received_us = elapsed_us(grams_received_started);
+            profile.grams_received_bytes = (grams_received.len() * gram_bytes) as u64;
+            (offset, grams_received.len() as u32)
+        };
+        let (grams_indexed_offset, grams_indexed_count) = if grams_indexed.is_empty() {
+            (0, 0)
+        } else {
+            let grams_indexed_started = Instant::now();
+            let offset = append_exact_gram_slice_with_writer(
+                &mut self.append_writers.grams_indexed,
+                grams_indexed,
+                gram_bytes,
+            )?;
+            profile.grams_indexed_us = elapsed_us(grams_indexed_started);
+            profile.grams_indexed_bytes = (grams_indexed.len() * gram_bytes) as u64;
+            (offset, grams_indexed.len() as u32)
+        };
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
         } else {
@@ -4276,9 +3876,9 @@ impl CandidateStore {
             bloom_offset,
             bloom_len: bloom_filter.len() as u32,
             grams_received_offset,
-            grams_received_count: grams_received.len() as u32,
+            grams_received_count,
             grams_indexed_offset,
-            grams_indexed_count: grams_indexed.len() as u32,
+            grams_indexed_count,
             external_id_offset,
             external_id_len,
             metadata_offset,
@@ -5238,6 +4838,9 @@ fn read_blob_from_path(
 }
 
 fn append_exact_gram_slice(path: PathBuf, values: &[u64], gram_bytes: usize) -> Result<u64> {
+    if values.is_empty() {
+        return Ok(0);
+    }
     let mut payload = Vec::with_capacity(values.len() * gram_bytes);
     for value in values {
         let encoded = value.to_le_bytes();
@@ -5251,6 +4854,9 @@ fn append_exact_gram_slice_with_writer(
     values: &[u64],
     gram_bytes: usize,
 ) -> Result<u64> {
+    if values.is_empty() {
+        return Ok(0);
+    }
     let mut payload = Vec::with_capacity(values.len() * gram_bytes);
     for value in values {
         let encoded = value.to_le_bytes();
@@ -6006,36 +5612,6 @@ fn decode_packed_exact_gram(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(out)
 }
 
-fn exact_gram_bytes_contains_all(bytes: &[u8], required: &[u64], gram_bytes: usize) -> bool {
-    if required.is_empty() {
-        return true;
-    }
-    let count = bytes.len() / gram_bytes;
-    for needle in required {
-        let mut left = 0usize;
-        let mut right = count;
-        let mut found = false;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let start = mid * gram_bytes;
-            let value = decode_packed_exact_gram(&bytes[start..start + gram_bytes]);
-            if value == *needle {
-                found = true;
-                break;
-            }
-            if value < *needle {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        if !found {
-            return false;
-        }
-    }
-    true
-}
-
 fn validate_config(config: &CandidateConfig) -> Result<()> {
     if config.df_min == 0 {
         return Err(SspryError::from("candidate config values must be positive"));
@@ -6329,7 +5905,7 @@ fn evaluate_pattern(
     pattern: &PatternPlan,
     pattern_masks: &PreparedPatternMasks,
     doc: &CandidateDoc,
-    indexed_bytes: &[u8],
+    _indexed_bytes: &[u8],
     bloom_bytes: &[u8],
     tier2_bloom_bytes: &[u8],
     plan: &CompiledQueryPlan,
@@ -6346,73 +5922,52 @@ fn evaluate_pattern(
                 score: 10_000,
             });
         }
-        let exact_gram_bytes = if plan.tier1_gram_size <= 4 { 4 } else { 8 };
-        if exact_gram_bytes_contains_all(indexed_bytes, alternative, exact_gram_bytes) {
-            return Ok(MatchOutcome {
-                matched: true,
-                tiers: TierFlags {
-                    used_tier1: true,
-                    used_tier2: false,
-                },
-                score: 10_000u32
-                    .saturating_add((alternative.len() as u32).saturating_mul(32))
-                    .saturating_add(
-                        pattern
-                            .tier2_alternatives
-                            .get(alt_index)
-                            .map(|grams| grams.len() as u32)
-                            .unwrap_or(0)
-                            .saturating_mul(16),
-                    ),
-            });
+        let primary_match = pattern_masks
+            .tier1
+            .get(alt_index)
+            .and_then(|by_key| by_key.get(&(doc.filter_bytes, doc.bloom_hashes)))
+            .is_some_and(|required| raw_filter_matches_masks(bloom_bytes, required));
+        if !primary_match {
+            continue;
         }
-        if !doc.grams_complete && allow_tier2 {
-            let primary_match = pattern_masks
-                .tier1
+        let tier2_alternative = pattern
+            .tier2_alternatives
+            .get(alt_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut used_tier2 = false;
+        if allow_tier2
+            && !tier2_alternative.is_empty()
+            && doc.tier2_filter_bytes > 0
+            && doc.tier2_bloom_hashes > 0
+            && !tier2_bloom_bytes.is_empty()
+        {
+            let tier2_match = pattern_masks
+                .tier2
                 .get(alt_index)
-                .and_then(|by_key| by_key.get(&(doc.filter_bytes, doc.bloom_hashes)))
-                .is_some_and(|required| raw_filter_matches_masks(bloom_bytes, required));
-            if !primary_match {
+                .and_then(|by_key| by_key.get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes)))
+                .is_some_and(|required| raw_filter_matches_masks(tier2_bloom_bytes, required));
+            if !tier2_match {
                 continue;
             }
-            let tier2_alternative = pattern
-                .tier2_alternatives
-                .get(alt_index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if !tier2_alternative.is_empty()
-                && doc.tier2_filter_bytes > 0
-                && doc.tier2_bloom_hashes > 0
-                && !tier2_bloom_bytes.is_empty()
-            {
-                let tier2_match = pattern_masks
-                    .tier2
-                    .get(alt_index)
-                    .and_then(|by_key| {
-                        by_key.get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
-                    })
-                    .is_some_and(|required| raw_filter_matches_masks(tier2_bloom_bytes, required));
-                if !tier2_match {
-                    continue;
-                }
-            }
-            return Ok(MatchOutcome {
-                matched: true,
-                tiers: TierFlags {
-                    used_tier1: false,
-                    used_tier2: true,
-                },
-                score: 1_000u32
-                    .saturating_add((alternative.len() as u32).saturating_mul(16))
-                    .saturating_add(
-                        tier2_alternative
-                            .len()
-                            .saturating_mul(8)
-                            .try_into()
-                            .unwrap_or(u32::MAX),
-                    ),
-            });
+            used_tier2 = true;
         }
+        return Ok(MatchOutcome {
+            matched: true,
+            tiers: TierFlags {
+                used_tier1: true,
+                used_tier2,
+            },
+            score: 1_000u32
+                .saturating_add((alternative.len() as u32).saturating_mul(16))
+                .saturating_add(
+                    tier2_alternative
+                        .len()
+                        .saturating_mul(8)
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                ),
+        });
     }
     Ok(MatchOutcome::default())
 }
@@ -7256,7 +6811,7 @@ rule q {
             true,
         )
         .expect("insert");
-        assert_eq!(second.grams_indexed, 1);
+        assert_eq!(second.grams_indexed, 0);
     }
 
     #[test]
@@ -8078,7 +7633,7 @@ rule q {
         )
         .expect("insert");
         assert_eq!(inserted.status, "inserted");
-        assert_eq!(inserted.grams_received, 2);
+        assert_eq!(inserted.grams_received, 0);
 
         let duplicate = insert_primary(
             &mut store,
@@ -8096,7 +7651,7 @@ rule q {
         .expect("duplicate");
         assert_eq!(duplicate.status, "already_exists");
         assert_eq!(duplicate.doc_id, inserted.doc_id);
-        assert_eq!(duplicate.grams_received, 2);
+        assert_eq!(duplicate.grams_received, 0);
 
         let missing = store
             .delete_document(&hex::encode([0x33; 32]))
@@ -8372,10 +7927,10 @@ rule q {
             tier2_bloom_bytes,
             &allow_fallback_plan,
         )
-        .expect("complete doc should not tier2 fallback");
-        assert!(!outcome.matched);
-        assert_eq!(outcome.tiers.as_label(), "none");
-        assert_eq!(outcome.score, 0);
+        .expect("complete doc should match via bloom path");
+        assert!(outcome.matched);
+        assert_eq!(outcome.tiers.as_label(), "tier1");
+        assert!(outcome.score > 0);
 
         let no_overlap_doc = CandidateDoc {
             grams_complete: false,
@@ -8391,9 +7946,9 @@ rule q {
             tier2_bloom_bytes,
             &allow_fallback_plan,
         )
-        .expect("incomplete doc without indexed overlap should still tier2 fallback");
+        .expect("bloom-only path should match without exact grams");
         assert!(outcome.matched);
-        assert_eq!(outcome.tiers.as_label(), "tier2");
+        assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
         let outcome = evaluate_node(
@@ -8465,7 +8020,7 @@ rule q {
         )
         .expect("or");
         assert!(outcome.matched);
-        assert_eq!(outcome.tiers.as_label(), "tier2");
+        assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
         let outcome = evaluate_node(
@@ -8501,7 +8056,7 @@ rule q {
         )
         .expect("n_of");
         assert!(outcome.matched);
-        assert_eq!(outcome.tiers.as_label(), "tier1+tier2");
+        assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
         assert!(
@@ -9051,27 +8606,13 @@ rule q {
         .expect("init");
 
         let file_size = 4096u64;
-        let (sha256, grams, filter_bytes, bloom_hashes, bloom_bytes) =
+        let (_sha256, grams, _filter_bytes, _bloom_hashes, _bloom_bytes) =
             make_doc(&store, file_size, 0x41, pack_exact_gram(&[1, 2, 3, 4]));
-        store
-            .insert_document(
-                sha256,
-                file_size,
-                Some(grams.len()),
-                Some(bloom_hashes),
-                Some(grams.len()),
-                Some(bloom_hashes),
-                filter_bytes,
-                &bloom_bytes,
-                filter_bytes,
-                &bloom_bytes,
-                &grams,
-                true,
-                None,
-                None,
-                true,
-            )
-            .expect("insert");
+        let mut payload = Vec::new();
+        extend_unit_df_payload_from_values(&mut payload, &grams, store.meta.exact_gram_bytes());
+        append_df_count_unit_payload_with_writer(&mut store.append_writers.df_counts_unit_delta, &payload)
+            .expect("append df payload");
+        store.df_counts.apply_unit_deltas(&grams);
 
         let bytes_before = current_df_counts_delta_bytes(&root);
         assert!(bytes_before > 0);

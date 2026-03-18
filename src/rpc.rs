@@ -25,7 +25,7 @@ use crate::candidate::store::{
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
-    candidate_shard_index, candidate_shard_root, decode_grams_delta_u64, metadata_field_is_boolean,
+    candidate_shard_index, candidate_shard_root, metadata_field_is_boolean,
     metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
     read_candidate_shard_count, write_candidate_shard_count,
 };
@@ -48,7 +48,6 @@ const ACTION_CANDIDATE_INSERT_BATCH: u8 = 3;
 const ACTION_CANDIDATE_DELETE: u8 = 4;
 const ACTION_CANDIDATE_QUERY: u8 = 5;
 const ACTION_CANDIDATE_STATS: u8 = 6;
-const ACTION_CANDIDATE_DF: u8 = 7;
 const ACTION_SHUTDOWN: u8 = 8;
 const ACTION_PUBLISH: u8 = 9;
 const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
@@ -59,7 +58,6 @@ const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
-const DF_CACHE_CAPACITY: usize = 128;
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
@@ -206,11 +204,6 @@ pub struct CandidateDocumentWire {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CandidateDfWireResponse {
-    df: BTreeMap<String, usize>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CandidateDeleteRequest {
     sha256: String,
 }
@@ -228,11 +221,6 @@ struct CandidateQueryRequest {
     chunk_size: Option<usize>,
     #[serde(default)]
     include_external_ids: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CandidateDfRequest {
-    grams: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -518,7 +506,6 @@ struct ServerState {
     last_published_tier2_snapshot_seal_failures: AtomicU64,
     last_published_tier2_snapshot_seal_completed_unix_ms: AtomicU64,
     adaptive_publish: Mutex<AdaptivePublishState>,
-    df_cache: Mutex<BoundedCache<Vec<u64>, Arc<HashMap<u64, usize>>>>,
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
     query_cache: Mutex<BoundedCache<String, Arc<CachedCandidateQuery>>>,
@@ -1033,22 +1020,6 @@ impl SspryClient {
 
     pub fn candidate_status(&self) -> Result<Map<String, Value>> {
         self.request_json_value(ACTION_CANDIDATE_STATUS, &json!({}))
-    }
-
-    pub fn candidate_df(&self, grams: &[u64]) -> Result<HashMap<u64, usize>> {
-        let response: CandidateDfWireResponse = self.request_typed_json(
-            ACTION_CANDIDATE_DF,
-            &CandidateDfRequest {
-                grams: grams.to_vec(),
-            },
-        )?;
-        let mut out = HashMap::new();
-        for (gram, count) in response.df {
-            if let Ok(value) = gram.parse::<u64>() {
-                out.insert(value, count);
-            }
-        }
-        Ok(out)
     }
 
     pub fn shutdown(&self) -> Result<String> {
@@ -1950,7 +1921,6 @@ impl ServerState {
                 auto_publish_initial_idle_ms,
                 candidate_shards,
             )),
-            df_cache: Mutex::new(BoundedCache::new(DF_CACHE_CAPACITY)),
             normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             query_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
@@ -2437,9 +2407,6 @@ impl ServerState {
         self.last_published_df_snapshot_seal_failures
             .store(failures, Ordering::SeqCst);
         if persisted_shards > 0 || failures > 0 {
-            if persisted_shards > 0 {
-                self.invalidate_df_cache();
-            }
             self.published_df_snapshot_seal_runs_total
                 .fetch_add(1, Ordering::SeqCst);
             self.last_published_df_snapshot_seal_completed_unix_ms
@@ -4506,9 +4473,6 @@ impl ServerState {
     }
 
     fn invalidate_search_caches(&self) {
-        if let Ok(mut cache) = self.df_cache.lock() {
-            cache.clear();
-        }
         if let Ok(mut cache) = self.normalized_plan_cache.lock() {
             cache.clear();
         }
@@ -4516,12 +4480,6 @@ impl ServerState {
             cache.clear();
         }
         if let Ok(mut cache) = self.query_cache.lock() {
-            cache.clear();
-        }
-    }
-
-    fn invalidate_df_cache(&self) {
-        if let Ok(mut cache) = self.df_cache.lock() {
             cache.clear();
         }
     }
@@ -4652,13 +4610,6 @@ impl ServerState {
     #[cfg(test)]
     fn run_compaction_cycle_for_tests(&self) -> Result<()> {
         self.run_compaction_cycle()
-    }
-
-    fn normalized_df_cache_key(grams: &[u64]) -> Vec<u64> {
-        let mut key = grams.to_vec();
-        key.sort_unstable();
-        key.dedup();
-        key
     }
 
     fn query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
@@ -4914,10 +4865,6 @@ impl ServerState {
             }
             ACTION_CANDIDATE_STATUS => json_bytes(&Value::Object(self.status_json()?)),
             ACTION_CANDIDATE_STATS => json_bytes(&Value::Object(self.current_stats_json()?)),
-            ACTION_CANDIDATE_DF => {
-                let request: CandidateDfRequest = json_from_bytes(payload)?;
-                json_bytes(&self.handle_candidate_df(&request.grams)?)
-            }
             ACTION_SHUTDOWN => {
                 self.shutdown.store(true, Ordering::SeqCst);
                 json_bytes(&json!({ "message": "shutdown requested" }))
@@ -4953,23 +4900,7 @@ impl ServerState {
         } else {
             Vec::new()
         };
-        let (grams, grams_sorted_unique) = if let Some(payload) = &document.grams_delta_b64 {
-            let packed = base64::engine::general_purpose::STANDARD
-                .decode(payload.as_bytes())
-                .map_err(|_| {
-                    SspryError::from(format!(
-                        "{field_prefix}.grams_delta_b64 must be valid base64."
-                    ))
-                })?;
-            (
-                decode_grams_delta_u64(&packed).map_err(|err| {
-                    SspryError::from(format!("{field_prefix}.grams_delta_b64 is invalid: {err}"))
-                })?,
-                true,
-            )
-        } else {
-            (document.grams.clone(), false)
-        };
+        let _ = (&document.grams_delta_b64, &document.grams);
         let gram_count_estimate = document
             .gram_count_estimate
             .map(|value| {
@@ -4982,17 +4913,7 @@ impl ServerState {
                 }
             })
             .transpose()?;
-        let selected_grams = if grams_sorted_unique {
-            grams
-        } else {
-            let mut dedup: Vec<u64> = grams
-                .into_iter()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            dedup.sort_unstable();
-            dedup
-        };
+        let selected_grams = Vec::new();
         let bloom_hashes = document.bloom_hashes.filter(|value| *value > 0);
         let metadata = if let Some(payload) = &document.metadata_b64 {
             base64::engine::general_purpose::STANDARD
@@ -5026,7 +4947,7 @@ impl ServerState {
             tier2_bloom_hashes,
             tier2_bloom_filter,
             selected_grams,
-            document.grams_complete,
+            false,
             document
                 .effective_diversity
                 .map(|value| value.clamp(0.0, 1.0)),
@@ -5730,50 +5651,6 @@ impl ServerState {
             tier_used: cached.tier_used.clone(),
             external_ids,
         })
-    }
-
-    fn handle_candidate_df(&self, grams: &[u64]) -> Result<CandidateDfWireResponse> {
-        let _op = self
-            .operation_gate
-            .read()
-            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
-        let key = Self::normalized_df_cache_key(grams);
-        let cached = {
-            let mut cache = self
-                .df_cache
-                .lock()
-                .map_err(|_| SspryError::from("DF cache lock poisoned."))?;
-            cache.get(&key)
-        };
-        let counts = if let Some(entry) = cached {
-            record_counter("rpc.handle_candidate_df_cache_hits_total", 1);
-            entry
-        } else {
-            record_counter("rpc.handle_candidate_df_cache_misses_total", 1);
-            let mut merged = HashMap::<u64, usize>::with_capacity(key.len());
-            let published = self.published_store_set()?;
-            for gram in &key {
-                merged.insert(*gram, 0);
-            }
-            for store_lock in &published.stores {
-                let store = lock_candidate_store_blocking(store_lock)?;
-                for (gram, count) in store.df_counts_for(&key) {
-                    *merged.entry(gram).or_insert(0) += count;
-                }
-            }
-            let entry = Arc::new(merged);
-            let mut cache = self
-                .df_cache
-                .lock()
-                .map_err(|_| SspryError::from("DF cache lock poisoned."))?;
-            cache.insert(key.clone(), entry.clone());
-            entry
-        };
-        let mut out = BTreeMap::new();
-        for gram in grams {
-            out.insert(gram.to_string(), counts.get(gram).copied().unwrap_or(0));
-        }
-        Ok(CandidateDfWireResponse { df: out })
     }
 
     fn handle_publish(&self) -> Result<CandidatePublishResponse> {
@@ -7166,43 +7043,6 @@ mod tests {
     }
 
     #[test]
-    fn published_df_lookup_waits_for_locked_shard() {
-        let tmp = tempdir().expect("tmp");
-        let state = sample_workspace_server_state(tmp.path(), 1);
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-
-        state
-            .handle_candidate_insert(&candidate_document_wire_from_bytes(
-                &tmp.path().join("published-df-wait.bin"),
-                b"xxABCDyy",
-            ))
-            .expect("insert");
-        state.handle_publish().expect("publish");
-
-        let published = state.published_store_set().expect("published stores");
-        let waited = thread::scope(|scope| {
-            let store_lock = &published.stores[0];
-            let holder = scope.spawn(move || {
-                let _guard = store_lock.lock().expect("lock published shard");
-                thread::sleep(Duration::from_millis(150));
-            });
-            thread::sleep(Duration::from_millis(25));
-
-            let started = Instant::now();
-            let df = state.handle_candidate_df(&[gram]).expect("df after wait");
-            let waited = started.elapsed();
-            holder.join().expect("join holder");
-            assert_eq!(df.df.get(&gram.to_string()).copied(), Some(1));
-            waited
-        });
-
-        assert!(
-            waited >= Duration::from_millis(100),
-            "expected df lookup to wait for shard lock, waited {waited:?}"
-        );
-    }
-
-    #[test]
     fn published_query_waits_for_locked_shard() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -8320,69 +8160,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn published_df_seal_refreshes_counts_and_invalidates_df_cache() {
-        fn wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDocumentWire {
-            fs::write(path, bytes).expect("write sample");
-            let features = crate::candidate::scan_file_features(
-                path, 1024, 7, 0, 0, 1024, true, None, None, 2048, 1, 1337,
-            )
-            .expect("features");
-            CandidateDocumentWire {
-                sha256: hex::encode(features.sha256),
-                file_size: features.file_size,
-                bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                    .encode(features.bloom_filter),
-                gram_count_estimate: None,
-                bloom_hashes: Some(7),
-                tier2_bloom_filter_b64: None,
-                tier2_gram_count_estimate: None,
-                tier2_bloom_hashes: None,
-                grams_delta_b64: None,
-                grams: features.unique_grams,
-                grams_complete: !features.unique_grams_truncated,
-                effective_diversity: None,
-                metadata_b64: None,
-                external_id: None,
-            }
-        }
-
-        let tmp = tempdir().expect("tmp");
-        let state = sample_workspace_server_state(tmp.path(), 1);
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-
-        state
-            .handle_candidate_insert(&wire_from_bytes(
-                &tmp.path().join("df-publish-one.bin"),
-                b"xxABCDyy",
-            ))
-            .expect("insert first");
-        state.handle_publish().expect("publish first");
-        state
-            .run_published_df_snapshot_seal_cycle()
-            .expect("seal first publish");
-        let df_after_first = state.handle_candidate_df(&[gram]).expect("df after first");
-        assert_eq!(df_after_first.df.get(&gram.to_string()).copied(), Some(1));
-
-        state
-            .handle_candidate_insert(&wire_from_bytes(
-                &tmp.path().join("df-publish-two.bin"),
-                b"zzABCDww",
-            ))
-            .expect("insert second");
-        state.handle_publish().expect("publish second");
-        let stale_df = state
-            .handle_candidate_df(&[gram])
-            .expect("stale df before seal");
-        assert_eq!(stale_df.df.get(&gram.to_string()).copied(), Some(1));
-
-        state
-            .run_published_df_snapshot_seal_cycle()
-            .expect("seal second publish");
-        let df_after_second = state.handle_candidate_df(&[gram]).expect("df after second");
-        assert_eq!(df_after_second.df.get(&gram.to_string()).copied(), Some(2));
-    }
-
     #[cfg(unix)]
     fn start_unix_server(base: &Path, candidate_shards: usize) -> ClientConfig {
         let socket_parent = base.join("nested").join("rpc");
@@ -8828,28 +8605,10 @@ mod tests {
     }
 
     #[test]
-    fn candidate_df_ignores_unparsable_keys_and_empty_insert_batch_short_circuits() {
-        let config = one_shot_tcp_config(|mut stream| {
-            let (_, action, _) = read_frame(&mut stream).expect("read request");
-            assert_eq!(action, ACTION_CANDIDATE_DF);
-            write_frame(
-                &mut stream,
-                PROTOCOL_VERSION,
-                STATUS_OK,
-                &json_bytes(&CandidateDfWireResponse {
-                    df: BTreeMap::from([
-                        ("123".to_owned(), 7usize),
-                        ("not-a-u64".to_owned(), 9usize),
-                    ]),
-                })
-                .expect("df bytes"),
-            )
-            .expect("write response");
-        });
-        let client = SspryClient::new(config);
-        let df = client.candidate_df(&[1, 2, 3]).expect("candidate df");
-        assert_eq!(df, HashMap::from([(123u64, 7usize)]));
-
+    fn candidate_insert_batch_short_circuits_empty_requests() {
+        let client = SspryClient::new(one_shot_tcp_config(|_| {
+            panic!("empty insert batch should not connect");
+        }));
         let empty = client
             .candidate_insert_batch(&[])
             .expect("empty insert batch");
@@ -9670,26 +9429,6 @@ rule q {
         assert!(query_with_ids.next_cursor.is_some());
         assert!(query_with_ids.external_ids.is_some());
 
-        let mut grams = Vec::new();
-        for pattern in &plan.patterns {
-            for alt in &pattern.alternatives {
-                grams.extend(alt.iter().copied());
-            }
-        }
-        let df: CandidateDfWireResponse = json_from_bytes(
-            &state
-                .dispatch(
-                    ACTION_CANDIDATE_DF,
-                    &json_bytes(&CandidateDfRequest {
-                        grams: grams.clone(),
-                    })
-                    .expect("df payload"),
-                )
-                .expect("df"),
-        )
-        .expect("decode df");
-        assert!(!df.df.is_empty());
-
         let stats: Map<String, Value> = json_from_bytes(
             &state
                 .dispatch(ACTION_CANDIDATE_STATS, b"{}")
@@ -9776,23 +9515,6 @@ rule q {
                 .to_string()
                 .contains("invalid JSON object")
         );
-
-        let df_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
-            let _ = read_frame(&mut stream);
-            write_frame(
-                &mut stream,
-                PROTOCOL_VERSION,
-                STATUS_OK,
-                &serde_json::to_vec(&serde_json::json!({
-                    "df": {"42": 7, "invalid": 11}
-                }))
-                .expect("df payload"),
-            )
-            .expect("write df payload");
-        }));
-        let df = df_client.candidate_df(&[42]).expect("candidate df");
-        assert_eq!(df.get(&42).copied(), Some(7));
-        assert_eq!(df.len(), 1);
 
         let default_error_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let _ = read_frame(&mut stream);
@@ -10080,10 +9802,6 @@ rule q {
             stats.get("candidate_shards").and_then(Value::as_u64),
             Some(2)
         );
-        let df = client
-            .candidate_df(&plan.patterns[0].alternatives[0])
-            .expect("df");
-        assert!(!df.is_empty());
         let deleted = client
             .candidate_delete_sha256(&inserted.sha256)
             .expect("delete");
@@ -10294,10 +10012,6 @@ rule q {
         assert_eq!(page_two.returned_count, 1);
         assert_eq!(page_two.next_cursor, None);
         assert!(page_two.external_ids.is_none());
-        let df = state.handle_candidate_df(&[gram]).expect("df");
-        assert_eq!(df.df.get(&gram.to_string()).copied(), Some(2));
-        let empty_df = state.handle_candidate_df(&[]).expect("empty df");
-        assert!(empty_df.df.is_empty());
         let deleted = state
             .handle_candidate_delete(&docs[0].sha256)
             .expect("delete first multishard doc");
@@ -10314,9 +10028,6 @@ rule q {
             )
             .expect("query after delete");
         assert_eq!(query_after_delete.total_candidates, 1);
-        let df_after_delete = state.handle_candidate_df(&[gram]).expect("df after delete");
-        assert_eq!(df_after_delete.df.get(&gram.to_string()).copied(), Some(1));
-
         assert!(
             state
                 .handle_candidate_insert(&CandidateDocumentWire {
@@ -10357,9 +10068,7 @@ rule q {
                     metadata_b64: None,
                     external_id: None,
                 })
-                .expect_err("invalid grams_delta base64")
-                .to_string()
-                .contains("grams_delta_b64 must be valid base64")
+                .is_ok()
         );
         assert!(
             state

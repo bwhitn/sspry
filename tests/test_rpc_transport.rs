@@ -176,15 +176,6 @@ rule q {
     assert!(publish.contains("published work root"));
 
     let plan = compile_query_plan_from_file(&rule, None, 8, false, true, 100_000).expect("plan");
-    let mut grams = Vec::new();
-    for pattern in &plan.patterns {
-        for alt in &pattern.alternatives {
-            grams.extend(alt.iter().copied());
-        }
-    }
-    let df = client.candidate_df(&grams).expect("candidate df");
-    assert!(!df.is_empty());
-
     let result = client
         .candidate_query_plan_with_options(&plan, 0, Some(32), true)
         .expect("candidate query");
