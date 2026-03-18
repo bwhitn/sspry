@@ -19,17 +19,17 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
 use crate::candidate::query_plan::{
-    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
+    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
 };
 #[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-    GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
-    choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
-    derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
-    scan_file_features_bloom_only_with_gram_sizes,
+    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
+    compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
+    estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
+    extract_compact_document_metadata, read_candidate_shard_count,
+    scan_file_features_bloom_only_with_gram_sizes, BoundedCache, CandidateConfig, CandidateStore,
+    GramSizes, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, HLL_DEFAULT_PRECISION,
 };
 use crate::perf;
 use crate::rpc::{
@@ -783,7 +783,6 @@ fn json_f64_opt(stats: &serde_json::Map<String, serde_json::Value>, key: &str) -
 const INTERNAL_FILTER_BYTES: usize = 2048;
 const INTERNAL_FILTER_MIN_BYTES: usize = 1;
 const INTERNAL_FILTER_MAX_BYTES: usize = 0;
-const INTERNAL_FILTER_SIZE_DIVISOR: usize = 1;
 const INTERNAL_BLOOM_HASHES: usize = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1299,7 +1298,6 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
             INTERNAL_FILTER_BYTES,
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
-            INTERNAL_FILTER_SIZE_DIVISOR,
             policy.filter_target_fp,
             gram_count_estimate,
         )?
@@ -1312,7 +1310,6 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
             INTERNAL_FILTER_BYTES,
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
-            INTERNAL_FILTER_SIZE_DIVISOR,
             policy.filter_target_fp,
             tier2_gram_count_estimate,
         )?
@@ -2628,7 +2625,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
         } else {
             let client = search_rpc_client(&args.connection);
             let server_policy = server_scan_policy(&args.connection)?;
-            // Bloom-only search no longer does a remote DF replanning round-trip here.
+            // Bloom-only search compiles directly against the server's gram sizes.
             let plan = compile_query_plan_from_file_with_gram_sizes(
                 &args.rule,
                 server_policy.gram_sizes,
@@ -3538,12 +3535,10 @@ mod tests {
             file_digest,
             path_identity_sha256(&sample).expect("path digest")
         );
-        assert!(
-            sha256_file(&sample, 0)
-                .expect_err("zero chunk size")
-                .to_string()
-                .contains("positive integer")
-        );
+        assert!(sha256_file(&sample, 0)
+            .expect_err("zero chunk size")
+            .to_string()
+            .contains("positive integer"));
 
         let mut files = Vec::new();
         collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -4414,24 +4409,18 @@ rule remote_q {
         let sample = tmp.path().join("sample.bin");
         fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-        assert!(
-            md5_file(&sample, 0)
-                .expect_err("md5 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha1_file(&sample, 0)
-                .expect_err("sha1 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha512_file(&sample, 0)
-                .expect_err("sha512 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
+        assert!(md5_file(&sample, 0)
+            .expect_err("md5 zero chunk")
+            .to_string()
+            .contains("positive integer"));
+        assert!(sha1_file(&sample, 0)
+            .expect_err("sha1 zero chunk")
+            .to_string()
+            .contains("positive integer"));
+        assert!(sha512_file(&sample, 0)
+            .expect_err("sha512 zero chunk")
+            .to_string()
+            .contains("positive integer"));
 
         assert_eq!(
             detect_digest_identity_source(&"aa".repeat(16)),

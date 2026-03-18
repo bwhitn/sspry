@@ -16,11 +16,8 @@ pub use features::{
 };
 pub use filter_policy::{
     choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,
-    normalize_filter_policy,
 };
-pub use grams::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
-};
+pub use grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram};
 pub use metadata::{
     extract_compact_document_metadata, metadata_field_is_boolean, metadata_field_is_integer,
     metadata_field_matches_eq, normalize_query_metadata_field,

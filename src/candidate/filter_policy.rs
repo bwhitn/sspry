@@ -20,14 +20,13 @@ fn round_to_nearest_kib(value: usize) -> usize {
     ((value + 512) / 1024) * 1024
 }
 
-pub fn normalize_filter_policy(
-    legacy_filter_bytes: usize,
+fn normalize_filter_policy(
+    base_filter_bytes: usize,
     filter_min_bytes: Option<usize>,
     filter_max_bytes: Option<usize>,
-    filter_size_divisor: usize,
     filter_target_fp: Option<f64>,
-) -> Result<(usize, usize, usize, Option<f64>)> {
-    let base = legacy_filter_bytes.max(1);
+) -> Result<(usize, usize, Option<f64>)> {
+    let base = base_filter_bytes.max(1);
     let minimum = round_up_power_of_two(filter_min_bytes.unwrap_or(base).max(1));
     let raw_maximum = filter_max_bytes.unwrap_or(base);
     let mut maximum = if raw_maximum == 0 {
@@ -35,7 +34,6 @@ pub fn normalize_filter_policy(
     } else {
         round_up_power_of_two(raw_maximum.max(1))
     };
-    let divisor = filter_size_divisor.max(1);
     if maximum != 0 && maximum < minimum {
         maximum = minimum;
     }
@@ -46,7 +44,7 @@ pub fn normalize_filter_policy(
             ));
         }
     }
-    Ok((minimum, maximum, divisor, filter_target_fp))
+    Ok((minimum, maximum, filter_target_fp))
 }
 
 pub fn derive_bloom_hash_count(target_fp: Option<f64>, fallback_hashes: usize) -> Result<usize> {
@@ -78,22 +76,20 @@ pub fn derive_document_bloom_hash_count(
 
 pub fn choose_filter_bytes_for_file_size(
     file_size: u64,
-    legacy_filter_bytes: usize,
+    base_filter_bytes: usize,
     filter_min_bytes: Option<usize>,
     filter_max_bytes: Option<usize>,
-    filter_size_divisor: usize,
     filter_target_fp: Option<f64>,
     gram_count_estimate: Option<usize>,
 ) -> Result<usize> {
-    let (minimum, maximum, divisor, target_fp) = normalize_filter_policy(
-        legacy_filter_bytes,
+    let (minimum, maximum, target_fp) = normalize_filter_policy(
+        base_filter_bytes,
         filter_min_bytes,
         filter_max_bytes,
-        filter_size_divisor,
         filter_target_fp,
     )?;
     let size = file_size as usize;
-    let size_target = minimum.max(size.div_ceil(divisor));
+    let size_target = minimum.max(size);
     let target = if let Some(fp) = target_fp {
         let gram_count =
             gram_count_estimate.unwrap_or_else(|| size.saturating_sub(3).max(1)) as f64;
@@ -120,16 +116,9 @@ mod tests {
 
     #[test]
     fn variable_filter_size_rounds_to_power_of_two() {
-        let selected = choose_filter_bytes_for_file_size(
-            10_000,
-            2048,
-            Some(2048),
-            Some(131_072),
-            64,
-            None,
-            None,
-        )
-        .expect("size");
+        let selected =
+            choose_filter_bytes_for_file_size(10_000, 2048, Some(2048), Some(131_072), None, None)
+                .expect("size");
         assert!(selected.is_power_of_two());
         assert!(selected >= 2048);
     }
@@ -141,7 +130,6 @@ mod tests {
             512 * 1024,
             Some(8 * 1024),
             Some(512 * 1024),
-            8,
             Some(0.25),
             None,
         )
@@ -151,7 +139,6 @@ mod tests {
             512 * 1024,
             Some(8 * 1024),
             Some(512 * 1024),
-            8,
             Some(0.25),
             Some(4096),
         )
@@ -167,7 +154,6 @@ mod tests {
             2048,
             Some(2048),
             Some(0),
-            64,
             Some(0.0001),
             Some(22_000_000),
         )
@@ -186,20 +172,19 @@ mod tests {
 
     #[test]
     fn filter_policy_helpers_cover_validation_and_rounding_edges() {
-        let (minimum, maximum, divisor, fp) =
-            normalize_filter_policy(2048, Some(3000), Some(1024), 0, None).expect("normalized");
+        let (minimum, maximum, fp) =
+            normalize_filter_policy(2048, Some(3000), Some(1024), None).expect("normalized");
         assert_eq!(minimum, 4096);
         assert_eq!(maximum, 4096);
-        assert_eq!(divisor, 1);
         assert_eq!(fp, None);
 
-        assert!(normalize_filter_policy(2048, None, None, 64, Some(1.0)).is_err());
+        assert!(normalize_filter_policy(2048, None, None, Some(1.0)).is_err());
         assert_eq!(derive_bloom_hash_count(None, 0).expect("fallback"), 1);
         assert_eq!(derive_bloom_hash_count(Some(0.25), 13).expect("derived"), 2);
         assert!(derive_bloom_hash_count(Some(0.0), 13).is_err());
 
         let selected =
-            choose_filter_bytes_for_file_size(1, 1, Some(1), Some(0), 64, Some(0.5), Some(1))
+            choose_filter_bytes_for_file_size(1, 1, Some(1), Some(0), Some(0.5), Some(1))
                 .expect("kib rounding");
         assert_eq!(selected, 1024);
     }
