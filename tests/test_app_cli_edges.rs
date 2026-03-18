@@ -73,7 +73,7 @@ fn wait_for_info(addr: &str) {
     panic!("server did not become ready on {addr}");
 }
 
-fn wait_for_published_doc_count(addr: &str, expected_docs: u64) {
+fn wait_for_published_doc_count(addr: &str, expected_docs: u64, min_publish_runs: u64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let output = Command::new(bin_path())
@@ -93,13 +93,15 @@ fn wait_for_published_doc_count(addr: &str, expected_docs: u64) {
                 .get("work_dirty")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            if publish_runs_total >= 1 && doc_count == expected_docs && !work_dirty {
+            if publish_runs_total >= min_publish_runs && doc_count == expected_docs && !work_dirty {
                 return;
             }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("server did not publish {expected_docs} docs on {addr}");
+    panic!(
+        "server did not publish {expected_docs} docs with at least {min_publish_runs} publish runs on {addr}"
+    );
 }
 
 fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
@@ -362,7 +364,7 @@ rule q {
         String::from_utf8_lossy(&index_output.stderr)
     );
 
-    wait_for_published_doc_count(&addr, 2);
+    wait_for_published_doc_count(&addr, 2, 1);
 
     let info = run_ok(&["info", "--addr", &addr]);
     let parsed: Value = serde_json::from_str(&info).expect("stats json");
@@ -398,6 +400,63 @@ rule q {
     assert!(stdout.contains("verified_skipped: 0"));
     assert!(stdout.contains(&expected_hit_sha));
     assert!(!stdout.contains(&expected_miss_sha));
+
+    let delete_output = Command::new(bin_path())
+        .args(["delete", "--addr", &addr, hit_path.to_str().expect("hit path")])
+        .output()
+        .expect("run delete");
+    assert!(
+        delete_output.status.success(),
+        "delete failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&delete_output.stdout),
+        String::from_utf8_lossy(&delete_output.stderr)
+    );
+    let delete_stdout = String::from_utf8(delete_output.stdout).expect("utf8 delete stdout");
+    assert!(delete_stdout.contains("status: deleted"));
+    assert!(delete_stdout.contains(&expected_hit_sha));
+
+    let info = run_ok(&["info", "--addr", &addr]);
+    let parsed: Value = serde_json::from_str(&info).expect("stats json");
+    assert_eq!(
+        parsed.get("active_doc_count").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        parsed.get("deleted_doc_count").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        parsed
+            .get("publish")
+            .and_then(|value| value.get("publish_runs_total"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let post_delete_search_output = Command::new(bin_path())
+        .args([
+            "search",
+            "--addr",
+            &addr,
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--verify",
+        ])
+        .output()
+        .expect("run post-delete search");
+    assert!(
+        post_delete_search_output.status.success(),
+        "post-delete search failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&post_delete_search_output.stdout),
+        String::from_utf8_lossy(&post_delete_search_output.stderr)
+    );
+    let post_delete_stdout =
+        String::from_utf8(post_delete_search_output.stdout).expect("utf8 post-delete stdout");
+    assert!(post_delete_stdout.contains("tier_used:"));
+    assert!(post_delete_stdout.contains("verified_matched: 0"));
+    assert!(post_delete_stdout.contains("verified_skipped: 0"));
+    assert!(!post_delete_stdout.contains(&expected_hit_sha));
+    assert!(!post_delete_stdout.contains(&expected_miss_sha));
 
     let _ = child.kill();
     let _ = child.wait();
