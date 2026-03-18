@@ -15,6 +15,9 @@ Current baseline:
   - the CLI no longer prints the retired `legacy_query:` exact-gram expression on search
   - query-plan wire decode no longer accepts the retired pre-`ast` payload shape
   - workspace startup now rejects the retired single `work/` root instead of auto-migrating it
+  - candidate stats no longer emit the retired `gram_sizes` and `filter_bucket_counts` aliases
+  - live duplicate/import timing metrics are renamed from `classify_*` to `resolve_doc_state_*`
+  - the dead `ENABLE_PRESSURE_PUBLISH = false` gate is removed; live backpressure/pressure telemetry remains
 - `features.rs` status:
   - default ingest already scans with `collect_unique_grams = false`
   - `DocumentFeatures.unique_grams`, `unique_grams_truncated`, and `effective_diversity` still exist mainly for compatibility/test scaffolding

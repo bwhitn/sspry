@@ -70,7 +70,7 @@ pub struct CandidateInsertResult {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateInsertBatchProfile {
-    pub classify_us: u64,
+    pub resolve_doc_state_us: u64,
     pub append_sidecars_us: u64,
     pub append_sidecar_payloads_us: u64,
     pub append_bloom_payload_assemble_us: u64,
@@ -93,7 +93,7 @@ pub struct CandidateInsertBatchProfile {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CandidateImportBatchProfile {
-    pub classify_ms: u64,
+    pub resolve_doc_state_ms: u64,
     pub build_payloads_ms: u64,
     pub append_sidecars_ms: u64,
     pub append_sidecar_payloads_ms: u64,
@@ -1515,7 +1515,7 @@ impl CandidateStore {
                 }
             }
 
-            let classify_started = Instant::now();
+            let resolve_doc_state_started = Instant::now();
             let sha256_hex = hex::encode(sha256);
             let _ = gram_count_estimate;
 
@@ -1527,15 +1527,15 @@ impl CandidateStore {
                         doc_id: existing.doc_id,
                         sha256: existing.sha256.clone(),
                     });
-                    insert_profile.classify_us = insert_profile
-                        .classify_us
-                        .saturating_add(elapsed_us(classify_started));
+                    insert_profile.resolve_doc_state_us = insert_profile
+                        .resolve_doc_state_us
+                        .saturating_add(elapsed_us(resolve_doc_state_started));
                     continue;
                 }
 
-                insert_profile.classify_us = insert_profile
-                    .classify_us
-                    .saturating_add(elapsed_us(classify_started));
+                insert_profile.resolve_doc_state_us = insert_profile
+                    .resolve_doc_state_us
+                    .saturating_add(elapsed_us(resolve_doc_state_started));
                 let write_existing_started = Instant::now();
                 let snapshot = {
                     let existing = &mut self.docs[existing_pos];
@@ -1587,9 +1587,9 @@ impl CandidateStore {
                 continue;
             }
 
-            insert_profile.classify_us = insert_profile
-                .classify_us
-                .saturating_add(elapsed_us(classify_started));
+            insert_profile.resolve_doc_state_us = insert_profile
+                .resolve_doc_state_us
+                .saturating_add(elapsed_us(resolve_doc_state_started));
             let doc_id = self.meta.next_doc_id;
             self.meta.next_doc_id += 1;
             let doc = CandidateDoc {
@@ -1877,7 +1877,7 @@ impl CandidateStore {
         let mut meta_dirty = false;
         let mut import_profile = CandidateImportBatchProfile::default();
 
-        let classify_started = Instant::now();
+        let resolve_doc_state_started = Instant::now();
         for document in documents {
             total_scope.add_bytes(document.file_size);
             let sha256_hex = document.sha256_hex.clone();
@@ -1950,7 +1950,7 @@ impl CandidateStore {
             modified = true;
             meta_dirty = true;
         }
-        import_profile.classify_ms = classify_started
+        import_profile.resolve_doc_state_ms = resolve_doc_state_started
             .elapsed()
             .as_millis()
             .try_into()
@@ -2335,14 +2335,6 @@ impl CandidateStore {
             tier2_superblock_summary_bytes: self.tier2_superblocks.summary_memory_bytes,
             tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
         }
-    }
-
-    pub fn filter_bucket_counts(&self) -> BTreeMap<String, usize> {
-        let mut counts = BTreeMap::<String, usize>::new();
-        for doc in self.docs.iter().filter(|doc| !doc.deleted) {
-            *counts.entry(doc.filter_bytes.to_string()).or_insert(0) += 1;
-        }
-        counts
     }
 
     pub fn external_ids_for_sha256(&self, hashes: &[String]) -> Vec<Option<String>> {
@@ -4663,7 +4655,7 @@ rule q {
     }
 
     #[test]
-    fn filter_bucket_counts_and_external_ids_follow_active_docs() {
+    fn external_ids_follow_active_docs() {
         let tmp = tempdir().expect("tmp");
         let mut store = CandidateStore::init(
             CandidateConfig {
@@ -4723,10 +4715,6 @@ rule q {
         store
             .delete_document(&hex::encode(sha3))
             .expect("delete third");
-
-        let counts = store.filter_bucket_counts();
-        assert_eq!(counts.get("65536"), Some(&1));
-        assert_eq!(counts.get("262144"), Some(&1));
 
         let external_ids = store.external_ids_for_sha256(&[
             hex::encode(sha1),

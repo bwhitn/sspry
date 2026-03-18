@@ -797,11 +797,18 @@ struct ServerScanPolicy {
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
     let stats = rpc_client(connection).candidate_stats()?;
-    let gram_sizes = stats
-        .get("gram_sizes")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| SspryError::from("candidate stats missing gram_sizes"))?;
-    let gram_sizes = GramSizes::parse(gram_sizes)?;
+    let gram_sizes = GramSizes::new(
+        stats
+            .get("tier2_gram_size")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| SspryError::from("candidate stats missing tier2_gram_size"))?
+            as usize,
+        stats
+            .get("tier1_gram_size")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| SspryError::from("candidate stats missing tier1_gram_size"))?
+            as usize,
+    )?;
     let id_source = CandidateIdSource::parse_config_value(
         stats
             .get("id_source")
@@ -2177,8 +2184,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_promote_work_import_ms",
                         ),
                         (
-                            "last_publish_promote_work_import_classify_ms",
-                            "verbose.index.server_last_publish_promote_work_import_classify_ms",
+                            "last_publish_promote_work_import_resolve_doc_state_ms",
+                            "verbose.index.server_last_publish_promote_work_import_resolve_doc_state_ms",
                         ),
                         (
                             "last_publish_promote_work_import_build_payloads_ms",
@@ -2353,8 +2360,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 "verbose.index.server_index_insert_batch_finalize_us",
                             ),
                             (
-                                "store_classify_us",
-                                "verbose.index.server_index_insert_batch_store_classify_us",
+                                "store_resolve_doc_state_us",
+                                "verbose.index.server_index_insert_batch_store_resolve_doc_state_us",
                             ),
                             (
                                 "store_append_sidecars_us",

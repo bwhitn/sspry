@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
@@ -391,7 +391,7 @@ struct ServerState {
     index_session_server_insert_batch_build_us: AtomicU64,
     index_session_server_insert_batch_store_us: AtomicU64,
     index_session_server_insert_batch_finalize_us: AtomicU64,
-    index_session_server_insert_batch_store_classify_us: AtomicU64,
+    index_session_server_insert_batch_store_resolve_doc_state_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecars_us: AtomicU64,
     index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64,
     index_session_server_insert_batch_store_append_bloom_payload_assemble_us: AtomicU64,
@@ -417,7 +417,7 @@ struct ServerState {
     last_publish_promote_work_ms: AtomicU64,
     last_publish_promote_work_export_ms: AtomicU64,
     last_publish_promote_work_import_ms: AtomicU64,
-    last_publish_promote_work_import_classify_ms: AtomicU64,
+    last_publish_promote_work_import_resolve_doc_state_ms: AtomicU64,
     last_publish_promote_work_import_build_payloads_ms: AtomicU64,
     last_publish_promote_work_import_append_sidecars_ms: AtomicU64,
     last_publish_promote_work_import_install_docs_ms: AtomicU64,
@@ -526,8 +526,6 @@ struct WorkBufferPressure {
     document_threshold: u64,
     input_bytes_threshold: u64,
     rss_threshold_bytes: u64,
-    pressure_triggered: bool,
-    trigger_reason: &'static str,
     pressure_publish_blocked_by_seal_backlog: bool,
     pending_tier2_snapshot_shards: u64,
     index_backpressure_delay_ms: u64,
@@ -555,7 +553,6 @@ const WORK_BUFFER_REPUBLISH_INPUT_BYTES_DIVISOR: u64 = 4;
 const WORK_BUFFER_REPUBLISH_MIN_INPUT_BYTES_THRESHOLD: u64 = 4 << 30;
 const WORK_BUFFER_RSS_TRIGGER_NUMERATOR: u64 = 3;
 const WORK_BUFFER_RSS_TRIGGER_DENOMINATOR: u64 = 4;
-const ENABLE_PRESSURE_PUBLISH: bool = false;
 const INDEX_BACKPRESSURE_PUBLISH_DELAY_MS: u64 = 10;
 const INDEX_BACKPRESSURE_HEAVY_DELAY_MS: u64 = 50;
 
@@ -1300,7 +1297,6 @@ pub fn serve_with_shutdown(
 
 fn candidate_stats_json_from_parts_with_disk_usage(
     stats_rows: &[crate::candidate::CandidateStats],
-    filter_bucket_rows: &[BTreeMap<String, usize>],
     disk_usage_bytes: u64,
 ) -> Map<String, Value> {
     let stats = stats_rows
@@ -1329,17 +1325,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.tier2_superblock_memory_budget_bytes)
         .sum::<u64>();
-    let mut merged_filter_bucket_counts = BTreeMap::<String, usize>::new();
-    for row in filter_bucket_rows {
-        for (key, count) in row {
-            *merged_filter_bucket_counts.entry(key.clone()).or_insert(0) += *count;
-        }
-    }
-    let filter_bucket_counts = merged_filter_bucket_counts
-        .into_iter()
-        .map(|(key, count)| (key, json!(count)))
-        .collect::<Map<String, Value>>();
-
     let mut out = Map::<String, Value>::new();
     out.insert("active_doc_count".to_owned(), json!(active_doc_count));
     out.insert(
@@ -1367,10 +1352,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(compaction_generation),
     );
     out.insert(
-        "filter_bucket_counts".to_owned(),
-        Value::Object(filter_bucket_counts),
-    );
-    out.insert(
         "filter_target_fp".to_owned(),
         stats
             .filter_target_fp
@@ -1379,13 +1360,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     );
     out.insert("tier2_gram_size".to_owned(), json!(stats.tier2_gram_size));
     out.insert("tier1_gram_size".to_owned(), json!(stats.tier1_gram_size));
-    out.insert(
-        "gram_sizes".to_owned(),
-        Value::String(format!(
-            "{},{}",
-            stats.tier2_gram_size, stats.tier1_gram_size
-        )),
-    );
     out.insert("query_count".to_owned(), json!(stats.query_count));
     out.insert(
         "retired_generation_count".to_owned(),
@@ -1424,13 +1398,8 @@ fn candidate_stats_json_from_parts_with_disk_usage(
 fn candidate_stats_json_from_parts(
     root: &Path,
     stats_rows: &[crate::candidate::CandidateStats],
-    filter_bucket_rows: &[BTreeMap<String, usize>],
 ) -> Map<String, Value> {
-    candidate_stats_json_from_parts_with_disk_usage(
-        stats_rows,
-        filter_bucket_rows,
-        disk_usage_under(root),
-    )
+    candidate_stats_json_from_parts_with_disk_usage(stats_rows, disk_usage_under(root))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1441,7 +1410,7 @@ struct CandidateStatsBuildProfile {
 }
 
 pub fn candidate_stats_json(root: &Path, store: &CandidateStore) -> Map<String, Value> {
-    candidate_stats_json_from_parts(root, &[store.stats()], &[store.filter_bucket_counts()])
+    candidate_stats_json_from_parts(root, &[store.stats()])
 }
 
 pub fn candidate_stats_json_for_stores(
@@ -1449,11 +1418,7 @@ pub fn candidate_stats_json_for_stores(
     stores: &[CandidateStore],
 ) -> Map<String, Value> {
     let stats_rows = stores.iter().map(CandidateStore::stats).collect::<Vec<_>>();
-    let filter_bucket_rows = stores
-        .iter()
-        .map(CandidateStore::filter_bucket_counts)
-        .collect::<Vec<_>>();
-    candidate_stats_json_from_parts(root, &stats_rows, &filter_bucket_rows)
+    candidate_stats_json_from_parts(root, &stats_rows)
 }
 
 fn start_compaction_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
@@ -1621,7 +1586,7 @@ impl ServerState {
             index_session_server_insert_batch_build_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_us: AtomicU64::new(0),
             index_session_server_insert_batch_finalize_us: AtomicU64::new(0),
-            index_session_server_insert_batch_store_classify_us: AtomicU64::new(0),
+            index_session_server_insert_batch_store_resolve_doc_state_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecars_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_sidecar_payloads_us: AtomicU64::new(0),
             index_session_server_insert_batch_store_append_bloom_payload_assemble_us:
@@ -1656,7 +1621,7 @@ impl ServerState {
             last_publish_promote_work_ms: AtomicU64::new(0),
             last_publish_promote_work_export_ms: AtomicU64::new(0),
             last_publish_promote_work_import_ms: AtomicU64::new(0),
-            last_publish_promote_work_import_classify_ms: AtomicU64::new(0),
+            last_publish_promote_work_import_resolve_doc_state_ms: AtomicU64::new(0),
             last_publish_promote_work_import_build_payloads_ms: AtomicU64::new(0),
             last_publish_promote_work_import_append_sidecars_ms: AtomicU64::new(0),
             last_publish_promote_work_import_install_docs_ms: AtomicU64::new(0),
@@ -1876,18 +1841,6 @@ impl ServerState {
         }
         let rss_threshold_bytes = self.work_buffer_rss_threshold_bytes();
         let pressure_publish_blocked_by_seal_backlog = pending_tier2_snapshot_shards > 0;
-        let pressure_triggered = estimated_documents >= document_threshold
-            || estimated_input_bytes >= input_bytes_threshold
-            || current_rss_bytes >= rss_threshold_bytes;
-        let trigger_reason = if estimated_documents >= document_threshold {
-            "work_document_threshold"
-        } else if estimated_input_bytes >= input_bytes_threshold {
-            "work_input_bytes_threshold"
-        } else if current_rss_bytes >= rss_threshold_bytes {
-            "rss_threshold"
-        } else {
-            "idle_window"
-        };
         let index_backpressure_delay_ms = if self.active_index_sessions.load(Ordering::Acquire) == 0
         {
             0
@@ -1914,8 +1867,6 @@ impl ServerState {
             document_threshold,
             input_bytes_threshold,
             rss_threshold_bytes,
-            pressure_triggered,
-            trigger_reason,
             pressure_publish_blocked_by_seal_backlog,
             pending_tier2_snapshot_shards,
             index_backpressure_delay_ms,
@@ -2188,7 +2139,7 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_finalize_us
                     .store(0, Ordering::SeqCst);
-                self.index_session_server_insert_batch_store_classify_us
+                self.index_session_server_insert_batch_store_resolve_doc_state_us
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_append_sidecars_us
                     .store(0, Ordering::SeqCst);
@@ -2319,8 +2270,8 @@ impl ServerState {
                 finalize.as_micros().min(u128::from(u64::MAX)) as u64,
                 Ordering::SeqCst,
             );
-        self.index_session_server_insert_batch_store_classify_us
-            .fetch_add(store_profile.classify_us, Ordering::SeqCst);
+        self.index_session_server_insert_batch_store_resolve_doc_state_us
+            .fetch_add(store_profile.resolve_doc_state_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecars_us
             .fetch_add(store_profile.append_sidecars_us, Ordering::SeqCst);
         self.index_session_server_insert_batch_store_append_sidecar_payloads_us
@@ -2441,8 +2392,8 @@ impl ServerState {
                     .load(Ordering::Acquire),
             ),
             (
-                "store_classify_us",
-                self.index_session_server_insert_batch_store_classify_us
+                "store_resolve_doc_state_us",
+                self.index_session_server_insert_batch_store_resolve_doc_state_us
                     .load(Ordering::Acquire),
             ),
             (
@@ -2565,15 +2516,6 @@ impl ServerState {
                 .unwrap_or(u64::MAX),
             adaptive.tier2_pending_shards,
         );
-        let pressure_eligible = ENABLE_PRESSURE_PUBLISH
-            && self.config.workspace_mode
-            && work_dirty
-            && active_mutations == 0
-            && !publish_requested
-            && !publish_in_progress
-            && !mutations_paused
-            && !pressure.pressure_publish_blocked_by_seal_backlog
-            && pressure.pressure_triggered;
         let idle_eligible = self.config.workspace_mode
             && work_dirty
             && active_index_sessions == 0
@@ -2583,10 +2525,10 @@ impl ServerState {
             && !mutations_paused
             && last_mutation != 0
             && idle_elapsed_ms >= idle_threshold_ms;
-        let eligible = pressure_eligible || idle_eligible;
+        let eligible = idle_eligible;
         let blocked_reason = if !self.config.workspace_mode {
             "workspace_disabled"
-        } else if pressure_eligible || idle_eligible {
+        } else if idle_eligible {
             "ready"
         } else if !work_dirty {
             "work_clean"
@@ -2596,15 +2538,6 @@ impl ServerState {
             "publish_in_progress"
         } else if mutations_paused {
             "mutations_paused"
-        } else if ENABLE_PRESSURE_PUBLISH
-            && pressure.pressure_triggered
-            && pressure.pressure_publish_blocked_by_seal_backlog
-        {
-            "seal_backlog_present"
-        } else if ENABLE_PRESSURE_PUBLISH && pressure.pressure_triggered && active_mutations > 0 {
-            "active_mutations"
-        } else if ENABLE_PRESSURE_PUBLISH && pressure.pressure_triggered {
-            "pressure_threshold"
         } else if active_index_sessions > 0 {
             "active_index_sessions"
         } else if active_mutations > 0 {
@@ -2619,18 +2552,12 @@ impl ServerState {
         PublishReadiness {
             eligible,
             blocked_reason,
-            trigger_mode: if pressure_eligible {
-                "pressure"
-            } else if idle_eligible {
+            trigger_mode: if idle_eligible {
                 "idle"
             } else {
                 "blocked"
             },
-            trigger_reason: if pressure_eligible {
-                pressure.trigger_reason
-            } else {
-                adaptive.reason
-            },
+            trigger_reason: adaptive.reason,
             idle_elapsed_ms,
             idle_threshold_ms,
             idle_remaining_ms,
@@ -2692,12 +2619,10 @@ impl ServerState {
         }
         let started_collect = Instant::now();
         let mut stats_rows = Vec::with_capacity(store_set.stores.len());
-        let mut filter_bucket_rows = Vec::with_capacity(store_set.stores.len());
         let mut deleted_storage_bytes = 0u64;
         for (shard_idx, store_lock) in store_set.stores.iter().enumerate() {
             let store = lock_candidate_store_with_timeout(store_lock, shard_idx, operation)?;
             stats_rows.push(store.stats());
-            filter_bucket_rows.push(store.filter_bucket_counts());
             deleted_storage_bytes =
                 deleted_storage_bytes.saturating_add(store.deleted_storage_bytes());
         }
@@ -2714,11 +2639,7 @@ impl ServerState {
             .try_into()
             .unwrap_or(u64::MAX);
         let started_build_json = Instant::now();
-        let stats = candidate_stats_json_from_parts_with_disk_usage(
-            &stats_rows,
-            &filter_bucket_rows,
-            disk_usage_bytes,
-        );
+        let stats = candidate_stats_json_from_parts_with_disk_usage(&stats_rows, disk_usage_bytes);
         let build_json_ms = started_build_json
             .elapsed()
             .as_millis()
@@ -3189,9 +3110,9 @@ impl ServerState {
                 ),
             );
             publish.insert(
-                "last_publish_promote_work_import_classify_ms".to_owned(),
+                "last_publish_promote_work_import_resolve_doc_state_ms".to_owned(),
                 json!(
-                    self.last_publish_promote_work_import_classify_ms
+                    self.last_publish_promote_work_import_resolve_doc_state_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -3593,9 +3514,9 @@ impl ServerState {
                 ),
             );
             publish.insert(
-                "last_publish_promote_work_import_classify_ms".to_owned(),
+                "last_publish_promote_work_import_resolve_doc_state_ms".to_owned(),
                 json!(
-                    self.last_publish_promote_work_import_classify_ms
+                    self.last_publish_promote_work_import_resolve_doc_state_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -4351,9 +4272,9 @@ impl ServerState {
                 results[idx] = Some(Self::candidate_insert_response(result));
             }
             let store_profile = store.last_insert_batch_profile();
-            store_profile_total.classify_us = store_profile_total
-                .classify_us
-                .saturating_add(store_profile.classify_us);
+            store_profile_total.resolve_doc_state_us = store_profile_total
+                .resolve_doc_state_us
+                .saturating_add(store_profile.resolve_doc_state_us);
             store_profile_total.append_sidecars_us = store_profile_total
                 .append_sidecars_us
                 .saturating_add(store_profile.append_sidecars_us);
@@ -4453,9 +4374,9 @@ impl ServerState {
                     results[original_idx] = Some(Self::candidate_insert_response(result));
                 }
                 let store_profile = store.last_insert_batch_profile();
-                store_profile_total.classify_us = store_profile_total
-                    .classify_us
-                    .saturating_add(store_profile.classify_us);
+                store_profile_total.resolve_doc_state_us = store_profile_total
+                    .resolve_doc_state_us
+                    .saturating_add(store_profile.resolve_doc_state_us);
                 store_profile_total.append_sidecars_us = store_profile_total
                     .append_sidecars_us
                     .saturating_add(store_profile.append_sidecars_us);
@@ -4817,7 +4738,7 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_ms
                     .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_classify_ms
+                self.last_publish_promote_work_import_resolve_doc_state_ms
                     .store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_import_build_payloads_ms
                     .store(0, Ordering::SeqCst);
@@ -4896,9 +4817,9 @@ impl ServerState {
                         published_store.import_documents_batch_quiet(&imported)?
                     }
                     let import_profile = published_store.last_import_batch_profile();
-                    import_profile_total.classify_ms = import_profile_total
-                        .classify_ms
-                        .saturating_add(import_profile.classify_ms);
+                    import_profile_total.resolve_doc_state_ms = import_profile_total
+                        .resolve_doc_state_ms
+                        .saturating_add(import_profile.resolve_doc_state_ms);
                     import_profile_total.build_payloads_ms = import_profile_total
                         .build_payloads_ms
                         .saturating_add(import_profile.build_payloads_ms);
@@ -4936,8 +4857,8 @@ impl ServerState {
                     import_ms_total.try_into().unwrap_or(u64::MAX),
                     Ordering::SeqCst,
                 );
-                self.last_publish_promote_work_import_classify_ms
-                    .store(import_profile_total.classify_ms, Ordering::SeqCst);
+                self.last_publish_promote_work_import_resolve_doc_state_ms
+                    .store(import_profile_total.resolve_doc_state_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_import_build_payloads_ms
                     .store(import_profile_total.build_payloads_ms, Ordering::SeqCst);
                 self.last_publish_promote_work_import_append_sidecars_ms
@@ -7349,7 +7270,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_stats_json_contains_python_compat_fields() {
+    fn candidate_stats_json_contains_current_scan_policy_fields() {
         let tmp = tempdir().expect("tmp");
         let config = CandidateConfig {
             root: tmp.path().join("candidate_db"),
@@ -7357,9 +7278,15 @@ mod tests {
         };
         let store = CandidateStore::init(config.clone(), true).expect("init");
         let stats = candidate_stats_json(&config.root, &store);
-        assert!(stats.contains_key("filter_bucket_counts"));
         assert!(stats.contains_key("disk_usage_bytes"));
-        assert_eq!(stats.get("gram_sizes").and_then(Value::as_str), Some("3,4"));
+        assert_eq!(
+            stats.get("tier2_gram_size").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            stats.get("tier1_gram_size").and_then(Value::as_u64),
+            Some(4)
+        );
         assert_eq!(
             stats.get("filter_target_fp").and_then(Value::as_f64),
             Some(0.35)
