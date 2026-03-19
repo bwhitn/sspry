@@ -732,6 +732,10 @@ fn count_input_files(paths: &[PathBuf]) -> Result<usize> {
     Ok(total)
 }
 
+fn input_paths_are_file_only(paths: &[PathBuf]) -> bool {
+    !paths.is_empty() && paths.iter().all(|path| path.is_file())
+}
+
 fn stream_input_files(
     paths: &[PathBuf],
     mut visit: impl FnMut(PathBuf) -> Result<()>,
@@ -1748,12 +1752,18 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let mut submit_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
         let input_roots = expand_input_paths(&args.paths, args.path_list)?;
-        let total_files = count_input_files(&input_roots)?;
+        let total_files = if input_paths_are_file_only(&input_roots) {
+            input_roots.len()
+        } else {
+            count_input_files(&input_roots)?
+        };
         if total_files == 0 {
             return Err(SspryError::from("No input files found."));
         }
         let show_progress = args.verbose
-            && (input_roots.iter().any(|path| path.is_dir()) || total_files > input_roots.len());
+            && (args.path_list
+                || input_roots.iter().any(|path| path.is_dir())
+                || total_files > input_roots.len());
         let mut last_progress_reported = 0usize;
         let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
