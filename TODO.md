@@ -428,8 +428,39 @@ Current indexing follow-up:
 - why:
   - the finished `50k` search-profile run still showed `store_append_sidecars_us = 563,206,853` out of `store_us = 586,659,295`
   - the write path is still the main indexing slope problem after the bloom-only cutover
+- accepted exact-capacity payload assembly on top of the batched append path:
+  - artifacts:
+    - `/root/pertest/results/sspry_verify_26000_appendcap_20260319_r1`
+    - `/root/pertest/results/sspry_verify_50000_appendcap_20260319_r1`
+  - accepted read:
+    - at `26k`, `store_us` improved from `61,089,086` to `50,657,735` and `append_sidecars_us` improved from `42,039,746` to `32,327,419`
+    - at `50k`, `store_us` improved from `586,659,295` to `359,010,311` and `append_sidecars_us` improved from `563,206,853` to `322,981,182`
+    - `append_tier2_bloom_payload_us` also dropped materially at both sizes
+    - end-to-end wall only moved slightly, but this is the first clear improvement in the actual scaled hot buckets, so keep it
+- rejected `tier2_update` experiments on top of exact-capacity:
+  - `HashMap` rebuild path
+    - artifact:
+      - `/root/pertest/results/sspry_verify_26000_tier2hash_20260319_r1`
+    - read:
+      - worse than exact-capacity baseline on `total_ms`, `store_us`, `append_sidecars_us`, and `tier2_update_us`
+      - reject and keep `BTreeMap`
+  - direct in-place tier2 summary updates
+    - artifact:
+      - `/root/pertest/results/sspry_verify_26000_tier2direct_20260319_r1`
+    - read:
+      - restored publish time to normal, but did not improve `tier2_update_us`
+      - regressed `store_us` and `append_sidecars_us` versus the exact-capacity baseline
+      - reject as the default path
+- next target on the accepted exact-capacity baseline:
+  - profile the publish-tail regression seen on the `50k` exact-capacity run (`publish_ms = 11,605` versus `81`)
+  - focus on publish/snapshot/seal path before touching `tier2_update` again
 - next validation:
   - rerun a quick `26k` or `50k` ingest slice on the batched doc-record path before doing larger-corpus indexing again
+
+Future storage direction to evaluate after the current ingest/search slope work:
+- multi-tree storage with older trees immutable by default
+- only trees affected by deletes or compaction need rewriting
+- goal: cap rewrite pressure and keep large-corpus ingest closer to linear as total history grows
 
 Current local `26k` smoke check for the lazy-load search patch:
 - artifact:

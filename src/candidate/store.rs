@@ -1995,8 +1995,16 @@ impl CandidateStore {
             let append_sidecars_started = Instant::now();
             let bloom_base = self.append_writers.blooms.offset;
             let tier2_bloom_base = self.append_writers.tier2_blooms.offset;
-            let mut blooms_payload = Vec::<u8>::new();
-            let mut tier2_blooms_payload = Vec::<u8>::new();
+            let bloom_total_bytes = pending_new_inserts
+                .iter()
+                .map(|pending| pending.bloom_filter.len())
+                .sum::<usize>();
+            let tier2_bloom_total_bytes = pending_new_inserts
+                .iter()
+                .map(|pending| pending.tier2_bloom_filter.len())
+                .sum::<usize>();
+            let mut blooms_payload = Vec::<u8>::with_capacity(bloom_total_bytes);
+            let mut tier2_blooms_payload = Vec::<u8>::with_capacity(tier2_bloom_total_bytes);
             let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_new_inserts.len() * 32);
             let mut doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_new_inserts.len() * DOC_META_ROW_BYTES);
@@ -2025,7 +2033,7 @@ impl CandidateStore {
                 .saturating_add(elapsed_us(append_bloom_started));
             insert_profile.append_bloom_payload_bytes = insert_profile
                 .append_bloom_payload_bytes
-                .saturating_add(blooms_payload.len() as u64);
+                .saturating_add(bloom_total_bytes as u64);
             let append_tier2_bloom_started = Instant::now();
             self.append_writers
                 .tier2_blooms
@@ -2035,7 +2043,7 @@ impl CandidateStore {
                 .saturating_add(elapsed_us(append_tier2_bloom_started));
             insert_profile.append_tier2_bloom_payload_bytes = insert_profile
                 .append_tier2_bloom_payload_bytes
-                .saturating_add(tier2_blooms_payload.len() as u64);
+                .saturating_add(tier2_bloom_total_bytes as u64);
 
             let mut prepared_rows =
                 Vec::<(PendingNewInsert<'_>, DocMetaRow, Tier2DocMetaRow)>::with_capacity(
@@ -2364,10 +2372,33 @@ impl CandidateStore {
             let external_ids_base = self.append_writers.external_ids.offset;
             let metadata_base = self.append_writers.metadata.offset;
             let tier2_blooms_base = self.append_writers.tier2_blooms.offset;
-            let mut blooms_payload = Vec::<u8>::new();
-            let mut external_ids_payload = Vec::<u8>::new();
-            let mut metadata_payload = Vec::<u8>::new();
-            let mut tier2_blooms_payload = Vec::<u8>::new();
+            let bloom_total_bytes = pending_inserts
+                .iter()
+                .map(|pending| pending.document.bloom_filter.len())
+                .sum::<usize>();
+            let tier2_bloom_total_bytes = pending_inserts
+                .iter()
+                .map(|pending| pending.document.tier2_bloom_filter.len())
+                .sum::<usize>();
+            let external_ids_total_bytes = pending_inserts
+                .iter()
+                .map(|pending| {
+                    pending
+                        .document
+                        .external_id
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(0)
+                })
+                .sum::<usize>();
+            let metadata_total_bytes = pending_inserts
+                .iter()
+                .map(|pending| pending.document.metadata_bytes.len())
+                .sum::<usize>();
+            let mut blooms_payload = Vec::<u8>::with_capacity(bloom_total_bytes);
+            let mut external_ids_payload = Vec::<u8>::with_capacity(external_ids_total_bytes);
+            let mut metadata_payload = Vec::<u8>::with_capacity(metadata_total_bytes);
+            let mut tier2_blooms_payload = Vec::<u8>::with_capacity(tier2_bloom_total_bytes);
             let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_inserts.len() * 32);
             let mut doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_inserts.len() * DOC_META_ROW_BYTES);
