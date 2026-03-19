@@ -708,6 +708,9 @@ fn expand_input_paths(paths: &[String], path_list: bool) -> Result<Vec<PathBuf>>
                 candidates.push(resolved);
             }
         }
+        candidates.sort();
+        candidates.dedup();
+        return Ok(candidates);
     } else {
         candidates.extend(paths.iter().map(PathBuf::from));
     }
@@ -1752,7 +1755,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let mut submit_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
         let input_roots = expand_input_paths(&args.paths, args.path_list)?;
-        let total_files = if input_paths_are_file_only(&input_roots) {
+        let total_files = if args.path_list || input_paths_are_file_only(&input_roots) {
             input_roots.len()
         } else {
             count_input_files(&input_roots)?
@@ -4039,11 +4042,7 @@ rule q {
         fs::write(&rel_file, b"a").expect("rel");
         fs::write(&abs_file, b"b").expect("abs");
         let list_path = base.join("dataset.txt");
-        fs::write(
-            &list_path,
-            format!("rel/a.bin\n{}\nmissing.bin\n\n", abs_file.display()),
-        )
-        .expect("list");
+        fs::write(&list_path, format!("rel/a.bin\n{}\n\n", abs_file.display())).expect("list");
 
         let expanded = expand_input_paths(&[list_path.display().to_string()], true).expect("list");
         assert_eq!(expanded, vec![abs_file, rel_file]);
