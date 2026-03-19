@@ -739,6 +739,21 @@ fn input_paths_are_file_only(paths: &[PathBuf]) -> bool {
     !paths.is_empty() && paths.iter().all(|path| path.is_file())
 }
 
+fn stream_selected_input_files(
+    paths: &[PathBuf],
+    path_list: bool,
+    mut visit: impl FnMut(PathBuf) -> Result<()>,
+) -> Result<()> {
+    if path_list {
+        for path in paths {
+            visit(path.clone())?;
+        }
+        Ok(())
+    } else {
+        stream_input_files(paths, &mut visit)
+    }
+}
+
 fn stream_input_files(
     paths: &[PathBuf],
     mut visit: impl FnMut(PathBuf) -> Result<()>,
@@ -1799,7 +1814,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
             let mut pending = Vec::<IndexBatchRow>::new();
             if workers <= 1 {
-                stream_input_files(&input_roots, |file_path| {
+                stream_selected_input_files(&input_roots, args.path_list, |file_path| {
                     let started_scan = Instant::now();
                     pending.push(scan_index_batch_row(&file_path, policy)?);
                     scan_time += started_scan.elapsed();
@@ -1842,15 +1857,20 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     let producer_tx = job_tx.clone();
                     let producer_result_tx = result_tx.clone();
                     let producer_roots = input_roots.clone();
+                    let producer_path_list = args.path_list;
                     scope.spawn(move || {
-                        let produce = stream_input_files(&producer_roots, |file_path| {
-                            producer_tx.send(file_path).map_err(|_| {
-                                SspryError::from(
-                                    "candidate ingest file producer terminated unexpectedly",
-                                )
-                            })?;
-                            Ok(())
-                        });
+                        let produce = stream_selected_input_files(
+                            &producer_roots,
+                            producer_path_list,
+                            |file_path| {
+                                producer_tx.send(file_path).map_err(|_| {
+                                    SspryError::from(
+                                        "candidate ingest file producer terminated unexpectedly",
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        );
                         if let Err(err) = produce {
                             let _ = producer_result_tx.send(Err(err));
                         }
@@ -1941,7 +1961,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             };
             let remote_result = (|| -> Result<()> {
                 if workers <= 1 {
-                    stream_input_files(&input_roots, |file_path| {
+                    stream_selected_input_files(&input_roots, args.path_list, |file_path| {
                         let started_scan = Instant::now();
                         let scanned = scan_index_batch_row(&file_path, policy)?;
                         scan_time += started_scan.elapsed();
@@ -1989,15 +2009,20 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         let producer_tx = job_tx.clone();
                         let producer_result_tx = result_tx.clone();
                         let producer_roots = input_roots.clone();
+                        let producer_path_list = args.path_list;
                         scope.spawn(move || {
-                            let produce = stream_input_files(&producer_roots, |file_path| {
-                                producer_tx.send(file_path).map_err(|_| {
+                            let produce = stream_selected_input_files(
+                                &producer_roots,
+                                producer_path_list,
+                                |file_path| {
+                                    producer_tx.send(file_path).map_err(|_| {
                                     SspryError::from(
                                         "candidate ingest file producer terminated unexpectedly",
                                     )
                                 })?;
-                                Ok(())
-                            });
+                                    Ok(())
+                                },
+                            );
                             if let Err(err) = produce {
                                 let _ = producer_result_tx.send(Err(err));
                             }
