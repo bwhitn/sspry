@@ -378,7 +378,27 @@ Immediate search improvements on the bloom-only baseline:
       - `index_wall_ms = 561,343`
       - superblocks skipped per supported rule: `10-49`
       - `01`: `1.104 s`
-  - next validation should be the full `50k` `32 KiB` search profile on this new baseline before trying more summary-cap increases
+  - full `50k` validation on this baseline:
+    - artifact: `/root/pertest/results/sspry_searchprofile_50000_32k_20260319_r4/search_summary.json`
+    - `index_wall_ms = 1,629,496`
+    - publish finished cleanly with `current_rss_kb = 1,107,468`, `peak_rss_kb = 1,272,588`
+    - supported-rule totals:
+      - `01`: `267.88 s`
+      - `08`: `7.96 s`
+      - `09`: `24.67 s`
+      - `10`: `1.79 s`
+      - `11`: `10.55 s`
+      - `12`: `3.79 s`
+    - supported-rule scan shape:
+      - docs scanned: `49,884-49,966 / 50,000`
+      - superblocks skipped: `12-29`
+      - tier1 bloom loads: `49,884-49,966`
+      - tier1 bloom bytes per search: about `25.40 GiB`
+    - read:
+      - this is better than the old all-zero-skip path, but still far too close to a full scan
+      - `08` improved dramatically, but `01` is still unacceptable and `09/11/12` are still too expensive
+      - this baseline is not ready for `100k`
+  - next validation should not be `100k`; the next useful step is a stronger block gate and true contiguous block bloom reads before trying larger corpus search runs
 
 Current local `26k` smoke check for the lazy-load search patch:
 - artifact:
