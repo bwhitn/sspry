@@ -5,7 +5,9 @@ use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapOptions};
@@ -32,6 +34,7 @@ const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 32;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
+const DEFAULT_QUERY_SCAN_WORKERS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct CandidateConfig {
@@ -2696,19 +2699,105 @@ impl CandidateStore {
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
-        let mut matched_hits = Vec::<(String, u32)>::new();
-        let mut used_tiers = TierFlags::default();
-        let mut query_profile = CandidateQueryProfile::default();
         let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
         let block_count = self.tier2_superblocks.keys_per_block.len();
+        if block_count == 0 {
+            return Ok((Vec::new(), TierFlags::default(), CandidateQueryProfile::default()));
+        }
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
         let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
         let query_now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let worker_count = query_scan_worker_count(block_count);
 
-        for block_idx in 0..block_count {
+        if worker_count <= 1 {
+            return self.scan_query_hits_worker(
+                plan,
+                prepared,
+                docs_per_block,
+                block_count,
+                allow_block_skip,
+                prefetch_tier1_by_block,
+                query_now_unix,
+                None,
+            );
+        }
+
+        let next_block = AtomicUsize::new(0);
+        let partials = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let next_block = &next_block;
+                handles.push(scope.spawn(move || {
+                    self.scan_query_hits_worker(
+                        plan,
+                        prepared,
+                        docs_per_block,
+                        block_count,
+                        allow_block_skip,
+                        prefetch_tier1_by_block,
+                        query_now_unix,
+                        Some(next_block),
+                    )
+                }));
+            }
+
+            let mut merged = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let partial = handle
+                    .join()
+                    .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
+                merged.push(partial);
+            }
+            Ok::<Vec<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)>, SspryError>(merged)
+        })?;
+
+        let mut matched_hits = Vec::<(String, u32)>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for (hits, tiers, profile) in partials {
+            matched_hits.extend(hits);
+            used_tiers.merge(tiers);
+            query_profile.merge_from(&profile);
+        }
+
+        Ok((matched_hits, used_tiers, query_profile))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_query_hits_worker(
+        &self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+        docs_per_block: usize,
+        block_count: usize,
+        allow_block_skip: bool,
+        prefetch_tier1_by_block: bool,
+        query_now_unix: u64,
+        next_block: Option<&AtomicUsize>,
+    ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<(String, u32)>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+
+        let mut next_sequential_block = 0usize;
+        loop {
+            let block_idx = if let Some(next_block) = next_block {
+                let idx = next_block.fetch_add(1, Ordering::Relaxed);
+                if idx >= block_count {
+                    break;
+                }
+                idx
+            } else {
+                if next_sequential_block >= block_count {
+                    break;
+                }
+                let idx = next_sequential_block;
+                next_sequential_block += 1;
+                idx
+            };
             if allow_block_skip
                 && !block_maybe_matches_node(
                     block_idx,
@@ -4430,6 +4519,18 @@ fn block_maybe_matches_node(
             "Unsupported ast node kind: {other}"
         ))),
     }
+}
+
+fn query_scan_worker_count(block_count: usize) -> usize {
+    if block_count < 64 {
+        return 1;
+    }
+    thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(DEFAULT_QUERY_SCAN_WORKERS)
+        .min(block_count.max(1))
+        .max(1)
 }
 
 fn evaluate_pattern<'a, FT1, FT2>(

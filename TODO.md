@@ -448,6 +448,34 @@ Current local `26k` smoke check for the lazy-load search patch:
   - `12`: `0.776 s`, `10` candidates
 - read:
   - the lazy-load patch is functionally clean on a real bloom-only ingest/search pass
+
+Current local search-worker follow-up:
+- change set:
+  - query scanning inside one store now parallelizes across blocks with bounded worker threads
+  - the live path still uses the existing sampled-word block gate and dense tier1 block prefetch
+- `2000`-file published smoke artifact:
+  - `/root/pertest/results/sspry_smoke_parallel_2000_20260319_r1`
+- dataset:
+  - `/root/pertest/results/sspry_dataset_2000_sorted_20260319_from26000/dataset.json`
+  - `file_count = 2,000`
+  - `bytes_total = 6,552,639,181`
+- index/publish:
+  - `elapsed_ms = 157,451.837`
+  - `files_per_minute_wall = 762.14`
+  - `server_peak_rss_kb = 502,092`
+  - `last_publish_duration_ms = 85`
+  - `last_publish_reused_work_stores = true`
+- supported-rule search totals:
+  - `01`: `0.166 s`, `docs_scanned = 1,286`, `superblocks_skipped = 114`
+  - `08`: `0.122 s`, `docs_scanned = 1,922`, `superblocks_skipped = 17`
+  - `09`: `0.172 s`, `docs_scanned = 1,791`, `superblocks_skipped = 42`
+  - `10`: `0.172 s`, `docs_scanned = 909`, `superblocks_skipped = 151`
+  - `11`: `0.146 s`, `docs_scanned = 1,494`, `superblocks_skipped = 84`
+  - `12`: `0.147 s`, `docs_scanned = 1,630`, `superblocks_skipped = 61`
+- read:
+  - the bounded worker scan path is functionally clean on published search
+  - the query wall times are now comfortably sub-second on this small published slice
+  - block rejection is still the structural next target on larger corpora; worker parallelism reduces wall time but does not change the underlying admitted-block rate
   - all six supported rules completed without timeout on the `26k` smoke run
   - next validation should be the same search pack on the `50k` `32 KiB` baseline
 
