@@ -398,7 +398,38 @@ Immediate search improvements on the bloom-only baseline:
       - this is better than the old all-zero-skip path, but still far too close to a full scan
       - `08` improved dramatically, but `01` is still unacceptable and `09/11/12` are still too expensive
       - this baseline is not ready for `100k`
+  - dual-gate `50k` follow-up:
+    - artifact: `/root/pertest/results/sspry_searchprofile_50000_32k_20260319_r5/search_summary.json`
+    - change set:
+      - add a second block gate over tier2 blooms
+      - batch dense tier1 block reads through one contiguous mmap span when offsets are packed enough
+    - `index_wall_ms = 1,841,625`
+    - supported-rule totals:
+      - `01`: `233.38 s`
+      - `08`: `12.78 s`
+      - `09`: `25.87 s`
+      - `10`: `1.81 s`
+      - `11`: `10.97 s`
+      - `12`: `3.16 s`
+    - supported-rule scan shape:
+      - docs scanned: `49,873-49,966 / 50,000`
+      - superblocks skipped: `12-30`
+      - tier1 bloom loads: `49,873-49,966`
+      - tier1 bloom bytes per search: still about `25.40 GiB`
+    - read:
+      - this improved `01` and `12`, but block rejection still barely moved
+      - the dense read path is not enough by itself because the current sampled-word summary still admits almost every block
+      - the next search cut has to be a stronger dedicated block signature, not more tuning on the current sampled summary
   - next validation should not be `100k`; the next useful step is a stronger block gate and true contiguous block bloom reads before trying larger corpus search runs
+
+Current indexing follow-up:
+- accepted next cut:
+  - batch `sha_by_docid`, `doc_meta`, and `tier2_doc_meta` appends in the hot insert path instead of appending those doc records one document at a time
+- why:
+  - the finished `50k` search-profile run still showed `store_append_sidecars_us = 563,206,853` out of `store_us = 586,659,295`
+  - the write path is still the main indexing slope problem after the bloom-only cutover
+- next validation:
+  - rerun a quick `26k` or `50k` ingest slice on the batched doc-record path before doing larger-corpus indexing again
 
 Current local `26k` smoke check for the lazy-load search patch:
 - artifact:

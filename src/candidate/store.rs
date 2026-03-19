@@ -1990,6 +1990,11 @@ impl CandidateStore {
             let tier2_bloom_base = self.append_writers.tier2_blooms.offset;
             let mut blooms_payload = Vec::<u8>::new();
             let mut tier2_blooms_payload = Vec::<u8>::new();
+            let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_new_inserts.len() * 32);
+            let mut doc_meta_payload =
+                Vec::<u8>::with_capacity(pending_new_inserts.len() * DOC_META_ROW_BYTES);
+            let mut tier2_doc_meta_payload =
+                Vec::<u8>::with_capacity(pending_new_inserts.len() * TIER2_DOC_META_ROW_BYTES);
             let mut bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
             let mut tier2_bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
             let assemble_bloom_payloads_started = Instant::now();
@@ -2025,6 +2030,10 @@ impl CandidateStore {
                 .append_tier2_bloom_payload_bytes
                 .saturating_add(tier2_blooms_payload.len() as u64);
 
+            let mut prepared_rows =
+                Vec::<(PendingNewInsert<'_>, DocMetaRow, Tier2DocMetaRow)>::with_capacity(
+                    bloom_offsets.len(),
+                );
             for ((pending, bloom_offset), tier2_bloom_offset) in pending_new_inserts
                 .into_iter()
                 .zip(bloom_offsets.into_iter())
@@ -2066,11 +2075,25 @@ impl CandidateStore {
                 insert_profile.append_external_id_payload_bytes = insert_profile
                     .append_external_id_payload_bytes
                     .saturating_add(row_profile.external_id_bytes);
-                let append_doc_records_started = Instant::now();
-                self.append_new_doc(&pending.sha256, row, tier2_row)?;
-                insert_profile.append_doc_records_us = insert_profile
-                    .append_doc_records_us
-                    .saturating_add(elapsed_us(append_doc_records_started));
+                sha_by_docid_payload.extend_from_slice(&pending.sha256);
+                doc_meta_payload.extend_from_slice(&row.encode());
+                tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
+                prepared_rows.push((pending, row, tier2_row));
+            }
+
+            let append_doc_records_started = Instant::now();
+            self.append_writers
+                .sha_by_docid
+                .append(&sha_by_docid_payload)?;
+            self.append_writers.doc_meta.append(&doc_meta_payload)?;
+            self.append_writers
+                .tier2_doc_meta
+                .append(&tier2_doc_meta_payload)?;
+            insert_profile.append_doc_records_us = insert_profile
+                .append_doc_records_us
+                .saturating_add(elapsed_us(append_doc_records_started));
+
+            for (pending, row, tier2_row) in prepared_rows {
                 let install_docs_started = Instant::now();
                 let pos = self.docs.len();
                 self.doc_rows.push(row);
