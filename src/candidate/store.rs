@@ -301,6 +301,7 @@ struct CandidateDoc {
 const DOC_META_ROW_BYTES: usize = 56;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
+const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_DELETED: u8 = 0x02;
 
@@ -530,10 +531,16 @@ struct AppendFile {
     path: PathBuf,
     handle: Option<fs::File>,
     offset: u64,
+    sync_threshold_bytes: u64,
+    bytes_since_sync: u64,
 }
 
 impl AppendFile {
     fn new(path: PathBuf) -> Result<Self> {
+        Self::new_with_sync_threshold(path, 0)
+    }
+
+    fn new_with_sync_threshold(path: PathBuf, sync_threshold_bytes: u64) -> Result<Self> {
         let offset = fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -541,6 +548,8 @@ impl AppendFile {
             path,
             handle: None,
             offset,
+            sync_threshold_bytes,
+            bytes_since_sync: 0,
         })
     }
 
@@ -566,11 +575,21 @@ impl AppendFile {
             .ok_or_else(|| SspryError::from("append handle unexpectedly unavailable"))?;
         handle.write_all(bytes)?;
         self.offset = self.offset.saturating_add(bytes.len() as u64);
+        self.bytes_since_sync = self.bytes_since_sync.saturating_add(bytes.len() as u64);
+        if self.sync_threshold_bytes > 0 && self.bytes_since_sync >= self.sync_threshold_bytes {
+            handle.sync_data()?;
+            self.bytes_since_sync = 0;
+        }
         Ok(offset)
     }
 
     fn retarget(&mut self, path: PathBuf) {
         self.path = path;
+        self.handle = None;
+        self.offset = fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        self.bytes_since_sync = 0;
     }
 }
 
@@ -588,8 +607,14 @@ struct StoreAppendWriters {
 impl StoreAppendWriters {
     fn new(root: &Path) -> Result<Self> {
         Ok(Self {
-            blooms: AppendFile::new(blooms_path(root))?,
-            tier2_blooms: AppendFile::new(tier2_blooms_path(root))?,
+            blooms: AppendFile::new_with_sync_threshold(
+                blooms_path(root),
+                APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES,
+            )?,
+            tier2_blooms: AppendFile::new_with_sync_threshold(
+                tier2_blooms_path(root),
+                APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES,
+            )?,
             metadata: AppendFile::new(doc_metadata_path(root))?,
             external_ids: AppendFile::new(external_ids_path(root))?,
             sha_by_docid: AppendFile::new(sha_by_docid_path(root))?,
@@ -6135,12 +6160,14 @@ rule q {
         );
 
         let retarget_path = tmp.path().join("retarget").join("payload.bin");
+        fs::create_dir_all(retarget_path.parent().expect("retarget parent"))
+            .expect("create retarget dir");
+        fs::write(&retarget_path, b"pre").expect("seed retarget payload");
         append.retarget(retarget_path.clone());
-        append.handle = None;
-        assert_eq!(append.append(b"zz").expect("append retarget"), 5);
+        assert_eq!(append.append(b"zz").expect("append retarget"), 3);
         assert_eq!(
             fs::read(&retarget_path).expect("read retarget payload"),
-            b"zz"
+            b"prezz"
         );
 
         let mut writers = StoreAppendWriters::new(&root).expect("append writers");

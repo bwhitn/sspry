@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 import json
+import math
 import os
 import re
 import shutil
@@ -138,6 +139,133 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
     return record
 
 
+def parse_meminfo() -> dict:
+    out = {}
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        number = value.strip().split()[0]
+        try:
+            out[key] = int(number)
+        except ValueError:
+            continue
+    return out
+
+
+def parse_vmstat() -> dict:
+    wanted = {
+        'nr_dirty',
+        'nr_writeback',
+        'nr_dirtied',
+        'nr_written',
+        'nr_writeback_temp',
+    }
+    out = {}
+    for line in Path('/proc/vmstat').read_text().splitlines():
+        parts = line.split()
+        if len(parts) != 2 or parts[0] not in wanted:
+            continue
+        try:
+            out[parts[0]] = int(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+def parse_pressure(kind: str) -> dict:
+    path = Path('/proc/pressure') / kind
+    out = {}
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        bucket = parts[0]
+        metrics = {}
+        for item in parts[1:]:
+            if '=' not in item:
+                continue
+            key, value = item.split('=', 1)
+            try:
+                metrics[key] = float(value)
+            except ValueError:
+                continue
+        out[bucket] = metrics
+    return out
+
+
+def system_snapshot() -> dict:
+    meminfo = parse_meminfo()
+    vmstat = parse_vmstat()
+    io_pressure = parse_pressure('io')
+    return {
+        'timestamp_unix_s': time.time(),
+        'dirty_kb': meminfo.get('Dirty', 0),
+        'writeback_kb': meminfo.get('Writeback', 0),
+        'mem_available_kb': meminfo.get('MemAvailable', 0),
+        'active_anon_kb': meminfo.get('Active(anon)', 0),
+        'inactive_anon_kb': meminfo.get('Inactive(anon)', 0),
+        'active_file_kb': meminfo.get('Active(file)', 0),
+        'inactive_file_kb': meminfo.get('Inactive(file)', 0),
+        'cached_kb': meminfo.get('Cached', 0),
+        'nr_dirty_pages': vmstat.get('nr_dirty', 0),
+        'nr_writeback_pages': vmstat.get('nr_writeback', 0),
+        'nr_dirtied_pages': vmstat.get('nr_dirtied', 0),
+        'nr_written_pages': vmstat.get('nr_written', 0),
+        'nr_writeback_temp_pages': vmstat.get('nr_writeback_temp', 0),
+        'io_pressure': io_pressure,
+        'io_some_avg10': io_pressure.get('some', {}).get('avg10', 0.0),
+        'io_full_avg10': io_pressure.get('full', {}).get('avg10', 0.0),
+    }
+
+
+def write_snapshot(path: Path, snapshot: dict) -> dict:
+    path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+    return snapshot
+
+
+def drain_writeback(
+    run_dir: Path,
+    max_seconds: int,
+    sleep_s: float,
+    max_dirty_pages: int,
+    max_writeback_pages: int,
+    do_sync: bool,
+) -> dict:
+    started = time.time()
+    sync_rc = None
+    if do_sync:
+        sync_rc = run(['sync']).returncode
+    samples = []
+    while True:
+        snapshot = system_snapshot()
+        samples.append(snapshot)
+        if (
+            snapshot.get('nr_dirty_pages', 0) <= max_dirty_pages
+            and snapshot.get('nr_writeback_pages', 0) <= max_writeback_pages
+        ):
+            break
+        if time.time() - started >= max_seconds:
+            break
+        time.sleep(sleep_s)
+    summary = {
+        'started_unix_s': started,
+        'finished_unix_s': time.time(),
+        'duration_s': time.time() - started,
+        'sync_rc': sync_rc,
+        'max_seconds': max_seconds,
+        'sleep_s': sleep_s,
+        'max_dirty_pages': max_dirty_pages,
+        'max_writeback_pages': max_writeback_pages,
+        'samples': samples,
+        'completed': bool(samples)
+        and samples[-1].get('nr_dirty_pages', 0) <= max_dirty_pages
+        and samples[-1].get('nr_writeback_pages', 0) <= max_writeback_pages,
+    }
+    run_dir.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    return summary
+
+
 def run_search_one(sspry: Path, addr: str, rule: Path, timeout_s: int) -> tuple[subprocess.CompletedProcess, float]:
     started = time.time()
     attempts = 0
@@ -187,16 +315,66 @@ def aggregate_rule_results(rule: Path, tree_results: list[dict], elapsed_ms_para
     return out
 
 
-def split_manifest(dataset: Path, manifests_dir: Path, chunk_size: int) -> list[Path]:
+def split_manifest(
+    dataset: Path,
+    manifests_dir: Path,
+    chunk_size: int,
+    chunk_count: int | None,
+    balance_bytes: bool,
+) -> list[dict]:
     manifests_dir.mkdir(parents=True, exist_ok=True)
     lines = [line.strip() for line in dataset.read_text().splitlines() if line.strip()]
+    if chunk_count is None:
+        chunk_count = max(1, math.ceil(len(lines) / max(chunk_size, 1)))
+    indexed = []
+    for idx, line in enumerate(lines):
+        try:
+            size = os.path.getsize(line)
+        except OSError:
+            size = 0
+        indexed.append((idx, line, size))
     out = []
-    for idx in range(0, len(lines), chunk_size):
-        chunk = lines[idx: idx + chunk_size]
-        path = manifests_dir / f'chunk_{idx // chunk_size:02d}.txt'
-        path.write_text(''.join(line + '\n' for line in chunk))
-        out.append(path)
+    if not balance_bytes:
+        for idx in range(0, len(indexed), chunk_size):
+            chunk = indexed[idx: idx + chunk_size]
+            path = manifests_dir / f'chunk_{idx // chunk_size:02d}.txt'
+            path.write_text(''.join(item[1] + '\n' for item in chunk))
+            out.append({
+                'path': path,
+                'files': len(chunk),
+                'bytes': sum(item[2] for item in chunk),
+            })
+        return out
+
+    buckets = [{'items': [], 'bytes': 0} for _ in range(chunk_count)]
+    for item in sorted(indexed, key=lambda entry: entry[2], reverse=True):
+        bucket_idx = min(
+            range(len(buckets)),
+            key=lambda idx: (buckets[idx]['bytes'], len(buckets[idx]['items'])),
+        )
+        buckets[bucket_idx]['items'].append(item)
+        buckets[bucket_idx]['bytes'] += item[2]
+    for idx, bucket in enumerate(buckets):
+        if not bucket['items']:
+            continue
+        bucket['items'].sort(key=lambda item: item[0])
+        path = manifests_dir / f'chunk_{idx:02d}.txt'
+        path.write_text(''.join(item[1] + '\n' for item in bucket['items']))
+        out.append({
+            'path': path,
+            'files': len(bucket['items']),
+            'bytes': bucket['bytes'],
+        })
     return out
+
+
+def resolve_dataset_manifest(dataset: Path) -> Path:
+    if dataset.suffix != '.json':
+        return dataset
+    payload = json.loads(dataset.read_text())
+    if isinstance(payload, dict) and isinstance(payload.get('source_manifest'), str):
+        return Path(payload['source_manifest'])
+    raise RuntimeError(f'unsupported dataset descriptor at {dataset}')
 
 
 def main() -> int:
@@ -209,14 +387,23 @@ def main() -> int:
     parser.add_argument('--db-base', required=True)
     parser.add_argument('--base-port', type=int, default=18920)
     parser.add_argument('--chunk-size', type=int, default=25000)
+    parser.add_argument('--chunk-count', type=int)
+    parser.add_argument('--balance-bytes', action='store_true')
     parser.add_argument('--summary-cap-kib', type=int, default=32)
     parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--search-timeout-s', type=int, default=240)
+    parser.add_argument('--drain-between-trees', action='store_true')
+    parser.add_argument('--drain-sync', action='store_true')
+    parser.add_argument('--drain-max-seconds', type=int, default=900)
+    parser.add_argument('--drain-sleep-s', type=float, default=2.0)
+    parser.add_argument('--drain-max-dirty-pages', type=int, default=131072)
+    parser.add_argument('--drain-max-writeback-pages', type=int, default=8192)
     args = parser.parse_args()
 
     sspry = Path(args.sspry)
     dataset = Path(args.dataset)
+    dataset_manifest = resolve_dataset_manifest(dataset)
     rules_dir = Path(args.rules_dir)
     result_base = Path(args.result_base)
     db_base = Path(args.db_base)
@@ -230,14 +417,24 @@ def main() -> int:
     shutil.rmtree(db_base, ignore_errors=True)
     db_base.mkdir(parents=True, exist_ok=True)
 
-    manifests = split_manifest(dataset, manifests_dir, args.chunk_size)
+    manifests = split_manifest(
+        dataset_manifest,
+        manifests_dir,
+        args.chunk_size,
+        args.chunk_count,
+        args.balance_bytes,
+    )
     forest_summary = {
         'name': args.name,
         'dataset': str(dataset),
+        'dataset_manifest': str(dataset_manifest),
         'chunk_size': args.chunk_size,
+        'chunk_count': args.chunk_count,
+        'balance_bytes': args.balance_bytes,
         'tree_count': len(manifests),
         'summary_cap_kib': args.summary_cap_kib,
         'search_workers_per_tree': args.search_workers,
+        'drain_between_trees': args.drain_between_trees,
         'trees': [],
     }
 
@@ -248,7 +445,12 @@ def main() -> int:
         tree_run_dir.mkdir(parents=True, exist_ok=True)
         db_root = db_base / tree_name
         addr = f'127.0.0.1:{args.base_port + idx}'
-        print(f'index.start tree={tree_name} addr={addr} manifest={manifest}', flush=True)
+        before_index = write_snapshot(tree_run_dir / 'system.before_index.json', system_snapshot())
+        print(
+            f"index.start tree={tree_name} addr={addr} manifest={manifest['path']} "
+            f"files={manifest['files']} bytes={manifest['bytes']}",
+            flush=True,
+        )
         server = subprocess.Popen(
             [
                 str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',
@@ -265,7 +467,7 @@ def main() -> int:
             proc = run(
                 [
                     str(sspry), '--perf-report', str(tree_run_dir / 'index.perf.json'),
-                    'index', '--addr', addr, '--path-list', str(manifest), '--batch-size', '64', '--verbose',
+                    'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64', '--verbose',
                 ],
                 stdout=(tree_run_dir / 'index.stdout').open('w'),
                 stderr=(tree_run_dir / 'index.stderr').open('w'),
@@ -277,22 +479,39 @@ def main() -> int:
             if proc.returncode != 0:
                 raise RuntimeError(f'index failed for {tree_name} with exit {proc.returncode}')
             post_publish = wait_for_publish(sspry, addr, tree_run_dir / 'post_publish.info.light.json')
+            after_publish = write_snapshot(tree_run_dir / 'system.after_publish.json', system_snapshot())
             (tree_run_dir / 'final.dir_stats.json').write_text(json.dumps(dir_stats(db_root), indent=2, sort_keys=True))
             index_metrics = parse_index_metrics((tree_run_dir / 'index.stderr').read_text())
             tree_record = {
                 'tree': tree_name,
                 'addr': addr,
-                'manifest': str(manifest),
+                'manifest': str(manifest['path']),
                 'index_wall_seconds': elapsed_s,
-                'files': sum(1 for _ in manifest.open()),
+                'files': manifest['files'],
+                'manifest_bytes': manifest['bytes'],
+                'index_files_per_minute': ((manifest['files'] / elapsed_s) * 60.0) if elapsed_s > 0 else 0.0,
                 'index_metrics': index_metrics,
                 'post_publish_info': post_publish,
                 'dir_stats': json.loads((tree_run_dir / 'final.dir_stats.json').read_text()),
+                'system_before_index': before_index,
+                'system_after_publish': after_publish,
             }
+            if args.drain_between_trees and idx + 1 < len(manifests):
+                drain = drain_writeback(
+                    tree_run_dir / 'system.drain.json',
+                    args.drain_max_seconds,
+                    args.drain_sleep_s,
+                    args.drain_max_dirty_pages,
+                    args.drain_max_writeback_pages,
+                    args.drain_sync,
+                )
+                tree_record['drain'] = drain
             forest_summary['trees'].append(tree_record)
             print(
-                f"index.done tree={tree_name} files={tree_record['files']} wall_s={elapsed_s:.3f} "
-                f"db_bytes={tree_record['dir_stats']['db_bytes']}",
+                f"index.done tree={tree_name} files={tree_record['files']} bytes={tree_record['manifest_bytes']} "
+                f"wall_s={elapsed_s:.3f} files_per_min={tree_record['index_files_per_minute']:.3f} "
+                f"db_bytes={tree_record['dir_stats']['db_bytes']} dirty_pages={after_publish['nr_dirty_pages']} "
+                f"writeback_pages={after_publish['nr_writeback_pages']}",
                 flush=True,
             )
         finally:
