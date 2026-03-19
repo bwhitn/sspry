@@ -479,6 +479,33 @@ Current local search-worker follow-up:
   - all six supported rules completed without timeout on the `26k` smoke run
   - next validation should be the same search pack on the `50k` `32 KiB` baseline
 
+Rejected follow-ups on top of the worker path:
+- sampled lane summaries inside `32`-doc blocks
+  - artifact:
+    - `/root/pertest/results/sspry_smoke_lane4_2000_20260319_r2/search_summary.json`
+  - kept total summary bytes bounded and held `docs_per_block = 32`
+  - but search got worse than the worker-only baseline:
+    - `08`: `docs_scanned 1993`, `superblocks_skipped 3`
+    - `09`: `docs_scanned 1954`, `superblocks_skipped 10`
+    - `10`: `docs_scanned 1287`, `superblocks_skipped 88`
+    - `11`: `docs_scanned 1808`, `superblocks_skipped 33`
+    - `12`: `docs_scanned 1936`, `superblocks_skipped 12`
+  - not worth carrying to `50k`
+- folded `u64`-word lane signatures
+  - artifact:
+    - `/root/pertest/results/sspry_smoke_lane4_2000_20260319_r3/search_summary.json`
+  - slightly better ingest/storage shape than sampled lanes
+  - but block rejection collapsed even further:
+    - `08`: `docs_scanned 1998`, `superblocks_skipped 1`
+    - `09`: `docs_scanned 1989`, `superblocks_skipped 2`
+    - `10`: `docs_scanned 1955`, `superblocks_skipped 4`
+    - `11`: `docs_scanned 1988`, `superblocks_skipped 2`
+    - `12`: `docs_scanned 1988`, `superblocks_skipped 3`
+  - rejected
+- current read:
+  - deriving block gates from the existing per-doc bloom bytes is not strong enough
+  - the next credible search move is a dedicated block-gate signature built from the scan path itself, not another transformation of the stored per-doc blooms
+
 ### 0a. Bloom-only cutover and dead-code removal
 
 Accepted direction:
