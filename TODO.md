@@ -943,6 +943,41 @@ Constraints:
 Goal:
 - reduce search latency and candidate counts without increasing false negatives
 
+Latest rejected search-gate experiments on `2k` published smoke:
+- block-gate sweeps using the current sampled `4/3`-gram gate:
+  - `32 docs/block`:
+    - `01`: `261 ms`, `16` skipped
+    - `08`: `71 ms`, `0` skipped
+    - `09`: `249 ms`, `0` skipped
+    - `10`: `348 ms`, `16` skipped
+    - `11`: `221 ms`, `9` skipped
+    - `12`: `147 ms`, `0` skipped
+  - `8 docs/block`:
+    - `01`: `288 ms`, `63` skipped
+    - `08`: `71 ms`, `0` skipped
+    - `09`: `249 ms`, `0` skipped
+    - `10`: `348 ms`, `65` skipped
+    - `11`: `222 ms`, `44` skipped
+    - `12`: `121 ms`, `0` skipped
+  - `4 docs/block`:
+    - `01`: `307 ms`, `171` skipped
+    - `08`: `71 ms`, `0` skipped
+    - `09`: `248 ms`, `0` skipped
+    - `10`: `323 ms`, `198` skipped
+    - `11`: `223 ms`, `150` skipped
+    - `12`: `121 ms`, `0` skipped
+- sampled exact `8`-byte literal/file window gate with `8 docs/block`:
+  - `01`: `352 ms`, `30` skipped
+  - `08`: `152 ms`, `27` skipped
+  - `09`: `329 ms`, `35` skipped
+  - `10`: `404 ms`, `0` skipped
+  - `11`: `278 ms`, `38` skipped
+  - `12`: `202 ms`, `24` skipped
+- read:
+  - smaller blocks alone only help a subset of rules
+  - the `8`-byte gate finally created skips for the broad string rules, but it cost more than it saved
+  - neither design is good enough to justify a `50k` rerun yet
+
 Current likely directions:
 - planner-side shortcut expansion and normalization should happen before DF ordering and branch-budget decisions
 - keep improving selectivity ordering for mixed:
