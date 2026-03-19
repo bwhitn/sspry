@@ -2,6 +2,11 @@ use crate::{Result, SspryError};
 
 const LN_2: f64 = std::f64::consts::LN_2;
 const LN_2_SQ: f64 = LN_2 * LN_2;
+const BLOOM_WORD_BYTES: usize = 8;
+
+pub(crate) fn align_filter_bytes(value: usize) -> usize {
+    value.max(1).div_ceil(BLOOM_WORD_BYTES) * BLOOM_WORD_BYTES
+}
 
 fn round_up_power_of_two(value: usize) -> usize {
     if value <= 1 {
@@ -26,13 +31,13 @@ fn normalize_filter_policy(
     filter_max_bytes: Option<usize>,
     filter_target_fp: Option<f64>,
 ) -> Result<(usize, usize, Option<f64>)> {
-    let base = base_filter_bytes.max(1);
-    let minimum = round_up_power_of_two(filter_min_bytes.unwrap_or(base).max(1));
+    let base = align_filter_bytes(base_filter_bytes);
+    let minimum = align_filter_bytes(round_up_power_of_two(filter_min_bytes.unwrap_or(base)));
     let raw_maximum = filter_max_bytes.unwrap_or(base);
     let mut maximum = if raw_maximum == 0 {
         0
     } else {
-        round_up_power_of_two(raw_maximum.max(1))
+        align_filter_bytes(round_up_power_of_two(raw_maximum))
     };
     if maximum != 0 && maximum < minimum {
         maximum = minimum;
@@ -96,13 +101,13 @@ pub fn choose_filter_bytes_for_file_size(
         let bits = ((-gram_count * fp.ln()) / LN_2_SQ).ceil() as usize;
         let theoretical_bytes = bits.div_ceil(8).max(1);
         let _ = (minimum, maximum, size_target);
-        round_to_nearest_kib(theoretical_bytes)
+        align_filter_bytes(round_to_nearest_kib(theoretical_bytes))
     } else {
-        round_up_power_of_two(if maximum == 0 {
+        align_filter_bytes(round_up_power_of_two(if maximum == 0 {
             size_target
         } else {
             size_target.min(maximum)
-        })
+        }))
     };
     Ok(target)
 }
@@ -110,7 +115,7 @@ pub fn choose_filter_bytes_for_file_size(
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_filter_bytes_for_file_size, derive_bloom_hash_count,
+        align_filter_bytes, choose_filter_bytes_for_file_size, derive_bloom_hash_count,
         derive_document_bloom_hash_count, normalize_filter_policy,
     };
 
@@ -187,5 +192,8 @@ mod tests {
             choose_filter_bytes_for_file_size(1, 1, Some(1), Some(0), Some(0.5), Some(1))
                 .expect("kib rounding");
         assert_eq!(selected, 1024);
+        assert_eq!(align_filter_bytes(1), 8);
+        assert_eq!(align_filter_bytes(9), 16);
+        assert_eq!(selected % 8, 0);
     }
 }

@@ -24,8 +24,8 @@ use crate::candidate::store::{
     write_compacted_snapshot,
 };
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode,
-    candidate_shard_index, candidate_shard_root, metadata_field_is_boolean,
+    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
+    PatternPlan, QueryNode, candidate_shard_index, candidate_shard_root, metadata_field_is_boolean,
     metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
     read_candidate_shard_count, write_candidate_shard_count,
 };
@@ -167,6 +167,8 @@ pub struct CandidateQueryResponse {
     pub cursor: usize,
     pub next_cursor: Option<usize>,
     pub tier_used: String,
+    #[serde(default)]
+    pub query_profile: CandidateQueryProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ids: Option<Vec<Option<String>>>,
 }
@@ -450,6 +452,7 @@ struct ServerState {
 struct CachedCandidateQuery {
     ordered_hashes: Vec<String>,
     tier_used: String,
+    query_profile: CandidateQueryProfile,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3882,9 +3885,10 @@ impl ServerState {
         store: &mut CandidateStore,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-    ) -> Result<(Vec<(String, u32)>, Vec<String>)> {
+    ) -> Result<(Vec<(String, u32)>, Vec<String>, CandidateQueryProfile)> {
         let mut hits = Vec::<(String, u32)>::new();
         let mut tier_used = Vec::<String>::new();
+        let mut query_profile = CandidateQueryProfile::default();
         let collect_chunk = plan.max_candidates.max(1).min(4096);
         let mut cursor = 0usize;
         loop {
@@ -3892,13 +3896,14 @@ impl ServerState {
                 store.query_candidates_with_prepared(plan, prepared, cursor, collect_chunk)?;
             tier_used.push(local.tier_used.clone());
             hits.extend(local.sha256.into_iter().zip(local.scores.into_iter()));
+            query_profile.merge_from(&local.query_profile);
             if let Some(next) = local.next_cursor {
                 cursor = next;
             } else {
                 break;
             }
         }
-        Ok((hits, tier_used))
+        Ok((hits, tier_used, query_profile))
     }
 
     fn collect_query_matches_all_shards(
@@ -3909,13 +3914,14 @@ impl ServerState {
         let published = self.published_store_set()?;
         if self.candidate_shard_count() == 1 {
             let mut store = lock_candidate_store_blocking(&published.stores[0])?;
-            let (mut hits, tier_used) =
+            let (mut hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
             hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
             let ordered_hashes = hits.into_iter().map(|(sha256, _)| sha256).collect();
             return Ok(CachedCandidateQuery {
                 ordered_hashes,
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
+                query_profile,
             });
         }
 
@@ -3928,18 +3934,21 @@ impl ServerState {
         if worker_count <= 1 {
             let mut hits = Vec::<(String, u32)>::new();
             let mut tier_used = Vec::<String>::new();
+            let mut query_profile = CandidateQueryProfile::default();
             for store_lock in &published.stores {
                 let mut store = lock_candidate_store_blocking(store_lock)?;
-                let (local_hits, local_tiers) =
+                let (local_hits, local_tiers, local_profile) =
                     Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
                 hits.extend(local_hits);
                 tier_used.extend(local_tiers);
+                query_profile.merge_from(&local_profile);
             }
             hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
             let ordered_hashes = hits.into_iter().map(|(sha256, _)| sha256).collect();
             return Ok(CachedCandidateQuery {
                 ordered_hashes,
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
+                query_profile,
             });
         }
 
@@ -3951,10 +3960,11 @@ impl ServerState {
                 let plan = plan;
                 let prepared = prepared.clone();
                 let next_shard = &next_shard;
-                handles.push(
-                    scope.spawn(move || -> Result<(Vec<(String, u32)>, Vec<String>)> {
+                handles.push(scope.spawn(
+                    move || -> Result<(Vec<(String, u32)>, Vec<String>, CandidateQueryProfile)> {
                         let mut local_hits = Vec::<(String, u32)>::new();
                         let mut local_tiers = Vec::<String>::new();
+                        let mut local_profile = CandidateQueryProfile::default();
                         loop {
                             let shard_idx = next_shard.fetch_add(1, Ordering::Relaxed);
                             if shard_idx >= stores.stores.len() {
@@ -3962,15 +3972,16 @@ impl ServerState {
                             }
                             let mut store =
                                 lock_candidate_store_blocking(&stores.stores[shard_idx])?;
-                            let (hits, tiers) = Self::collect_query_matches_single_store(
+                            let (hits, tiers, profile) = Self::collect_query_matches_single_store(
                                 &mut store, plan, &prepared,
                             )?;
                             local_hits.extend(hits);
                             local_tiers.extend(tiers);
+                            local_profile.merge_from(&profile);
                         }
-                        Ok((local_hits, local_tiers))
-                    }),
-                );
+                        Ok((local_hits, local_tiers, local_profile))
+                    },
+                ));
             }
 
             let mut merged = Vec::with_capacity(handles.len());
@@ -3980,20 +3991,23 @@ impl ServerState {
                     .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
                 merged.push(partial);
             }
-            Ok::<Vec<(Vec<(String, u32)>, Vec<String>)>, SspryError>(merged)
+            Ok::<Vec<(Vec<(String, u32)>, Vec<String>, CandidateQueryProfile)>, SspryError>(merged)
         })?;
 
         let mut hits = Vec::<(String, u32)>::new();
         let mut tier_used = Vec::<String>::new();
-        for (local_hits, local_tiers) in partials {
+        let mut query_profile = CandidateQueryProfile::default();
+        for (local_hits, local_tiers, local_profile) in partials {
             hits.extend(local_hits);
             tier_used.extend(local_tiers);
+            query_profile.merge_from(&local_profile);
         }
         hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         let ordered_hashes = hits.into_iter().map(|(sha256, _)| sha256).collect();
         Ok(CachedCandidateQuery {
             ordered_hashes,
             tier_used: Self::merge_candidate_tier_used(&tier_used),
+            query_profile,
         })
     }
 
@@ -4589,6 +4603,7 @@ impl ServerState {
             cursor: start,
             next_cursor,
             tier_used: cached.tier_used.clone(),
+            query_profile: cached.query_profile.clone(),
             external_ids,
         })
     }

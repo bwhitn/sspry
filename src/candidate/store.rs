@@ -170,6 +170,42 @@ pub struct CandidateQueryResult {
     pub cursor: usize,
     pub next_cursor: Option<usize>,
     pub tier_used: String,
+    pub query_profile: CandidateQueryProfile,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CandidateQueryProfile {
+    pub docs_scanned: u64,
+    pub superblocks_skipped: u64,
+    pub metadata_loads: u64,
+    pub metadata_bytes: u64,
+    pub tier1_bloom_loads: u64,
+    pub tier1_bloom_bytes: u64,
+    pub tier2_bloom_loads: u64,
+    pub tier2_bloom_bytes: u64,
+}
+
+impl CandidateQueryProfile {
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        self.docs_scanned = self.docs_scanned.saturating_add(other.docs_scanned);
+        self.superblocks_skipped = self
+            .superblocks_skipped
+            .saturating_add(other.superblocks_skipped);
+        self.metadata_loads = self.metadata_loads.saturating_add(other.metadata_loads);
+        self.metadata_bytes = self.metadata_bytes.saturating_add(other.metadata_bytes);
+        self.tier1_bloom_loads = self
+            .tier1_bloom_loads
+            .saturating_add(other.tier1_bloom_loads);
+        self.tier1_bloom_bytes = self
+            .tier1_bloom_bytes
+            .saturating_add(other.tier1_bloom_bytes);
+        self.tier2_bloom_loads = self
+            .tier2_bloom_loads
+            .saturating_add(other.tier2_bloom_loads);
+        self.tier2_bloom_bytes = self
+            .tier2_bloom_bytes
+            .saturating_add(other.tier2_bloom_bytes);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -720,6 +756,7 @@ struct LazyDocQueryInputs<'a> {
     metadata_bytes: Option<Cow<'a, [u8]>>,
     tier1_bloom_bytes: Option<Cow<'a, [u8]>>,
     tier2_bloom_bytes: Option<Cow<'a, [u8]>>,
+    profile: CandidateQueryProfile,
 }
 
 impl<'a> LazyDocQueryInputs<'a> {
@@ -729,6 +766,7 @@ impl<'a> LazyDocQueryInputs<'a> {
             metadata_bytes: None,
             tier1_bloom_bytes: None,
             tier2_bloom_bytes: None,
+            profile: CandidateQueryProfile::default(),
         }
     }
 
@@ -744,7 +782,12 @@ impl<'a> LazyDocQueryInputs<'a> {
             metadata_bytes: Some(Cow::Borrowed(metadata_bytes)),
             tier1_bloom_bytes: Some(Cow::Borrowed(tier1_bloom_bytes)),
             tier2_bloom_bytes: Some(Cow::Borrowed(tier2_bloom_bytes)),
+            profile: CandidateQueryProfile::default(),
         }
+    }
+
+    fn into_profile(self) -> CandidateQueryProfile {
+        self.profile
     }
 
     fn metadata_bytes<F>(&mut self, load: &mut F) -> Result<&[u8]>
@@ -752,7 +795,13 @@ impl<'a> LazyDocQueryInputs<'a> {
         F: FnMut() -> Result<Cow<'a, [u8]>>,
     {
         if self.metadata_bytes.is_none() {
-            self.metadata_bytes = Some(load()?);
+            let bytes = load()?;
+            self.profile.metadata_loads = self.profile.metadata_loads.saturating_add(1);
+            self.profile.metadata_bytes = self
+                .profile
+                .metadata_bytes
+                .saturating_add(bytes.len() as u64);
+            self.metadata_bytes = Some(bytes);
         }
         Ok(self.metadata_bytes.as_deref().unwrap_or(&[]))
     }
@@ -762,7 +811,13 @@ impl<'a> LazyDocQueryInputs<'a> {
         F: FnMut() -> Result<Cow<'a, [u8]>>,
     {
         if self.tier1_bloom_bytes.is_none() {
-            self.tier1_bloom_bytes = Some(load()?);
+            let bytes = load()?;
+            self.profile.tier1_bloom_loads = self.profile.tier1_bloom_loads.saturating_add(1);
+            self.profile.tier1_bloom_bytes = self
+                .profile
+                .tier1_bloom_bytes
+                .saturating_add(bytes.len() as u64);
+            self.tier1_bloom_bytes = Some(bytes);
         }
         Ok(self.tier1_bloom_bytes.as_deref().unwrap_or(&[]))
     }
@@ -772,7 +827,13 @@ impl<'a> LazyDocQueryInputs<'a> {
         F: FnMut() -> Result<Cow<'a, [u8]>>,
     {
         if self.tier2_bloom_bytes.is_none() {
-            self.tier2_bloom_bytes = Some(load()?);
+            let bytes = load()?;
+            self.profile.tier2_bloom_loads = self.profile.tier2_bloom_loads.saturating_add(1);
+            self.profile.tier2_bloom_bytes = self
+                .profile
+                .tier2_bloom_bytes
+                .saturating_add(bytes.len() as u64);
+            self.tier2_bloom_bytes = Some(bytes);
         }
         Ok(self.tier2_bloom_bytes.as_deref().unwrap_or(&[]))
     }
@@ -2264,16 +2325,16 @@ impl CandidateStore {
                 cursor: 0,
                 next_cursor: None,
                 tier_used: "none".to_owned(),
+                query_profile: CandidateQueryProfile::default(),
             });
         }
-        let (mut matched_hits, used_tiers, docs_scanned, superblocks_skipped) =
-            self.scan_query_hits(plan, prepared)?;
+        let (mut matched_hits, used_tiers, query_profile) = self.scan_query_hits(plan, prepared)?;
         let (page, page_scores, total, start, end, next_cursor) =
             paginate_query_hits(&mut matched_hits, plan.max_candidates, cursor, chunk_size);
-        total_scope.add_items(docs_scanned);
+        total_scope.add_items(query_profile.docs_scanned);
         record_counter(
             "candidate.query_candidates_docs_scanned_total",
-            docs_scanned,
+            query_profile.docs_scanned,
         );
         record_counter(
             "candidate.query_candidates_matches_total",
@@ -2281,13 +2342,41 @@ impl CandidateStore {
         );
         record_counter(
             "candidate.query_candidates_superblocks_skipped_total",
-            superblocks_skipped,
+            query_profile.superblocks_skipped,
+        );
+        record_counter(
+            "candidate.query_candidates_metadata_loads_total",
+            query_profile.metadata_loads,
+        );
+        record_counter(
+            "candidate.query_candidates_metadata_bytes_total",
+            query_profile.metadata_bytes,
+        );
+        record_counter(
+            "candidate.query_candidates_tier1_bloom_loads_total",
+            query_profile.tier1_bloom_loads,
+        );
+        record_counter(
+            "candidate.query_candidates_tier1_bloom_bytes_total",
+            query_profile.tier1_bloom_bytes,
+        );
+        record_counter(
+            "candidate.query_candidates_tier2_bloom_loads_total",
+            query_profile.tier2_bloom_loads,
+        );
+        record_counter(
+            "candidate.query_candidates_tier2_bloom_bytes_total",
+            query_profile.tier2_bloom_bytes,
         );
         record_max(
             "candidate.query_candidates_max_matches",
             matched_hits.len() as u64,
         );
-        self.record_query_metrics(docs_scanned, matched_hits.len() as u64, superblocks_skipped);
+        self.record_query_metrics(
+            query_profile.docs_scanned,
+            matched_hits.len() as u64,
+            query_profile.superblocks_skipped,
+        );
 
         Ok(CandidateQueryResult {
             sha256: page,
@@ -2297,6 +2386,7 @@ impl CandidateStore {
             cursor: start,
             next_cursor,
             tier_used: used_tiers.as_label(),
+            query_profile,
         })
     }
 
@@ -2304,11 +2394,10 @@ impl CandidateStore {
         &self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-    ) -> Result<(Vec<(String, u32)>, TierFlags, u64, u64)> {
+    ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
         let mut matched_hits = Vec::<(String, u32)>::new();
         let mut used_tiers = TierFlags::default();
-        let mut docs_scanned = 0u64;
-        let mut superblocks_skipped = 0u64;
+        let mut query_profile = CandidateQueryProfile::default();
         let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
         let block_count = self.tier2_superblocks.keys_per_block.len();
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
@@ -2326,7 +2415,8 @@ impl CandidateStore {
                     &self.tier2_superblocks,
                 )?
             {
-                superblocks_skipped = superblocks_skipped.saturating_add(1);
+                query_profile.superblocks_skipped =
+                    query_profile.superblocks_skipped.saturating_add(1);
                 continue;
             }
             let start = block_idx * docs_per_block;
@@ -2336,7 +2426,7 @@ impl CandidateStore {
                 if doc.deleted {
                     continue;
                 }
-                docs_scanned += 1;
+                query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
                 let mut doc_inputs = LazyDocQueryInputs::new(doc);
                 let mut load_metadata = || self.doc_metadata_bytes(pos);
                 let mut load_tier1 = || self.doc_bloom_bytes(pos);
@@ -2358,10 +2448,11 @@ impl CandidateStore {
                     matched_hits.push((doc.sha256.clone(), outcome.score));
                     used_tiers.merge(outcome.tiers);
                 }
+                query_profile.merge_from(&doc_inputs.into_profile());
             }
         }
 
-        Ok((matched_hits, used_tiers, docs_scanned, superblocks_skipped))
+        Ok((matched_hits, used_tiers, query_profile))
     }
 
     pub fn stats(&self) -> CandidateStats {

@@ -26,8 +26,9 @@ pub use query_plan::{
     compile_query_plan_with_gram_sizes, normalize_max_candidates,
 };
 pub use store::{
-    CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryResult,
-    CandidateStats, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-    candidate_shard_index, candidate_shard_manifest_path, candidate_shard_root,
-    read_candidate_shard_count, write_candidate_shard_count,
+    CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryProfile,
+    CandidateQueryResult, CandidateStats, CandidateStore,
+    DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, candidate_shard_index,
+    candidate_shard_manifest_path, candidate_shard_root, read_candidate_shard_count,
+    write_candidate_shard_count,
 };

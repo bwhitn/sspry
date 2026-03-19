@@ -349,12 +349,7 @@ rule q {
     wait_for_info(&addr);
 
     let index_output = Command::new(bin_path())
-        .args([
-            "index",
-            "--addr",
-            &addr,
-            dataset.to_str().expect("dataset"),
-        ])
+        .args(["index", "--addr", &addr, dataset.to_str().expect("dataset")])
         .output()
         .expect("run index");
     assert!(
@@ -402,7 +397,12 @@ rule q {
     assert!(!stdout.contains(&expected_miss_sha));
 
     let delete_output = Command::new(bin_path())
-        .args(["delete", "--addr", &addr, hit_path.to_str().expect("hit path")])
+        .args([
+            "delete",
+            "--addr",
+            &addr,
+            hit_path.to_str().expect("hit path"),
+        ])
         .output()
         .expect("run delete");
     assert!(

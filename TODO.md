@@ -339,9 +339,31 @@ Immediate search improvements on the bloom-only baseline:
 2. done:
    - search no longer replans through the retired remote DF path
    - per-doc search evaluation now lazy-loads metadata and bloom sidecars instead of reading metadata + tier1 + tier2 up front for every scanned doc
-3. re-profile the heavy supported rules on the `50k` `32 KiB` baseline after the lazy-load patch
-4. if `01` / `08` are still heavy, profile block admission and per-doc bloom reads next
-5. after that, test `64 KiB` only if `32 KiB` still leaves too much block-level false-positive pressure
+3. done: re-profile the heavy supported rules on the `50k` `32 KiB` baseline after the lazy-load patch
+  - artifact:
+    - `/root/pertest/results/sspry_searchprofile_50000_32k_20260319_r3/search_summary.json`
+  - all supported rules still scanned all `50,000` docs
+  - all supported rules skipped `0` superblocks
+  - all supported rules loaded all `50,000` tier1 blooms
+  - tier1 bloom bytes touched per search:
+    - `25,405,137,920` bytes (`23.66 GiB`)
+  - heavy supported rule totals:
+    - `01`: timed out at `180s+`
+    - `08`: `177.56s`
+    - `09`: `102.66s`
+    - `10`: `14.59s`
+    - `11`: `46.94s`
+    - `12`: `29.75s`
+4. current bottleneck read:
+  - metadata is no longer the problem
+  - planner/DF work is no longer the problem
+  - block admission is doing no useful filtering on the `50k` `32 KiB` baseline
+  - next experiment order should be:
+    1. `64 KiB` and `128 KiB` superblock summary caps
+    2. block-level bloom read batching/locality work if block skipping is still weak
+    3. only then revisit more invasive search parallelism ideas
+5. bloom-size cleanup:
+  - new chosen bloom sizes should stay aligned to `8` bytes so future `u64`-oriented bloom paths remain possible without another format change
 
 Current local `26k` smoke check for the lazy-load search patch:
 - artifact:

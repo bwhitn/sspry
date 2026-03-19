@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256, Sha512};
 use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
+use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
     FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
 };
@@ -1287,7 +1288,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         (None, None)
     };
     let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
-        value
+        align_filter_bytes(value)
     } else {
         choose_filter_bytes_for_file_size(
             file_size,
@@ -1299,7 +1300,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         )?
     };
     let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
-        value
+        align_filter_bytes(value)
     } else {
         choose_filter_bytes_for_file_size(
             file_size,
@@ -1816,12 +1817,12 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     drop(job_tx);
                     drop(result_tx);
 
-                    for _ in 0..total_files {
+                    let mut received = 0usize;
+                    while let Ok(scanned) = result_rx.recv() {
                         let started_wait = Instant::now();
-                        let scanned = result_rx.recv().map_err(|_| {
-                            SspryError::from("candidate ingest workers terminated unexpectedly")
-                        })??;
                         result_wait_time += started_wait.elapsed();
+                        let scanned = scanned?;
+                        received = received.saturating_add(1);
                         scan_time += scanned.scan_elapsed;
                         pending.push(scanned.row);
                         if pending.len() >= batch_size {
@@ -1836,6 +1837,11 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 &mut last_progress_at,
                             )?;
                         }
+                    }
+                    if received != total_files {
+                        return Err(SspryError::from(format!(
+                            "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
+                        )));
                     }
                     Ok::<(), SspryError>(())
                 })?;
@@ -1958,12 +1964,12 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         drop(job_tx);
                         drop(result_tx);
 
-                        for _ in 0..total_files {
+                        let mut received = 0usize;
+                        while let Ok(scanned) = result_rx.recv() {
                             let started_wait = Instant::now();
-                            let scanned = result_rx.recv().map_err(|_| {
-                                SspryError::from("candidate ingest workers terminated unexpectedly")
-                            })??;
                             result_wait_time += started_wait.elapsed();
+                            let scanned = scanned?;
+                            received = received.saturating_add(1);
                             scan_time += scanned.scan_elapsed;
                             let started_encode = Instant::now();
                             let row = batch_row_to_wire(scanned.row);
@@ -1981,6 +1987,11 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 &mut last_progress_at,
                                 empty_payload_size,
                             )?;
+                        }
+                        if received != total_files {
+                            return Err(SspryError::from(format!(
+                                "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
+                            )));
                         }
                         Ok::<(), SspryError>(())
                     })?;
@@ -2580,17 +2591,20 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     cursor: result.cursor,
                     next_cursor: result.next_cursor,
                     tier_used: result.tier_used,
+                    query_profile: result.query_profile,
                     external_ids: None,
                 }
             } else {
                 let mut hashes = std::collections::BTreeSet::<String>::new();
                 let mut tier_used = Vec::<String>::new();
+                let mut query_profile = crate::candidate::CandidateQueryProfile::default();
                 let collect_chunk = plan.max_candidates.max(1).min(4096);
                 for store in &mut stores {
                     let mut cursor = 0usize;
                     loop {
                         let local = store.query_candidates(&plan, cursor, collect_chunk)?;
                         tier_used.push(local.tier_used.clone());
+                        query_profile.merge_from(&local.query_profile);
                         hashes.extend(local.sha256);
                         if let Some(next) = local.next_cursor {
                             cursor = next;
@@ -2613,6 +2627,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     cursor: start,
                     next_cursor: (end < total_candidates).then_some(end),
                     tier_used: merge_tier_used(tier_used),
+                    query_profile,
                     external_ids: None,
                 }
             }
@@ -2779,6 +2794,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut verified_checked = 0usize;
         let mut verified_matched = 0usize;
         let mut verified_skipped = 0usize;
+        let mut query_profile = None::<crate::candidate::CandidateQueryProfile>;
         let (total, tier_used) = loop {
             let started_query = Instant::now();
             let result = client.candidate_query_plan_with_options(
@@ -2788,6 +2804,9 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 verify_yara_files,
             )?;
             query_time += started_query.elapsed();
+            if query_profile.is_none() {
+                query_profile = Some(result.query_profile.clone());
+            }
             if !verify_yara_files {
                 rows.extend(result.sha256.iter().cloned());
             } else {
@@ -2896,6 +2915,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             server_rss_kb = server_memory_kb(&args.connection)?;
         }
         if args.verbose {
+            let query_profile = query_profile.unwrap_or_default();
             let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
             let plan_ms = plan_time.as_secs_f64() * 1000.0;
             let query_ms = query_time.as_secs_f64() * 1000.0;
@@ -2904,6 +2924,38 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             eprintln!("verbose.search.plan_ms: {plan_ms:.3}");
             eprintln!("verbose.search.query_ms: {query_ms:.3}");
             eprintln!("verbose.search.verify_ms: {verify_ms:.3}");
+            eprintln!(
+                "verbose.search.docs_scanned: {}",
+                query_profile.docs_scanned
+            );
+            eprintln!(
+                "verbose.search.superblocks_skipped: {}",
+                query_profile.superblocks_skipped
+            );
+            eprintln!(
+                "verbose.search.metadata_loads: {}",
+                query_profile.metadata_loads
+            );
+            eprintln!(
+                "verbose.search.metadata_bytes: {}",
+                query_profile.metadata_bytes
+            );
+            eprintln!(
+                "verbose.search.tier1_bloom_loads: {}",
+                query_profile.tier1_bloom_loads
+            );
+            eprintln!(
+                "verbose.search.tier1_bloom_bytes: {}",
+                query_profile.tier1_bloom_bytes
+            );
+            eprintln!(
+                "verbose.search.tier2_bloom_loads: {}",
+                query_profile.tier2_bloom_loads
+            );
+            eprintln!(
+                "verbose.search.tier2_bloom_bytes: {}",
+                query_profile.tier2_bloom_bytes
+            );
             eprintln!("verbose.search.max_candidates: {}", args.max_candidates);
             eprintln!(
                 "verbose.search.max_anchors_per_pattern: {}",
@@ -3743,11 +3795,28 @@ mod tests {
             },
         )
         .expect("scan md5 row");
+        assert_eq!(row.filter_bytes % 8, 0);
+        assert_eq!(row.tier2_filter_bytes % 8, 0);
         assert_eq!(
             md5_row.sha256,
             identity_from_file(&sample, 4, CandidateIdSource::Md5).expect("md5 id")
         );
         assert!(md5_row.external_id.is_none());
+
+        let aligned_row = scan_index_batch_row(
+            &sample,
+            ScanPolicy {
+                fixed_filter_bytes: Some(2051),
+                filter_target_fp: None,
+                gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
+                chunk_size: 4,
+                store_path: false,
+                id_source: CandidateIdSource::Sha256,
+            },
+        )
+        .expect("scan aligned row");
+        assert_eq!(aligned_row.filter_bytes, 2056);
+        assert_eq!(aligned_row.tier2_filter_bytes, 2056);
 
         assert_eq!(merge_tier_used(Vec::<String>::new()), "unknown");
         assert_eq!(merge_tier_used(vec![" tier1 ".to_owned()]), "tier1");
