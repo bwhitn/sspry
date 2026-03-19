@@ -341,23 +341,16 @@ mod tests {
         bloom
             .add_in_lane(0x0102_0304, 1, DEFAULT_BLOOM_POSITION_LANES)
             .expect("lane add");
-        let required = bloom_word_masks_in_lane(
-            &[0x0102_0304],
-            64,
-            3,
-            1,
-            DEFAULT_BLOOM_POSITION_LANES,
-        )
-        .expect("lane masks");
+        let required =
+            bloom_word_masks_in_lane(&[0x0102_0304], 64, 3, 1, DEFAULT_BLOOM_POSITION_LANES)
+                .expect("lane masks");
         assert!(raw_filter_matches_word_masks(bloom.as_bytes(), &required));
-        let wrong_lane = bloom_word_masks_in_lane(
-            &[0x0102_0304],
-            64,
-            3,
-            2,
-            DEFAULT_BLOOM_POSITION_LANES,
-        )
-        .expect("wrong lane masks");
-        assert!(!raw_filter_matches_word_masks(bloom.as_bytes(), &wrong_lane));
+        let wrong_lane =
+            bloom_word_masks_in_lane(&[0x0102_0304], 64, 3, 2, DEFAULT_BLOOM_POSITION_LANES)
+                .expect("wrong lane masks");
+        assert!(!raw_filter_matches_word_masks(
+            bloom.as_bytes(),
+            &wrong_lane
+        ));
     }
 }

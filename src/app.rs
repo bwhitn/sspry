@@ -681,10 +681,38 @@ fn count_files_recursive(path: &Path) -> Result<usize> {
     Ok(total)
 }
 
-fn normalize_input_paths(paths: &[String]) -> Vec<PathBuf> {
+fn expand_input_paths(paths: &[String], path_list: bool) -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    if path_list {
+        for list_path_text in paths {
+            let list_path = PathBuf::from(list_path_text);
+            if !list_path.exists() {
+                println!("Skipping missing path: {}", list_path.display());
+                continue;
+            }
+            let base_dir = list_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            for line in fs::read_to_string(&list_path)?.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let entry_path = PathBuf::from(trimmed);
+                let resolved = if entry_path.is_absolute() {
+                    entry_path
+                } else {
+                    base_dir.join(entry_path)
+                };
+                candidates.push(resolved);
+            }
+        }
+    } else {
+        candidates.extend(paths.iter().map(PathBuf::from));
+    }
     let mut roots = Vec::new();
-    for root_path in paths {
-        let path = PathBuf::from(root_path);
+    for path in candidates {
         if path.exists() {
             roots.push(path);
         } else {
@@ -692,7 +720,8 @@ fn normalize_input_paths(paths: &[String]) -> Vec<PathBuf> {
         }
     }
     roots.sort();
-    roots
+    roots.dedup();
+    Ok(roots)
 }
 
 fn count_input_files(paths: &[PathBuf]) -> Result<usize> {
@@ -1718,12 +1747,13 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let mut progress_rpc_time = Duration::ZERO;
         let mut submit_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
-        let input_roots = normalize_input_paths(&args.paths);
+        let input_roots = expand_input_paths(&args.paths, args.path_list)?;
         let total_files = count_input_files(&input_roots)?;
         if total_files == 0 {
             return Err(SspryError::from("No input files found."));
         }
-        let show_progress = args.verbose && input_roots.iter().any(|path| path.is_dir());
+        let show_progress = args.verbose
+            && (input_roots.iter().any(|path| path.is_dir()) || total_files > input_roots.len());
         let mut last_progress_reported = 0usize;
         let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
@@ -2709,6 +2739,7 @@ fn cmd_index(args: &IndexArgs) -> i32 {
     cmd_internal_index_batch(&InternalIndexBatchArgs {
         connection: args.connection.clone(),
         paths: args.paths.clone(),
+        path_list: args.path_list,
         root: None,
         batch_size: args.batch_size,
         workers: args.workers.unwrap_or(0),
@@ -3058,6 +3089,12 @@ struct IndexArgs {
     #[arg(required = true, help = "File or directory paths.")]
     paths: Vec<String>,
     #[arg(
+        long = "path-list",
+        action = ArgAction::SetTrue,
+        help = "Treat each input path as a newline-delimited manifest of file paths."
+    )]
+    path_list: bool,
+    #[arg(
         long = "batch-size",
         default_value_t = 64,
         help = "Documents per insert_batch request."
@@ -3291,6 +3328,8 @@ struct InternalIndexBatchArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
     paths: Vec<String>,
+    #[arg(long = "path-list", action = ArgAction::SetTrue, help = "Treat input paths as newline-delimited file manifests.")]
+    path_list: bool,
     #[arg(long = "root", help = "Candidate store root directory.")]
     root: Option<String>,
     #[arg(
@@ -3934,6 +3973,7 @@ rule q {
         let ingest_batch = InternalIndexBatchArgs {
             connection: default_connection(),
             paths: vec![sample_dir.display().to_string()],
+            path_list: false,
             root: Some(candidate_root.display().to_string()),
             batch_size: 1,
             workers: 2,
@@ -3976,6 +4016,27 @@ rule q {
             }),
             1
         );
+    }
+
+    #[test]
+    fn expand_input_paths_supports_path_lists() {
+        let tmp = tempdir().expect("tmp");
+        let base = tmp.path();
+        let rel_dir = base.join("rel");
+        fs::create_dir_all(&rel_dir).expect("rel dir");
+        let rel_file = rel_dir.join("a.bin");
+        let abs_file = base.join("b.bin");
+        fs::write(&rel_file, b"a").expect("rel");
+        fs::write(&abs_file, b"b").expect("abs");
+        let list_path = base.join("dataset.txt");
+        fs::write(
+            &list_path,
+            format!("rel/a.bin\n{}\nmissing.bin\n\n", abs_file.display()),
+        )
+        .expect("list");
+
+        let expanded = expand_input_paths(&[list_path.display().to_string()], true).expect("list");
+        assert_eq!(expanded, vec![abs_file, rel_file]);
     }
 
     #[test]
@@ -4071,6 +4132,7 @@ rule q {
                     sample_dir.display().to_string(),
                     base.join("missing").display().to_string(),
                 ],
+                path_list: false,
                 root: Some(candidate_root.display().to_string()),
                 batch_size: 1,
                 workers: 1,
@@ -4084,6 +4146,7 @@ rule q {
             cmd_internal_index_batch(&InternalIndexBatchArgs {
                 connection: default_connection(),
                 paths: vec![base.join("missing_only").display().to_string()],
+                path_list: false,
                 root: Some(candidate_root.display().to_string()),
                 batch_size: 1,
                 workers: 1,
@@ -4201,6 +4264,7 @@ rule remote_q {
                     sample_b.display().to_string(),
                     sample_c.display().to_string()
                 ],
+                path_list: false,
                 batch_size: 1,
                 workers: Some(2),
                 verbose: false,
@@ -4412,6 +4476,7 @@ rule remote_q {
             cmd_index(&IndexArgs {
                 connection: connection.clone(),
                 paths: vec![sample.display().to_string()],
+                path_list: false,
                 batch_size: 1,
                 workers: Some(1),
                 verbose: false,

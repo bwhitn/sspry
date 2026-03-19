@@ -5,8 +5,8 @@ use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -2737,7 +2737,11 @@ impl CandidateStore {
         let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
         let block_count = self.tier2_superblocks.keys_per_block.len();
         if block_count == 0 {
-            return Ok((Vec::new(), TierFlags::default(), CandidateQueryProfile::default()));
+            return Ok((
+                Vec::new(),
+                TierFlags::default(),
+                CandidateQueryProfile::default(),
+            ));
         }
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
         let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
@@ -4328,7 +4332,8 @@ fn lane_position_variants_for_pattern(
                 return variants;
             }
             variants.push(
-                combo.iter()
+                combo
+                    .iter()
                     .map(|position| (shift + position) % lane_count.max(1))
                     .collect(),
             );
@@ -4350,7 +4355,10 @@ fn merge_cached_lane_bloom_word_masks(
 ) -> Result<Vec<(usize, u64)>> {
     let mut merged = BTreeMap::<usize, u64>::new();
     for (gram_idx, value) in values.iter().enumerate() {
-        let lane = lanes.get(gram_idx).copied().unwrap_or(gram_idx % lane_count.max(1));
+        let lane = lanes
+            .get(gram_idx)
+            .copied()
+            .unwrap_or(gram_idx % lane_count.max(1));
         let key = (*value, size_bytes, hash_count, lane, lane_count);
         let cached = if let Some(entry) = cache.get(&key) {
             entry.clone()
@@ -4409,8 +4417,10 @@ fn build_pattern_mask_cache(
     tier2_superblock_summary_cap_bytes: usize,
 ) -> Result<PatternMaskCache> {
     let mut out = HashMap::with_capacity(patterns.len());
-    let mut tier1_gram_cache = HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
-    let mut tier2_gram_cache = HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
+    let mut tier1_gram_cache =
+        HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
+    let mut tier2_gram_cache =
+        HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
     for pattern in patterns {
         let mut tier1_masks = Vec::with_capacity(pattern.alternatives.len());
         let mut tier1_superblock_masks = Vec::with_capacity(pattern.alternatives.len());
@@ -4751,16 +4761,13 @@ where
         }
         let doc = doc_inputs.doc;
         let bloom_bytes = doc_inputs.tier1_bloom_bytes(load_tier1)?;
-        let primary_match = pattern_masks
-            .tier1
-            .get(alt_index)
-            .is_some_and(|shifted| {
-                shifted.shifts.iter().any(|by_key| {
-                    by_key
-                        .get(&(doc.filter_bytes, doc.bloom_hashes))
-                        .is_some_and(|required| raw_filter_matches_word_masks(bloom_bytes, required))
-                })
-            });
+        let primary_match = pattern_masks.tier1.get(alt_index).is_some_and(|shifted| {
+            shifted.shifts.iter().any(|by_key| {
+                by_key
+                    .get(&(doc.filter_bytes, doc.bloom_hashes))
+                    .is_some_and(|required| raw_filter_matches_word_masks(bloom_bytes, required))
+            })
+        });
         if !primary_match {
             continue;
         }
@@ -4779,18 +4786,15 @@ where
             if tier2_bloom_bytes.is_empty() {
                 continue;
             }
-            let tier2_match = pattern_masks
-                .tier2
-                .get(alt_index)
-                .is_some_and(|shifted| {
-                    shifted.shifts.iter().any(|by_key| {
-                        by_key
-                            .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
-                            .is_some_and(|required| {
-                                raw_filter_matches_word_masks(tier2_bloom_bytes, required)
-                            })
-                    })
-                });
+            let tier2_match = pattern_masks.tier2.get(alt_index).is_some_and(|shifted| {
+                shifted.shifts.iter().any(|by_key| {
+                    by_key
+                        .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
+                        .is_some_and(|required| {
+                            raw_filter_matches_word_masks(tier2_bloom_bytes, required)
+                        })
+                })
+            });
             if !tier2_match {
                 continue;
             }
@@ -5007,8 +5011,8 @@ where
 mod tests {
     use tempfile::tempdir;
 
-    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::BloomFilter;
+    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::{
         DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
         extract_compact_document_metadata, pack_exact_gram,

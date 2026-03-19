@@ -4,8 +4,8 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
 use crate::candidate::BloomFilter;
+use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
 use crate::candidate::grams::{GramSizes, pack_exact_gram};
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
