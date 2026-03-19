@@ -57,6 +57,7 @@ pub const DEFAULT_STANDARD_SHARDS: usize = 256;
 pub const DEFAULT_INCREMENTAL_SHARDS: usize = 64;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
+const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
 
 struct ServeSignalFlags {
     shutdown: Arc<AtomicBool>,
@@ -201,7 +202,7 @@ fn detect_storage_class_for_path(_path: &Path) -> IngestStorageClass {
 
 fn detect_storage_class_for_paths(paths: &[PathBuf]) -> IngestStorageClass {
     let mut saw_solid_state = false;
-    for path in paths {
+    for path in paths.iter().take(STORAGE_CLASS_SAMPLE_LIMIT) {
         match detect_storage_class_for_path(path) {
             IngestStorageClass::Rotational => return IngestStorageClass::Rotational,
             IngestStorageClass::SolidState => saw_solid_state = true,
