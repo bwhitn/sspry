@@ -451,6 +451,24 @@ impl BlobSidecar {
         file.read_exact(&mut bytes)?;
         Ok(Cow::Owned(bytes))
     }
+
+    fn mmap_slice<'a>(&'a self, offset: u64, len: usize, label: &str) -> Result<Option<&'a [u8]>> {
+        if len == 0 {
+            return Ok(Some(&[]));
+        }
+        let Some(mmap) = &self.mmap else {
+            return Ok(None);
+        };
+        let start = offset as usize;
+        let end = start.saturating_add(len);
+        if end > mmap.len() {
+            return Err(SspryError::from(format!(
+                "Invalid {label} payload range at {}",
+                self.path.display()
+            )));
+        }
+        Ok(Some(&mmap[start..end]))
+    }
 }
 
 #[derive(Debug)]
@@ -750,6 +768,149 @@ fn sample_bloom_word_masks_for_superblock(
     sampled.into_iter().collect()
 }
 
+fn ensure_superblock_capacity_for(
+    index: &mut Tier2SuperblockIndex,
+    block_idx: usize,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+    summary_cap_bytes: usize,
+) {
+    let needed_blocks = block_idx + 1;
+    if index.keys_per_block.len() < needed_blocks {
+        index.keys_per_block.resize_with(needed_blocks, Vec::new);
+    }
+    let filter_key = (filter_bytes, bloom_hashes);
+    let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+    let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes);
+    index.bucket_for_key.insert(filter_key, bucket_key);
+    index
+        .summary_bytes_by_bucket
+        .insert(bucket_key, summary_bytes);
+    let blocks = index
+        .masks_by_bucket
+        .entry(bucket_key)
+        .or_insert_with(Vec::new);
+    while blocks.len() < needed_blocks {
+        blocks.push(vec![0u8; summary_bytes]);
+        index.summary_memory_bytes = index
+            .summary_memory_bytes
+            .saturating_add(summary_bytes as u64);
+    }
+    let keys = &mut index.keys_per_block[block_idx];
+    if !keys.contains(&filter_key) {
+        keys.push(filter_key);
+        keys.sort_unstable();
+    }
+}
+
+fn update_superblocks_for_doc_bytes_inner(
+    index: &mut Tier2SuperblockIndex,
+    summary_cap_bytes: usize,
+    docs_per_block: usize,
+    pos: usize,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+    bloom_bytes: &[u8],
+) {
+    let block_idx = pos / docs_per_block.max(1);
+    ensure_superblock_capacity_for(
+        index,
+        block_idx,
+        filter_bytes,
+        bloom_hashes,
+        summary_cap_bytes,
+    );
+    let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+    if let Some(blocks) = index.masks_by_bucket.get_mut(&bucket_key) {
+        if let Some(block) = blocks.get_mut(block_idx) {
+            merge_sampled_bloom_words_into_summary(block, bloom_bytes, filter_bytes);
+        }
+    }
+}
+
+fn update_superblocks_for_doc_bytes_batch<'a>(
+    index: &mut Tier2SuperblockIndex,
+    summary_cap_bytes: usize,
+    updates: &[(usize, usize, usize, &'a [u8])],
+) {
+    if updates.is_empty() {
+        return;
+    }
+    let docs_per_block = index.docs_per_block.max(1);
+    let mut max_needed_blocks = index.keys_per_block.len();
+    let mut keys_by_block = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+    let mut max_block_by_bucket = BTreeMap::<(usize, usize), usize>::new();
+    let mut aggregated = BTreeMap::<(usize, (usize, usize)), Vec<u8>>::new();
+
+    for (pos, filter_bytes, bloom_hashes, bloom_bytes) in updates {
+        let block_idx = *pos / docs_per_block;
+        max_needed_blocks = max_needed_blocks.max(block_idx + 1);
+        let filter_key = (*filter_bytes, *bloom_hashes);
+        let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
+        let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes).max(1);
+        keys_by_block.entry(block_idx).or_default().push(filter_key);
+        max_block_by_bucket
+            .entry(bucket_key)
+            .and_modify(|value| *value = (*value).max(block_idx))
+            .or_insert(block_idx);
+        let folded = aggregated
+            .entry((block_idx, filter_key))
+            .or_insert_with(|| vec![0u8; summary_bytes]);
+        merge_sampled_bloom_words_into_summary(folded, bloom_bytes, *filter_bytes);
+    }
+
+    if index.keys_per_block.len() < max_needed_blocks {
+        index
+            .keys_per_block
+            .resize_with(max_needed_blocks, Vec::new);
+    }
+
+    for (bucket_key, max_block_idx) in max_block_by_bucket {
+        let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes);
+        index
+            .summary_bytes_by_bucket
+            .insert(bucket_key, summary_bytes);
+        let blocks = index
+            .masks_by_bucket
+            .entry(bucket_key)
+            .or_insert_with(Vec::new);
+        while blocks.len() <= max_block_idx {
+            blocks.push(vec![0u8; summary_bytes]);
+            index.summary_memory_bytes = index
+                .summary_memory_bytes
+                .saturating_add(summary_bytes as u64);
+        }
+    }
+
+    for (block_idx, mut filter_keys) in keys_by_block {
+        filter_keys.sort_unstable();
+        filter_keys.dedup();
+        let keys = &mut index.keys_per_block[block_idx];
+        let before_len = keys.len();
+        for filter_key in filter_keys {
+            let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
+            index.bucket_for_key.insert(filter_key, bucket_key);
+            if !keys.contains(&filter_key) {
+                keys.push(filter_key);
+            }
+        }
+        if keys.len() != before_len {
+            keys.sort_unstable();
+        }
+    }
+
+    for ((block_idx, filter_key), folded) in aggregated {
+        let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
+        if let Some(blocks) = index.masks_by_bucket.get_mut(&bucket_key) {
+            if let Some(block) = blocks.get_mut(block_idx) {
+                for (dst, src) in block.iter_mut().zip(folded.iter()) {
+                    *dst |= *src;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CandidateStore {
     root: PathBuf,
@@ -765,6 +926,7 @@ pub struct CandidateStore {
     retired_generation_roots: Vec<String>,
     last_write_activity_monotonic: Option<Instant>,
     tier2_superblocks: Tier2SuperblockIndex,
+    tier2_pattern_superblocks: Tier2SuperblockIndex,
     tier2_telemetry: Tier2Telemetry,
     prepared_query_cache: BoundedCache<String, Arc<PreparedQueryArtifacts>>,
     memory_budget_bytes: u64,
@@ -1043,6 +1205,7 @@ impl CandidateStore {
             retired_generation_roots: Vec::new(),
             last_write_activity_monotonic: None,
             tier2_superblocks: Tier2SuperblockIndex::default(),
+            tier2_pattern_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
@@ -1110,6 +1273,7 @@ impl CandidateStore {
             retired_generation_roots: compaction_manifest.retired_roots,
             last_write_activity_monotonic: None,
             tier2_superblocks: Tier2SuperblockIndex::default(),
+            tier2_pattern_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
@@ -1537,6 +1701,10 @@ impl CandidateStore {
                 self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
             }
             self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
+            self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
+                existing_pos,
+                tier2_bloom_filter,
+            )?;
             self.maybe_rebalance_tier2_superblocks()?;
         } else {
             doc_id = self.meta.next_doc_id;
@@ -1580,6 +1748,10 @@ impl CandidateStore {
             self.sha_to_pos
                 .insert(sha256_hex.clone(), self.docs.len() - 1);
             self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
+            self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
+                self.docs.len() - 1,
+                tier2_bloom_filter,
+            )?;
             self.maybe_rebalance_tier2_superblocks()?;
             status = "inserted".to_owned();
         }
@@ -1631,6 +1803,8 @@ impl CandidateStore {
         let mut meta_dirty = false;
         let mut insert_profile = CandidateInsertBatchProfile::default();
         let mut tier2_updates = Vec::<(usize, usize, usize, &[u8])>::with_capacity(documents.len());
+        let mut tier2_pattern_updates =
+            Vec::<(usize, usize, usize, &[u8])>::with_capacity(documents.len());
         let mut pending_new_inserts = Vec::<PendingNewInsert<'_>>::new();
 
         for document in documents {
@@ -1756,6 +1930,14 @@ impl CandidateStore {
                     expected_bloom_hashes,
                     bloom_filter,
                 ));
+                if !tier2_bloom_filter.is_empty() {
+                    tier2_pattern_updates.push((
+                        existing_pos,
+                        *tier2_filter_bytes,
+                        expected_tier2_bloom_hashes,
+                        tier2_bloom_filter,
+                    ));
+                }
                 modified = true;
                 results.push(CandidateInsertResult {
                     status: "restored".to_owned(),
@@ -1904,6 +2086,14 @@ impl CandidateStore {
                     pending.doc.bloom_hashes,
                     pending.bloom_filter,
                 ));
+                if !pending.tier2_bloom_filter.is_empty() {
+                    tier2_pattern_updates.push((
+                        pos,
+                        pending.doc.tier2_filter_bytes,
+                        pending.doc.tier2_bloom_hashes,
+                        pending.tier2_bloom_filter,
+                    ));
+                }
             }
             insert_profile.append_sidecar_payloads_us =
                 insert_profile.append_sidecar_payloads_us.saturating_add(
@@ -1920,6 +2110,7 @@ impl CandidateStore {
         if modified {
             let tier2_update_started = Instant::now();
             self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
+            self.update_tier2_pattern_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
             insert_profile.tier2_update_us = insert_profile
                 .tier2_update_us
                 .saturating_add(elapsed_us(tier2_update_started));
@@ -2106,6 +2297,10 @@ impl CandidateStore {
                         existing_pos,
                         &document.bloom_filter,
                     )?;
+                    self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
+                        existing_pos,
+                        &document.tier2_bloom_filter,
+                    )?;
                     modified = true;
                     if collect_results {
                         results.push(CandidateInsertResult {
@@ -2153,6 +2348,9 @@ impl CandidateStore {
                 DocMetaRow,
                 Tier2DocMetaRow,
                 String,
+                usize,
+                usize,
+                &'_ [u8],
                 usize,
                 usize,
                 &'_ [u8],
@@ -2229,6 +2427,9 @@ impl CandidateStore {
                     document.filter_bytes,
                     document.bloom_hashes,
                     document.bloom_filter.as_slice(),
+                    document.tier2_filter_bytes,
+                    document.tier2_bloom_hashes,
+                    document.tier2_bloom_filter.as_slice(),
                 ));
             }
             import_profile.build_payloads_ms = build_payloads_started
@@ -2261,9 +2462,21 @@ impl CandidateStore {
 
             let mut tier2_updates =
                 Vec::<(usize, usize, usize, &'_ [u8])>::with_capacity(prepared.len());
+            let mut tier2_pattern_updates =
+                Vec::<(usize, usize, usize, &'_ [u8])>::with_capacity(prepared.len());
             let install_docs_started = Instant::now();
-            for (doc, row, tier2_row, sha256_hex, filter_bytes, bloom_hashes, bloom_filter) in
-                prepared
+            for (
+                doc,
+                row,
+                tier2_row,
+                sha256_hex,
+                filter_bytes,
+                bloom_hashes,
+                bloom_filter,
+                tier2_filter_bytes,
+                tier2_bloom_hashes,
+                tier2_bloom_filter,
+            ) in prepared
             {
                 self.doc_rows.push(row);
                 self.tier2_doc_rows.push(tier2_row);
@@ -2271,6 +2484,14 @@ impl CandidateStore {
                 self.docs.push(doc.clone());
                 self.sha_to_pos.insert(sha256_hex.clone(), pos);
                 tier2_updates.push((pos, filter_bytes, bloom_hashes, bloom_filter));
+                if !tier2_bloom_filter.is_empty() {
+                    tier2_pattern_updates.push((
+                        pos,
+                        tier2_filter_bytes,
+                        tier2_bloom_hashes,
+                        tier2_bloom_filter,
+                    ));
+                }
                 if collect_results {
                     results.push(CandidateInsertResult {
                         status: "inserted".to_owned(),
@@ -2286,6 +2507,7 @@ impl CandidateStore {
                 .unwrap_or(u64::MAX);
             let tier2_update_started = Instant::now();
             self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
+            self.update_tier2_pattern_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
             import_profile.tier2_update_ms = tier2_update_started
                 .elapsed()
                 .as_millis()
@@ -2470,6 +2692,8 @@ impl CandidateStore {
                     &plan.root,
                     &prepared.mask_cache,
                     &self.tier2_superblocks,
+                    &self.tier2_pattern_superblocks,
+                    true,
                 )?
             {
                 query_profile.superblocks_skipped =
@@ -2555,7 +2779,10 @@ impl CandidateStore {
             tier2_match_ratio,
             tier2_superblock_count: self.tier2_superblocks.keys_per_block.len(),
             tier2_superblock_docs: self.tier2_superblocks.docs_per_block,
-            tier2_superblock_summary_bytes: self.tier2_superblocks.summary_memory_bytes,
+            tier2_superblock_summary_bytes: self
+                .tier2_superblocks
+                .summary_memory_bytes
+                .saturating_add(self.tier2_pattern_superblocks.summary_memory_bytes),
             tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
         }
     }
@@ -2617,6 +2844,47 @@ impl CandidateStore {
         start: usize,
         end: usize,
     ) -> Result<Vec<Option<Cow<'a, [u8]>>>> {
+        let mut total_len = 0usize;
+        let mut span_start = u64::MAX;
+        let mut span_end = 0u64;
+        let mut has_live = false;
+        for pos in start..end {
+            if self.docs[pos].deleted {
+                continue;
+            }
+            let row = self.doc_rows[pos];
+            if row.bloom_len == 0 {
+                continue;
+            }
+            has_live = true;
+            total_len = total_len.saturating_add(row.bloom_len as usize);
+            span_start = span_start.min(row.bloom_offset);
+            span_end = span_end.max(row.bloom_offset.saturating_add(row.bloom_len as u64));
+        }
+        if has_live && span_start < span_end {
+            let span_len = span_end.saturating_sub(span_start) as usize;
+            let dense_enough = span_len <= total_len.saturating_mul(2).saturating_add(64 * 1024);
+            if dense_enough {
+                if let Some(span) = self
+                    .sidecars
+                    .blooms
+                    .mmap_slice(span_start, span_len, "bloom")?
+                {
+                    let mut out = Vec::with_capacity(end.saturating_sub(start));
+                    for pos in start..end {
+                        if self.docs[pos].deleted {
+                            out.push(None);
+                            continue;
+                        }
+                        let row = self.doc_rows[pos];
+                        let rel_start = row.bloom_offset.saturating_sub(span_start) as usize;
+                        let rel_end = rel_start.saturating_add(row.bloom_len as usize);
+                        out.push(Some(Cow::Borrowed(&span[rel_start..rel_end])));
+                    }
+                    return Ok(out);
+                }
+            }
+        }
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         for pos in start..end {
             if self.docs[pos].deleted {
@@ -2915,46 +3183,6 @@ impl CandidateStore {
         tier2_superblock_summary_bytes(filter_bytes, self.meta.tier2_superblock_summary_cap_bytes)
     }
 
-    fn ensure_tier2_superblock_capacity(
-        &mut self,
-        block_idx: usize,
-        filter_bytes: usize,
-        bloom_hashes: usize,
-    ) {
-        let needed_blocks = block_idx + 1;
-        if self.tier2_superblocks.keys_per_block.len() < needed_blocks {
-            self.tier2_superblocks
-                .keys_per_block
-                .resize_with(needed_blocks, Vec::new);
-        }
-        let filter_key = (filter_bytes, bloom_hashes);
-        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
-        let summary_bytes = self.tier2_superblock_summary_bytes(bucket_key.0);
-        self.tier2_superblocks
-            .bucket_for_key
-            .insert(filter_key, bucket_key);
-        self.tier2_superblocks
-            .summary_bytes_by_bucket
-            .insert(bucket_key, summary_bytes);
-        let blocks = self
-            .tier2_superblocks
-            .masks_by_bucket
-            .entry(bucket_key)
-            .or_insert_with(Vec::new);
-        while blocks.len() < needed_blocks {
-            blocks.push(vec![0u8; summary_bytes]);
-            self.tier2_superblocks.summary_memory_bytes = self
-                .tier2_superblocks
-                .summary_memory_bytes
-                .saturating_add(summary_bytes as u64);
-        }
-        let keys = &mut self.tier2_superblocks.keys_per_block[block_idx];
-        if !keys.contains(&filter_key) {
-            keys.push(filter_key);
-            keys.sort_unstable();
-        }
-    }
-
     fn update_tier2_superblocks_for_doc_bytes_inner(
         &mut self,
         pos: usize,
@@ -2963,16 +3191,18 @@ impl CandidateStore {
         if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
-        let block_idx = pos / self.tier2_superblocks.docs_per_block.max(1);
         let filter_bytes = self.docs[pos].filter_bytes;
         let bloom_hashes = self.docs[pos].bloom_hashes;
-        self.ensure_tier2_superblock_capacity(block_idx, filter_bytes, bloom_hashes);
-        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
-        if let Some(blocks) = self.tier2_superblocks.masks_by_bucket.get_mut(&bucket_key) {
-            if let Some(block) = blocks.get_mut(block_idx) {
-                merge_sampled_bloom_words_into_summary(block, bloom_bytes, filter_bytes);
-            }
-        }
+        let docs_per_block = self.tier2_superblocks.docs_per_block;
+        update_superblocks_for_doc_bytes_inner(
+            &mut self.tier2_superblocks,
+            self.meta.tier2_superblock_summary_cap_bytes,
+            docs_per_block,
+            pos,
+            filter_bytes,
+            bloom_hashes,
+            bloom_bytes,
+        );
         Ok(())
     }
 
@@ -2980,87 +3210,49 @@ impl CandidateStore {
         &mut self,
         updates: &[(usize, usize, usize, &[u8])],
     ) -> Result<()> {
-        if updates.is_empty() {
+        update_superblocks_for_doc_bytes_batch(
+            &mut self.tier2_superblocks,
+            self.meta.tier2_superblock_summary_cap_bytes,
+            updates,
+        );
+        Ok(())
+    }
+
+    fn update_tier2_pattern_superblocks_for_doc_bytes_inner(
+        &mut self,
+        pos: usize,
+        bloom_bytes: &[u8],
+    ) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
-        let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
-        let mut max_needed_blocks = self.tier2_superblocks.keys_per_block.len();
-        let mut keys_by_block = BTreeMap::<usize, Vec<(usize, usize)>>::new();
-        let mut max_block_by_bucket = BTreeMap::<(usize, usize), usize>::new();
-        let mut aggregated = BTreeMap::<(usize, (usize, usize)), Vec<u8>>::new();
-
-        for (pos, filter_bytes, bloom_hashes, bloom_bytes) in updates {
-            let block_idx = *pos / docs_per_block;
-            max_needed_blocks = max_needed_blocks.max(block_idx + 1);
-            let filter_key = (*filter_bytes, *bloom_hashes);
-            let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-            let summary_bytes = self.tier2_superblock_summary_bytes(bucket_key.0).max(1);
-            keys_by_block.entry(block_idx).or_default().push(filter_key);
-            max_block_by_bucket
-                .entry(bucket_key)
-                .and_modify(|value| *value = (*value).max(block_idx))
-                .or_insert(block_idx);
-            let folded = aggregated
-                .entry((block_idx, filter_key))
-                .or_insert_with(|| vec![0u8; summary_bytes]);
-            merge_sampled_bloom_words_into_summary(folded, bloom_bytes, *filter_bytes);
+        let filter_bytes = self.docs[pos].tier2_filter_bytes;
+        let bloom_hashes = self.docs[pos].tier2_bloom_hashes;
+        if filter_bytes == 0 || bloom_hashes == 0 || bloom_bytes.is_empty() {
+            return Ok(());
         }
+        let docs_per_block = self.tier2_pattern_superblocks.docs_per_block;
+        update_superblocks_for_doc_bytes_inner(
+            &mut self.tier2_pattern_superblocks,
+            self.meta.tier2_superblock_summary_cap_bytes,
+            docs_per_block,
+            pos,
+            filter_bytes,
+            bloom_hashes,
+            bloom_bytes,
+        );
+        Ok(())
+    }
 
-        if self.tier2_superblocks.keys_per_block.len() < max_needed_blocks {
-            self.tier2_superblocks
-                .keys_per_block
-                .resize_with(max_needed_blocks, Vec::new);
-        }
-
-        for (bucket_key, max_block_idx) in max_block_by_bucket {
-            let summary_bytes = self.tier2_superblock_summary_bytes(bucket_key.0);
-            self.tier2_superblocks
-                .summary_bytes_by_bucket
-                .insert(bucket_key, summary_bytes);
-            let blocks = self
-                .tier2_superblocks
-                .masks_by_bucket
-                .entry(bucket_key)
-                .or_insert_with(Vec::new);
-            while blocks.len() <= max_block_idx {
-                blocks.push(vec![0u8; summary_bytes]);
-                self.tier2_superblocks.summary_memory_bytes = self
-                    .tier2_superblocks
-                    .summary_memory_bytes
-                    .saturating_add(summary_bytes as u64);
-            }
-        }
-
-        for (block_idx, mut filter_keys) in keys_by_block {
-            filter_keys.sort_unstable();
-            filter_keys.dedup();
-            let keys = &mut self.tier2_superblocks.keys_per_block[block_idx];
-            let before_len = keys.len();
-            for filter_key in filter_keys {
-                let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
-                self.tier2_superblocks
-                    .bucket_for_key
-                    .insert(filter_key, bucket_key);
-                if !keys.contains(&filter_key) {
-                    keys.push(filter_key);
-                }
-            }
-            if keys.len() != before_len {
-                keys.sort_unstable();
-            }
-        }
-
-        for ((block_idx, filter_key), folded) in aggregated {
-            let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
-            if let Some(blocks) = self.tier2_superblocks.masks_by_bucket.get_mut(&bucket_key) {
-                if let Some(block) = blocks.get_mut(block_idx) {
-                    for (dst, src) in block.iter_mut().zip(folded.iter()) {
-                        *dst |= *src;
-                    }
-                }
-            }
-        }
-
+    fn update_tier2_pattern_superblocks_for_doc_bytes_batch(
+        &mut self,
+        updates: &[(usize, usize, usize, &[u8])],
+    ) -> Result<()> {
+        update_superblocks_for_doc_bytes_batch(
+            &mut self.tier2_pattern_superblocks,
+            self.meta.tier2_superblock_summary_cap_bytes,
+            updates,
+        );
         Ok(())
     }
 
@@ -3080,6 +3272,25 @@ impl CandidateStore {
         self.update_tier2_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
     }
 
+    fn update_tier2_pattern_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
+            return Ok(());
+        }
+        let doc_id = self.docs[pos].doc_id;
+        let row = self.tier2_doc_rows[pos];
+        if row.bloom_len == 0 {
+            return Ok(());
+        }
+        let bloom_bytes = self.sidecars.tier2_blooms.read_bytes(
+            row.bloom_offset,
+            row.bloom_len as usize,
+            "tier2_bloom",
+            doc_id,
+        )?;
+        let owned_bloom_bytes = bloom_bytes.into_owned();
+        self.update_tier2_pattern_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
+    }
+
     fn rebuild_tier2_superblocks_with_docs_per_block(
         &mut self,
         docs_per_block: usize,
@@ -3088,15 +3299,23 @@ impl CandidateStore {
             docs_per_block: docs_per_block.max(1),
             ..Tier2SuperblockIndex::default()
         };
+        self.tier2_pattern_superblocks = Tier2SuperblockIndex {
+            docs_per_block: docs_per_block.max(1),
+            ..Tier2SuperblockIndex::default()
+        };
         for pos in 0..self.docs.len() {
             self.update_tier2_superblocks_for_doc_inner(pos)?;
+            self.update_tier2_pattern_superblocks_for_doc_inner(pos)?;
         }
         Ok(())
     }
 
     fn maybe_rebalance_tier2_superblocks(&mut self) -> Result<()> {
         let budget_bytes = self.tier2_superblock_memory_budget_bytes;
-        let current_bytes = self.tier2_superblocks.summary_memory_bytes;
+        let current_bytes = self
+            .tier2_superblocks
+            .summary_memory_bytes
+            .saturating_add(self.tier2_pattern_superblocks.summary_memory_bytes);
         if budget_bytes == 0 || current_bytes <= budget_bytes {
             return Ok(());
         }
@@ -3168,7 +3387,20 @@ impl CandidateStore {
         let (loaded_tier2_superblocks_from_snapshot, tier2_superblocks_ms) =
             if let Some(snapshot) = maybe_snapshot {
                 self.tier2_superblocks = snapshot;
-                (true, 0)
+                let tier2_started = Instant::now();
+                self.tier2_pattern_superblocks = Tier2SuperblockIndex {
+                    docs_per_block: self.tier2_superblocks.docs_per_block,
+                    ..Tier2SuperblockIndex::default()
+                };
+                for pos in 0..self.docs.len() {
+                    self.update_tier2_pattern_superblocks_for_doc_inner(pos)?;
+                }
+                let tier2_superblocks_ms = tier2_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                (true, tier2_superblocks_ms)
             } else {
                 let tier2_started = Instant::now();
                 self.rebuild_tier2_superblocks()?;
@@ -3872,6 +4104,7 @@ struct PreparedPatternMasks {
     tier1: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
     tier1_superblocks: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
     tier2: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
+    tier2_superblocks: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
 }
 
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
@@ -3970,20 +4203,30 @@ fn build_pattern_mask_cache(
         }
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
+        let mut tier2_superblock_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
         for alternative in &pattern.tier2_alternatives {
             let mut by_key = BTreeMap::<(usize, usize), Vec<(usize, u64)>>::new();
+            let mut superblock_by_key = BTreeMap::<(usize, usize), Vec<(usize, u64)>>::new();
             for (filter_bytes, bloom_hashes) in tier2_filter_keys {
-                by_key.insert(
-                    (*filter_bytes, *bloom_hashes),
-                    merge_cached_bloom_word_masks(
-                        alternative,
-                        *filter_bytes,
-                        *bloom_hashes,
-                        &mut tier2_gram_cache,
-                    )?,
+                let required = merge_cached_bloom_word_masks(
+                    alternative,
+                    *filter_bytes,
+                    *bloom_hashes,
+                    &mut tier2_gram_cache,
+                )?;
+                let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
+                let summary_bytes = tier2_superblock_summary_bytes(
+                    summary_bucket.0,
+                    tier2_superblock_summary_cap_bytes,
                 );
+                superblock_by_key.insert(
+                    (*filter_bytes, *bloom_hashes),
+                    sample_bloom_word_masks_for_superblock(&required, *filter_bytes, summary_bytes),
+                );
+                by_key.insert((*filter_bytes, *bloom_hashes), required);
             }
             tier2_masks.push(by_key);
+            tier2_superblock_masks.push(superblock_by_key);
         }
 
         out.insert(
@@ -3992,6 +4235,7 @@ fn build_pattern_mask_cache(
                 tier1: tier1_masks,
                 tier1_superblocks: tier1_superblock_masks,
                 tier2: tier2_masks,
+                tier2_superblocks: tier2_superblock_masks,
             },
         );
     }
@@ -4023,45 +4267,70 @@ pub(crate) fn build_prepared_query_artifacts(
     }))
 }
 
+fn block_matches_required_masks(
+    block_idx: usize,
+    by_key: &BTreeMap<(usize, usize), Vec<(usize, u64)>>,
+    superblocks: &Tier2SuperblockIndex,
+) -> bool {
+    if by_key.is_empty() {
+        return true;
+    }
+    let Some(keys) = superblocks.keys_per_block.get(block_idx) else {
+        return false;
+    };
+    keys.iter().any(|filter_key| {
+        let Some(required) = by_key.get(filter_key) else {
+            return false;
+        };
+        let Some(bucket_key) = superblocks.bucket_for_key.get(filter_key) else {
+            return false;
+        };
+        let Some(blocks) = superblocks.masks_by_bucket.get(bucket_key) else {
+            return false;
+        };
+        let Some(block) = blocks.get(block_idx) else {
+            return false;
+        };
+        raw_filter_matches_word_masks(block, required)
+    })
+}
+
 fn block_matches_pattern(
     block_idx: usize,
     pattern_id: &str,
     mask_cache: &PatternMaskCache,
-    superblocks: &Tier2SuperblockIndex,
+    tier1_superblocks: &Tier2SuperblockIndex,
+    tier2_superblocks: &Tier2SuperblockIndex,
+    allow_tier2: bool,
 ) -> bool {
     let Some(pattern_masks) = mask_cache.get(pattern_id) else {
         return false;
     };
-    let Some(keys) = superblocks.keys_per_block.get(block_idx) else {
-        return false;
-    };
-    pattern_masks.tier1_superblocks.iter().any(|by_key| {
-        if by_key.is_empty() {
-            return true;
-        }
-        keys.iter().any(|filter_key| {
-            let Some(required) = by_key.get(filter_key) else {
+    pattern_masks
+        .tier1_superblocks
+        .iter()
+        .enumerate()
+        .any(|(alt_index, tier1_by_key)| {
+            if !block_matches_required_masks(block_idx, tier1_by_key, tier1_superblocks) {
                 return false;
+            }
+            let Some(tier2_by_key) = pattern_masks.tier2_superblocks.get(alt_index) else {
+                return true;
             };
-            let Some(bucket_key) = superblocks.bucket_for_key.get(filter_key) else {
-                return false;
-            };
-            let Some(blocks) = superblocks.masks_by_bucket.get(bucket_key) else {
-                return false;
-            };
-            let Some(block) = blocks.get(block_idx) else {
-                return false;
-            };
-            raw_filter_matches_word_masks(block, required)
+            if !allow_tier2 || tier2_by_key.is_empty() {
+                return true;
+            }
+            block_matches_required_masks(block_idx, tier2_by_key, tier2_superblocks)
         })
-    })
 }
 
 fn block_maybe_matches_node(
     block_idx: usize,
     node: &QueryNode,
     mask_cache: &PatternMaskCache,
-    superblocks: &Tier2SuperblockIndex,
+    tier1_superblocks: &Tier2SuperblockIndex,
+    tier2_superblocks: &Tier2SuperblockIndex,
+    allow_tier2: bool,
 ) -> Result<bool> {
     match node.kind.as_str() {
         "pattern" => {
@@ -4073,7 +4342,9 @@ fn block_maybe_matches_node(
                 block_idx,
                 pattern_id,
                 mask_cache,
-                superblocks,
+                tier1_superblocks,
+                tier2_superblocks,
+                allow_tier2,
             ))
         }
         "verifier_only_eq" => Ok(true),
@@ -4082,7 +4353,14 @@ fn block_maybe_matches_node(
         "time_now_eq" => Ok(true),
         "and" => {
             for child in &node.children {
-                if !block_maybe_matches_node(block_idx, child, mask_cache, superblocks)? {
+                if !block_maybe_matches_node(
+                    block_idx,
+                    child,
+                    mask_cache,
+                    tier1_superblocks,
+                    tier2_superblocks,
+                    allow_tier2,
+                )? {
                     return Ok(false);
                 }
             }
@@ -4090,7 +4368,14 @@ fn block_maybe_matches_node(
         }
         "or" => {
             for child in &node.children {
-                if block_maybe_matches_node(block_idx, child, mask_cache, superblocks)? {
+                if block_maybe_matches_node(
+                    block_idx,
+                    child,
+                    mask_cache,
+                    tier1_superblocks,
+                    tier2_superblocks,
+                    allow_tier2,
+                )? {
                     return Ok(true);
                 }
             }
@@ -4102,7 +4387,14 @@ fn block_maybe_matches_node(
                 .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
             let mut matched = 0usize;
             for child in &node.children {
-                if block_maybe_matches_node(block_idx, child, mask_cache, superblocks)? {
+                if block_maybe_matches_node(
+                    block_idx,
+                    child,
+                    mask_cache,
+                    tier1_superblocks,
+                    tier2_superblocks,
+                    allow_tier2,
+                )? {
                     matched += 1;
                     if matched >= threshold {
                         return Ok(true);
