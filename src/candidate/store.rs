@@ -13,12 +13,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::candidate::bloom::{bloom_word_masks, raw_filter_matches_word_masks};
+use crate::candidate::bloom::{
+    DEFAULT_BLOOM_POSITION_LANES, bloom_word_masks_in_lane, raw_filter_matches_word_masks,
+};
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
     align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
-use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
+use crate::candidate::grams::{
+    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
+};
 use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::perf::{record_counter, record_max, scope};
@@ -4211,29 +4215,117 @@ fn normalize_sha256_hex(value: &str) -> Result<String> {
     Ok(text)
 }
 
+type RequiredMasksByKey = BTreeMap<(usize, usize), Vec<(usize, u64)>>;
+
+#[derive(Clone, Debug, Default)]
+struct ShiftedRequiredMasks {
+    shifts: Vec<RequiredMasksByKey>,
+}
+
+impl ShiftedRequiredMasks {
+    fn is_empty(&self) -> bool {
+        self.shifts.iter().all(BTreeMap::is_empty)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct PreparedPatternMasks {
-    tier1: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
-    tier1_superblocks: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
-    tier2: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
-    tier2_superblocks: Vec<BTreeMap<(usize, usize), Vec<(usize, u64)>>>,
+    tier1: Vec<ShiftedRequiredMasks>,
+    tier1_superblocks: Vec<ShiftedRequiredMasks>,
+    tier2: Vec<ShiftedRequiredMasks>,
+    tier2_superblocks: Vec<ShiftedRequiredMasks>,
 }
 
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
 
-fn merge_cached_bloom_word_masks(
+const MAX_LANE_POSITION_VARIANTS: usize = 64;
+
+fn lane_position_variants_for_pattern(
+    values: &[u64],
+    fixed_literal: &[u8],
+    gram_size: usize,
+    lane_count: usize,
+) -> Vec<Vec<usize>> {
+    let mut positions_per_gram = Vec::<Vec<usize>>::with_capacity(values.len());
+    if !fixed_literal.is_empty() && fixed_literal.len() >= gram_size {
+        let mut positions_by_gram = HashMap::<u64, Vec<usize>>::new();
+        for idx in 0..=(fixed_literal.len() - gram_size) {
+            let gram = pack_exact_gram(&fixed_literal[idx..idx + gram_size]);
+            positions_by_gram.entry(gram).or_default().push(idx);
+        }
+        for (gram_idx, value) in values.iter().enumerate() {
+            positions_per_gram.push(
+                positions_by_gram
+                    .get(value)
+                    .cloned()
+                    .filter(|positions| !positions.is_empty())
+                    .unwrap_or_else(|| vec![gram_idx]),
+            );
+        }
+    } else {
+        for gram_idx in 0..values.len() {
+            positions_per_gram.push(vec![gram_idx]);
+        }
+    }
+
+    let mut combos = vec![Vec::<usize>::new()];
+    for positions in positions_per_gram {
+        let mut next = Vec::<Vec<usize>>::new();
+        for combo in &combos {
+            for position in &positions {
+                if next.len() >= MAX_LANE_POSITION_VARIANTS {
+                    break;
+                }
+                let mut variant = combo.clone();
+                variant.push(*position);
+                next.push(variant);
+            }
+            if next.len() >= MAX_LANE_POSITION_VARIANTS {
+                break;
+            }
+        }
+        combos = next;
+        if combos.is_empty() {
+            combos.push(Vec::new());
+        }
+    }
+
+    let mut variants = Vec::<Vec<usize>>::new();
+    for shift in 0..lane_count.max(1) {
+        for combo in &combos {
+            if variants.len() >= MAX_LANE_POSITION_VARIANTS {
+                return variants;
+            }
+            variants.push(
+                combo.iter()
+                    .map(|position| (shift + position) % lane_count.max(1))
+                    .collect(),
+            );
+        }
+    }
+    if variants.is_empty() {
+        variants.push(Vec::new());
+    }
+    variants
+}
+
+fn merge_cached_lane_bloom_word_masks(
     values: &[u64],
     size_bytes: usize,
     hash_count: usize,
-    cache: &mut HashMap<(u64, usize, usize), Vec<(usize, u64)>>,
+    lanes: &[usize],
+    lane_count: usize,
+    cache: &mut HashMap<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>,
 ) -> Result<Vec<(usize, u64)>> {
     let mut merged = BTreeMap::<usize, u64>::new();
-    for value in values {
-        let key = (*value, size_bytes, hash_count);
+    for (gram_idx, value) in values.iter().enumerate() {
+        let lane = lanes.get(gram_idx).copied().unwrap_or(gram_idx % lane_count.max(1));
+        let key = (*value, size_bytes, hash_count, lane, lane_count);
         let cached = if let Some(entry) = cache.get(&key) {
             entry.clone()
         } else {
-            let entry = bloom_word_masks(&[*value], size_bytes, hash_count)?;
+            let entry =
+                bloom_word_masks_in_lane(&[*value], size_bytes, hash_count, lane, lane_count)?;
             cache.insert(key, entry.clone());
             entry
         };
@@ -4281,64 +4373,120 @@ fn build_pattern_mask_cache(
     patterns: &[PatternPlan],
     tier1_filter_keys: &[(usize, usize)],
     tier2_filter_keys: &[(usize, usize)],
+    tier1_gram_size: usize,
+    tier2_gram_size: usize,
     tier2_superblock_summary_cap_bytes: usize,
 ) -> Result<PatternMaskCache> {
     let mut out = HashMap::with_capacity(patterns.len());
-    let mut tier1_gram_cache = HashMap::<(u64, usize, usize), Vec<(usize, u64)>>::new();
-    let mut tier2_gram_cache = HashMap::<(u64, usize, usize), Vec<(usize, u64)>>::new();
+    let mut tier1_gram_cache = HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
+    let mut tier2_gram_cache = HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
     for pattern in patterns {
         let mut tier1_masks = Vec::with_capacity(pattern.alternatives.len());
         let mut tier1_superblock_masks = Vec::with_capacity(pattern.alternatives.len());
-        for alternative in &pattern.alternatives {
-            let mut by_key = BTreeMap::<(usize, usize), Vec<(usize, u64)>>::new();
-            let mut superblock_by_key = BTreeMap::<(usize, usize), Vec<(usize, u64)>>::new();
-            for (filter_bytes, bloom_hashes) in tier1_filter_keys {
-                let required = merge_cached_bloom_word_masks(
-                    alternative,
-                    *filter_bytes,
-                    *bloom_hashes,
-                    &mut tier1_gram_cache,
-                )?;
-                let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-                let summary_bytes = tier2_superblock_summary_bytes(
-                    summary_bucket.0,
-                    tier2_superblock_summary_cap_bytes,
-                );
-                superblock_by_key.insert(
-                    (*filter_bytes, *bloom_hashes),
-                    sample_bloom_word_masks_for_superblock(&required, *filter_bytes, summary_bytes),
-                );
-                by_key.insert((*filter_bytes, *bloom_hashes), required);
+        for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
+            let fixed_literal = pattern
+                .fixed_literals
+                .get(alt_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let lane_variants = lane_position_variants_for_pattern(
+                alternative,
+                fixed_literal,
+                tier1_gram_size,
+                DEFAULT_BLOOM_POSITION_LANES,
+            );
+            let mut shifted_tier1 = ShiftedRequiredMasks {
+                shifts: Vec::with_capacity(lane_variants.len()),
+            };
+            let mut shifted_tier1_superblocks = ShiftedRequiredMasks {
+                shifts: Vec::with_capacity(lane_variants.len()),
+            };
+            for lanes in &lane_variants {
+                let mut by_key = RequiredMasksByKey::new();
+                let mut superblock_by_key = RequiredMasksByKey::new();
+                for (filter_bytes, bloom_hashes) in tier1_filter_keys {
+                    let required = merge_cached_lane_bloom_word_masks(
+                        alternative,
+                        *filter_bytes,
+                        *bloom_hashes,
+                        lanes,
+                        DEFAULT_BLOOM_POSITION_LANES,
+                        &mut tier1_gram_cache,
+                    )?;
+                    let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
+                    let summary_bytes = tier2_superblock_summary_bytes(
+                        summary_bucket.0,
+                        tier2_superblock_summary_cap_bytes,
+                    );
+                    superblock_by_key.insert(
+                        (*filter_bytes, *bloom_hashes),
+                        sample_bloom_word_masks_for_superblock(
+                            &required,
+                            *filter_bytes,
+                            summary_bytes,
+                        ),
+                    );
+                    by_key.insert((*filter_bytes, *bloom_hashes), required);
+                }
+                shifted_tier1.shifts.push(by_key);
+                shifted_tier1_superblocks.shifts.push(superblock_by_key);
             }
-            tier1_masks.push(by_key);
-            tier1_superblock_masks.push(superblock_by_key);
+            tier1_masks.push(shifted_tier1);
+            tier1_superblock_masks.push(shifted_tier1_superblocks);
         }
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
         let mut tier2_superblock_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
-        for alternative in &pattern.tier2_alternatives {
-            let mut by_key = BTreeMap::<(usize, usize), Vec<(usize, u64)>>::new();
-            let mut superblock_by_key = BTreeMap::<(usize, usize), Vec<(usize, u64)>>::new();
-            for (filter_bytes, bloom_hashes) in tier2_filter_keys {
-                let required = merge_cached_bloom_word_masks(
-                    alternative,
-                    *filter_bytes,
-                    *bloom_hashes,
-                    &mut tier2_gram_cache,
-                )?;
-                let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-                let summary_bytes = tier2_superblock_summary_bytes(
-                    summary_bucket.0,
-                    tier2_superblock_summary_cap_bytes,
-                );
-                superblock_by_key.insert(
-                    (*filter_bytes, *bloom_hashes),
-                    sample_bloom_word_masks_for_superblock(&required, *filter_bytes, summary_bytes),
-                );
-                by_key.insert((*filter_bytes, *bloom_hashes), required);
+        for (alt_index, alternative) in pattern.tier2_alternatives.iter().enumerate() {
+            let fixed_literal = pattern
+                .fixed_literals
+                .get(alt_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let lane_variants = lane_position_variants_for_pattern(
+                alternative,
+                fixed_literal,
+                tier2_gram_size,
+                DEFAULT_BLOOM_POSITION_LANES,
+            );
+            let mut shifted_tier2 = ShiftedRequiredMasks {
+                shifts: Vec::with_capacity(lane_variants.len()),
+            };
+            let mut shifted_tier2_superblocks = ShiftedRequiredMasks {
+                shifts: Vec::with_capacity(lane_variants.len()),
+            };
+            for lanes in &lane_variants {
+                let mut by_key = RequiredMasksByKey::new();
+                let mut superblock_by_key = RequiredMasksByKey::new();
+                for (filter_bytes, bloom_hashes) in tier2_filter_keys {
+                    let required = merge_cached_lane_bloom_word_masks(
+                        alternative,
+                        *filter_bytes,
+                        *bloom_hashes,
+                        lanes,
+                        DEFAULT_BLOOM_POSITION_LANES,
+                        &mut tier2_gram_cache,
+                    )?;
+                    let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
+                    let summary_bytes = tier2_superblock_summary_bytes(
+                        summary_bucket.0,
+                        tier2_superblock_summary_cap_bytes,
+                    );
+                    superblock_by_key.insert(
+                        (*filter_bytes, *bloom_hashes),
+                        sample_bloom_word_masks_for_superblock(
+                            &required,
+                            *filter_bytes,
+                            summary_bytes,
+                        ),
+                    );
+                    by_key.insert((*filter_bytes, *bloom_hashes), required);
+                }
+                shifted_tier2.shifts.push(by_key);
+                shifted_tier2_superblocks.shifts.push(superblock_by_key);
             }
-            tier2_masks.push(by_key);
-            tier2_superblock_masks.push(superblock_by_key);
+            tier2_masks.push(shifted_tier2);
+            tier2_superblock_masks.push(shifted_tier2_superblocks);
         }
 
         out.insert(
@@ -4370,6 +4518,8 @@ pub(crate) fn build_prepared_query_artifacts(
         &plan.patterns,
         tier1_filter_keys,
         tier2_filter_keys,
+        plan.tier1_gram_size,
+        plan.tier2_gram_size,
         tier2_superblock_summary_cap_bytes,
     )?;
     Ok(Arc::new(PreparedQueryArtifacts {
@@ -4381,7 +4531,7 @@ pub(crate) fn build_prepared_query_artifacts(
 
 fn block_matches_required_masks(
     block_idx: usize,
-    by_key: &BTreeMap<(usize, usize), Vec<(usize, u64)>>,
+    by_key: &RequiredMasksByKey,
     superblocks: &Tier2SuperblockIndex,
 ) -> bool {
     if by_key.is_empty() {
@@ -4407,6 +4557,17 @@ fn block_matches_required_masks(
     })
 }
 
+fn block_matches_shifted_required_masks(
+    block_idx: usize,
+    shifted: &ShiftedRequiredMasks,
+    superblocks: &Tier2SuperblockIndex,
+) -> bool {
+    shifted
+        .shifts
+        .iter()
+        .any(|by_key| block_matches_required_masks(block_idx, by_key, superblocks))
+}
+
 fn block_matches_pattern(
     block_idx: usize,
     pattern_id: &str,
@@ -4423,7 +4584,7 @@ fn block_matches_pattern(
         .iter()
         .enumerate()
         .any(|(alt_index, tier1_by_key)| {
-            if !block_matches_required_masks(block_idx, tier1_by_key, tier1_superblocks) {
+            if !block_matches_shifted_required_masks(block_idx, tier1_by_key, tier1_superblocks) {
                 return false;
             }
             let Some(tier2_by_key) = pattern_masks.tier2_superblocks.get(alt_index) else {
@@ -4432,7 +4593,7 @@ fn block_matches_pattern(
             if !allow_tier2 || tier2_by_key.is_empty() {
                 return true;
             }
-            block_matches_required_masks(block_idx, tier2_by_key, tier2_superblocks)
+            block_matches_shifted_required_masks(block_idx, tier2_by_key, tier2_superblocks)
         })
 }
 
@@ -4562,8 +4723,13 @@ where
         let primary_match = pattern_masks
             .tier1
             .get(alt_index)
-            .and_then(|by_key| by_key.get(&(doc.filter_bytes, doc.bloom_hashes)))
-            .is_some_and(|required| raw_filter_matches_word_masks(bloom_bytes, required));
+            .is_some_and(|shifted| {
+                shifted.shifts.iter().any(|by_key| {
+                    by_key
+                        .get(&(doc.filter_bytes, doc.bloom_hashes))
+                        .is_some_and(|required| raw_filter_matches_word_masks(bloom_bytes, required))
+                })
+            });
         if !primary_match {
             continue;
         }
@@ -4585,8 +4751,15 @@ where
             let tier2_match = pattern_masks
                 .tier2
                 .get(alt_index)
-                .and_then(|by_key| by_key.get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes)))
-                .is_some_and(|required| raw_filter_matches_word_masks(tier2_bloom_bytes, required));
+                .is_some_and(|shifted| {
+                    shifted.shifts.iter().any(|by_key| {
+                        by_key
+                            .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
+                            .is_some_and(|required| {
+                                raw_filter_matches_word_masks(tier2_bloom_bytes, required)
+                            })
+                    })
+                });
             if !tier2_match {
                 continue;
             }
@@ -4803,6 +4976,7 @@ where
 mod tests {
     use tempfile::tempdir;
 
+    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::BloomFilter;
     use crate::candidate::{
         DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
@@ -4814,6 +4988,20 @@ mod tests {
 
     fn borrowed_bytes<'a>(bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         Ok(Cow::Borrowed(bytes))
+    }
+
+    fn lane_bloom_bytes(filter_bytes: usize, bloom_hashes: usize, grams: &[u64]) -> Vec<u8> {
+        let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
+        for (idx, gram) in grams.iter().enumerate() {
+            bloom
+                .add_in_lane(
+                    *gram,
+                    idx % DEFAULT_BLOOM_POSITION_LANES,
+                    DEFAULT_BLOOM_POSITION_LANES,
+                )
+                .expect("add gram");
+        }
+        bloom.into_bytes()
     }
 
     fn prefetched_query_inputs<'a>(
@@ -4907,11 +5095,7 @@ mod tests {
             None,
             None,
             filter_bytes,
-            &{
-                let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
-                bloom.add(0x4443_4241).expect("add gram");
-                bloom.into_bytes()
-            },
+            &lane_bloom_bytes(filter_bytes, bloom_hashes, &[0x4443_4241]),
             Some("doc-1".to_owned()),
         )
         .expect("insert");
@@ -6047,13 +6231,9 @@ rule q {
         .expect("init");
 
         let filter_bytes = 8;
-        let mut bloom_one = BloomFilter::new(filter_bytes, 2).expect("bloom one");
-        bloom_one.add(1).expect("add gram");
-        let mut bloom_two = BloomFilter::new(filter_bytes, 2).expect("bloom two");
-        bloom_two.add(2).expect("add gram");
-        let mut bloom_one_two = BloomFilter::new(filter_bytes, 2).expect("bloom one two");
-        bloom_one_two.add(1).expect("add gram");
-        bloom_one_two.add(2).expect("add gram");
+        let bloom_one = lane_bloom_bytes(filter_bytes, 2, &[1]);
+        let bloom_two = lane_bloom_bytes(filter_bytes, 2, &[2]);
+        let bloom_one_two = lane_bloom_bytes(filter_bytes, 2, &[1, 2]);
 
         insert_primary(
             &mut store,
@@ -6062,7 +6242,7 @@ rule q {
             None,
             Some(2),
             filter_bytes,
-            &bloom_one.into_bytes(),
+            &bloom_one,
             None,
         )
         .expect("insert doc one");
@@ -6073,7 +6253,7 @@ rule q {
             None,
             Some(2),
             filter_bytes,
-            &bloom_two.into_bytes(),
+            &bloom_two,
             None,
         )
         .expect("insert doc two");
@@ -6084,7 +6264,7 @@ rule q {
             None,
             Some(2),
             filter_bytes,
-            &bloom_one_two.into_bytes(),
+            &bloom_one_two,
             None,
         )
         .expect("insert doc three");
@@ -6136,9 +6316,7 @@ rule q {
         assert_eq!(result.next_cursor, Some(1));
         assert_eq!(result.tier_used, "tier1");
 
-        let mut bloom = BloomFilter::new(64, 2).expect("bloom");
-        bloom.add(1).expect("add gram");
-        bloom.add(2).expect("add gram");
+        let bloom_bytes = lane_bloom_bytes(64, 2, &[1, 2]);
         let doc = CandidateDoc {
             doc_id: 99,
             sha256: hex::encode([0x44; 32]),
@@ -6194,12 +6372,13 @@ rule q {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
-        let bloom_bytes = bloom.into_bytes();
         let tier2_bloom_bytes = &[][..];
         let mask_cache = build_pattern_mask_cache(
             &patterns_vec,
             &[(64, 2)],
             &[(64, 2)],
+            DEFAULT_TIER1_GRAM_SIZE,
+            DEFAULT_TIER2_GRAM_SIZE,
             DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
         )
         .expect("pattern mask cache");

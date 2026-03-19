@@ -1,5 +1,7 @@
 use crate::{Result, SspryError};
 
+pub const DEFAULT_BLOOM_POSITION_LANES: usize = 4;
+
 fn mix64(mut value: u64, seed: u64) -> u64 {
     value ^= seed;
     value ^= value >> 30;
@@ -65,6 +67,48 @@ pub fn bloom_word_masks(
     for value in values {
         for pos in bloom_positions(*value, bits, hash_count)? {
             let word_idx = pos / 64;
+            let bit_idx = pos % 64;
+            *masks.entry(word_idx).or_insert(0) |= 1u64 << bit_idx;
+        }
+    }
+    Ok(masks.into_iter().collect())
+}
+
+fn validate_lane_layout(size_bytes: usize, lane_count: usize) -> Result<usize> {
+    if size_bytes == 0 {
+        return Err(SspryError::from("size_bytes must be > 0"));
+    }
+    if lane_count == 0 {
+        return Err(SspryError::from("lane_count must be > 0"));
+    }
+    if size_bytes % lane_count != 0 {
+        return Err(SspryError::from(
+            "size_bytes must be divisible by lane_count",
+        ));
+    }
+    Ok(size_bytes / lane_count)
+}
+
+pub fn bloom_word_masks_in_lane(
+    values: &[u64],
+    size_bytes: usize,
+    hash_count: usize,
+    lane_idx: usize,
+    lane_count: usize,
+) -> Result<Vec<(usize, u64)>> {
+    if hash_count == 0 {
+        return Err(SspryError::from("hash_count must be > 0"));
+    }
+    let lane_bytes = validate_lane_layout(size_bytes, lane_count)?;
+    if lane_idx >= lane_count {
+        return Err(SspryError::from("lane_idx must be < lane_count"));
+    }
+    let lane_bits = lane_bytes * 8;
+    let lane_word_offset = lane_idx * (lane_bytes / 8);
+    let mut masks = std::collections::BTreeMap::<usize, u64>::new();
+    for value in values {
+        for pos in bloom_positions(*value, lane_bits, hash_count)? {
+            let word_idx = lane_word_offset + (pos / 64);
             let bit_idx = pos % 64;
             *masks.entry(word_idx).or_insert(0) |= 1u64 << bit_idx;
         }
@@ -150,6 +194,21 @@ impl BloomFilter {
         Ok(())
     }
 
+    pub fn add_in_lane(&mut self, value: u64, lane_idx: usize, lane_count: usize) -> Result<()> {
+        let lane_bytes = validate_lane_layout(self.data.len(), lane_count)?;
+        if lane_idx >= lane_count {
+            return Err(SspryError::from("lane_idx must be < lane_count"));
+        }
+        let lane_bits = lane_bytes * 8;
+        let lane_byte_offset = lane_idx * lane_bytes;
+        for pos in bloom_positions(value, lane_bits, self.hash_count)? {
+            let byte_idx = lane_byte_offset + (pos / 8);
+            let bit_idx = pos % 8;
+            self.data[byte_idx] |= 1 << bit_idx;
+        }
+        Ok(())
+    }
+
     pub fn maybe_contains(&self, value: u64) -> Result<bool> {
         let bits = self.data.len() * 8;
         for pos in bloom_positions(value, bits, self.hash_count)? {
@@ -183,7 +242,8 @@ impl BloomFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        BloomFilter, bloom_byte_masks, bloom_positions, bloom_word_masks, raw_filter_matches_masks,
+        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, bloom_byte_masks, bloom_positions,
+        bloom_word_masks, bloom_word_masks_in_lane, raw_filter_matches_masks,
         raw_filter_matches_word_masks,
     };
 
@@ -238,6 +298,8 @@ mod tests {
         assert!(bloom_word_masks(&[1], 0, 1).is_err());
         assert!(bloom_byte_masks(&[1], 8, 0).is_err());
         assert!(bloom_word_masks(&[1], 8, 0).is_err());
+        assert!(bloom_word_masks_in_lane(&[1], 6, 1, 0, 4).is_err());
+        assert!(bloom_word_masks_in_lane(&[1], 8, 1, 4, 4).is_err());
         assert!(BloomFilter::new(0, 1).is_err());
         assert!(BloomFilter::new(8, 0).is_err());
         assert!(BloomFilter::from_bytes(&[], 1).is_err());
@@ -271,5 +333,31 @@ mod tests {
             &encoded,
             &[(encoded.len() / 8, 0x01)]
         ));
+    }
+
+    #[test]
+    fn lane_helpers_round_trip_inserted_values() {
+        let mut bloom = BloomFilter::new(64, 3).expect("bloom");
+        bloom
+            .add_in_lane(0x0102_0304, 1, DEFAULT_BLOOM_POSITION_LANES)
+            .expect("lane add");
+        let required = bloom_word_masks_in_lane(
+            &[0x0102_0304],
+            64,
+            3,
+            1,
+            DEFAULT_BLOOM_POSITION_LANES,
+        )
+        .expect("lane masks");
+        assert!(raw_filter_matches_word_masks(bloom.as_bytes(), &required));
+        let wrong_lane = bloom_word_masks_in_lane(
+            &[0x0102_0304],
+            64,
+            3,
+            2,
+            DEFAULT_BLOOM_POSITION_LANES,
+        )
+        .expect("wrong lane masks");
+        assert!(!raw_filter_matches_word_masks(bloom.as_bytes(), &wrong_lane));
     }
 }

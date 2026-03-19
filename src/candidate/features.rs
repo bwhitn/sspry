@@ -4,6 +4,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
 use crate::candidate::BloomFilter;
 use crate::candidate::grams::{GramSizes, pack_exact_gram};
 use crate::perf::{record_counter, record_max, scope};
@@ -295,6 +296,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     let mut trailing = Vec::<u8>::new();
     let mut buf = vec![0u8; chunk_size];
     let mut gram_windows = 0u64;
+    let mut processed_bytes = 0u64;
 
     loop {
         let read_len = file.read(&mut buf)?;
@@ -306,22 +308,30 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
         digest.update(chunk);
         let mut data = trailing.clone();
         data.extend_from_slice(chunk);
+        let data_start_offset = processed_bytes.saturating_sub(trailing.len() as u64);
         if data.len() < gram_sizes.tier1 {
             trailing = data;
+            processed_bytes = processed_bytes.saturating_add(read_len as u64);
             continue;
         }
         for idx in 0..=(data.len() - gram_sizes.tier1) {
-            bloom.add(pack_exact_gram(&data[idx..idx + gram_sizes.tier1]))?;
+            let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier1]);
+            let lane = ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
+            bloom.add_in_lane(gram, lane, DEFAULT_BLOOM_POSITION_LANES)?;
             gram_windows = gram_windows.saturating_add(1);
         }
         if let Some(tier2_bloom_ref) = tier2_bloom.as_mut() {
             if data.len() >= gram_sizes.tier2 {
                 for idx in 0..=(data.len() - gram_sizes.tier2) {
-                    tier2_bloom_ref.add(pack_exact_gram(&data[idx..idx + gram_sizes.tier2]))?;
+                    let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier2]);
+                    let lane =
+                        ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
+                    tier2_bloom_ref.add_in_lane(gram, lane, DEFAULT_BLOOM_POSITION_LANES)?;
                 }
             }
         }
         trailing = data[data.len() - trailing_bytes..].to_vec();
+        processed_bytes = processed_bytes.saturating_add(read_len as u64);
     }
 
     let digest_bytes = digest.finalize();

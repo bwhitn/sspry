@@ -5218,6 +5218,7 @@ fn compiled_query_plan_to_wire(plan: &CompiledQueryPlan) -> Value {
                 "id": pattern.pattern_id,
                 "alternatives": pattern.alternatives,
                 "tier2_alternatives": pattern.tier2_alternatives,
+                "fixed_literals": pattern.fixed_literals,
             })
         }).collect::<Vec<_>>(),
         "ast": query_node_to_wire(&plan.root),
@@ -5257,9 +5258,15 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_else(|| vec![Value::Array(Vec::new()); alternatives_raw.len()]);
+        let fixed_literals_raw = object
+            .get("fixed_literals")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![Value::Array(Vec::new()); alternatives_raw.len()]);
         let alt_count = alternatives_raw.len();
         let mut alternatives = Vec::with_capacity(alt_count);
         let mut tier2_alternatives = Vec::with_capacity(alt_count);
+        let mut fixed_literals = Vec::with_capacity(alt_count);
         for alt in alternatives_raw {
             let grams = alt
                 .as_array()
@@ -5291,12 +5298,34 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         while tier2_alternatives.len() < alternatives.len() {
             tier2_alternatives.push(Vec::new());
         }
-        let alt_count = tier2_alternatives.len();
+        for literal in fixed_literals_raw.into_iter().take(alt_count) {
+            let bytes = literal
+                .as_array()
+                .ok_or_else(|| {
+                    SspryError::from("pattern fixed_literals entries must be byte lists")
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .ok_or_else(|| SspryError::from("pattern fixed literal byte out of range"))
+                        .and_then(|byte| {
+                            u8::try_from(byte).map_err(|_| {
+                                SspryError::from("pattern fixed literal byte out of range")
+                            })
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            fixed_literals.push(bytes);
+        }
+        while fixed_literals.len() < alternatives.len() {
+            fixed_literals.push(Vec::new());
+        }
         patterns.push(PatternPlan {
             pattern_id,
             alternatives,
             tier2_alternatives,
-            fixed_literals: vec![Vec::new(); alt_count],
+            fixed_literals,
         });
     }
 
@@ -5810,9 +5839,25 @@ mod tests {
     use std::io::Cursor;
     use std::net::TcpListener;
 
+    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
+    use crate::candidate::BloomFilter;
     use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
     use base64::Engine;
     use tempfile::tempdir;
+
+    fn lane_bloom_bytes(filter_bytes: usize, bloom_hashes: usize, grams: &[u64]) -> Vec<u8> {
+        let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");
+        for (idx, gram) in grams.iter().enumerate() {
+            bloom
+                .add_in_lane(
+                    *gram,
+                    idx % DEFAULT_BLOOM_POSITION_LANES,
+                    DEFAULT_BLOOM_POSITION_LANES,
+                )
+                .expect("add gram");
+        }
+        bloom.into_bytes()
+    }
 
     fn sample_server_state(base: &Path) -> Arc<ServerState> {
         Arc::new(
@@ -5970,11 +6015,8 @@ mod tests {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(1024, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(1024, 7, &[gram]));
         let plan = CompiledQueryPlan {
             patterns: vec![PatternPlan {
                 pattern_id: "$a".to_owned(),
@@ -7313,11 +7355,7 @@ mod tests {
         )
         .expect("init");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            bloom.into_bytes()
-        };
+        let bloom_filter = lane_bloom_bytes(32, 7, &[gram]);
 
         for byte in [0x11u8, 0x22u8] {
             store
@@ -8628,11 +8666,8 @@ rule q {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state_with_shards(tmp.path(), 2);
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(1024, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(1024, 7, &[gram]));
         let plan = CompiledQueryPlan {
             patterns: vec![PatternPlan {
                 pattern_id: "$a".to_owned(),
@@ -8881,11 +8916,8 @@ rule q {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state_with_shards(tmp.path(), 1);
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(1024, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(1024, 7, &[gram]));
         let inserted = state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: "AA".repeat(32),
@@ -8981,11 +9013,8 @@ rule q {
         )
         .expect("server state");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(16, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(16, 7, &[gram]));
         let mut docs = Vec::new();
         for byte in 1_u8..=64 {
             let sha = [byte; 32];
@@ -9114,11 +9143,8 @@ rule q {
             .expect("server state"),
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(32, 7, &[gram]));
 
         for byte in [0x11u8, 0x22u8] {
             state
@@ -9205,11 +9231,8 @@ rule q {
             .expect("server state"),
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(32, 7, &[gram]));
 
         let mut deleted_sha = None;
         for byte in 1u8..=32 {
@@ -9287,11 +9310,8 @@ rule q {
             .expect("server state"),
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = {
-            let mut bloom = crate::candidate::BloomFilter::new(32, 7).expect("bloom");
-            bloom.add(gram).expect("add gram");
-            base64::engine::general_purpose::STANDARD.encode(bloom.into_bytes())
-        };
+        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
+            .encode(lane_bloom_bytes(32, 7, &[gram]));
 
         for byte in [0x11u8, 0x22u8] {
             state
