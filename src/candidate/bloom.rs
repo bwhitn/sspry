@@ -49,12 +49,54 @@ pub fn bloom_byte_masks(
     Ok(masks.into_iter().collect())
 }
 
+pub fn bloom_word_masks(
+    values: &[u64],
+    size_bytes: usize,
+    hash_count: usize,
+) -> Result<Vec<(usize, u64)>> {
+    if size_bytes == 0 {
+        return Err(SspryError::from("size_bytes must be > 0"));
+    }
+    if hash_count == 0 {
+        return Err(SspryError::from("hash_count must be > 0"));
+    }
+    let bits = size_bytes * 8;
+    let mut masks = std::collections::BTreeMap::<usize, u64>::new();
+    for value in values {
+        for pos in bloom_positions(*value, bits, hash_count)? {
+            let word_idx = pos / 64;
+            let bit_idx = pos % 64;
+            *masks.entry(word_idx).or_insert(0) |= 1u64 << bit_idx;
+        }
+    }
+    Ok(masks.into_iter().collect())
+}
+
 pub fn raw_filter_matches_masks(raw_filter: &[u8], required_masks: &[(usize, u8)]) -> bool {
     for (byte_idx, mask) in required_masks {
         if *byte_idx >= raw_filter.len() {
             return false;
         }
         if (raw_filter[*byte_idx] & *mask) != *mask {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn raw_filter_matches_word_masks(raw_filter: &[u8], required_masks: &[(usize, u64)]) -> bool {
+    for (word_idx, mask) in required_masks {
+        let start = word_idx.saturating_mul(8);
+        let end = start.saturating_add(8);
+        if end > raw_filter.len() {
+            return false;
+        }
+        let actual = u64::from_le_bytes(
+            raw_filter[start..end]
+                .try_into()
+                .expect("word-sized bloom slice"),
+        );
+        if (actual & *mask) != *mask {
             return false;
         }
     }
@@ -140,7 +182,10 @@ impl BloomFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::{BloomFilter, bloom_byte_masks, bloom_positions, raw_filter_matches_masks};
+    use super::{
+        BloomFilter, bloom_byte_masks, bloom_positions, bloom_word_masks, raw_filter_matches_masks,
+        raw_filter_matches_word_masks,
+    };
 
     #[test]
     fn bloom_round_trip_contains_inserted_value() {
@@ -174,11 +219,25 @@ mod tests {
     }
 
     #[test]
+    fn raw_word_masks_match_inserted_values() {
+        let grams = [0x0102_0304, 0xAABB_CCDD_1020_3040];
+        let mut bloom = BloomFilter::new(128, 7).expect("bloom");
+        for gram in grams {
+            bloom.add(gram).expect("add");
+        }
+        let required = bloom_word_masks(&grams, 128, 7).expect("required word masks");
+        assert!(raw_filter_matches_word_masks(bloom.as_bytes(), &required));
+        assert!(!raw_filter_matches_word_masks(&[0u8; 128], &required));
+    }
+
+    #[test]
     fn bloom_validation_and_roundtrip_helpers_cover_remaining_paths() {
         assert!(bloom_positions(1, 0, 1).is_err());
         assert!(bloom_positions(1, 64, 0).is_err());
         assert!(bloom_byte_masks(&[1], 0, 1).is_err());
+        assert!(bloom_word_masks(&[1], 0, 1).is_err());
         assert!(bloom_byte_masks(&[1], 8, 0).is_err());
+        assert!(bloom_word_masks(&[1], 8, 0).is_err());
         assert!(BloomFilter::new(0, 1).is_err());
         assert!(BloomFilter::new(8, 0).is_err());
         assert!(BloomFilter::from_bytes(&[], 1).is_err());
@@ -201,10 +260,16 @@ mod tests {
         let encoded = bloom.into_bytes();
         assert_eq!(encoded.len(), 32);
         let required = bloom_byte_masks(&[0x0102_0304], 32, 3).expect("required");
+        let required_words = bloom_word_masks(&[0x0102_0304], 32, 3).expect("required words");
         assert!(raw_filter_matches_masks(&encoded, &required));
+        assert!(raw_filter_matches_word_masks(&encoded, &required_words));
         assert!(!raw_filter_matches_masks(
             &encoded,
             &[(encoded.len(), 0x01)]
+        ));
+        assert!(!raw_filter_matches_word_masks(
+            &encoded,
+            &[(encoded.len() / 8, 0x01)]
         ));
     }
 }

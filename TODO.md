@@ -358,12 +358,27 @@ Immediate search improvements on the bloom-only baseline:
   - metadata is no longer the problem
   - planner/DF work is no longer the problem
   - block admission is doing no useful filtering on the `50k` `32 KiB` baseline
-  - next experiment order should be:
-    1. `64 KiB` and `128 KiB` superblock summary caps
-    2. block-level bloom read batching/locality work if block skipping is still weak
-    3. only then revisit more invasive search parallelism ideas
+  - `64 KiB` helped some search totals on `50k`, but still skipped `0` superblocks and still loaded all `50,000` tier1 blooms
+  - the next useful lever was smaller blocks plus a non-folded block-summary shape, not larger folded summaries
 5. bloom-size cleanup:
   - new chosen bloom sizes should stay aligned to `8` bytes so future `u64`-oriented bloom paths remain possible without another format change
+6. current local accepted search slice:
+  - block summaries now use sampled exact `u64` words instead of modulo-folded OR summaries
+  - search mask evaluation now uses `u64` word masks
+  - admitted blocks prefetch tier1 bloom slices before per-doc evaluation
+  - default `docs_per_block` is now `32` and still scales upward under the existing superblock-memory budget
+  - local `26k` smoke comparison:
+    - previous `128`-doc blocks:
+      - artifact: `/root/pertest/results/sspry_searchsmoke_26000_32k_20260319_r1/search_summary.json`
+      - `index_wall_ms = 722,055`
+      - superblocks skipped per supported rule: `0-1`
+      - `01`: `6.128 s`
+    - new `32`-doc blocks:
+      - artifact: `/root/pertest/results/sspry_searchsmoke_26000_32k_20260319_r2_block32/search_summary.json`
+      - `index_wall_ms = 561,343`
+      - superblocks skipped per supported rule: `10-49`
+      - `01`: `1.104 s`
+  - next validation should be the full `50k` `32 KiB` search profile on this new baseline before trying more summary-cap increases
 
 Current local `26k` smoke check for the lazy-load search patch:
 - artifact:
