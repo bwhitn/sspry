@@ -479,6 +479,40 @@ Current local search-worker follow-up:
   - all six supported rules completed without timeout on the `26k` smoke run
   - next validation should be the same search pack on the `50k` `32 KiB` baseline
 
+Correctness fix for the lane-aware experiment:
+- root cause:
+  - the client compiled `PatternPlan.fixed_literals`, but RPC dropped them on the wire
+  - the server rebuilt every query plan with empty `fixed_literals`
+  - lane-aware mask construction then fell back to synthetic gram-index positions, which broke wide-literal matching
+- fix:
+  - commit `9b78b16` restored `fixed_literals` in `compiled_query_plan_to_wire()` / `compiled_query_plan_from_wire()`
+  - focused regression:
+    - `cargo test -q search_supports_time_now_and_wide_literal_conditions --test test_cli_compat`
+  - full suite:
+    - `161 + 7 + 16 + 1` tests passed
+
+Corrected `2000`-file published smoke on the lane-aware path:
+- artifact:
+  - `/root/pertest/results/sspry_smoke_laneaware_2000_20260319_r1`
+- index/publish:
+  - `elapsed_ms = 70,312`
+  - `files_per_minute_wall = 1706.3`
+  - `server_peak_rss_kb = 370,612`
+  - `last_publish_duration_ms = 83`
+  - `last_publish_reused_work_stores = true`
+- supported-rule search totals:
+  - `01`: `0.321 s`, `docs_scanned = 1,753`, `superblocks_skipped = 44`
+  - `08`: `0.147 s`, `docs_scanned = 1,988`, `superblocks_skipped = 5`
+  - `09`: `0.322 s`, `docs_scanned = 1,958`, `superblocks_skipped = 13`
+  - `10`: `0.398 s`, `docs_scanned = 1,226`, `superblocks_skipped = 117`
+  - `11`: `0.298 s`, `docs_scanned = 1,795`, `superblocks_skipped = 39`
+  - `12`: `0.197 s`, `docs_scanned = 1,938`, `superblocks_skipped = 18`
+- read:
+  - correctness is fixed, but the lane-aware layout regressed block rejection versus the prior worker-path baseline
+  - search is worse on `01/08/09/11/12` and only marginally acceptable on `10`
+  - this is not a good enough shape to justify a `50k` rerun yet
+  - next search work should not be another `50k` measurement; it should be a different block-gate design
+
 Rejected follow-ups on top of the worker path:
 - sampled lane summaries inside `32`-doc blocks
   - artifact:
