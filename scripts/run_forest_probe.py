@@ -248,6 +248,7 @@ def main() -> int:
         tree_run_dir.mkdir(parents=True, exist_ok=True)
         db_root = db_base / tree_name
         addr = f'127.0.0.1:{args.base_port + idx}'
+        print(f'index.start tree={tree_name} addr={addr} manifest={manifest}', flush=True)
         server = subprocess.Popen(
             [
                 str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',
@@ -289,6 +290,11 @@ def main() -> int:
                 'dir_stats': json.loads((tree_run_dir / 'final.dir_stats.json').read_text()),
             }
             forest_summary['trees'].append(tree_record)
+            print(
+                f"index.done tree={tree_name} files={tree_record['files']} wall_s={elapsed_s:.3f} "
+                f"db_bytes={tree_record['dir_stats']['db_bytes']}",
+                flush=True,
+            )
         finally:
             shutdown_server(sspry, addr, server, tree_run_dir)
 
@@ -312,9 +318,11 @@ def main() -> int:
 
         searches_dir.mkdir(parents=True, exist_ok=True)
         search_summary = []
+        print(f'search.start trees={len(search_servers)}', flush=True)
         for rule in sorted(rules_dir.glob('*.yar')):
             started = time.time()
             per_tree = []
+            print(f'search.rule.start rule={rule.name}', flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(search_servers)) as pool:
                 future_map = {
                     pool.submit(run_search_one, sspry, addr, rule, args.search_timeout_s): (addr, tree_run_dir)
@@ -332,7 +340,13 @@ def main() -> int:
                     record['tree'] = tree_run_dir.name
                     per_tree.append(record)
             per_tree.sort(key=lambda item: item['tree'])
-            search_summary.append(aggregate_rule_results(rule, per_tree, (time.time() - started) * 1000.0))
+            aggregated = aggregate_rule_results(rule, per_tree, (time.time() - started) * 1000.0)
+            search_summary.append(aggregated)
+            print(
+                f"search.rule.done rule={rule.name} exit={aggregated['exit_code']} "
+                f"wall_ms={aggregated['elapsed_ms_wall_parallel']:.3f}",
+                flush=True,
+            )
         (run_dir / 'search_summary.json').write_text(json.dumps(search_summary, indent=2, sort_keys=True))
     finally:
         for addr, server, tree_run_dir in search_servers:
@@ -348,6 +362,11 @@ def main() -> int:
         int(tree['post_publish_info'].get('peak_rss_kb', 0)) for tree in forest_summary['trees']
     ) if forest_summary['trees'] else 0
     (run_dir / 'forest_summary.json').write_text(json.dumps(forest_summary, indent=2, sort_keys=True))
+    print(
+        f"forest.done trees={forest_summary['tree_count']} total_index_wall_s={total_index_wall_s:.3f} "
+        f"avg_files_per_min={forest_summary['avg_index_files_per_minute']:.3f}",
+        flush=True,
+    )
     return 0
 
 
