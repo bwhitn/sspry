@@ -452,8 +452,19 @@ Current indexing follow-up:
       - regressed `store_us` and `append_sidecars_us` versus the exact-capacity baseline
       - reject as the default path
 - next target on the accepted exact-capacity baseline:
-  - profile the publish-tail regression seen on the `50k` exact-capacity run (`publish_ms = 11,605` versus `81`)
-  - focus on publish/snapshot/seal path before touching `tier2_update` again
+  - done: split publish timing into actual publish time and publish lock wait
+  - rerun artifact:
+    - `/root/pertest/results/sspry_publishprobe_50000_appendcap_20260319_r2`
+  - read:
+    - `last_publish_duration_ms = 94`
+    - `last_publish_lock_wait_ms = 0`
+    - `last_publish_swap_ms = 0`
+    - `last_publish_init_work_ms = 91`
+    - `last_publish_persisted_snapshot_shards = 256`
+  - conclusion:
+    - the earlier `11,605 ms` publish tail was not reproducible on the accepted exact-capacity baseline
+    - publish is not the current blocker
+    - move back to the ingest slope and the hottest remaining write-path buckets
 - next validation:
   - rerun a quick `26k` or `50k` ingest slice on the batched doc-record path before doing larger-corpus indexing again
 

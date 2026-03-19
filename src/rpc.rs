@@ -409,6 +409,7 @@ struct ServerState {
     last_publish_started_unix_ms: AtomicU64,
     last_publish_completed_unix_ms: AtomicU64,
     last_publish_duration_ms: AtomicU64,
+    last_publish_lock_wait_ms: AtomicU64,
     last_publish_swap_ms: AtomicU64,
     last_publish_promote_work_ms: AtomicU64,
     last_publish_promote_work_export_ms: AtomicU64,
@@ -1614,6 +1615,7 @@ impl ServerState {
             last_publish_started_unix_ms: AtomicU64::new(0),
             last_publish_completed_unix_ms: AtomicU64::new(0),
             last_publish_duration_ms: AtomicU64::new(0),
+            last_publish_lock_wait_ms: AtomicU64::new(0),
             last_publish_swap_ms: AtomicU64::new(0),
             last_publish_promote_work_ms: AtomicU64::new(0),
             last_publish_promote_work_export_ms: AtomicU64::new(0),
@@ -3081,6 +3083,10 @@ impl ServerState {
                 json!(self.last_publish_duration_ms.load(Ordering::Acquire)),
             );
             publish.insert(
+                "last_publish_lock_wait_ms".to_owned(),
+                json!(self.last_publish_lock_wait_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
                 "last_publish_swap_ms".to_owned(),
                 json!(self.last_publish_swap_ms.load(Ordering::Acquire)),
             );
@@ -3483,6 +3489,10 @@ impl ServerState {
             publish.insert(
                 "last_publish_duration_ms".to_owned(),
                 json!(self.last_publish_duration_ms.load(Ordering::Acquire)),
+            );
+            publish.insert(
+                "last_publish_lock_wait_ms".to_owned(),
+                json!(self.last_publish_lock_wait_ms.load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_swap_ms".to_owned(),
@@ -4624,9 +4634,8 @@ impl ServerState {
         }
         self.publish_in_progress.store(true, Ordering::SeqCst);
         let result = (|| -> Result<CandidatePublishResponse> {
-            let publish_started_unix_ms = current_unix_ms();
-            self.last_publish_started_unix_ms
-                .store(publish_started_unix_ms, Ordering::SeqCst);
+            let publish_lock_wait_started = Instant::now();
+            self.last_publish_lock_wait_ms.store(0, Ordering::SeqCst);
             self.last_publish_promote_work_ms.store(0, Ordering::SeqCst);
             self.last_publish_promote_work_export_ms
                 .store(0, Ordering::SeqCst);
@@ -4650,6 +4659,17 @@ impl ServerState {
                 .operation_gate
                 .write()
                 .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
+            self.last_publish_lock_wait_ms.store(
+                publish_lock_wait_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            let publish_started_unix_ms = current_unix_ms();
+            self.last_publish_started_unix_ms
+                .store(publish_started_unix_ms, Ordering::SeqCst);
             let (
                 workspace_root,
                 current_root,
@@ -5839,8 +5859,8 @@ mod tests {
     use std::io::Cursor;
     use std::net::TcpListener;
 
-    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::BloomFilter;
+    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
     use base64::Engine;
     use tempfile::tempdir;
@@ -6015,8 +6035,8 @@ mod tests {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(1024, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
         let plan = CompiledQueryPlan {
             patterns: vec![PatternPlan {
                 pattern_id: "$a".to_owned(),
@@ -8666,8 +8686,8 @@ rule q {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state_with_shards(tmp.path(), 2);
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(1024, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
         let plan = CompiledQueryPlan {
             patterns: vec![PatternPlan {
                 pattern_id: "$a".to_owned(),
@@ -8916,8 +8936,8 @@ rule q {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state_with_shards(tmp.path(), 1);
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(1024, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
         let inserted = state
             .handle_candidate_insert(&CandidateDocumentWire {
                 sha256: "AA".repeat(32),
@@ -9013,8 +9033,8 @@ rule q {
         )
         .expect("server state");
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(16, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(16, 7, &[gram]));
         let mut docs = Vec::new();
         for byte in 1_u8..=64 {
             let sha = [byte; 32];
@@ -9143,8 +9163,8 @@ rule q {
             .expect("server state"),
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(32, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
 
         for byte in [0x11u8, 0x22u8] {
             state
@@ -9231,8 +9251,8 @@ rule q {
             .expect("server state"),
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(32, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
 
         let mut deleted_sha = None;
         for byte in 1u8..=32 {
@@ -9310,8 +9330,8 @@ rule q {
             .expect("server state"),
         );
         let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
-        let bloom_filter_b64 = base64::engine::general_purpose::STANDARD
-            .encode(lane_bloom_bytes(32, 7, &[gram]));
+        let bloom_filter_b64 =
+            base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
 
         for byte in [0x11u8, 0x22u8] {
             state

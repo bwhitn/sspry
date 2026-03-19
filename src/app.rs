@@ -2170,6 +2170,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_duration_ms",
                         ),
                         (
+                            "last_publish_lock_wait_ms",
+                            "verbose.index.server_last_publish_lock_wait_ms",
+                        ),
+                        (
                             "last_publish_swap_ms",
                             "verbose.index.server_last_publish_swap_ms",
                         ),
