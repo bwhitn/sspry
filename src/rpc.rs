@@ -5669,7 +5669,10 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
                 return Err(SspryError::from("time_now_eq node must not have children"));
             }
         }
-        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" => {
+        "verifier_only_eq"
+        | "verifier_only_at"
+        | "verifier_only_count"
+        | "verifier_only_in_range" => {
             if pattern_id.as_deref().unwrap_or_default().is_empty() {
                 return Err(SspryError::from(format!(
                     "{kind} node requires a non-empty pattern_id"
@@ -8218,6 +8221,19 @@ mod tests {
             Some("count:$a:gt:2")
         );
         assert_eq!(verifier_only_count.threshold, None);
+
+        let verifier_only_in_range = query_node_from_wire(&serde_json::json!({
+            "kind": "verifier_only_in_range",
+            "pattern_id": "range:$a:filesize-256:filesize",
+            "children": []
+        }))
+        .expect("verifier_only_in_range");
+        assert_eq!(verifier_only_in_range.kind, "verifier_only_in_range");
+        assert_eq!(
+            verifier_only_in_range.pattern_id.as_deref(),
+            Some("range:$a:filesize-256:filesize")
+        );
+        assert_eq!(verifier_only_in_range.threshold, None);
 
         assert!(
             query_node_from_wire(&serde_json::json!({

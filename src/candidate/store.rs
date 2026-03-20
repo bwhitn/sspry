@@ -4969,6 +4969,7 @@ fn node_structurally_impossible(node: &QueryNode) -> bool {
         "verifier_only_eq" => false,
         "verifier_only_at" => false,
         "verifier_only_count" => false,
+        "verifier_only_in_range" => false,
         "filesize_eq" => false,
         "filesize_lt" => false,
         "filesize_le" => false,
@@ -5295,6 +5296,7 @@ fn tree_maybe_matches_node(
         "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
+        | "verifier_only_in_range"
         | "filesize_eq"
         | "filesize_lt"
         | "filesize_le"
@@ -5429,6 +5431,7 @@ fn block_maybe_matches_node(
         "verifier_only_eq" => Ok(true),
         "verifier_only_at" => Ok(true),
         "verifier_only_count" => Ok(true),
+        "verifier_only_in_range" => Ok(true),
         "filesize_eq" => Ok(true),
         "filesize_lt" => Ok(true),
         "filesize_le" => Ok(true),
@@ -5659,7 +5662,10 @@ where
                 score: 0,
             })
         }
-        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" => Ok(MatchOutcome {
+        "verifier_only_eq"
+        | "verifier_only_at"
+        | "verifier_only_count"
+        | "verifier_only_in_range" => Ok(MatchOutcome {
             matched: true,
             tiers: TierFlags::default(),
             score: 0,

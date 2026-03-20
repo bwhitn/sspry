@@ -72,15 +72,19 @@ enum Token {
     LParen,
     RParen,
     Comma,
+    DotDot,
     EqEq,
     Gt,
     Ge,
     Lt,
     Le,
+    Plus,
+    Minus,
     And,
     Any,
     All,
     At,
+    In,
     Not,
     Or,
     Of,
@@ -100,6 +104,14 @@ enum NumericReadKind {
 }
 
 const NUMERIC_READ_ANCHOR_PREFIX: &str = "__numeric_eq_anchor_";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RangeBoundExpr {
+    Literal(usize),
+    Filesize,
+    FilesizePlus(usize),
+    FilesizeMinus(usize),
+}
 
 struct ConditionParser {
     tokens: Vec<Token>,
@@ -248,6 +260,37 @@ impl ConditionParser {
                             QueryNode {
                                 kind: "verifier_only_at".to_owned(),
                                 pattern_id: Some(format!("{raw_id}@{offset}")),
+                                threshold: None,
+                                children: Vec::new(),
+                            },
+                        ],
+                    });
+                }
+                if matches!(self.peek(), Some(Token::In)) {
+                    self.consume(Some(&Token::In))?;
+                    self.consume(Some(&Token::LParen))?;
+                    let start = self.parse_range_bound_expr()?;
+                    self.consume(Some(&Token::DotDot))?;
+                    let end = self.parse_range_bound_expr()?;
+                    self.consume(Some(&Token::RParen))?;
+                    return Ok(QueryNode {
+                        kind: "and".to_owned(),
+                        pattern_id: None,
+                        threshold: None,
+                        children: vec![
+                            QueryNode {
+                                kind: "pattern".to_owned(),
+                                pattern_id: Some(raw_id.clone()),
+                                threshold: None,
+                                children: Vec::new(),
+                            },
+                            QueryNode {
+                                kind: "verifier_only_in_range".to_owned(),
+                                pattern_id: Some(format!(
+                                    "range:{raw_id}:{}:{}",
+                                    encode_range_bound_expr(&start),
+                                    encode_range_bound_expr(&end)
+                                )),
                                 threshold: None,
                                 children: Vec::new(),
                             },
@@ -524,6 +567,41 @@ impl ConditionParser {
         })
     }
 
+    fn parse_range_bound_expr(&mut self) -> Result<RangeBoundExpr> {
+        match self.consume(None)? {
+            Token::Int(value) => Ok(RangeBoundExpr::Literal(value)),
+            Token::Name(name) if name == "filesize" => match self.peek() {
+                Some(Token::Plus) => {
+                    self.consume(Some(&Token::Plus))?;
+                    let Token::Int(value) = self.consume(None)? else {
+                        return Err(SspryError::from(
+                            "filesize range arithmetic requires an integer literal.",
+                        ));
+                    };
+                    Ok(RangeBoundExpr::FilesizePlus(value))
+                }
+                Some(Token::Minus) => {
+                    self.consume(Some(&Token::Minus))?;
+                    let Token::Int(value) = self.consume(None)? else {
+                        return Err(SspryError::from(
+                            "filesize range arithmetic requires an integer literal.",
+                        ));
+                    };
+                    Ok(RangeBoundExpr::FilesizeMinus(value))
+                }
+                _ => Ok(RangeBoundExpr::Filesize),
+            },
+            Token::LParen => {
+                let expr = self.parse_range_bound_expr()?;
+                self.consume(Some(&Token::RParen))?;
+                Ok(expr)
+            }
+            token => Err(SspryError::from(format!(
+                "Expected range bound expression, got {token:?}"
+            ))),
+        }
+    }
+
     fn parse_n_of_targets(&mut self) -> Result<Vec<QueryNode>> {
         let pattern_ids = match self.peek() {
             Some(Token::LParen) => self.parse_n_of_target_list()?,
@@ -644,6 +722,23 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 index += 1;
                 continue;
             }
+            '+' => {
+                tokens.push(Token::Plus);
+                index += 1;
+                continue;
+            }
+            '-' => {
+                tokens.push(Token::Minus);
+                index += 1;
+                continue;
+            }
+            '.' => {
+                if chars.get(index + 1) == Some(&'.') {
+                    tokens.push(Token::DotDot);
+                    index += 2;
+                    continue;
+                }
+            }
             '=' => {
                 if chars.get(index + 1) == Some(&'=') {
                     tokens.push(Token::EqEq);
@@ -724,7 +819,7 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
             while index < chars.len() && chars[index].is_ascii_digit() {
                 index += 1;
             }
-            if matches!(chars.get(index), Some('.')) {
+            if matches!(chars.get(index), Some('.')) && !matches!(chars.get(index + 1), Some('.')) {
                 let dot = index;
                 index += 1;
                 let frac_start = index;
@@ -753,7 +848,6 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
             if number_end < index {
                 let suffix: String = chars[number_end..index].iter().collect();
                 let multiplier = match suffix.to_ascii_lowercase().as_str() {
-                    "b" => 1usize,
                     "kb" => 1024usize,
                     "mb" => 1024usize * 1024usize,
                     "gb" => 1024usize * 1024usize * 1024usize,
@@ -784,6 +878,7 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 "any" => tokens.push(Token::Any),
                 "all" => tokens.push(Token::All),
                 "at" => tokens.push(Token::At),
+                "in" => tokens.push(Token::In),
                 "not" => tokens.push(Token::Not),
                 "or" => tokens.push(Token::Or),
                 "of" => tokens.push(Token::Of),
@@ -802,6 +897,15 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
         )));
     }
     Ok(tokens)
+}
+
+fn encode_range_bound_expr(expr: &RangeBoundExpr) -> String {
+    match expr {
+        RangeBoundExpr::Literal(value) => value.to_string(),
+        RangeBoundExpr::Filesize => "filesize".to_owned(),
+        RangeBoundExpr::FilesizePlus(value) => format!("filesize+{value}"),
+        RangeBoundExpr::FilesizeMinus(value) => format!("filesize-{value}"),
+    }
 }
 
 fn grams_from_bytes(blob: &[u8], gram_size: usize) -> Vec<u64> {
@@ -1948,7 +2052,7 @@ fn inject_numeric_read_anchor_patterns(
 fn contains_verifier_only_node(node: &QueryNode) -> bool {
     matches!(
         node.kind.as_str(),
-        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count"
+        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" | "verifier_only_in_range"
     ) || node.children.iter().any(contains_verifier_only_node)
 }
 
@@ -2031,6 +2135,9 @@ pub fn evaluate_fixed_literal_match(
         "verifier_only_count" => Err(SspryError::from(
             "verifier_only_count requires file verification and cannot use the fixed-literal fast path",
         )),
+        "verifier_only_in_range" => Err(SspryError::from(
+            "verifier_only_in_range requires file verification and cannot use the fixed-literal fast path",
+        )),
         "metadata_eq" => Err(SspryError::from(
             "metadata_eq requires stored metadata and cannot use the fixed-literal fast path",
         )),
@@ -2097,7 +2204,8 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
         | "time_now_eq"
         | "verifier_only_eq"
         | "verifier_only_at"
-        | "verifier_only_count" => u128::MAX / 2,
+        | "verifier_only_count"
+        | "verifier_only_in_range" => u128::MAX / 2,
         "or" => node
             .children
             .iter()
@@ -2688,6 +2796,12 @@ rule numeric_only_unanchorable {
                 > 4
         );
         assert!(
+            tokenize_condition("filesize == 8B")
+                .expect_err("reject non-yara byte suffix")
+                .to_string()
+                .contains("Unsupported numeric suffix")
+        );
+        assert!(
             tokenize_condition("PE.Machine == 0x14c and pe.is_pe == true and time.now == 42")
                 .expect("tokenize metadata condition")
                 .len()
@@ -2704,6 +2818,12 @@ rule numeric_only_unanchorable {
                 .expect("tokenize count/at condition")
                 .len()
                 > 6
+        );
+        assert!(
+            tokenize_condition("$a in (filesize - 256 .. filesize)")
+                .expect("tokenize range condition")
+                .len()
+                > 8
         );
         assert!(
             tokenize_condition("@")
@@ -2831,6 +2951,22 @@ rule numeric_only_unanchorable {
         assert_eq!(
             count_node.children[1].pattern_id.as_deref(),
             Some("count:$a:gt:2")
+        );
+
+        let mut parser = ConditionParser::new(
+            "$a in (filesize - 256 .. filesize)",
+            HashSet::from(["$a".to_owned()]),
+        )
+        .expect("parser");
+        let range_node = parser.parse().expect("range parse");
+        assert_eq!(range_node.kind, "and");
+        assert_eq!(range_node.children.len(), 2);
+        assert_eq!(range_node.children[0].kind, "pattern");
+        assert_eq!(range_node.children[0].pattern_id.as_deref(), Some("$a"));
+        assert_eq!(range_node.children[1].kind, "verifier_only_in_range");
+        assert_eq!(
+            range_node.children[1].pattern_id.as_deref(),
+            Some("range:$a:filesize-256:filesize")
         );
 
         let mut parser = ConditionParser::new(
