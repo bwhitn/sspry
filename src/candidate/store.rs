@@ -255,6 +255,16 @@ pub struct CandidateStats {
     pub tier2_superblock_count: usize,
     pub tier2_superblock_docs: usize,
     pub tier2_superblock_summary_bytes: u64,
+    pub tier1_superblock_summary_bytes: u64,
+    pub tier2_pattern_superblock_summary_bytes: u64,
+    pub tier1_superblock_positions_bytes: u64,
+    pub tier2_pattern_superblock_positions_bytes: u64,
+    pub tree_tier1_gate_bytes: u64,
+    pub tree_tier2_gate_bytes: u64,
+    pub mapped_bloom_bytes: u64,
+    pub mapped_tier2_bloom_bytes: u64,
+    pub mapped_metadata_bytes: u64,
+    pub mapped_external_id_bytes: u64,
     pub tier2_superblock_memory_budget_bytes: u64,
 }
 
@@ -490,7 +500,11 @@ impl BlobSidecar {
         let mut file = fs::File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes)?;
+        file.read_exact(&mut bytes).map_err(|err| {
+            SspryError::from(format!(
+                "Invalid {label} payload stored for doc_id {doc_id}: {err}"
+            ))
+        })?;
         Ok(Cow::Owned(bytes))
     }
 
@@ -510,6 +524,13 @@ impl BlobSidecar {
             )));
         }
         Ok(Some(&mmap[start..end]))
+    }
+
+    fn mapped_bytes(&self) -> u64 {
+        self.mmap
+            .as_ref()
+            .map(|mmap| mmap.len() as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -557,6 +578,15 @@ impl StoreSidecars {
         self.tier2_blooms.retarget(tier2_blooms_path(root));
         self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
+    }
+
+    fn mapped_bytes(&self) -> (u64, u64, u64, u64) {
+        (
+            self.blooms.mapped_bytes(),
+            self.tier2_blooms.mapped_bytes(),
+            self.metadata.mapped_bytes(),
+            self.external_ids.mapped_bytes(),
+        )
     }
 }
 
@@ -708,6 +738,16 @@ impl Tier2SuperblockIndex {
         }
         out
     }
+
+    fn positions_memory_bytes(&self) -> u64 {
+        self.positions_by_bucket
+            .values()
+            .flat_map(|blocks| blocks.iter())
+            .map(|positions| {
+                (positions.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64)
+            })
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -716,6 +756,15 @@ struct TreeBloomGateIndex {
     summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
     masks_by_bucket: BTreeMap<(usize, usize), Vec<u8>>,
     summary_memory_bytes: u64,
+}
+
+impl TreeBloomGateIndex {
+    fn memory_bytes(&self) -> u64 {
+        self.masks_by_bucket
+            .values()
+            .map(|mask| mask.len() as u64)
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2894,7 +2943,13 @@ impl CandidateStore {
             &plan.root,
             &prepared.mask_cache,
             &self.tree_tier1_gates,
+            &self.tier2_superblocks,
             &self.tree_tier2_gates,
+            if self.tier2_pattern_superblocks.masks_by_bucket.is_empty() {
+                None
+            } else {
+                Some(&self.tier2_pattern_superblocks)
+            },
             allow_block_skip,
         )?;
         let has_special_docs = self.has_live_special_docs();
@@ -3135,6 +3190,12 @@ impl CandidateStore {
         } else {
             0.0
         };
+        let (
+            mapped_bloom_bytes,
+            mapped_tier2_bloom_bytes,
+            mapped_metadata_bytes,
+            mapped_external_id_bytes,
+        ) = self.sidecars.mapped_bytes();
         CandidateStats {
             doc_count,
             deleted_doc_count,
@@ -3167,6 +3228,20 @@ impl CandidateStore {
                 .tier2_superblocks
                 .summary_memory_bytes
                 .saturating_add(self.tier2_pattern_superblocks.summary_memory_bytes),
+            tier1_superblock_summary_bytes: self.tier2_superblocks.summary_memory_bytes,
+            tier2_pattern_superblock_summary_bytes: self
+                .tier2_pattern_superblocks
+                .summary_memory_bytes,
+            tier1_superblock_positions_bytes: self.tier2_superblocks.positions_memory_bytes(),
+            tier2_pattern_superblock_positions_bytes: self
+                .tier2_pattern_superblocks
+                .positions_memory_bytes(),
+            tree_tier1_gate_bytes: self.tree_tier1_gates.memory_bytes(),
+            tree_tier2_gate_bytes: self.tree_tier2_gates.memory_bytes(),
+            mapped_bloom_bytes,
+            mapped_tier2_bloom_bytes,
+            mapped_metadata_bytes,
+            mapped_external_id_bytes,
             tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
         }
     }
@@ -3879,7 +3954,8 @@ impl CandidateStore {
             .unwrap_or(u64::MAX);
         let load_tier2_started = Instant::now();
         let expected_active_doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
-        self.rebuild_tree_gates()?;
+        self.tree_tier1_gates = TreeBloomGateIndex::default();
+        self.tree_tier2_gates = TreeBloomGateIndex::default();
         let maybe_snapshot = self
             .load_tier2_superblocks_snapshot(self.docs.len(), expected_active_doc_count)
             .ok()
@@ -4927,12 +5003,61 @@ fn block_matches_required_masks(
     raw_filter_matches_word_masks(block, required)
 }
 
-fn tree_gate_matches_required_masks(
+fn tree_superblocks_match_required_masks(
     by_key: &RequiredMasksByKey,
-    gates: &TreeBloomGateIndex,
+    superblocks: &Tier2SuperblockIndex,
 ) -> bool {
     if by_key.is_empty() {
         return true;
+    }
+    by_key.iter().any(|(filter_key, required)| {
+        let Some(bucket_key) = superblocks.bucket_for_key.get(filter_key).copied() else {
+            return false;
+        };
+        let Some(blocks) = superblocks.masks_by_bucket.get(&bucket_key) else {
+            return false;
+        };
+        let mut merged = vec![0u64; required.len()];
+        for block in blocks {
+            for (idx, (word_idx, _)) in required.iter().enumerate() {
+                let start = word_idx.saturating_mul(8);
+                let end = start.saturating_add(8);
+                if end > block.len() {
+                    continue;
+                }
+                merged[idx] |= u64::from_le_bytes(
+                    block[start..end]
+                        .try_into()
+                        .expect("word-sized superblock chunk"),
+                );
+            }
+            if merged
+                .iter()
+                .zip(required.iter())
+                .all(|(value, (_, mask))| (*value & *mask) == *mask)
+            {
+                return true;
+            }
+        }
+        merged
+            .iter()
+            .zip(required.iter())
+            .all(|(value, (_, mask))| (*value & *mask) == *mask)
+    })
+}
+
+fn tree_gate_matches_required_masks(
+    by_key: &RequiredMasksByKey,
+    gates: &TreeBloomGateIndex,
+    fallback_superblocks: Option<&Tier2SuperblockIndex>,
+) -> bool {
+    if by_key.is_empty() {
+        return true;
+    }
+    if gates.masks_by_bucket.is_empty() {
+        return fallback_superblocks
+            .map(|superblocks| tree_superblocks_match_required_masks(by_key, superblocks))
+            .unwrap_or(true);
     }
     by_key.iter().any(|(filter_key, required)| {
         let Some(bucket_key) = gates.bucket_for_key.get(filter_key) else {
@@ -4948,18 +5073,21 @@ fn tree_gate_matches_required_masks(
 fn tree_gate_matches_shifted_required_masks(
     shifted: &ShiftedRequiredMasks,
     gates: &TreeBloomGateIndex,
+    fallback_superblocks: Option<&Tier2SuperblockIndex>,
 ) -> bool {
     shifted
         .shifts
         .iter()
-        .any(|by_key| tree_gate_matches_required_masks(by_key, gates))
+        .any(|by_key| tree_gate_matches_required_masks(by_key, gates, fallback_superblocks))
 }
 
 fn tree_gate_matches_pattern(
     pattern_id: &str,
     mask_cache: &PatternMaskCache,
     tier1_gates: &TreeBloomGateIndex,
+    tier1_superblocks: &Tier2SuperblockIndex,
     tier2_gates: &TreeBloomGateIndex,
+    tier2_superblocks: Option<&Tier2SuperblockIndex>,
     allow_tier2: bool,
 ) -> bool {
     let Some(pattern_masks) = mask_cache.get(pattern_id) else {
@@ -4970,7 +5098,11 @@ fn tree_gate_matches_pattern(
         .iter()
         .enumerate()
         .any(|(alt_index, tier1_by_key)| {
-            if !tree_gate_matches_shifted_required_masks(tier1_by_key, tier1_gates) {
+            if !tree_gate_matches_shifted_required_masks(
+                tier1_by_key,
+                tier1_gates,
+                Some(tier1_superblocks),
+            ) {
                 return false;
             }
             let Some(tier2_by_key) = pattern_masks.tier2.get(alt_index) else {
@@ -4979,7 +5111,7 @@ fn tree_gate_matches_pattern(
             if !allow_tier2 || tier2_by_key.is_empty() {
                 return true;
             }
-            tree_gate_matches_shifted_required_masks(tier2_by_key, tier2_gates)
+            tree_gate_matches_shifted_required_masks(tier2_by_key, tier2_gates, tier2_superblocks)
         })
 }
 
@@ -4987,7 +5119,9 @@ fn tree_maybe_matches_node(
     node: &QueryNode,
     mask_cache: &PatternMaskCache,
     tier1_gates: &TreeBloomGateIndex,
+    tier1_superblocks: &Tier2SuperblockIndex,
     tier2_gates: &TreeBloomGateIndex,
+    tier2_superblocks: Option<&Tier2SuperblockIndex>,
     allow_tier2: bool,
 ) -> Result<bool> {
     match node.kind.as_str() {
@@ -5000,7 +5134,9 @@ fn tree_maybe_matches_node(
                 pattern_id,
                 mask_cache,
                 tier1_gates,
+                tier1_superblocks,
                 tier2_gates,
+                tier2_superblocks,
                 allow_tier2,
             ))
         }
@@ -5011,7 +5147,9 @@ fn tree_maybe_matches_node(
                     child,
                     mask_cache,
                     tier1_gates,
+                    tier1_superblocks,
                     tier2_gates,
+                    tier2_superblocks,
                     allow_tier2,
                 )? {
                     return Ok(false);
@@ -5025,7 +5163,9 @@ fn tree_maybe_matches_node(
                     child,
                     mask_cache,
                     tier1_gates,
+                    tier1_superblocks,
                     tier2_gates,
+                    tier2_superblocks,
                     allow_tier2,
                 )? {
                     return Ok(true);
@@ -5043,7 +5183,9 @@ fn tree_maybe_matches_node(
                     child,
                     mask_cache,
                     tier1_gates,
+                    tier1_superblocks,
                     tier2_gates,
+                    tier2_superblocks,
                     allow_tier2,
                 )? {
                     matched += 1;

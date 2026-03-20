@@ -1322,6 +1322,46 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.tier2_superblock_summary_bytes)
         .sum::<u64>();
+    let tier1_superblock_summary_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier1_superblock_summary_bytes)
+        .sum::<u64>();
+    let tier2_pattern_superblock_summary_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier2_pattern_superblock_summary_bytes)
+        .sum::<u64>();
+    let tier1_superblock_positions_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier1_superblock_positions_bytes)
+        .sum::<u64>();
+    let tier2_pattern_superblock_positions_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier2_pattern_superblock_positions_bytes)
+        .sum::<u64>();
+    let tree_tier1_gate_bytes = stats_rows
+        .iter()
+        .map(|item| item.tree_tier1_gate_bytes)
+        .sum::<u64>();
+    let tree_tier2_gate_bytes = stats_rows
+        .iter()
+        .map(|item| item.tree_tier2_gate_bytes)
+        .sum::<u64>();
+    let mapped_bloom_bytes = stats_rows
+        .iter()
+        .map(|item| item.mapped_bloom_bytes)
+        .sum::<u64>();
+    let mapped_tier2_bloom_bytes = stats_rows
+        .iter()
+        .map(|item| item.mapped_tier2_bloom_bytes)
+        .sum::<u64>();
+    let mapped_metadata_bytes = stats_rows
+        .iter()
+        .map(|item| item.mapped_metadata_bytes)
+        .sum::<u64>();
+    let mapped_external_id_bytes = stats_rows
+        .iter()
+        .map(|item| item.mapped_external_id_bytes)
+        .sum::<u64>();
     let tier2_superblock_memory_budget_bytes = stats_rows
         .iter()
         .map(|item| item.tier2_superblock_memory_budget_bytes)
@@ -1338,6 +1378,43 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "tier2_superblock_summary_bytes".to_owned(),
         json!(tier2_superblock_summary_bytes),
+    );
+    out.insert(
+        "tier1_superblock_summary_bytes".to_owned(),
+        json!(tier1_superblock_summary_bytes),
+    );
+    out.insert(
+        "tier2_pattern_superblock_summary_bytes".to_owned(),
+        json!(tier2_pattern_superblock_summary_bytes),
+    );
+    out.insert(
+        "tier1_superblock_positions_bytes".to_owned(),
+        json!(tier1_superblock_positions_bytes),
+    );
+    out.insert(
+        "tier2_pattern_superblock_positions_bytes".to_owned(),
+        json!(tier2_pattern_superblock_positions_bytes),
+    );
+    out.insert(
+        "tree_tier1_gate_bytes".to_owned(),
+        json!(tree_tier1_gate_bytes),
+    );
+    out.insert(
+        "tree_tier2_gate_bytes".to_owned(),
+        json!(tree_tier2_gate_bytes),
+    );
+    out.insert("mapped_bloom_bytes".to_owned(), json!(mapped_bloom_bytes));
+    out.insert(
+        "mapped_tier2_bloom_bytes".to_owned(),
+        json!(mapped_tier2_bloom_bytes),
+    );
+    out.insert(
+        "mapped_metadata_bytes".to_owned(),
+        json!(mapped_metadata_bytes),
+    );
+    out.insert(
+        "mapped_external_id_bytes".to_owned(),
+        json!(mapped_external_id_bytes),
     );
     out.insert(
         "tier2_superblock_memory_budget_bytes".to_owned(),
