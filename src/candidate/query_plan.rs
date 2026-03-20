@@ -104,6 +104,7 @@ enum NumericReadKind {
 }
 
 const NUMERIC_READ_ANCHOR_PREFIX: &str = "__numeric_eq_anchor_";
+const MAX_HEX_GROUP_ALTERNATIVES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RangeBoundExpr {
@@ -1605,10 +1606,143 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
     Ok(best)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HexToken {
+    Bytes(Vec<u8>),
+    Gap,
+    Group(Vec<Vec<u8>>),
+}
+
+fn parse_hex_bytes_token(token: &str) -> Result<Vec<u8>> {
+    let compact = token.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    if compact.is_empty() || compact.len() % 2 != 0 || !compact.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Err(SspryError::from(format!(
+            "Invalid hex byte token: {token}"
+        )));
+    }
+    let mut out = Vec::with_capacity(compact.len() / 2);
+    for index in (0..compact.len()).step_by(2) {
+        out.push(
+            u8::from_str_radix(&compact[index..index + 2], 16)
+                .map_err(|_| SspryError::from(format!("Invalid hex byte token: {token}")))?,
+        );
+    }
+    Ok(out)
+}
+
+fn tokenize_hex_body(body: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for ch in body.chars() {
+        match ch {
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                if paren_depth == 0 {
+                    return Err(SspryError::from("Unbalanced ')' in hex string."));
+                }
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                if bracket_depth == 0 {
+                    return Err(SspryError::from("Unbalanced ']' in hex string."));
+                }
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            _ if ch.is_whitespace() && paren_depth == 0 && bracket_depth == 0 => {
+                if !current.trim().is_empty() {
+                    out.push(current.trim().to_owned());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if paren_depth != 0 || bracket_depth != 0 {
+        return Err(SspryError::from(
+            "Unterminated group or gap token in hex string.",
+        ));
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_owned());
+    }
+    Ok(out)
+}
+
+fn parse_hex_group_token(token: &str) -> Result<Vec<Vec<u8>>> {
+    let inner = token
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(|| SspryError::from(format!("Invalid hex group token: {token}")))?;
+    if inner.contains('(') || inner.contains(')') {
+        return Err(SspryError::from(format!(
+            "Nested hex groups are unsupported: {token}"
+        )));
+    }
+    let mut branches = Vec::new();
+    for branch in inner.split('|') {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return Err(SspryError::from(format!(
+                "Empty branch in hex group token: {token}"
+            )));
+        }
+        if branch.contains("??") || branch.contains('[') || branch.contains(']') {
+            return Err(SspryError::from(format!(
+                "Unsupported hex group branch for {token:?}. Supported: same-length concrete byte branches."
+            )));
+        }
+        branches.push(parse_hex_bytes_token(branch)?);
+    }
+    let expected_len = branches
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| SspryError::from(format!("Invalid hex group token: {token}")))?;
+    if expected_len == 0 || branches.iter().any(|branch| branch.len() != expected_len) {
+        return Err(SspryError::from(format!(
+            "Hex group branches must be the same non-zero byte length: {token}"
+        )));
+    }
+    Ok(branches)
+}
+
+fn parse_hex_body_tokens(body: &str) -> Result<Vec<HexToken>> {
+    let mut out = Vec::new();
+    for token in tokenize_hex_body(body)? {
+        if token == "??" || is_gap_token(&token) {
+            out.push(HexToken::Gap);
+            continue;
+        }
+        if token.starts_with('(') && token.ends_with(')') {
+            out.push(HexToken::Group(parse_hex_group_token(&token)?));
+            continue;
+        }
+        if token.chars().all(|ch| ch.is_ascii_hexdigit()) && token.len() % 2 == 0 {
+            out.push(HexToken::Bytes(parse_hex_bytes_token(&token)?));
+            continue;
+        }
+        return Err(SspryError::from(format!(
+            "Unsupported hex token: {token:?}. Supported: concrete bytes, packed concrete bytes, ??, [n], [n-m], simple same-length groups."
+        )));
+    }
+    Ok(out)
+}
+
 fn parse_hex_line_to_grams(
     line: &str,
     gram_sizes: GramSizes,
-) -> Result<Option<(String, Vec<u64>, Vec<u64>, Vec<u8>)>> {
+) -> Result<Option<(String, Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<Vec<u8>>)>> {
     let trimmed = line.trim();
     let Some(eq_idx) = trimmed.find('=') else {
         return Ok(None);
@@ -1628,60 +1762,85 @@ fn parse_hex_line_to_grams(
         )));
     }
 
-    let mut runs = Vec::<Vec<u8>>::new();
-    let mut current = Vec::<u8>::new();
-    let mut saw_gap = false;
-    for token in body.split_whitespace() {
-        if token.len() == 2 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            current.push(
-                u8::from_str_radix(token, 16)
-                    .map_err(|_| SspryError::from(format!("Invalid hex byte: {token}")))?,
-            );
-            continue;
-        }
-        if token == "??" || is_gap_token(token) {
-            saw_gap = true;
-            if !current.is_empty() {
-                runs.push(current.clone());
-                current.clear();
+    let tokens = parse_hex_body_tokens(body).map_err(|err| {
+        SspryError::from(format!("Unsupported hex token for {pattern_id}: {}", err))
+    })?;
+
+    let mut variants = vec![Vec::<HexToken>::new()];
+    for token in tokens {
+        match token {
+            HexToken::Group(branches) => {
+                if variants.len().saturating_mul(branches.len()) > MAX_HEX_GROUP_ALTERNATIVES {
+                    return Err(SspryError::from(format!(
+                        "Hex pattern {pattern_id} expands to too many alternation branches."
+                    )));
+                }
+                let mut next = Vec::with_capacity(variants.len().saturating_mul(branches.len()));
+                for variant in &variants {
+                    for branch in &branches {
+                        let mut expanded = variant.clone();
+                        expanded.push(HexToken::Bytes(branch.clone()));
+                        next.push(expanded);
+                    }
+                }
+                variants = next;
             }
-            continue;
+            other => {
+                for variant in &mut variants {
+                    variant.push(other.clone());
+                }
+            }
         }
-        return Err(SspryError::from(format!(
-            "Unsupported hex token for {pattern_id}: {token:?}. Supported: concrete bytes, ??, [n], [n-m]."
-        )));
-    }
-    if !current.is_empty() {
-        runs.push(current);
     }
 
-    let mut seen = HashSet::new();
-    let mut seen_tier2 = HashSet::new();
-    let mut grams = Vec::new();
-    let mut tier2_grams = Vec::new();
-    let fixed_literal = if !saw_gap && runs.len() == 1 {
-        runs[0].clone()
-    } else {
-        Vec::new()
-    };
-    for run in runs {
-        for gram in grams_tier1_from_bytes(&run, gram_sizes.tier1) {
-            if seen.insert(gram) {
-                grams.push(gram);
+    let mut all_alts = Vec::with_capacity(variants.len());
+    let mut all_tier2_alts = Vec::with_capacity(variants.len());
+    let mut all_fixed_literals = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let mut runs = Vec::<Vec<u8>>::new();
+        let mut current = Vec::<u8>::new();
+        let mut saw_gap = false;
+        for token in variant {
+            match token {
+                HexToken::Bytes(bytes) => current.extend(bytes),
+                HexToken::Gap => {
+                    saw_gap = true;
+                    if !current.is_empty() {
+                        runs.push(std::mem::take(&mut current));
+                    }
+                }
+                HexToken::Group(_) => unreachable!("groups should be expanded"),
             }
         }
-        for gram in grams_tier2_from_bytes(&run, gram_sizes.tier2) {
-            if seen_tier2.insert(gram) {
-                tier2_grams.push(gram);
+        if !current.is_empty() {
+            runs.push(current);
+        }
+        let fixed_literal = if !saw_gap && runs.len() == 1 {
+            runs[0].clone()
+        } else {
+            Vec::new()
+        };
+        let mut seen = HashSet::new();
+        let mut seen_tier2 = HashSet::new();
+        let mut grams = Vec::new();
+        let mut tier2_grams = Vec::new();
+        for run in runs {
+            for gram in grams_tier1_from_bytes(&run, gram_sizes.tier1) {
+                if seen.insert(gram) {
+                    grams.push(gram);
+                }
+            }
+            for gram in grams_tier2_from_bytes(&run, gram_sizes.tier2) {
+                if seen_tier2.insert(gram) {
+                    tier2_grams.push(gram);
+                }
             }
         }
+        all_alts.push(grams);
+        all_tier2_alts.push(tier2_grams);
+        all_fixed_literals.push(fixed_literal);
     }
-    Ok(Some((
-        pattern_id.to_owned(),
-        grams,
-        tier2_grams,
-        fixed_literal,
-    )))
+    Ok(Some((pattern_id.to_owned(), all_alts, all_tier2_alts, all_fixed_literals)))
 }
 
 fn is_gap_token(token: &str) -> bool {
@@ -2284,14 +2443,15 @@ pub fn compile_query_plan_with_gram_sizes(
             pattern_fixed_literal_fullword.insert(def.pattern_id, def.fullword_flags);
             continue;
         }
-        if let Some((pattern_id, grams, tier2_grams, fixed_literal)) =
+        if let Some((pattern_id, alternatives, tier2_alternatives, fixed_literals)) =
             parse_hex_line_to_grams(&line, gram_sizes)?
         {
-            pattern_alternatives.insert(pattern_id.clone(), vec![grams]);
-            pattern_tier2_alternatives.insert(pattern_id.clone(), vec![tier2_grams]);
-            pattern_fixed_literals.insert(pattern_id.clone(), vec![fixed_literal]);
-            pattern_fixed_literal_wide.insert(pattern_id.clone(), vec![false]);
-            pattern_fixed_literal_fullword.insert(pattern_id, vec![false]);
+            let alt_count = alternatives.len();
+            pattern_alternatives.insert(pattern_id.clone(), alternatives);
+            pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
+            pattern_fixed_literals.insert(pattern_id.clone(), fixed_literals);
+            pattern_fixed_literal_wide.insert(pattern_id.clone(), vec![false; alt_count]);
+            pattern_fixed_literal_fullword.insert(pattern_id, vec![false; alt_count]);
             continue;
         }
         return Err(SspryError::from(format!(
@@ -3081,7 +3241,7 @@ rule empty {
                 .is_none()
         );
 
-        let (pattern_id, grams, tier2_grams, fixed_literal) = parse_hex_line_to_grams(
+        let (pattern_id, alternatives, tier2_alternatives, fixed_literals) = parse_hex_line_to_grams(
             "$h = { 41 42 43 44 ?? 45 46 47 48 [2-4] 49 4A 4B 4C }",
             GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
                 .expect("default gram sizes"),
@@ -3089,9 +3249,36 @@ rule empty {
         .expect("hex line")
         .expect("parsed hex");
         assert_eq!(pattern_id, "$h");
-        assert_eq!(grams.len(), 3);
-        assert_eq!(tier2_grams.len(), 6);
-        assert!(fixed_literal.is_empty());
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].len(), 3);
+        assert_eq!(tier2_alternatives[0].len(), 6);
+        assert!(fixed_literals[0].is_empty());
+        let packed = parse_hex_line_to_grams(
+            "$p = { 8bec 83ec10 }",
+            GramSizes::new(3, 4).expect("gram sizes"),
+        )
+        .expect("packed hex")
+        .expect("parsed packed");
+        assert_eq!(packed.0, "$p");
+        assert_eq!(packed.3, vec![vec![0x8b, 0xec, 0x83, 0xec, 0x10]]);
+        let grouped_hex = parse_hex_line_to_grams(
+            "$g = { 41 (42|43) 44 }",
+            GramSizes::new(3, 4).expect("gram sizes"),
+        )
+        .expect("grouped hex")
+        .expect("parsed grouped");
+        assert_eq!(grouped_hex.0, "$g");
+        assert_eq!(grouped_hex.1.len(), 2);
+        assert_eq!(grouped_hex.3, vec![vec![0x41, 0x42, 0x44], vec![0x41, 0x43, 0x44]]);
+        assert!(
+            parse_hex_line_to_grams(
+                "$g = { 41 (42|4344) 45 }",
+                GramSizes::new(3, 4).expect("gram sizes"),
+            )
+            .expect_err("mismatched group lengths")
+            .to_string()
+            .contains("same non-zero byte length")
+        );
         assert!(is_gap_token("[3]"));
         assert!(is_gap_token("[1-9]"));
         assert!(!is_gap_token("[a-b]"));
@@ -3538,9 +3725,10 @@ rule disk_rule {
         .expect("hex parse")
         .expect("pattern");
         assert_eq!(fixed.0, "$hex");
-        assert_eq!(fixed.3, b"ABCDE".to_vec());
-        assert_eq!(fixed.1.len(), 2);
-        assert_eq!(fixed.2.len(), 3);
+        assert_eq!(fixed.3, vec![b"ABCDE".to_vec()]);
+        assert_eq!(fixed.1.len(), 1);
+        assert_eq!(fixed.1[0].len(), 2);
+        assert_eq!(fixed.2[0].len(), 3);
         assert!(
             parse_hex_line_to_grams(
                 "identifier = { 41 42 }",
