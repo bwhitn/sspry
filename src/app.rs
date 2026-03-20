@@ -1533,18 +1533,84 @@ fn fixed_literal_plan_from_rule(rule_path: &Path) -> Option<FixedLiteralMatchPla
     fixed_literal_match_plan(&plan)
 }
 
-fn file_contains_literal(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty()
-        || (haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle))
+fn is_ascii_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_wide_word_unit(unit: &[u8]) -> bool {
+    unit.len() == 2 && unit[1] == 0 && is_ascii_word_byte(unit[0])
+}
+
+fn file_contains_literal_with_mode(haystack: &[u8], needle: &[u8], wide: bool, fullword: bool) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    for index in 0..=(haystack.len() - needle.len()) {
+        if &haystack[index..index + needle.len()] != needle {
+            continue;
+        }
+        if !fullword {
+            return true;
+        }
+        if wide {
+            let left_ok = if index >= 2 {
+                !is_wide_word_unit(&haystack[index - 2..index])
+            } else {
+                true
+            };
+            let right_ok = if index + needle.len() + 2 <= haystack.len() {
+                !is_wide_word_unit(&haystack[index + needle.len()..index + needle.len() + 2])
+            } else {
+                true
+            };
+            if left_ok && right_ok {
+                return true;
+            }
+        } else {
+            let left_ok = if index > 0 {
+                !is_ascii_word_byte(haystack[index - 1])
+            } else {
+                true
+            };
+            let right_ok = if index + needle.len() < haystack.len() {
+                !is_ascii_word_byte(haystack[index + needle.len()])
+            } else {
+                true
+            };
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn verify_fixed_literal_plan_on_file(path: &Path, plan: &FixedLiteralMatchPlan) -> Result<bool> {
     let bytes = fs::read(path)?;
     let mut matches = HashMap::with_capacity(plan.literals.len());
     for (pattern_id, literals) in &plan.literals {
+        let wide_flags = plan
+            .literal_wide
+            .get(pattern_id)
+            .ok_or_else(|| SspryError::from("fixed literal plan missing wide flags"))?;
+        let fullword_flags = plan
+            .literal_fullword
+            .get(pattern_id)
+            .ok_or_else(|| SspryError::from("fixed literal plan missing fullword flags"))?;
         let matched = literals
             .iter()
-            .any(|literal| file_contains_literal(&bytes, literal));
+            .enumerate()
+            .any(|(index, literal)| {
+                file_contains_literal_with_mode(
+                    &bytes,
+                    literal,
+                    wide_flags.get(index).copied().unwrap_or(false),
+                    fullword_flags.get(index).copied().unwrap_or(false),
+                )
+            });
         matches.insert(pattern_id.clone(), matched);
     }
     evaluate_fixed_literal_match(&plan.root, &matches)
@@ -4040,6 +4106,14 @@ mod tests {
                 ("$a".to_owned(), vec![b"ABCD".to_vec()]),
                 ("$b".to_owned(), vec![b"EFGH".to_vec()]),
             ]),
+            literal_wide: HashMap::from([
+                ("$a".to_owned(), vec![false]),
+                ("$b".to_owned(), vec![false]),
+            ]),
+            literal_fullword: HashMap::from([
+                ("$a".to_owned(), vec![false]),
+                ("$b".to_owned(), vec![false]),
+            ]),
             root: QueryNode {
                 kind: "and".to_owned(),
                 pattern_id: None,
@@ -4063,6 +4137,28 @@ mod tests {
         assert!(verify_fixed_literal_plan_on_file(&fixed_match_path, &fixed_plan).expect("match"));
         fs::write(&fixed_match_path, b"--ABCD----").expect("fixed miss");
         assert!(!verify_fixed_literal_plan_on_file(&fixed_match_path, &fixed_plan).expect("miss"));
+
+        let fullword_path = tmp.path().join("fullword.bin");
+        fs::write(&fullword_path, b".WORD! xWORDx").expect("fullword bytes");
+        let fullword_plan = FixedLiteralMatchPlan {
+            literals: HashMap::from([("$a".to_owned(), vec![b"WORD".to_vec()])]),
+            literal_wide: HashMap::from([("$a".to_owned(), vec![false])]),
+            literal_fullword: HashMap::from([("$a".to_owned(), vec![true])]),
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+        };
+        assert!(
+            verify_fixed_literal_plan_on_file(&fullword_path, &fullword_plan).expect("fullword")
+        );
+        fs::write(&fullword_path, b"xWORDx").expect("fullword miss bytes");
+        assert!(
+            !verify_fixed_literal_plan_on_file(&fullword_path, &fullword_plan)
+                .expect("fullword miss")
+        );
     }
 
     #[test]

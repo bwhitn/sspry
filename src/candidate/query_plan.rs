@@ -25,6 +25,10 @@ pub struct PatternPlan {
     pub tier2_alternatives: Vec<Vec<u64>>,
     #[serde(default)]
     pub fixed_literals: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub fixed_literal_wide: Vec<bool>,
+    #[serde(default)]
+    pub fixed_literal_fullword: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +53,8 @@ pub fn normalize_max_candidates(max_candidates: usize) -> usize {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FixedLiteralMatchPlan {
     pub literals: HashMap<String, Vec<Vec<u8>>>,
+    pub literal_wide: HashMap<String, Vec<bool>>,
+    pub literal_fullword: HashMap<String, Vec<bool>>,
     pub root: QueryNode,
 }
 
@@ -56,6 +62,9 @@ pub struct FixedLiteralMatchPlan {
 struct PatternDef {
     pattern_id: String,
     alternatives: Vec<Vec<u8>>,
+    wide_flags: Vec<bool>,
+    fullword_flags: Vec<bool>,
+    exact_literals: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -579,7 +588,7 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
     };
     let literal_raw = &rest[1..end_idx];
     let flags_raw = rest[end_idx + 1..].trim();
-    let flags: HashSet<String> = if flags_raw.is_empty() {
+    let mut flags: HashSet<String> = if flags_raw.is_empty() {
         HashSet::from(["ascii".to_owned()])
     } else {
         flags_raw
@@ -588,18 +597,25 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
             .collect()
     };
     for flag in &flags {
-        if flag != "ascii" && flag != "wide" {
+        if flag != "ascii" && flag != "wide" && flag != "fullword" {
             return Err(SspryError::from(format!(
                 "Unsupported literal flag(s) for {pattern_id}: {flag}"
             )));
         }
     }
+    if !flags.contains("ascii") && !flags.contains("wide") {
+        flags.insert("ascii".to_owned());
+    }
     let literal_text: String = serde_json::from_str(&format!("\"{literal_raw}\""))
         .map_err(|_| SspryError::from(format!("Invalid literal string: {literal_raw:?}")))?;
 
     let mut alternatives = Vec::new();
+    let mut wide_flags = Vec::new();
+    let mut fullword_flags = Vec::new();
     if flags.contains("ascii") {
         alternatives.push(literal_text.as_bytes().to_vec());
+        wide_flags.push(false);
+        fullword_flags.push(flags.contains("fullword"));
     }
     if flags.contains("wide") {
         let mut wide = Vec::with_capacity(literal_text.len() * 2);
@@ -607,12 +623,290 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
             wide.extend_from_slice(&unit.to_le_bytes());
         }
         alternatives.push(wide);
+        wide_flags.push(true);
+        fullword_flags.push(flags.contains("fullword"));
     }
 
     Ok(Some(PatternDef {
         pattern_id: pattern_id.to_owned(),
         alternatives,
+        wide_flags,
+        fullword_flags,
+        exact_literals: true,
     }))
+}
+
+fn parse_regex_line(line: &str, gram_sizes: GramSizes) -> Result<Option<PatternDef>> {
+    let trimmed = line.trim();
+    let Some(eq_idx) = trimmed.find('=') else {
+        return Ok(None);
+    };
+    let pattern_id = trimmed[..eq_idx].trim();
+    if !pattern_id.starts_with('$') {
+        return Ok(None);
+    }
+    let rest = trimmed[eq_idx + 1..].trim();
+    if !rest.starts_with('/') {
+        return Ok(None);
+    }
+
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut end_slash = None;
+    for (idx, ch) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+            continue;
+        }
+        if ch == ']' && in_class {
+            in_class = false;
+            continue;
+        }
+        if ch == '/' && !in_class {
+            end_slash = Some(idx);
+            break;
+        }
+    }
+    let Some(end_idx) = end_slash else {
+        return Err(SspryError::from(format!(
+            "Invalid regex string: {trimmed:?}"
+        )));
+    };
+    let regex_raw = &rest[1..end_idx];
+    let flags_raw = rest[end_idx + 1..].trim();
+    let mut flags: HashSet<String> = if flags_raw.is_empty() {
+        HashSet::from(["ascii".to_owned()])
+    } else {
+        flags_raw
+            .split_whitespace()
+            .map(|item| item.to_ascii_lowercase())
+            .collect()
+    };
+    for flag in &flags {
+        if flag != "ascii" && flag != "wide" && flag != "fullword" {
+            return Err(SspryError::from(format!(
+                "Unsupported regex flag(s) for {pattern_id}: {flag}"
+            )));
+        }
+    }
+    if !flags.contains("ascii") && !flags.contains("wide") {
+        flags.insert("ascii".to_owned());
+    }
+
+    let literal = extract_regex_mandatory_literal(regex_raw)?;
+    if literal.len() < gram_sizes.tier1 {
+        return Err(SspryError::from(format!(
+            "Regex {pattern_id} does not contain a mandatory literal long enough for tier1 grams."
+        )));
+    }
+
+    let mut alternatives = Vec::new();
+    let mut wide_flags = Vec::new();
+    let mut fullword_flags = Vec::new();
+    if flags.contains("ascii") {
+        alternatives.push(literal.clone());
+        wide_flags.push(false);
+        fullword_flags.push(flags.contains("fullword"));
+    }
+    if flags.contains("wide") {
+        let mut wide = Vec::with_capacity(literal.len() * 2);
+        for byte in &literal {
+            wide.push(*byte);
+            wide.push(0);
+        }
+        if wide.len() >= gram_sizes.tier1 {
+            alternatives.push(wide);
+            wide_flags.push(true);
+            fullword_flags.push(flags.contains("fullword"));
+        }
+    }
+    if alternatives.is_empty() {
+        return Err(SspryError::from(format!(
+            "Regex {pattern_id} does not contain an anchorable mandatory literal for the active gram sizes."
+        )));
+    }
+
+    Ok(Some(PatternDef {
+        pattern_id: pattern_id.to_owned(),
+        alternatives,
+        wide_flags,
+        fullword_flags,
+        exact_literals: false,
+    }))
+}
+
+fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RegexAtom {
+        Literal(u8),
+        Variable,
+        Anchor,
+    }
+
+    fn parse_quantifier(chars: &[char], index: usize) -> Result<(usize, usize)> {
+        if index >= chars.len() {
+            return Ok((1, 0));
+        }
+        match chars[index] {
+            '?' => Ok((0, 1)),
+            '*' => Ok((0, 1)),
+            '+' => Ok((1, 1)),
+            '{' => {
+                let mut end = index + 1;
+                while end < chars.len() && chars[end] != '}' {
+                    end += 1;
+                }
+                if end >= chars.len() {
+                    return Err(SspryError::from(
+                        "Unsupported regex quantifier: missing closing '}'",
+                    ));
+                }
+                let body = chars[index + 1..end].iter().collect::<String>();
+                let Some((left, _right)) = body
+                    .split_once(',')
+                    .or_else(|| Some((body.as_str(), body.as_str())))
+                else {
+                    return Err(SspryError::from("Unsupported regex quantifier body."));
+                };
+                let min = left
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| SspryError::from("Unsupported regex quantifier body."))?;
+                Ok((min, end - index + 1))
+            }
+            _ => Ok((1, 0)),
+        }
+    }
+
+    let chars = regex_raw.chars().collect::<Vec<_>>();
+    let mut best = Vec::<u8>::new();
+    let mut current = Vec::<u8>::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let atom = match chars[index] {
+            '^' | '$' => {
+                index += 1;
+                RegexAtom::Anchor
+            }
+            '(' | ')' | '|' => {
+                return Err(SspryError::from(
+                    "Unsupported regex string: groups and alternation are not searchable yet.",
+                ));
+            }
+            '[' => {
+                index += 1;
+                let mut escaped = false;
+                while index < chars.len() {
+                    let ch = chars[index];
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if ch == ']' {
+                        break;
+                    }
+                }
+                RegexAtom::Variable
+            }
+            '.' => {
+                index += 1;
+                RegexAtom::Variable
+            }
+            '\\' => {
+                index += 1;
+                if index >= chars.len() {
+                    return Err(SspryError::from("Invalid regex escape."));
+                }
+                let escaped = chars[index];
+                index += 1;
+                match escaped {
+                    'b' | 'B' | 'A' | 'z' | 'Z' => RegexAtom::Anchor,
+                    'd' | 'D' | 's' | 'S' | 'w' | 'W' => RegexAtom::Variable,
+                    'n' => RegexAtom::Literal(b'\n'),
+                    'r' => RegexAtom::Literal(b'\r'),
+                    't' => RegexAtom::Literal(b'\t'),
+                    'x' => {
+                        if index + 1 > chars.len() {
+                            return Err(SspryError::from("Invalid regex hex escape."));
+                        }
+                        let hi = chars.get(index).copied();
+                        let lo = chars.get(index + 1).copied();
+                        let (Some(hi), Some(lo)) = (hi, lo) else {
+                            return Err(SspryError::from("Invalid regex hex escape."));
+                        };
+                        if !(hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit()) {
+                            return Err(SspryError::from("Invalid regex hex escape."));
+                        }
+                        index += 2;
+                        let text = [hi, lo].iter().collect::<String>();
+                        let value = u8::from_str_radix(&text, 16)
+                            .map_err(|_| SspryError::from("Invalid regex hex escape."))?;
+                        RegexAtom::Literal(value)
+                    }
+                    other if other.is_ascii() => RegexAtom::Literal(other as u8),
+                    _ => {
+                        return Err(SspryError::from(
+                            "Unsupported non-ASCII regex escape in searchable regex.",
+                        ));
+                    }
+                }
+            }
+            ch if ch.is_ascii() => {
+                index += 1;
+                RegexAtom::Literal(ch as u8)
+            }
+            _ => {
+                return Err(SspryError::from(
+                    "Unsupported non-ASCII regex string in searchable regex.",
+                ));
+            }
+        };
+
+        let (min_repeat, quantifier_len) = parse_quantifier(&chars, index)?;
+        if quantifier_len > 0 {
+            index += quantifier_len;
+            if index < chars.len() && chars[index] == '?' {
+                index += 1;
+            }
+        }
+
+        match atom {
+            RegexAtom::Anchor => {}
+            RegexAtom::Literal(byte) if min_repeat > 0 => {
+                for _ in 0..min_repeat {
+                    current.push(byte);
+                }
+            }
+            RegexAtom::Literal(_) | RegexAtom::Variable => {
+                if current.len() > best.len() {
+                    best = current.clone();
+                }
+                current.clear();
+            }
+        }
+    }
+    if current.len() > best.len() {
+        best = current;
+    }
+    if best.is_empty() {
+        return Err(SspryError::from(
+            "Regex string does not contain a searchable mandatory literal.",
+        ));
+    }
+    Ok(best)
 }
 
 fn parse_hex_line_to_grams(
@@ -869,27 +1163,43 @@ fn dedupe_pattern_alternatives(
     alternatives: Vec<Vec<u64>>,
     tier2_alternatives: Vec<Vec<u64>>,
     fixed_literals: Vec<Vec<u8>>,
-) -> (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<Vec<u8>>) {
-    let mut seen = HashSet::<(Vec<u64>, Vec<u64>, Vec<u8>)>::new();
+    fixed_literal_wide: Vec<bool>,
+    fixed_literal_fullword: Vec<bool>,
+) -> (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<Vec<u8>>, Vec<bool>, Vec<bool>) {
+    let mut seen = HashSet::<(Vec<u64>, Vec<u64>, Vec<u8>, bool, bool)>::new();
     let mut kept_tier1 = Vec::new();
     let mut kept_tier2 = Vec::new();
     let mut kept_literals = Vec::new();
+    let mut kept_wide = Vec::new();
+    let mut kept_fullword = Vec::new();
     let max_len = alternatives
         .len()
         .max(tier2_alternatives.len())
-        .max(fixed_literals.len());
+        .max(fixed_literals.len())
+        .max(fixed_literal_wide.len())
+        .max(fixed_literal_fullword.len());
     for index in 0..max_len {
         let tier1 = alternatives.get(index).cloned().unwrap_or_default();
         let tier2 = tier2_alternatives.get(index).cloned().unwrap_or_default();
         let literal = fixed_literals.get(index).cloned().unwrap_or_default();
-        if !seen.insert((tier1.clone(), tier2.clone(), literal.clone())) {
+        let wide = fixed_literal_wide.get(index).copied().unwrap_or(false);
+        let fullword = fixed_literal_fullword.get(index).copied().unwrap_or(false);
+        if !seen.insert((tier1.clone(), tier2.clone(), literal.clone(), wide, fullword)) {
             continue;
         }
         kept_tier1.push(tier1);
         kept_tier2.push(tier2);
         kept_literals.push(literal);
+        kept_wide.push(wide);
+        kept_fullword.push(fullword);
     }
-    (kept_tier1, kept_tier2, kept_literals)
+    (
+        kept_tier1,
+        kept_tier2,
+        kept_literals,
+        kept_wide,
+        kept_fullword,
+    )
 }
 
 fn numeric_read_kind(name: &str) -> Option<NumericReadKind> {
@@ -970,6 +1280,8 @@ fn inject_numeric_read_anchor_patterns(
     pattern_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
     pattern_tier2_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
     pattern_fixed_literals: &mut BTreeMap<String, Vec<Vec<u8>>>,
+    pattern_fixed_literal_wide: &mut BTreeMap<String, Vec<bool>>,
+    pattern_fixed_literal_fullword: &mut BTreeMap<String, Vec<bool>>,
     gram_sizes: GramSizes,
     next_anchor_id: &mut usize,
 ) -> Result<()> {
@@ -979,6 +1291,8 @@ fn inject_numeric_read_anchor_patterns(
             pattern_alternatives,
             pattern_tier2_alternatives,
             pattern_fixed_literals,
+            pattern_fixed_literal_wide,
+            pattern_fixed_literal_fullword,
             gram_sizes,
             next_anchor_id,
         )?;
@@ -1007,6 +1321,8 @@ fn inject_numeric_read_anchor_patterns(
         vec![grams_tier2_from_bytes(&anchor_bytes, gram_sizes.tier2)],
     );
     pattern_fixed_literals.insert(synthetic_pattern_id.clone(), vec![anchor_bytes]);
+    pattern_fixed_literal_wide.insert(synthetic_pattern_id.clone(), vec![false]);
+    pattern_fixed_literal_fullword.insert(synthetic_pattern_id.clone(), vec![false]);
     let verifier_node = node.clone();
     *node = QueryNode {
         kind: "and".to_owned(),
@@ -1035,11 +1351,18 @@ fn contains_pattern_node(node: &QueryNode) -> bool {
 
 pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteralMatchPlan> {
     let mut literals = HashMap::<String, Vec<Vec<u8>>>::new();
+    let mut literal_wide = HashMap::<String, Vec<bool>>::new();
+    let mut literal_fullword = HashMap::<String, Vec<bool>>::new();
     for pattern in &plan.patterns {
         if pattern.fixed_literals.is_empty() {
             return None;
         }
         if pattern.alternatives.len() != pattern.fixed_literals.len() {
+            return None;
+        }
+        if pattern.alternatives.len() != pattern.fixed_literal_wide.len()
+            || pattern.alternatives.len() != pattern.fixed_literal_fullword.len()
+        {
             return None;
         }
         if pattern
@@ -1050,9 +1373,16 @@ pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteral
             return None;
         }
         literals.insert(pattern.pattern_id.clone(), pattern.fixed_literals.clone());
+        literal_wide.insert(pattern.pattern_id.clone(), pattern.fixed_literal_wide.clone());
+        literal_fullword.insert(
+            pattern.pattern_id.clone(),
+            pattern.fixed_literal_fullword.clone(),
+        );
     }
     Some(FixedLiteralMatchPlan {
         literals,
+        literal_wide,
+        literal_fullword,
         root: plan.root.clone(),
     })
 }
@@ -1161,6 +1491,8 @@ pub fn compile_query_plan_with_gram_sizes(
     let mut pattern_alternatives = BTreeMap::<String, Vec<Vec<u64>>>::new();
     let mut pattern_tier2_alternatives = BTreeMap::<String, Vec<Vec<u64>>>::new();
     let mut pattern_fixed_literals = BTreeMap::<String, Vec<Vec<u8>>>::new();
+    let mut pattern_fixed_literal_wide = BTreeMap::<String, Vec<bool>>::new();
+    let mut pattern_fixed_literal_fullword = BTreeMap::<String, Vec<bool>>::new();
     for line in strings_lines {
         if let Some(def) = parse_literal_line(&line)? {
             let alternatives = def
@@ -1173,10 +1505,39 @@ pub fn compile_query_plan_with_gram_sizes(
                 .iter()
                 .map(|alt| grams_tier2_from_bytes(alt, gram_sizes.tier2))
                 .collect::<Vec<_>>();
-            let fixed_literals = def.alternatives.clone();
+            let fixed_literals = if def.exact_literals {
+                def.alternatives.clone()
+            } else {
+                vec![Vec::new(); def.alternatives.len()]
+            };
             pattern_alternatives.insert(def.pattern_id.clone(), alternatives);
             pattern_tier2_alternatives.insert(def.pattern_id.clone(), tier2_alternatives);
-            pattern_fixed_literals.insert(def.pattern_id, fixed_literals);
+            pattern_fixed_literals.insert(def.pattern_id.clone(), fixed_literals);
+            pattern_fixed_literal_wide.insert(def.pattern_id.clone(), def.wide_flags);
+            pattern_fixed_literal_fullword.insert(def.pattern_id, def.fullword_flags);
+            continue;
+        }
+        if let Some(def) = parse_regex_line(&line, gram_sizes)? {
+            let alternatives = def
+                .alternatives
+                .iter()
+                .map(|alt| grams_tier1_from_bytes(alt, gram_sizes.tier1))
+                .collect::<Vec<_>>();
+            let tier2_alternatives = def
+                .alternatives
+                .iter()
+                .map(|alt| grams_tier2_from_bytes(alt, gram_sizes.tier2))
+                .collect::<Vec<_>>();
+            let fixed_literals = if def.exact_literals {
+                def.alternatives.clone()
+            } else {
+                vec![Vec::new(); def.alternatives.len()]
+            };
+            pattern_alternatives.insert(def.pattern_id.clone(), alternatives);
+            pattern_tier2_alternatives.insert(def.pattern_id.clone(), tier2_alternatives);
+            pattern_fixed_literals.insert(def.pattern_id.clone(), fixed_literals);
+            pattern_fixed_literal_wide.insert(def.pattern_id.clone(), def.wide_flags);
+            pattern_fixed_literal_fullword.insert(def.pattern_id, def.fullword_flags);
             continue;
         }
         if let Some((pattern_id, grams, tier2_grams, fixed_literal)) =
@@ -1184,11 +1545,13 @@ pub fn compile_query_plan_with_gram_sizes(
         {
             pattern_alternatives.insert(pattern_id.clone(), vec![grams]);
             pattern_tier2_alternatives.insert(pattern_id.clone(), vec![tier2_grams]);
-            pattern_fixed_literals.insert(pattern_id, vec![fixed_literal]);
+            pattern_fixed_literals.insert(pattern_id.clone(), vec![fixed_literal]);
+            pattern_fixed_literal_wide.insert(pattern_id.clone(), vec![false]);
+            pattern_fixed_literal_fullword.insert(pattern_id, vec![false]);
             continue;
         }
         return Err(SspryError::from(format!(
-            "Unsupported strings declaration: {:?}. Supported forms: $id = \"...\" [ascii|wide], $id = {{ ... }}",
+            "Unsupported strings declaration: {:?}. Supported forms: $id = \"...\" [ascii|wide|fullword], $id = /.../ [ascii|wide|fullword], $id = {{ ... }}",
             line.trim()
         )));
     }
@@ -1204,6 +1567,8 @@ pub fn compile_query_plan_with_gram_sizes(
         &mut pattern_alternatives,
         &mut pattern_tier2_alternatives,
         &mut pattern_fixed_literals,
+        &mut pattern_fixed_literal_wide,
+        &mut pattern_fixed_literal_fullword,
         gram_sizes,
         &mut next_numeric_anchor_id,
     )?;
@@ -1225,8 +1590,25 @@ pub fn compile_query_plan_with_gram_sizes(
         let fixed_literals = pattern_fixed_literals
             .remove(&pattern_id)
             .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let (alternatives, tier2_alternatives, fixed_literals) =
-            dedupe_pattern_alternatives(alternatives, tier2_alternatives, fixed_literals);
+        let fixed_literal_wide = pattern_fixed_literal_wide
+            .remove(&pattern_id)
+            .unwrap_or_else(|| vec![false; alternatives.len()]);
+        let fixed_literal_fullword = pattern_fixed_literal_fullword
+            .remove(&pattern_id)
+            .unwrap_or_else(|| vec![false; alternatives.len()]);
+        let (
+            alternatives,
+            tier2_alternatives,
+            fixed_literals,
+            fixed_literal_wide,
+            fixed_literal_fullword,
+        ) = dedupe_pattern_alternatives(
+            alternatives,
+            tier2_alternatives,
+            fixed_literals,
+            fixed_literal_wide,
+            fixed_literal_fullword,
+        );
         let per_pattern_budget = branch_budgets
             .get(&pattern_id)
             .copied()
@@ -1243,6 +1625,8 @@ pub fn compile_query_plan_with_gram_sizes(
             alternatives: optimized,
             tier2_alternatives,
             fixed_literals,
+            fixed_literal_wide,
+            fixed_literal_fullword,
         });
     }
 
@@ -1775,6 +2159,10 @@ rule empty {
             .expect("pattern");
         assert_eq!(ascii_wide.pattern_id, "$a");
         assert_eq!(ascii_wide.alternatives.len(), 2);
+        let fullword = parse_literal_line(r#"$a = "Ab" fullword"#)
+            .expect("literal")
+            .expect("pattern");
+        assert_eq!(fullword.fullword_flags, vec![true]);
         assert!(
             parse_literal_line(r#"$a = "Ab" nocase"#)
                 .expect_err("unsupported flag")
@@ -1847,6 +2235,35 @@ rule empty {
         let ranked = optimize_grams(&grams, b"ABCDEABCDE", 4, 2);
         assert_eq!(ranked.len(), 2);
         assert_eq!(optimize_grams(&grams, b"", 4, 0), grams);
+
+        let regex = parse_regex_line(
+            r#"$r = /[A-Z]+applesause[0-9]+/"#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+        )
+        .expect("regex parse")
+        .expect("regex pattern");
+        assert_eq!(regex.alternatives, vec![b"applesause".to_vec()]);
+        assert!(!regex.exact_literals);
+
+        let regex_escaped = parse_regex_line(
+            r#"$r = /https?:\/\/evil\.com/"#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+        )
+        .expect("regex parse")
+        .expect("regex pattern");
+        assert_eq!(regex_escaped.alternatives, vec![b"://evil.com".to_vec()]);
+        assert!(
+            parse_regex_line(
+                r#"$r = /(apple|orange)/"#,
+                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                    .expect("default gram sizes"),
+            )
+            .expect_err("alternation unsupported")
+            .to_string()
+            .contains("groups and alternation")
+        );
     }
 
     #[test]
@@ -1979,6 +2396,8 @@ rule sample {
         let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
         let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
         assert_eq!(literal_plan.literals["$a"], vec![b"ABCD".to_vec()]);
+        assert_eq!(literal_plan.literal_wide["$a"], vec![false]);
+        assert_eq!(literal_plan.literal_fullword["$a"], vec![false]);
         let mut matches = HashMap::new();
         matches.insert("$a".to_owned(), false);
         matches.insert("$b".to_owned(), true);
@@ -1990,7 +2409,7 @@ rule sample {
         let rule = r#"
 rule sample {
   strings:
-    $a = "AB" ascii wide
+    $a = "AB" ascii wide fullword
   condition:
     $a
 }
@@ -2001,6 +2420,20 @@ rule sample {
         assert_eq!(literals.len(), 2);
         assert_eq!(literals[0], b"AB".to_vec());
         assert_eq!(literals[1], vec![b'A', 0, b'B', 0]);
+        assert_eq!(literal_plan.literal_wide["$a"], vec![false, true]);
+        assert_eq!(literal_plan.literal_fullword["$a"], vec![true, true]);
+
+        let regex_rule = r#"
+rule sample {
+  strings:
+    $a = /[A-Z]+applesause[0-9]+/
+  condition:
+    $a
+}
+"#;
+        let regex_plan =
+            compile_query_plan_default(regex_rule, 16, false, true, 100_000).expect("plan");
+        assert!(fixed_literal_match_plan(&regex_plan).is_none());
     }
 
     #[test]
@@ -2307,6 +2740,8 @@ rule q {
                 alternatives: vec![vec![1_u64]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -2328,6 +2763,8 @@ rule q {
                 alternatives: vec![vec![1_u64], vec![2_u64]],
                 tier2_alternatives: vec![Vec::new(), Vec::new()],
                 fixed_literals: vec![vec![0x41]],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -2429,13 +2866,17 @@ rule q {
         assert_eq!(root.children[0].pattern_id.as_deref(), Some("$a"));
         assert_eq!(root.children[1].pattern_id.as_deref(), Some("$b"));
 
-        let (alts, alts5, literals) = dedupe_pattern_alternatives(
+        let (alts, alts5, literals, wide, fullword) = dedupe_pattern_alternatives(
             vec![vec![1_u64, 2], vec![1_u64, 2], vec![3_u64]],
             vec![vec![7_u64], vec![7_u64], vec![8_u64]],
             vec![b"AB".to_vec(), b"AB".to_vec(), b"CD".to_vec()],
+            vec![false, false, true],
+            vec![false, false, true],
         );
         assert_eq!(alts, vec![vec![1_u64, 2], vec![3_u64]]);
         assert_eq!(alts5, vec![vec![7_u64], vec![8_u64]]);
         assert_eq!(literals, vec![b"AB".to_vec(), b"CD".to_vec()]);
+        assert_eq!(wide, vec![false, true]);
+        assert_eq!(fullword, vec![false, true]);
     }
 }

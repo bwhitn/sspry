@@ -112,6 +112,37 @@ fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
     panic!("search did not reach {expected} candidates on {addr}");
 }
 
+fn wait_for_published_doc_count(addr: &str, expected_docs: u64, min_publish_runs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let output = Command::new(bin_path())
+            .args(["info", "--addr", addr])
+            .output()
+            .expect("run info");
+        if output.status.success() {
+            let parsed: Value =
+                serde_json::from_slice(&output.stdout).expect("stats json from info");
+            let publish_runs_total = parsed
+                .get("publish")
+                .and_then(|value| value.get("publish_runs_total"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let doc_count = parsed.get("doc_count").and_then(Value::as_u64).unwrap_or(0);
+            let work_dirty = parsed
+                .get("work_dirty")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if publish_runs_total >= min_publish_runs && doc_count == expected_docs && !work_dirty {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "server did not publish {expected_docs} docs with at least {min_publish_runs} publish runs on {addr}"
+    );
+}
+
 fn wait_for_verified_matches(
     addr: &str,
     rule: &Path,
@@ -119,6 +150,7 @@ fn wait_for_verified_matches(
     expected_matched: usize,
 ) {
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_output = String::new();
     while Instant::now() < deadline {
         let output = Command::new(bin_path())
             .args([
@@ -133,16 +165,23 @@ fn wait_for_verified_matches(
             .expect("run verified search");
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            last_output = stdout.to_string();
             if stdout.contains(&format!("verified_checked: {expected_checked}"))
                 && stdout.contains(&format!("verified_matched: {expected_matched}"))
             {
                 return;
             }
+        } else {
+            last_output = format!(
+                "stdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }
     panic!(
-        "verified search did not reach checked={expected_checked} matched={expected_matched} on {addr}"
+        "verified search did not reach checked={expected_checked} matched={expected_matched} on {addr}; last_output={last_output}"
     );
 }
 
@@ -303,7 +342,7 @@ rule q {
     )
     .expect("write rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -380,7 +419,7 @@ fn info_uses_sspry_addr_env() {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
     wait_for_info(&addr);
 
     let info = run_ok_env(&["info"], &[("SSPRY_ADDR", &addr)]);
@@ -407,7 +446,7 @@ fn info_light_exposes_adaptive_publish_status() {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
     wait_for_info(&addr);
 
     let info = run_ok(&["info", "--addr", &addr, "--light"]);
@@ -1421,6 +1460,98 @@ rule TimeNow {{
         thread::sleep(Duration::from_millis(25));
     }
     assert!(matched, "time.now rule did not match within deadline");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_verifies_fullword_and_regex_literal_anchors() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let fullword_rule = base.join("fullword_rule.yar");
+    let regex_rule = base.join("regex_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("fullword-match.bin"), b".WORD!").expect("write fullword match");
+    fs::write(sample_dir.join("fullword-miss.bin"), b"xWORDx").expect("write fullword miss");
+    fs::write(sample_dir.join("regex-match.bin"), b"ZZapplesause123").expect("write regex match");
+    fs::write(sample_dir.join("regex-miss.bin"), b"applesauseABC").expect("write regex miss");
+
+    fs::write(
+        &fullword_rule,
+        r#"
+rule FullwordLiteral {
+  strings:
+    $a = "WORD" fullword
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write fullword rule");
+    fs::write(
+        &regex_rule,
+        r#"
+rule RegexLiteral {
+  strings:
+    $a = /[A-Z]+applesause[0-9]+/
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write regex rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 4"));
+    wait_for_published_doc_count(&addr, 4, 1);
+
+    wait_for_verified_matches(&addr, &fullword_rule, 2, 1);
+    let fullword_search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        fullword_rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(fullword_search.contains("candidates: 2"), "{fullword_search}");
+    assert!(
+        fullword_search.contains("verified_checked: 2"),
+        "{fullword_search}"
+    );
+    assert!(
+        fullword_search.contains("verified_matched: 1"),
+        "{fullword_search}"
+    );
+
+    wait_for_verified_matches(&addr, &regex_rule, 2, 1);
+    let regex_search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        regex_rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(regex_search.contains("candidates: 2"), "{regex_search}");
+    assert!(regex_search.contains("verified_checked: 2"), "{regex_search}");
+    assert!(regex_search.contains("verified_matched: 1"), "{regex_search}");
 
     let _ = child.kill();
     let _ = child.wait();

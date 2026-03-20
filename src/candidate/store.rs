@@ -7060,12 +7060,16 @@ rule q {
                     alternatives: vec![vec![1]],
                     tier2_alternatives: vec![Vec::new()],
                     fixed_literals: vec![Vec::new()],
+                    fixed_literal_wide: vec![false],
+                    fixed_literal_fullword: vec![false],
                 },
                 PatternPlan {
                     pattern_id: "tier2".to_owned(),
                     alternatives: vec![vec![2]],
                     tier2_alternatives: vec![Vec::new()],
                     fixed_literals: vec![Vec::new()],
+                    fixed_literal_wide: vec![false],
+                    fixed_literal_fullword: vec![false],
                 },
             ],
             root: QueryNode {
@@ -7118,24 +7122,32 @@ rule q {
                 alternatives: vec![Vec::new()],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             },
             PatternPlan {
                 pattern_id: "tier1".to_owned(),
                 alternatives: vec![vec![1]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             },
             PatternPlan {
                 pattern_id: "tier2".to_owned(),
                 alternatives: vec![vec![1, 2]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             },
             PatternPlan {
                 pattern_id: "missing".to_owned(),
                 alternatives: vec![vec![99]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             },
         ];
         let patterns = patterns_vec
@@ -7593,6 +7605,8 @@ rule q {
                     pack_exact_gram(&[2, 3, 4]),
                 ]],
                 fixed_literals: vec![vec![1, 2, 3, 4]],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -7669,6 +7683,8 @@ rule q {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![vec![1, 2, 3, 4]],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),

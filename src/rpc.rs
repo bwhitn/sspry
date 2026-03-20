@@ -5338,6 +5338,8 @@ fn compiled_query_plan_to_wire(plan: &CompiledQueryPlan) -> Value {
                 "alternatives": pattern.alternatives,
                 "tier2_alternatives": pattern.tier2_alternatives,
                 "fixed_literals": pattern.fixed_literals,
+                "fixed_literal_wide": pattern.fixed_literal_wide,
+                "fixed_literal_fullword": pattern.fixed_literal_fullword,
             })
         }).collect::<Vec<_>>(),
         "ast": query_node_to_wire(&plan.root),
@@ -5382,10 +5384,22 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_else(|| vec![Value::Array(Vec::new()); alternatives_raw.len()]);
+        let fixed_literal_wide_raw = object
+            .get("fixed_literal_wide")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![Value::Bool(false); alternatives_raw.len()]);
+        let fixed_literal_fullword_raw = object
+            .get("fixed_literal_fullword")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![Value::Bool(false); alternatives_raw.len()]);
         let alt_count = alternatives_raw.len();
         let mut alternatives = Vec::with_capacity(alt_count);
         let mut tier2_alternatives = Vec::with_capacity(alt_count);
         let mut fixed_literals = Vec::with_capacity(alt_count);
+        let mut fixed_literal_wide = Vec::with_capacity(alt_count);
+        let mut fixed_literal_fullword = Vec::with_capacity(alt_count);
         for alt in alternatives_raw {
             let grams = alt
                 .as_array()
@@ -5440,11 +5454,35 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         while fixed_literals.len() < alternatives.len() {
             fixed_literals.push(Vec::new());
         }
+        for value in fixed_literal_wide_raw.into_iter().take(alt_count) {
+            fixed_literal_wide.push(
+                value
+                    .as_bool()
+                    .ok_or_else(|| SspryError::from("pattern fixed_literal_wide entries must be bools"))?,
+            );
+        }
+        while fixed_literal_wide.len() < alternatives.len() {
+            fixed_literal_wide.push(false);
+        }
+        for value in fixed_literal_fullword_raw.into_iter().take(alt_count) {
+            fixed_literal_fullword.push(
+                value
+                    .as_bool()
+                    .ok_or_else(|| {
+                        SspryError::from("pattern fixed_literal_fullword entries must be bools")
+                    })?,
+            );
+        }
+        while fixed_literal_fullword.len() < alternatives.len() {
+            fixed_literal_fullword.push(false);
+        }
         patterns.push(PatternPlan {
             pattern_id,
             alternatives,
             tier2_alternatives,
             fixed_literals,
+            fixed_literal_wide,
+            fixed_literal_fullword,
         });
     }
 
@@ -6143,6 +6181,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -6822,6 +6862,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -6941,6 +6983,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -7546,6 +7590,8 @@ mod tests {
                 alternatives: vec![vec![0x01020304]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -7867,6 +7913,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -8821,6 +8869,8 @@ rule q {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -9098,6 +9148,8 @@ rule q {
                         alternatives: vec![vec![gram]],
                         tier2_alternatives: vec![Vec::new()],
                         fixed_literals: vec![Vec::new()],
+                    fixed_literal_wide: vec![false],
+                    fixed_literal_fullword: vec![false],
                     }],
                     root: QueryNode {
                         kind: "pattern".to_owned(),
@@ -9203,6 +9255,8 @@ rule q {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
