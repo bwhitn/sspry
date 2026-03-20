@@ -107,6 +107,8 @@ enum NumericReadKind {
 const NUMERIC_READ_ANCHOR_PREFIX: &str = "__numeric_eq_anchor_";
 const MAX_HEX_GROUP_ALTERNATIVES: usize = 16;
 const MAX_NOCASE_LITERAL_VARIANTS: usize = 32;
+const IGNORED_MODULE_PLACEHOLDER_PREFIX: &str = "ignoredmodulepred";
+const IGNORED_SEARCH_MODULES: &[&str] = &["androguard", "console", "cuckoo"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RangeBoundExpr {
@@ -133,6 +135,15 @@ fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&
         ("uint32", 0, 0x04034b50) | ("uint32be", 0, 0x504b0304) => Some("zip.is_zip"),
         _ => None,
     }
+}
+
+fn ignored_search_module_name(name: &str) -> bool {
+    IGNORED_SEARCH_MODULES.iter().any(|module| {
+        name == *module
+            || name
+                .strip_prefix(module)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
 }
 
 impl ConditionParser {
@@ -321,6 +332,14 @@ impl ConditionParser {
                 let Token::Name(field_name) = self.consume(None)? else {
                     unreachable!();
                 };
+                if field_name.starts_with(IGNORED_MODULE_PLACEHOLDER_PREFIX) {
+                    return Ok(QueryNode {
+                        kind: "ignored_module_predicate".to_owned(),
+                        pattern_id: Some(field_name),
+                        threshold: None,
+                        children: Vec::new(),
+                    });
+                }
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.consume(Some(&Token::LParen))?;
                     let Token::Int(offset) = self.consume(None)? else {
@@ -1072,7 +1091,186 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
             "Rule does not contain a condition section.",
         ));
     }
-    Ok((strings_lines, condition_lines.join(" ")))
+    Ok((
+        strings_lines,
+        rewrite_ignored_module_calls(&condition_lines.join(" ")),
+    ))
+}
+
+fn consume_parenthesized_span(chars: &[char], open_idx: usize) -> Option<usize> {
+    if chars.get(open_idx) != Some(&'(') {
+        return None;
+    }
+    let mut index = open_idx;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut in_regex = false;
+    let mut regex_in_class = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        let next = chars.get(index + 1).copied();
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_regex {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '[' {
+                regex_in_class = true;
+            } else if ch == ']' && regex_in_class {
+                regex_in_class = false;
+            } else if ch == '/' && !regex_in_class {
+                in_regex = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                index += 1;
+            }
+            '/' if next != Some('/') && next != Some('*') => {
+                in_regex = true;
+                regex_in_class = false;
+                index += 1;
+            }
+            '(' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+fn rewrite_ignored_module_calls(condition_text: &str) -> String {
+    let chars = condition_text.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(condition_text.len());
+    let mut index = 0usize;
+    let mut replacement_id = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_ascii_alphabetic() {
+            let mut cursor = index + 1;
+            while cursor < chars.len()
+                && (chars[cursor].is_ascii_alphanumeric()
+                    || chars[cursor] == '_'
+                    || chars[cursor] == '.')
+            {
+                cursor += 1;
+            }
+            let name = chars[index..cursor].iter().collect::<String>();
+            if ignored_search_module_name(&name) {
+                let mut next = cursor;
+                while next < chars.len() && chars[next].is_whitespace() {
+                    next += 1;
+                }
+                if let Some(end) = consume_parenthesized_span(&chars, next) {
+                    out.push_str(IGNORED_MODULE_PLACEHOLDER_PREFIX);
+                    out.push_str(&replacement_id.to_string());
+                    replacement_id += 1;
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
+}
+
+fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
+    match node.kind.as_str() {
+        "ignored_module_predicate" => None,
+        "pattern"
+        | "metadata_eq"
+        | "filesize_eq"
+        | "filesize_gt"
+        | "filesize_ge"
+        | "filesize_lt"
+        | "filesize_le"
+        | "time_now_eq"
+        | "verifier_only_eq"
+        | "verifier_only_at"
+        | "verifier_only_count"
+        | "verifier_only_in_range" => Some(node),
+        "not" => node
+            .children
+            .into_iter()
+            .next()
+            .and_then(prune_ignored_module_predicates)
+            .map(|child| QueryNode {
+                kind: "not".to_owned(),
+                pattern_id: None,
+                threshold: None,
+                children: vec![child],
+            }),
+        "and" | "or" => {
+            let children = node
+                .children
+                .into_iter()
+                .filter_map(prune_ignored_module_predicates)
+                .collect::<Vec<_>>();
+            match children.len() {
+                0 => None,
+                1 => children.into_iter().next(),
+                _ => Some(QueryNode {
+                    kind: node.kind,
+                    pattern_id: None,
+                    threshold: None,
+                    children,
+                }),
+            }
+        }
+        "n_of" => {
+            let children = node
+                .children
+                .into_iter()
+                .filter_map(prune_ignored_module_predicates)
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                return None;
+            }
+            let original = node.threshold.unwrap_or(children.len());
+            let threshold = original.min(children.len());
+            if threshold == 0 {
+                return None;
+            }
+            if threshold == 1 && children.len() == 1 {
+                return children.into_iter().next();
+            }
+            Some(QueryNode {
+                kind: "n_of".to_owned(),
+                pattern_id: None,
+                threshold: Some(threshold),
+                children,
+            })
+        }
+        _ => Some(node),
+    }
 }
 
 fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
@@ -2570,7 +2768,11 @@ pub fn compile_query_plan_with_gram_sizes(
         &condition_text,
         pattern_alternatives.keys().cloned().collect(),
     )?;
-    let mut root = parser.parse()?;
+    let mut root = prune_ignored_module_predicates(parser.parse()?).ok_or_else(|| {
+        SspryError::from(
+            "Rule condition does not contain searchable anchors after pruning ignored module predicates.",
+        )
+    })?;
     let mut next_numeric_anchor_id = 0usize;
     inject_numeric_read_anchor_patterns(
         &mut root,
@@ -3626,6 +3828,34 @@ rule nocase_anchor {
         assert_eq!(nocase.patterns.len(), 1);
         assert!(nocase.patterns[0].alternatives.len() > 1);
         assert!(nocase.patterns[0].fixed_literals.iter().all(Vec::is_empty));
+
+        let ignored_modules = compile_query_plan_default(
+            r#"
+rule ignored_modules {
+  strings:
+    $a = "ABCD"
+    $b = "WXYZ"
+  condition:
+    ($a and androguard.url(/evil\.example/)) or
+    (not cuckoo.sync.mutex(/demo/) and console.log("dbg") and $b)
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile ignored imports");
+        assert_eq!(ignored_modules.patterns.len(), 2);
+        assert_eq!(ignored_modules.root.kind, "or");
+        assert_eq!(ignored_modules.root.children.len(), 2);
+        assert!(
+            ignored_modules
+                .root
+                .children
+                .iter()
+                .all(|child| child.kind == "pattern")
+        );
 
         assert!(
             compile_query_plan_with_gram_sizes(

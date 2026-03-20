@@ -33,6 +33,7 @@ MODULE_NAMES = ("pe", "elf", "dotnet", "math", "hash")
 UNSUPPORTED_MODULES = {"math", "hash"}
 SUPPORTED_IMPORTS = {"pe", "elf", "dotnet"}
 SUPPORTED_DOTNET_FIELDS = {"is_dotnet"}
+IGNORED_IMPORTS = {"androguard", "console", "cuckoo"}
 TEMPORARY_SEARCH_MARKERS = (
     "Resource temporarily unavailable",
     "busy during query scan; retry later",
@@ -141,7 +142,12 @@ def analyze_static(path: Path) -> dict:
     heavy_module = any(module in UNSUPPORTED_MODULES for module in modules) or bool(
         unsupported_dotnet_fields
     )
-    unknown_imports = sorted(import_name for import_name in imports if import_name not in SUPPORTED_IMPORTS)
+    ignored_imports = sorted(import_name for import_name in imports if import_name in IGNORED_IMPORTS)
+    unknown_imports = sorted(
+        import_name
+        for import_name in imports
+        if import_name not in SUPPORTED_IMPORTS and import_name not in IGNORED_IMPORTS
+    )
     module_loop = bool(modules) and (for_any or for_all)
     wide_or_burst = or_count >= 12 and string_defs >= 12
 
@@ -149,6 +155,8 @@ def analyze_static(path: Path) -> dict:
         notes.append("uses include")
     if unknown_imports:
         notes.append("uses unknown import")
+    if ignored_imports:
+        notes.append("uses ignored import")
     if heavy_module:
         notes.append("uses unsupported-heavy module path")
     if unsupported_dotnet_fields:
@@ -182,7 +190,7 @@ def analyze_static(path: Path) -> dict:
         bucket = "unsupported_or_manual_review"
     elif module_loop or matches_regex or regex_strings or xor_count or base64_count:
         bucket = "likely_bad_for_search"
-    elif rewrite_hints or modules or filesize_count or uint_reads or has_entrypoint:
+    elif rewrite_hints or modules or ignored_imports or filesize_count or uint_reads or has_entrypoint:
         bucket = "optimizable"
     else:
         bucket = "good_candidate"
@@ -220,6 +228,7 @@ def analyze_static(path: Path) -> dict:
         "has_any_of_them": has_any_of_them,
         "has_string_decl_comment": has_string_decl_comment,
         "unknown_imports": unknown_imports,
+        "ignored_imports": ignored_imports,
         "dotnet_fields": dotnet_fields,
         "unsupported_dotnet_fields": unsupported_dotnet_fields,
         "static_bucket": bucket,
@@ -297,6 +306,7 @@ def run_search(rule: Path, sspry: Path, addr: str, timeout_s: int, verify: bool)
             "error": "client_timeout",
         }
     record = parse_search_result(rule, proc, (time.time() - started) * 1000.0)
+    record["verify_enabled"] = verify
     if record.get("error"):
         err = record["error"]
         if any(marker in err for marker in TEMPORARY_SEARCH_MARKERS):
@@ -323,6 +333,8 @@ def final_bucket(record: dict, dataset_count: int) -> str:
         return "unsupported_or_manual_review"
     if error_kind in {"temporary_busy", "search_error"}:
         return "manual_review"
+    if record.get("ignored_imports"):
+        return "optimizable_rule"
     docs_scanned = float(dynamic.get("verbose_search_docs_scanned", 0.0))
     total_ms = float(dynamic.get("verbose_search_total_ms", dynamic.get("elapsed_ms_wall", 0.0)))
     scanned_ratio = docs_scanned / float(dataset_count) if dataset_count else 0.0
@@ -436,7 +448,14 @@ def main() -> int:
         wait_for_server(sspry, args.addr, run_dir / "server.info.light.json", attempts=300)
         dynamic_map = {}
         for index, record in enumerate(selected, start=1):
-            result = run_search(Path(record["path"]), sspry, args.addr, args.timeout_s, args.verify)
+            verify_enabled = args.verify and not record.get("ignored_imports")
+            result = run_search(
+                Path(record["path"]),
+                sspry,
+                args.addr,
+                args.timeout_s,
+                verify_enabled,
+            )
             dynamic_map[record["path"]] = result
             if index % 25 == 0:
                 sys.stderr.write(f"dynamic_progress: {index}/{len(selected)}\n")
