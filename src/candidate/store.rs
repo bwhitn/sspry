@@ -4966,6 +4966,8 @@ fn node_structurally_impossible(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "pattern" => false,
         "verifier_only_eq" => false,
+        "verifier_only_at" => false,
+        "verifier_only_count" => false,
         "filesize_eq" => false,
         "metadata_eq" => false,
         "time_now_eq" => false,
@@ -5284,7 +5286,12 @@ fn tree_maybe_matches_node(
                 allow_tier2,
             ))
         }
-        "verifier_only_eq" | "filesize_eq" | "metadata_eq" | "time_now_eq" => Ok(true),
+        "verifier_only_eq"
+        | "verifier_only_at"
+        | "verifier_only_count"
+        | "filesize_eq"
+        | "metadata_eq"
+        | "time_now_eq" => Ok(true),
         "and" => {
             for child in &node.children {
                 if !tree_maybe_matches_node(
@@ -5409,6 +5416,8 @@ fn block_maybe_matches_node(
             ))
         }
         "verifier_only_eq" => Ok(true),
+        "verifier_only_at" => Ok(true),
+        "verifier_only_count" => Ok(true),
         "filesize_eq" => Ok(true),
         "metadata_eq" => Ok(true),
         "time_now_eq" => Ok(true),
@@ -5612,7 +5621,7 @@ where
                 .insert(pattern_id.clone(), outcome);
             Ok(outcome)
         }
-        "verifier_only_eq" => Ok(MatchOutcome {
+        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" => Ok(MatchOutcome {
             matched: true,
             tiers: TierFlags::default(),
             score: 0,

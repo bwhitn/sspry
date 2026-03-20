@@ -5648,20 +5648,20 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
                 return Err(SspryError::from("time_now_eq node must not have children"));
             }
         }
-        "verifier_only_eq" => {
+        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" => {
             if pattern_id.as_deref().unwrap_or_default().is_empty() {
                 return Err(SspryError::from(
-                    "verifier_only_eq node requires a non-empty pattern_id",
+                    format!("{kind} node requires a non-empty pattern_id"),
                 ));
             }
             if threshold.is_some() {
                 return Err(SspryError::from(
-                    "verifier_only_eq node must not use threshold",
+                    format!("{kind} node must not use threshold"),
                 ));
             }
             if !children.is_empty() {
                 return Err(SspryError::from(
-                    "verifier_only_eq node must not have children",
+                    format!("{kind} node must not have children"),
                 ));
             }
         }
@@ -8154,6 +8154,29 @@ mod tests {
         );
         assert_eq!(verifier_only_eq.threshold, None);
 
+        let verifier_only_at = query_node_from_wire(&serde_json::json!({
+            "kind": "verifier_only_at",
+            "pattern_id": "$a@0",
+            "children": []
+        }))
+        .expect("verifier_only_at");
+        assert_eq!(verifier_only_at.kind, "verifier_only_at");
+        assert_eq!(verifier_only_at.pattern_id.as_deref(), Some("$a@0"));
+        assert_eq!(verifier_only_at.threshold, None);
+
+        let verifier_only_count = query_node_from_wire(&serde_json::json!({
+            "kind": "verifier_only_count",
+            "pattern_id": "count:$a:gt:2",
+            "children": []
+        }))
+        .expect("verifier_only_count");
+        assert_eq!(verifier_only_count.kind, "verifier_only_count");
+        assert_eq!(
+            verifier_only_count.pattern_id.as_deref(),
+            Some("count:$a:gt:2")
+        );
+        assert_eq!(verifier_only_count.threshold, None);
+
         assert!(
             query_node_from_wire(&serde_json::json!({
                 "kind": "filesize_eq",
@@ -8199,6 +8222,17 @@ mod tests {
             .expect_err("empty verifier-only pattern id")
             .to_string()
             .contains("requires a non-empty pattern_id")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "verifier_only_at",
+                "pattern_id": "",
+                "children": []
+            }))
+            .expect_err("empty verifier-only-at pattern id")
+            .to_string()
+            .contains("verifier_only_at node requires a non-empty pattern_id")
         );
 
         assert!(

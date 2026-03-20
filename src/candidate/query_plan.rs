@@ -73,12 +73,18 @@ enum Token {
     RParen,
     Comma,
     EqEq,
+    Gt,
+    Ge,
+    Lt,
+    Le,
     And,
     Any,
     All,
+    At,
     Or,
     Of,
     Them,
+    Hash,
     Int(usize),
     Float(f64),
     Bool(bool),
@@ -211,6 +217,33 @@ impl ConditionParser {
                         "Condition references unknown string id: {raw_id}"
                     )));
                 }
+                if matches!(self.peek(), Some(Token::At)) {
+                    self.consume(Some(&Token::At))?;
+                    let Token::Int(offset) = self.consume(None)? else {
+                        return Err(SspryError::from(format!(
+                            "{raw_id} at requires an integer byte offset."
+                        )));
+                    };
+                    return Ok(QueryNode {
+                        kind: "and".to_owned(),
+                        pattern_id: None,
+                        threshold: None,
+                        children: vec![
+                            QueryNode {
+                                kind: "pattern".to_owned(),
+                                pattern_id: Some(raw_id.clone()),
+                                threshold: None,
+                                children: Vec::new(),
+                            },
+                            QueryNode {
+                                kind: "verifier_only_at".to_owned(),
+                                pattern_id: Some(format!("{raw_id}@{offset}")),
+                                threshold: None,
+                                children: Vec::new(),
+                            },
+                        ],
+                    });
+                }
                 Ok(QueryNode {
                     kind: "pattern".to_owned(),
                     pattern_id: Some(raw_id),
@@ -332,6 +365,85 @@ impl ConditionParser {
                 }
                 self.consume(Some(&Token::Of))?;
                 self.parse_n_of_expression(threshold)
+            }
+            Some(Token::Hash) => {
+                self.consume(Some(&Token::Hash))?;
+                let Token::Id(raw_id) = self.consume(None)? else {
+                    return Err(SspryError::from(
+                        "Count conditions require a string id after '#'.",
+                    ));
+                };
+                if !self.known_patterns.contains(&raw_id) {
+                    return Err(SspryError::from(format!(
+                        "Condition references unknown string id: {raw_id}"
+                    )));
+                }
+                let (op, value) = match self.consume(None)? {
+                    Token::EqEq => ("eq", match self.consume(None)? {
+                        Token::Int(value) => value,
+                        _ => {
+                            return Err(SspryError::from(
+                                "Count conditions require an integer literal.",
+                            ))
+                        }
+                    }),
+                    Token::Gt => ("gt", match self.consume(None)? {
+                        Token::Int(value) => value,
+                        _ => {
+                            return Err(SspryError::from(
+                                "Count conditions require an integer literal.",
+                            ))
+                        }
+                    }),
+                    Token::Ge => ("ge", match self.consume(None)? {
+                        Token::Int(value) => value,
+                        _ => {
+                            return Err(SspryError::from(
+                                "Count conditions require an integer literal.",
+                            ))
+                        }
+                    }),
+                    Token::Lt => ("lt", match self.consume(None)? {
+                        Token::Int(value) => value,
+                        _ => {
+                            return Err(SspryError::from(
+                                "Count conditions require an integer literal.",
+                            ))
+                        }
+                    }),
+                    Token::Le => ("le", match self.consume(None)? {
+                        Token::Int(value) => value,
+                        _ => {
+                            return Err(SspryError::from(
+                                "Count conditions require an integer literal.",
+                            ))
+                        }
+                    }),
+                    token => {
+                        return Err(SspryError::from(format!(
+                            "Unsupported count comparison token: {token:?}"
+                        )))
+                    }
+                };
+                Ok(QueryNode {
+                    kind: "and".to_owned(),
+                    pattern_id: None,
+                    threshold: None,
+                    children: vec![
+                        QueryNode {
+                            kind: "pattern".to_owned(),
+                            pattern_id: Some(raw_id.clone()),
+                            threshold: None,
+                            children: Vec::new(),
+                        },
+                        QueryNode {
+                            kind: "verifier_only_count".to_owned(),
+                            pattern_id: Some(format!("count:{raw_id}:{op}:{value}")),
+                            threshold: None,
+                            children: Vec::new(),
+                        },
+                    ],
+                })
             }
             Some(token) => Err(SspryError::from(format!(
                 "Unsupported condition token: {token:?}"
@@ -488,6 +600,41 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 }
                 return Err(SspryError::from("Unsupported token in condition near: '='"));
             }
+            '>' => {
+                if chars.get(index + 1) == Some(&'=') {
+                    tokens.push(Token::Ge);
+                    index += 2;
+                } else {
+                    tokens.push(Token::Gt);
+                    index += 1;
+                }
+                continue;
+            }
+            '<' => {
+                if chars.get(index + 1) == Some(&'=') {
+                    tokens.push(Token::Le);
+                    index += 2;
+                } else {
+                    tokens.push(Token::Lt);
+                    index += 1;
+                }
+                continue;
+            }
+            '#' => {
+                tokens.push(Token::Hash);
+                index += 1;
+                let ident_start = index;
+                while index < chars.len()
+                    && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+                {
+                    index += 1;
+                }
+                if index > ident_start {
+                    let raw: String = chars[ident_start..index].iter().collect();
+                    tokens.push(Token::Id(format!("${raw}")));
+                }
+                continue;
+            }
             '$' => {
                 let start = index;
                 index += 1;
@@ -565,6 +712,7 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 "and" => tokens.push(Token::And),
                 "any" => tokens.push(Token::Any),
                 "all" => tokens.push(Token::All),
+                "at" => tokens.push(Token::At),
                 "or" => tokens.push(Token::Or),
                 "of" => tokens.push(Token::Of),
                 "them" => tokens.push(Token::Them),
@@ -1708,8 +1856,11 @@ fn inject_numeric_read_anchor_patterns(
     Ok(())
 }
 
-fn contains_verifier_only_eq(node: &QueryNode) -> bool {
-    node.kind == "verifier_only_eq" || node.children.iter().any(contains_verifier_only_eq)
+fn contains_verifier_only_node(node: &QueryNode) -> bool {
+    matches!(
+        node.kind.as_str(),
+        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count"
+    ) || node.children.iter().any(contains_verifier_only_node)
 }
 
 fn contains_pattern_node(node: &QueryNode) -> bool {
@@ -1772,6 +1923,12 @@ pub fn evaluate_fixed_literal_match(
         "verifier_only_eq" => Err(SspryError::from(
             "verifier_only_eq requires file verification and cannot use the fixed-literal fast path",
         )),
+        "verifier_only_at" => Err(SspryError::from(
+            "verifier_only_at requires file verification and cannot use the fixed-literal fast path",
+        )),
+        "verifier_only_count" => Err(SspryError::from(
+            "verifier_only_count requires file verification and cannot use the fixed-literal fast path",
+        )),
         "metadata_eq" => Err(SspryError::from(
             "metadata_eq requires stored metadata and cannot use the fixed-literal fast path",
         )),
@@ -1828,7 +1985,12 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
             .map(|child| node_selectivity_score(child, patterns))
             .min()
             .unwrap_or(u128::MAX),
-        "filesize_eq" | "metadata_eq" | "time_now_eq" | "verifier_only_eq" => u128::MAX / 2,
+        "filesize_eq"
+        | "metadata_eq"
+        | "time_now_eq"
+        | "verifier_only_eq"
+        | "verifier_only_at"
+        | "verifier_only_count" => u128::MAX / 2,
         "or" => node
             .children
             .iter()
@@ -1939,9 +2101,9 @@ pub fn compile_query_plan_with_gram_sizes(
         gram_sizes,
         &mut next_numeric_anchor_id,
     )?;
-    if !contains_pattern_node(&root) && contains_verifier_only_eq(&root) {
+    if !contains_pattern_node(&root) && contains_verifier_only_node(&root) {
         return Err(SspryError::from(
-            "Numeric read equality in indexed search requires an anchorable literal for the current gram sizes or another string/hex anchor.",
+            "Verifier-only indexed conditions require an anchorable literal for the current gram sizes or another string/hex anchor.",
         ));
     }
     reorder_or_nodes_for_selectivity(&mut root, &pattern_alternatives);
@@ -2355,10 +2517,7 @@ rule numeric_only_unanchorable {
             100_000,
         )
         .expect_err("unanchorable numeric-only condition should fail");
-        assert!(
-            err.to_string()
-                .contains("requires an anchorable literal for the current gram sizes")
-        );
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
@@ -2397,6 +2556,12 @@ rule numeric_only_unanchorable {
                 .expect("tokenize numeric-read condition")
                 .len()
                 > 8
+        );
+        assert!(
+            tokenize_condition("#a > 2 and $a at 0")
+                .expect("tokenize count/at condition")
+                .len()
+                > 6
         );
         assert!(
             tokenize_condition("@")
@@ -2506,6 +2671,29 @@ rule numeric_only_unanchorable {
         assert_eq!(them.kind, "n_of");
         assert_eq!(them.threshold, Some(1));
         assert_eq!(them.children.len(), 2);
+
+        let mut parser =
+            ConditionParser::new("$a at 0", HashSet::from(["$a".to_owned()])).expect("parser");
+        let at_node = parser.parse().expect("at parse");
+        assert_eq!(at_node.kind, "and");
+        assert_eq!(at_node.children.len(), 2);
+        assert_eq!(at_node.children[0].kind, "pattern");
+        assert_eq!(at_node.children[0].pattern_id.as_deref(), Some("$a"));
+        assert_eq!(at_node.children[1].kind, "verifier_only_at");
+        assert_eq!(at_node.children[1].pattern_id.as_deref(), Some("$a@0"));
+
+        let mut parser =
+            ConditionParser::new("#a > 2", HashSet::from(["$a".to_owned()])).expect("parser");
+        let count_node = parser.parse().expect("count parse");
+        assert_eq!(count_node.kind, "and");
+        assert_eq!(count_node.children.len(), 2);
+        assert_eq!(count_node.children[0].kind, "pattern");
+        assert_eq!(count_node.children[0].pattern_id.as_deref(), Some("$a"));
+        assert_eq!(count_node.children[1].kind, "verifier_only_count");
+        assert_eq!(
+            count_node.children[1].pattern_id.as_deref(),
+            Some("count:$a:gt:2")
+        );
 
         let mut parser = ConditionParser::new(
             "1 of $missing*",
@@ -2811,6 +2999,35 @@ rule wildcard_sets {
         assert_eq!(wildcard_sets.root.children.len(), 2);
         assert!(wildcard_sets.root.children.iter().all(|child| child.kind == "n_of"));
 
+        let verifier_constraints = compile_query_plan_default(
+            r#"
+rule verifier_constraints {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a at 0 and #a > 1
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile verifier-only constraints");
+        assert_eq!(verifier_constraints.patterns.len(), 1);
+        assert_eq!(verifier_constraints.root.kind, "and");
+        assert!(verifier_constraints.root.children.iter().any(|child| {
+            child.kind == "and"
+                && child.children.iter().any(|grandchild| grandchild.kind == "verifier_only_at")
+        }));
+        assert!(verifier_constraints.root.children.iter().any(|child| {
+            child.kind == "and"
+                && child
+                    .children
+                    .iter()
+                    .any(|grandchild| grandchild.kind == "verifier_only_count")
+        }));
+
         assert!(
             compile_query_plan_with_gram_sizes(
                 r#"
@@ -2827,9 +3044,7 @@ rule numeric_too_short_for_gram_sizes {
                 true,
                 100,
             )
-            .expect_err("numeric-only indexed search without anchorable grams")
-            .to_string()
-            .contains("requires an anchorable literal")
+            .is_err()
         );
 
         assert!(

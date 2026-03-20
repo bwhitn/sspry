@@ -1354,6 +1354,107 @@ rule NumericF64Be {
 }
 
 #[test]
+fn search_verify_supports_at_and_count_conditions() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule_at = base.join("at_rule.yar");
+    let rule_count = base.join("count_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("at_hit.bin"), b"ABCD--tail").expect("write at hit");
+    fs::write(sample_dir.join("at_miss.bin"), b"xxABCDtail").expect("write at miss");
+    fs::write(sample_dir.join("count_hit.bin"), b"ABCD--ABCD--tail").expect("write count hit");
+    fs::write(sample_dir.join("count_miss.bin"), b"ABCD--tail").expect("write count miss");
+
+    fs::write(
+        &rule_at,
+        r#"
+rule AtRule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a at 0
+}
+"#,
+    )
+    .expect("write at rule");
+
+    fs::write(
+        &rule_count,
+        r#"
+rule CountRule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a > 1
+}
+"#,
+    )
+    .expect("write count rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 4"));
+
+    let wait_for_matched = |rule: &Path, expected_matched: usize| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last_output = String::new();
+        while Instant::now() < deadline {
+            let output = Command::new(bin_path())
+                .args([
+                    "search",
+                    "--addr",
+                    &addr,
+                    "--rule",
+                    rule.to_str().expect("rule"),
+                    "--verify",
+                ])
+                .output()
+                .expect("run verified search");
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                if stdout.contains(&format!("verified_matched: {expected_matched}")) {
+                    return stdout;
+                }
+                last_output = stdout;
+            } else {
+                last_output = format!(
+                    "stdout={}\nstderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "verified search did not reach matched={expected_matched} on {addr}; last_output={last_output}"
+        );
+    };
+
+    let search_at = wait_for_matched(&rule_at, 2);
+    assert!(search_at.contains("verified_matched: 2"), "{search_at}");
+
+    let search_count = wait_for_matched(&rule_count, 1);
+    assert!(search_count.contains("verified_matched: 1"), "{search_count}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn search_supports_time_now_and_wide_literal_conditions() {
     let tmp = tempdir().expect("tmp");
     let base = tmp.path();
