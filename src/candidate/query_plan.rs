@@ -846,6 +846,7 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
     enum RegexAtom {
         Literal(u8),
         Variable,
+        Candidate,
         Anchor,
     }
 
@@ -884,121 +885,290 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
         }
     }
 
-    let chars = regex_raw.chars().collect::<Vec<_>>();
-    let mut best = Vec::<u8>::new();
-    let mut current = Vec::<u8>::new();
-    let mut index = 0usize;
-    while index < chars.len() {
-        let atom = match chars[index] {
-            '^' | '$' => {
-                index += 1;
-                RegexAtom::Anchor
+    fn split_top_level_alternation(regex_raw: &str) -> Result<Vec<&str>> {
+        let mut parts = Vec::<&str>::new();
+        let mut start = 0usize;
+        let mut escaped = false;
+        let mut in_class = false;
+        let mut depth = 0usize;
+        for (idx, ch) in regex_raw.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
             }
-            '(' | ')' | '|' => {
-                return Err(SspryError::from(
-                    "Unsupported regex string: groups and alternation are not searchable yet.",
-                ));
-            }
-            '[' => {
-                index += 1;
-                let mut escaped = false;
-                while index < chars.len() {
-                    let ch = chars[index];
-                    index += 1;
-                    if escaped {
-                        escaped = false;
-                        continue;
-                    }
-                    if ch == '\\' {
-                        escaped = true;
-                        continue;
-                    }
-                    if ch == ']' {
-                        break;
-                    }
+            match ch {
+                '\\' => {
+                    escaped = true;
                 }
-                RegexAtom::Variable
-            }
-            '.' => {
-                index += 1;
-                RegexAtom::Variable
-            }
-            '\\' => {
-                index += 1;
-                if index >= chars.len() {
-                    return Err(SspryError::from("Invalid regex escape."));
+                '[' => {
+                    in_class = true;
                 }
-                let escaped = chars[index];
-                index += 1;
-                match escaped {
-                    'b' | 'B' | 'A' | 'z' | 'Z' => RegexAtom::Anchor,
-                    'd' | 'D' | 's' | 'S' | 'w' | 'W' => RegexAtom::Variable,
-                    'n' => RegexAtom::Literal(b'\n'),
-                    'r' => RegexAtom::Literal(b'\r'),
-                    't' => RegexAtom::Literal(b'\t'),
-                    'x' => {
-                        if index + 1 > chars.len() {
-                            return Err(SspryError::from("Invalid regex hex escape."));
-                        }
-                        let hi = chars.get(index).copied();
-                        let lo = chars.get(index + 1).copied();
-                        let (Some(hi), Some(lo)) = (hi, lo) else {
-                            return Err(SspryError::from("Invalid regex hex escape."));
-                        };
-                        if !(hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit()) {
-                            return Err(SspryError::from("Invalid regex hex escape."));
-                        }
-                        index += 2;
-                        let text = [hi, lo].iter().collect::<String>();
-                        let value = u8::from_str_radix(&text, 16)
-                            .map_err(|_| SspryError::from("Invalid regex hex escape."))?;
-                        RegexAtom::Literal(value)
-                    }
-                    other if other.is_ascii() => RegexAtom::Literal(other as u8),
-                    _ => {
-                        return Err(SspryError::from(
-                            "Unsupported non-ASCII regex escape in searchable regex.",
-                        ));
-                    }
+                ']' if in_class => {
+                    in_class = false;
                 }
-            }
-            ch if ch.is_ascii() => {
-                index += 1;
-                RegexAtom::Literal(ch as u8)
-            }
-            _ => {
-                return Err(SspryError::from(
-                    "Unsupported non-ASCII regex string in searchable regex.",
-                ));
-            }
-        };
-
-        let (min_repeat, quantifier_len) = parse_quantifier(&chars, index)?;
-        if quantifier_len > 0 {
-            index += quantifier_len;
-            if index < chars.len() && chars[index] == '?' {
-                index += 1;
+                '(' if !in_class => {
+                    depth += 1;
+                }
+                ')' if !in_class => {
+                    if depth == 0 {
+                        return Err(SspryError::from("Unbalanced ')' in regex string."));
+                    }
+                    depth -= 1;
+                }
+                '|' if !in_class && depth == 0 => {
+                    parts.push(&regex_raw[start..idx]);
+                    start = idx + 1;
+                }
+                _ => {}
             }
         }
+        if depth != 0 || in_class || escaped {
+            return Err(SspryError::from("Unterminated group or character class in regex."));
+        }
+        parts.push(&regex_raw[start..]);
+        Ok(parts)
+    }
 
-        match atom {
-            RegexAtom::Anchor => {}
-            RegexAtom::Literal(byte) if min_repeat > 0 => {
-                for _ in 0..min_repeat {
-                    current.push(byte);
+    fn longest_common_substring(branch_runs: &[Vec<Vec<u8>>]) -> Vec<u8> {
+        let Some(first_runs) = branch_runs.first() else {
+            return Vec::new();
+        };
+        let mut first_candidates = first_runs
+            .iter()
+            .filter(|run| !run.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        first_candidates.sort_by_key(|run| std::cmp::Reverse(run.len()));
+        for candidate in first_candidates {
+            for len in (1..=candidate.len()).rev() {
+                for start in 0..=(candidate.len() - len) {
+                    let needle = &candidate[start..start + len];
+                    if branch_runs[1..]
+                        .iter()
+                        .all(|runs| runs.iter().any(|run| run.windows(len).any(|w| w == needle)))
+                    {
+                        return needle.to_vec();
+                    }
                 }
             }
-            RegexAtom::Literal(_) | RegexAtom::Variable => {
-                if current.len() > best.len() {
-                    best = current.clone();
-                }
+        }
+        Vec::new()
+    }
+
+    fn extract_regex_branch_mandatory_runs(regex_raw: &str) -> Result<Vec<Vec<u8>>> {
+        fn flush_current(current: &mut Vec<u8>, runs: &mut Vec<Vec<u8>>) {
+            if !current.is_empty() {
+                runs.push(current.clone());
                 current.clear();
             }
         }
+
+        fn parse_group(chars: &[char], start: usize) -> Result<(String, usize)> {
+            let mut depth = 1usize;
+            let mut escaped = false;
+            let mut in_class = false;
+            let mut index = start + 1;
+            while index < chars.len() {
+                let ch = chars[index];
+                if escaped {
+                    escaped = false;
+                    index += 1;
+                    continue;
+                }
+                match ch {
+                    '\\' => {
+                        escaped = true;
+                    }
+                    '[' => {
+                        in_class = true;
+                    }
+                    ']' if in_class => {
+                        in_class = false;
+                    }
+                    '(' if !in_class => {
+                        depth += 1;
+                    }
+                    ')' if !in_class => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let inner = chars[start + 1..index].iter().collect::<String>();
+                            return Ok((inner, index + 1));
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+            Err(SspryError::from("Unterminated regex group."))
+        }
+
+        let chars = regex_raw.chars().collect::<Vec<_>>();
+        let mut runs = Vec::<Vec<u8>>::new();
+        let mut current = Vec::<u8>::new();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let mut candidate_bytes = Vec::<u8>::new();
+            let atom = match chars[index] {
+                '^' | '$' => {
+                    index += 1;
+                    RegexAtom::Anchor
+                }
+                '(' => {
+                    let (mut inner, next_index) = parse_group(&chars, index)?;
+                    index = next_index;
+                    if let Some(stripped) = inner.strip_prefix("?:") {
+                        inner = stripped.to_owned();
+                    } else if inner.starts_with('?') {
+                        return Err(SspryError::from(
+                            "Unsupported regex group extension in searchable regex.",
+                        ));
+                    }
+                    if let Ok(group_literal) = extract_regex_mandatory_literal(&inner) {
+                        if !group_literal.is_empty() {
+                            candidate_bytes = group_literal;
+                            RegexAtom::Candidate
+                        } else {
+                            RegexAtom::Variable
+                        }
+                    } else {
+                        RegexAtom::Variable
+                    }
+                }
+                '[' => {
+                    index += 1;
+                    let mut escaped = false;
+                    while index < chars.len() {
+                        let ch = chars[index];
+                        index += 1;
+                        if escaped {
+                            escaped = false;
+                            continue;
+                        }
+                        if ch == '\\' {
+                            escaped = true;
+                            continue;
+                        }
+                        if ch == ']' {
+                            break;
+                        }
+                    }
+                    RegexAtom::Variable
+                }
+                '.' => {
+                    index += 1;
+                    RegexAtom::Variable
+                }
+                '\\' => {
+                    index += 1;
+                    if index >= chars.len() {
+                        return Err(SspryError::from("Invalid regex escape."));
+                    }
+                    let escaped = chars[index];
+                    index += 1;
+                    match escaped {
+                        'b' | 'B' | 'A' | 'z' | 'Z' => RegexAtom::Anchor,
+                        'd' | 'D' | 's' | 'S' | 'w' | 'W' => RegexAtom::Variable,
+                        'n' => {
+                            candidate_bytes.push(b'\n');
+                            RegexAtom::Literal(b'\n')
+                        }
+                        'r' => {
+                            candidate_bytes.push(b'\r');
+                            RegexAtom::Literal(b'\r')
+                        }
+                        't' => {
+                            candidate_bytes.push(b'\t');
+                            RegexAtom::Literal(b'\t')
+                        }
+                        'x' => {
+                            let hi = chars.get(index).copied();
+                            let lo = chars.get(index + 1).copied();
+                            let (Some(hi), Some(lo)) = (hi, lo) else {
+                                return Err(SspryError::from("Invalid regex hex escape."));
+                            };
+                            if !(hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit()) {
+                                return Err(SspryError::from("Invalid regex hex escape."));
+                            }
+                            index += 2;
+                            let text = [hi, lo].iter().collect::<String>();
+                            let value = u8::from_str_radix(&text, 16)
+                                .map_err(|_| SspryError::from("Invalid regex hex escape."))?;
+                            candidate_bytes.push(value);
+                            RegexAtom::Literal(value)
+                        }
+                        other if other.is_ascii() => {
+                            candidate_bytes.push(other as u8);
+                            RegexAtom::Literal(other as u8)
+                        }
+                        _ => {
+                            return Err(SspryError::from(
+                                "Unsupported non-ASCII regex escape in searchable regex.",
+                            ));
+                        }
+                    }
+                }
+                '|' | ')' => {
+                    return Err(SspryError::from(
+                        "Unexpected alternation or group terminator in regex branch.",
+                    ));
+                }
+                ch if ch.is_ascii() => {
+                    index += 1;
+                    candidate_bytes.push(ch as u8);
+                    RegexAtom::Literal(ch as u8)
+                }
+                _ => {
+                    return Err(SspryError::from(
+                        "Unsupported non-ASCII regex string in searchable regex.",
+                    ));
+                }
+            };
+
+            let (min_repeat, quantifier_len) = parse_quantifier(&chars, index)?;
+            if quantifier_len > 0 {
+                index += quantifier_len;
+                if index < chars.len() && chars[index] == '?' {
+                    index += 1;
+                }
+            }
+
+            match atom {
+                RegexAtom::Anchor => {}
+                RegexAtom::Literal(byte) if min_repeat > 0 => {
+                    for _ in 0..min_repeat {
+                        current.push(byte);
+                    }
+                }
+                RegexAtom::Candidate if min_repeat > 0 => {
+                    flush_current(&mut current, &mut runs);
+                    runs.push(candidate_bytes);
+                }
+                RegexAtom::Literal(_) | RegexAtom::Variable | RegexAtom::Candidate => {
+                    flush_current(&mut current, &mut runs);
+                }
+            }
+        }
+        flush_current(&mut current, &mut runs);
+        Ok(runs)
     }
-    if current.len() > best.len() {
-        best = current;
+
+    let branches = split_top_level_alternation(regex_raw)?;
+    if branches.len() == 1 {
+        let runs = extract_regex_branch_mandatory_runs(regex_raw)?;
+        let best = runs.into_iter().max_by_key(|run| run.len()).unwrap_or_default();
+        if best.is_empty() {
+            return Err(SspryError::from(
+                "Regex string does not contain a searchable mandatory literal.",
+            ));
+        }
+        return Ok(best);
     }
+
+    let branch_runs = branches
+        .into_iter()
+        .map(extract_regex_branch_mandatory_runs)
+        .collect::<Result<Vec<_>>>()?;
+    let best = longest_common_substring(&branch_runs);
     if best.is_empty() {
         return Err(SspryError::from(
             "Regex string does not contain a searchable mandatory literal.",
@@ -2397,16 +2567,32 @@ rule empty {
         .expect("regex parse")
         .expect("regex pattern");
         assert_eq!(regex_escaped.alternatives, vec![b"://evil.com".to_vec()]);
+        let regex_alt = parse_regex_line(
+            r#"$r = /(apple|apricot)juice/"#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+        )
+        .expect("regex parse")
+        .expect("regex pattern");
+        assert_eq!(regex_alt.alternatives, vec![b"juice".to_vec()]);
         assert!(
             parse_regex_line(
                 r#"$r = /(apple|orange)/"#,
                 GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
                     .expect("default gram sizes"),
             )
-            .expect_err("alternation unsupported")
+            .expect_err("common anchor too short")
             .to_string()
-            .contains("groups and alternation")
+            .contains("long enough for tier1 grams")
         );
+        let grouped = parse_regex_line(
+            r#"$r = /fooba(bar|baz)qux/"#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+        )
+        .expect("regex parse")
+        .expect("regex pattern");
+        assert_eq!(grouped.alternatives, vec![b"fooba".to_vec()]);
     }
 
     #[test]
@@ -2599,6 +2785,25 @@ rule sample {
         let regex_plan =
             compile_query_plan_default(regex_rule, 16, false, true, 100_000).expect("plan");
         assert!(fixed_literal_match_plan(&regex_plan).is_none());
+
+        let grouped_regex_rule = r#"
+rule sample {
+  strings:
+    $a = /fooba(bar|baz)qux/
+  condition:
+    $a
+}
+"#;
+        let grouped_regex_plan = compile_query_plan_default(
+            grouped_regex_rule,
+            16,
+            false,
+            true,
+            100_000,
+        )
+        .expect("plan");
+        assert_eq!(grouped_regex_plan.patterns.len(), 1);
+        assert!(fixed_literal_match_plan(&grouped_regex_plan).is_none());
     }
 
     #[test]

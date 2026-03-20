@@ -1473,6 +1473,7 @@ fn search_verifies_fullword_and_regex_literal_anchors() {
     let sample_dir = base.join("samples");
     let fullword_rule = base.join("fullword_rule.yar");
     let regex_rule = base.join("regex_rule.yar");
+    let grouped_regex_rule = base.join("grouped_regex_rule.yar");
     let port = reserve_tcp_port();
     fs::create_dir_all(&sample_dir).expect("mkdir samples");
 
@@ -1480,6 +1481,10 @@ fn search_verifies_fullword_and_regex_literal_anchors() {
     fs::write(sample_dir.join("fullword-miss.bin"), b"xWORDx").expect("write fullword miss");
     fs::write(sample_dir.join("regex-match.bin"), b"ZZapplesause123").expect("write regex match");
     fs::write(sample_dir.join("regex-miss.bin"), b"applesauseABC").expect("write regex miss");
+    fs::write(sample_dir.join("grouped-regex-match.bin"), b"xxfoobabarquxzz")
+        .expect("write grouped regex match");
+    fs::write(sample_dir.join("grouped-regex-miss.bin"), b"xxfoobatquxzz")
+        .expect("write grouped regex miss");
 
     fs::write(
         &fullword_rule,
@@ -1505,6 +1510,18 @@ rule RegexLiteral {
 "#,
     )
     .expect("write regex rule");
+    fs::write(
+        &grouped_regex_rule,
+        r#"
+rule GroupedRegexLiteral {
+  strings:
+    $a = /fooba(bar|baz)qux/
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write grouped regex rule");
 
     let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
     let addr = tcp_addr(port);
@@ -1518,8 +1535,8 @@ rule RegexLiteral {
         "--batch-size",
         "1",
     ]);
-    assert!(ingest.contains("processed_documents: 4"));
-    wait_for_published_doc_count(&addr, 4, 1);
+    assert!(ingest.contains("processed_documents: 6"));
+    wait_for_published_doc_count(&addr, 6, 1);
 
     wait_for_verified_matches(&addr, &fullword_rule, 2, 1);
     let fullword_search = run_ok(&[
@@ -1552,6 +1569,28 @@ rule RegexLiteral {
     assert!(regex_search.contains("candidates: 2"), "{regex_search}");
     assert!(regex_search.contains("verified_checked: 2"), "{regex_search}");
     assert!(regex_search.contains("verified_matched: 1"), "{regex_search}");
+
+    wait_for_verified_matches(&addr, &grouped_regex_rule, 2, 1);
+    let grouped_regex_search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        grouped_regex_rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(
+        grouped_regex_search.contains("candidates: 2"),
+        "{grouped_regex_search}"
+    );
+    assert!(
+        grouped_regex_search.contains("verified_checked: 2"),
+        "{grouped_regex_search}"
+    );
+    assert!(
+        grouped_regex_search.contains("verified_matched: 1"),
+        "{grouped_regex_search}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
