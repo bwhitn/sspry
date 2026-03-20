@@ -81,6 +81,7 @@ enum Token {
     Any,
     All,
     At,
+    Not,
     Or,
     Of,
     Them,
@@ -207,6 +208,15 @@ impl ConditionParser {
                 let node = self.parse_or()?;
                 self.consume(Some(&Token::RParen))?;
                 Ok(node)
+            }
+            Some(Token::Not) => {
+                self.consume(Some(&Token::Not))?;
+                Ok(QueryNode {
+                    kind: "not".to_owned(),
+                    pattern_id: None,
+                    threshold: None,
+                    children: vec![self.parse_factor()?],
+                })
             }
             Some(Token::Id(_)) => {
                 let Token::Id(raw_id) = self.consume(None)? else {
@@ -343,6 +353,33 @@ impl ConditionParser {
                         threshold: Some(threshold),
                         children: Vec::new(),
                     })
+                } else if normalized == "filesize"
+                    && matches!(
+                        self.peek(),
+                        Some(Token::Gt | Token::Ge | Token::Lt | Token::Le)
+                    )
+                {
+                    let kind = match self.consume(None)? {
+                        Token::Gt => "filesize_gt",
+                        Token::Ge => "filesize_ge",
+                        Token::Lt => "filesize_lt",
+                        Token::Le => "filesize_le",
+                        _ => unreachable!(),
+                    };
+                    let threshold = match self.consume(None)? {
+                        Token::Int(value) => value,
+                        _ => {
+                            return Err(SspryError::from(format!(
+                                "Expected literal size value after {field_name} comparison."
+                            )));
+                        }
+                    };
+                    Ok(QueryNode {
+                        kind: kind.to_owned(),
+                        pattern_id: Some("filesize".to_owned()),
+                        threshold: Some(threshold),
+                        children: Vec::new(),
+                    })
                 } else if metadata_field_is_boolean(normalized) {
                     Ok(QueryNode {
                         kind: "metadata_eq".to_owned(),
@@ -379,50 +416,65 @@ impl ConditionParser {
                     )));
                 }
                 let (op, value) = match self.consume(None)? {
-                    Token::EqEq => ("eq", match self.consume(None)? {
-                        Token::Int(value) => value,
-                        _ => {
-                            return Err(SspryError::from(
-                                "Count conditions require an integer literal.",
-                            ))
-                        }
-                    }),
-                    Token::Gt => ("gt", match self.consume(None)? {
-                        Token::Int(value) => value,
-                        _ => {
-                            return Err(SspryError::from(
-                                "Count conditions require an integer literal.",
-                            ))
-                        }
-                    }),
-                    Token::Ge => ("ge", match self.consume(None)? {
-                        Token::Int(value) => value,
-                        _ => {
-                            return Err(SspryError::from(
-                                "Count conditions require an integer literal.",
-                            ))
-                        }
-                    }),
-                    Token::Lt => ("lt", match self.consume(None)? {
-                        Token::Int(value) => value,
-                        _ => {
-                            return Err(SspryError::from(
-                                "Count conditions require an integer literal.",
-                            ))
-                        }
-                    }),
-                    Token::Le => ("le", match self.consume(None)? {
-                        Token::Int(value) => value,
-                        _ => {
-                            return Err(SspryError::from(
-                                "Count conditions require an integer literal.",
-                            ))
-                        }
-                    }),
+                    Token::EqEq => (
+                        "eq",
+                        match self.consume(None)? {
+                            Token::Int(value) => value,
+                            _ => {
+                                return Err(SspryError::from(
+                                    "Count conditions require an integer literal.",
+                                ));
+                            }
+                        },
+                    ),
+                    Token::Gt => (
+                        "gt",
+                        match self.consume(None)? {
+                            Token::Int(value) => value,
+                            _ => {
+                                return Err(SspryError::from(
+                                    "Count conditions require an integer literal.",
+                                ));
+                            }
+                        },
+                    ),
+                    Token::Ge => (
+                        "ge",
+                        match self.consume(None)? {
+                            Token::Int(value) => value,
+                            _ => {
+                                return Err(SspryError::from(
+                                    "Count conditions require an integer literal.",
+                                ));
+                            }
+                        },
+                    ),
+                    Token::Lt => (
+                        "lt",
+                        match self.consume(None)? {
+                            Token::Int(value) => value,
+                            _ => {
+                                return Err(SspryError::from(
+                                    "Count conditions require an integer literal.",
+                                ));
+                            }
+                        },
+                    ),
+                    Token::Le => (
+                        "le",
+                        match self.consume(None)? {
+                            Token::Int(value) => value,
+                            _ => {
+                                return Err(SspryError::from(
+                                    "Count conditions require an integer literal.",
+                                ));
+                            }
+                        },
+                    ),
                     token => {
                         return Err(SspryError::from(format!(
                             "Unsupported count comparison token: {token:?}"
-                        )))
+                        )));
                     }
                 };
                 Ok(QueryNode {
@@ -690,10 +742,29 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Float(value));
                 continue;
             }
-            let raw: String = chars[start..index].iter().collect();
-            let value = raw
+            let number_end = index;
+            while index < chars.len() && chars[index].is_ascii_alphabetic() {
+                index += 1;
+            }
+            let raw: String = chars[start..number_end].iter().collect();
+            let mut value = raw
                 .parse::<usize>()
                 .map_err(|_| SspryError::from(format!("Invalid integer token: {raw}")))?;
+            if number_end < index {
+                let suffix: String = chars[number_end..index].iter().collect();
+                let multiplier = match suffix.to_ascii_lowercase().as_str() {
+                    "b" => 1usize,
+                    "kb" => 1024usize,
+                    "mb" => 1024usize * 1024usize,
+                    "gb" => 1024usize * 1024usize * 1024usize,
+                    _ => {
+                        return Err(SspryError::from(format!(
+                            "Unsupported numeric suffix in condition: {suffix}"
+                        )));
+                    }
+                };
+                value = value.saturating_mul(multiplier);
+            }
             tokens.push(Token::Int(value));
             continue;
         }
@@ -713,6 +784,7 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 "any" => tokens.push(Token::Any),
                 "all" => tokens.push(Token::All),
                 "at" => tokens.push(Token::At),
+                "not" => tokens.push(Token::Not),
                 "or" => tokens.push(Token::Or),
                 "of" => tokens.push(Token::Of),
                 "them" => tokens.push(Token::Them),
@@ -1170,7 +1242,9 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
             }
         }
         if depth != 0 || in_class || escaped {
-            return Err(SspryError::from("Unterminated group or character class in regex."));
+            return Err(SspryError::from(
+                "Unterminated group or character class in regex.",
+            ));
         }
         parts.push(&regex_raw[start..]);
         Ok(parts)
@@ -1402,7 +1476,10 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
     let branches = split_top_level_alternation(regex_raw)?;
     if branches.len() == 1 {
         let runs = extract_regex_branch_mandatory_runs(regex_raw)?;
-        let best = runs.into_iter().max_by_key(|run| run.len()).unwrap_or_default();
+        let best = runs
+            .into_iter()
+            .max_by_key(|run| run.len())
+            .unwrap_or_default();
         if best.is_empty() {
             return Err(SspryError::from(
                 "Regex string does not contain a searchable mandatory literal.",
@@ -1680,7 +1757,13 @@ fn dedupe_pattern_alternatives(
     fixed_literals: Vec<Vec<u8>>,
     fixed_literal_wide: Vec<bool>,
     fixed_literal_fullword: Vec<bool>,
-) -> (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<Vec<u8>>, Vec<bool>, Vec<bool>) {
+) -> (
+    Vec<Vec<u64>>,
+    Vec<Vec<u64>>,
+    Vec<Vec<u8>>,
+    Vec<bool>,
+    Vec<bool>,
+) {
     let mut seen = HashSet::<(Vec<u64>, Vec<u64>, Vec<u8>, bool, bool)>::new();
     let mut kept_tier1 = Vec::new();
     let mut kept_tier2 = Vec::new();
@@ -1699,7 +1782,13 @@ fn dedupe_pattern_alternatives(
         let literal = fixed_literals.get(index).cloned().unwrap_or_default();
         let wide = fixed_literal_wide.get(index).copied().unwrap_or(false);
         let fullword = fixed_literal_fullword.get(index).copied().unwrap_or(false);
-        if !seen.insert((tier1.clone(), tier2.clone(), literal.clone(), wide, fullword)) {
+        if !seen.insert((
+            tier1.clone(),
+            tier2.clone(),
+            literal.clone(),
+            wide,
+            fullword,
+        )) {
             continue;
         }
         kept_tier1.push(tier1);
@@ -1891,7 +1980,10 @@ pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteral
             return None;
         }
         literals.insert(pattern.pattern_id.clone(), pattern.fixed_literals.clone());
-        literal_wide.insert(pattern.pattern_id.clone(), pattern.fixed_literal_wide.clone());
+        literal_wide.insert(
+            pattern.pattern_id.clone(),
+            pattern.fixed_literal_wide.clone(),
+        );
         literal_fullword.insert(
             pattern.pattern_id.clone(),
             pattern.fixed_literal_fullword.clone(),
@@ -1917,8 +2009,18 @@ pub fn evaluate_fixed_literal_match(
                 .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
             Ok(matches.get(pattern_id).copied().unwrap_or(false))
         }
+        "not" => {
+            let child = node
+                .children
+                .first()
+                .ok_or_else(|| SspryError::from("not node requires one child"))?;
+            Ok(!evaluate_fixed_literal_match(child, matches)?)
+        }
         "filesize_eq" => Err(SspryError::from(
             "filesize_eq requires file metadata and cannot use the fixed-literal fast path",
+        )),
+        "filesize_lt" | "filesize_le" | "filesize_gt" | "filesize_ge" => Err(SspryError::from(
+            "filesize comparison requires file metadata and cannot use the fixed-literal fast path",
         )),
         "verifier_only_eq" => Err(SspryError::from(
             "verifier_only_eq requires file verification and cannot use the fixed-literal fast path",
@@ -1985,7 +2087,12 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
             .map(|child| node_selectivity_score(child, patterns))
             .min()
             .unwrap_or(u128::MAX),
+        "not" => u128::MAX / 2,
         "filesize_eq"
+        | "filesize_lt"
+        | "filesize_le"
+        | "filesize_gt"
+        | "filesize_ge"
         | "metadata_eq"
         | "time_now_eq"
         | "verifier_only_eq"
@@ -2339,6 +2446,32 @@ rule sized {
     }
 
     #[test]
+    fn compile_rule_with_filesize_comparisons_and_not() {
+        let rule = r#"
+rule sized {
+  strings:
+    $a = "ABCD"
+    $b = "WXYZ"
+  condition:
+    $a and not $b and filesize <= 10KB and filesize > 1KB
+}
+"#;
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.root.kind, "and");
+        assert!(plan.root.children.iter().any(|child| child.kind == "not"));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "filesize_le"
+                && child.pattern_id.as_deref() == Some("filesize")
+                && child.threshold == Some(10 * 1024)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "filesize_gt"
+                && child.pattern_id.as_deref() == Some("filesize")
+                && child.threshold == Some(1024)
+        }));
+    }
+
+    #[test]
     fn compile_rule_with_metadata_and_time_conditions() {
         let rule = r#"
 rule module_meta {
@@ -2408,7 +2541,10 @@ rule header_magic {
         }));
         assert!(plan.root.children.iter().any(|child| {
             child.kind == "and"
-                && child.children.iter().any(|grandchild| grandchild.kind == "verifier_only_eq")
+                && child
+                    .children
+                    .iter()
+                    .any(|grandchild| grandchild.kind == "verifier_only_eq")
         }));
     }
 
@@ -2546,6 +2682,12 @@ rule numeric_only_unanchorable {
                 > 4
         );
         assert!(
+            tokenize_condition("not $a and filesize <= 10KB")
+                .expect("tokenize not/filesize comparison")
+                .len()
+                > 4
+        );
+        assert!(
             tokenize_condition("PE.Machine == 0x14c and pe.is_pe == true and time.now == 42")
                 .expect("tokenize metadata condition")
                 .len()
@@ -2648,11 +2790,7 @@ rule numeric_only_unanchorable {
 
         let mut parser = ConditionParser::new(
             "all of $a*",
-            HashSet::from([
-                "$a1".to_owned(),
-                "$a2".to_owned(),
-                "$b1".to_owned(),
-            ]),
+            HashSet::from(["$a1".to_owned(), "$a2".to_owned(), "$b1".to_owned()]),
         )
         .expect("parser");
         let wildcard = parser.parse().expect("wildcard parse");
@@ -2997,7 +3135,13 @@ rule wildcard_sets {
         assert_eq!(wildcard_sets.patterns.len(), 3);
         assert_eq!(wildcard_sets.root.kind, "and");
         assert_eq!(wildcard_sets.root.children.len(), 2);
-        assert!(wildcard_sets.root.children.iter().all(|child| child.kind == "n_of"));
+        assert!(
+            wildcard_sets
+                .root
+                .children
+                .iter()
+                .all(|child| child.kind == "n_of")
+        );
 
         let verifier_constraints = compile_query_plan_default(
             r#"
@@ -3018,7 +3162,10 @@ rule verifier_constraints {
         assert_eq!(verifier_constraints.root.kind, "and");
         assert!(verifier_constraints.root.children.iter().any(|child| {
             child.kind == "and"
-                && child.children.iter().any(|grandchild| grandchild.kind == "verifier_only_at")
+                && child
+                    .children
+                    .iter()
+                    .any(|grandchild| grandchild.kind == "verifier_only_at")
         }));
         assert!(verifier_constraints.root.children.iter().any(|child| {
             child.kind == "and"
@@ -3129,14 +3276,8 @@ rule sample {
     $a
 }
 "#;
-        let grouped_regex_plan = compile_query_plan_default(
-            grouped_regex_rule,
-            16,
-            false,
-            true,
-            100_000,
-        )
-        .expect("plan");
+        let grouped_regex_plan =
+            compile_query_plan_default(grouped_regex_rule, 16, false, true, 100_000).expect("plan");
         assert_eq!(grouped_regex_plan.patterns.len(), 1);
         assert!(fixed_literal_match_plan(&grouped_regex_plan).is_none());
     }

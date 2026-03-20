@@ -4965,10 +4965,15 @@ fn merge_cached_lane_bloom_word_masks(
 fn node_structurally_impossible(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "pattern" => false,
+        "not" => false,
         "verifier_only_eq" => false,
         "verifier_only_at" => false,
         "verifier_only_count" => false,
         "filesize_eq" => false,
+        "filesize_lt" => false,
+        "filesize_le" => false,
+        "filesize_gt" => false,
+        "filesize_ge" => false,
         "metadata_eq" => false,
         "time_now_eq" => false,
         "and" => node.children.iter().any(node_structurally_impossible),
@@ -4992,7 +4997,7 @@ fn node_structurally_impossible(node: &QueryNode) -> bool {
 fn query_node_uses_pattern_blooms(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "pattern" => true,
-        "and" | "or" | "n_of" => node.children.iter().any(query_node_uses_pattern_blooms),
+        "and" | "or" | "n_of" | "not" => node.children.iter().any(query_node_uses_pattern_blooms),
         _ => false,
     }
 }
@@ -5286,10 +5291,15 @@ fn tree_maybe_matches_node(
                 allow_tier2,
             ))
         }
+        "not" => Ok(true),
         "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
         | "filesize_eq"
+        | "filesize_lt"
+        | "filesize_le"
+        | "filesize_gt"
+        | "filesize_ge"
         | "metadata_eq"
         | "time_now_eq" => Ok(true),
         "and" => {
@@ -5415,10 +5425,15 @@ fn block_maybe_matches_node(
                 tier1_superblocks,
             ))
         }
+        "not" => Ok(true),
         "verifier_only_eq" => Ok(true),
         "verifier_only_at" => Ok(true),
         "verifier_only_count" => Ok(true),
         "filesize_eq" => Ok(true),
+        "filesize_lt" => Ok(true),
+        "filesize_le" => Ok(true),
+        "filesize_gt" => Ok(true),
+        "filesize_ge" => Ok(true),
         "metadata_eq" => Ok(true),
         "time_now_eq" => Ok(true),
         "and" => {
@@ -5621,6 +5636,29 @@ where
                 .insert(pattern_id.clone(), outcome);
             Ok(outcome)
         }
+        "not" => {
+            let child = node
+                .children
+                .first()
+                .ok_or_else(|| SspryError::from("not node requires one child"))?;
+            let outcome = evaluate_node(
+                child,
+                doc_inputs,
+                load_metadata,
+                load_tier1,
+                load_tier2,
+                patterns,
+                mask_cache,
+                plan,
+                query_now_unix,
+                eval_cache,
+            )?;
+            Ok(MatchOutcome {
+                matched: !outcome.matched,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
         "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" => Ok(MatchOutcome {
             matched: true,
             tiers: TierFlags::default(),
@@ -5633,6 +5671,50 @@ where
                 as u64;
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.file_size == expected_size,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
+        "filesize_lt" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from("filesize_lt node requires threshold"))?
+                as u64;
+            Ok(MatchOutcome {
+                matched: doc_inputs.doc.file_size < expected_size,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
+        "filesize_le" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from("filesize_le node requires threshold"))?
+                as u64;
+            Ok(MatchOutcome {
+                matched: doc_inputs.doc.file_size <= expected_size,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
+        "filesize_gt" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from("filesize_gt node requires threshold"))?
+                as u64;
+            Ok(MatchOutcome {
+                matched: doc_inputs.doc.file_size > expected_size,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
+        }
+        "filesize_ge" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from("filesize_ge node requires threshold"))?
+                as u64;
+            Ok(MatchOutcome {
+                matched: doc_inputs.doc.file_size >= expected_size,
                 tiers: TierFlags::default(),
                 score: 0,
             })

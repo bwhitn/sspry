@@ -1541,7 +1541,12 @@ fn is_wide_word_unit(unit: &[u8]) -> bool {
     unit.len() == 2 && unit[1] == 0 && is_ascii_word_byte(unit[0])
 }
 
-fn file_contains_literal_with_mode(haystack: &[u8], needle: &[u8], wide: bool, fullword: bool) -> bool {
+fn file_contains_literal_with_mode(
+    haystack: &[u8],
+    needle: &[u8],
+    wide: bool,
+    fullword: bool,
+) -> bool {
     if needle.is_empty() {
         return true;
     }
@@ -1600,17 +1605,14 @@ fn verify_fixed_literal_plan_on_file(path: &Path, plan: &FixedLiteralMatchPlan) 
             .literal_fullword
             .get(pattern_id)
             .ok_or_else(|| SspryError::from("fixed literal plan missing fullword flags"))?;
-        let matched = literals
-            .iter()
-            .enumerate()
-            .any(|(index, literal)| {
-                file_contains_literal_with_mode(
-                    &bytes,
-                    literal,
-                    wide_flags.get(index).copied().unwrap_or(false),
-                    fullword_flags.get(index).copied().unwrap_or(false),
-                )
-            });
+        let matched = literals.iter().enumerate().any(|(index, literal)| {
+            file_contains_literal_with_mode(
+                &bytes,
+                literal,
+                wide_flags.get(index).copied().unwrap_or(false),
+                fullword_flags.get(index).copied().unwrap_or(false),
+            )
+        });
         matches.insert(pattern_id.clone(), matched);
     }
     evaluate_fixed_literal_match(&plan.root, &matches)

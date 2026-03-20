@@ -5455,23 +5455,17 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
             fixed_literals.push(Vec::new());
         }
         for value in fixed_literal_wide_raw.into_iter().take(alt_count) {
-            fixed_literal_wide.push(
-                value
-                    .as_bool()
-                    .ok_or_else(|| SspryError::from("pattern fixed_literal_wide entries must be bools"))?,
-            );
+            fixed_literal_wide.push(value.as_bool().ok_or_else(|| {
+                SspryError::from("pattern fixed_literal_wide entries must be bools")
+            })?);
         }
         while fixed_literal_wide.len() < alternatives.len() {
             fixed_literal_wide.push(false);
         }
         for value in fixed_literal_fullword_raw.into_iter().take(alt_count) {
-            fixed_literal_fullword.push(
-                value
-                    .as_bool()
-                    .ok_or_else(|| {
-                        SspryError::from("pattern fixed_literal_fullword entries must be bools")
-                    })?,
-            );
+            fixed_literal_fullword.push(value.as_bool().ok_or_else(|| {
+                SspryError::from("pattern fixed_literal_fullword entries must be bools")
+            })?);
         }
         while fixed_literal_fullword.len() < alternatives.len() {
             fixed_literal_fullword.push(false);
@@ -5584,6 +5578,16 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
                 )));
             }
         }
+        "not" => {
+            if children.len() != 1 {
+                return Err(SspryError::from("not node requires exactly one child"));
+            }
+            if pattern_id.is_some() || threshold.is_some() {
+                return Err(SspryError::from(
+                    "not node must not use pattern_id or threshold",
+                ));
+            }
+        }
         "n_of" => {
             if threshold.unwrap_or(0) == 0 {
                 return Err(SspryError::from("n_of threshold must be > 0"));
@@ -5603,6 +5607,23 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
             }
             if !children.is_empty() {
                 return Err(SspryError::from("filesize_eq node must not have children"));
+            }
+        }
+        "filesize_lt" | "filesize_le" | "filesize_gt" | "filesize_ge" => {
+            if pattern_id.as_deref() != Some("filesize") {
+                return Err(SspryError::from(format!(
+                    "{kind} node requires pattern_id=filesize"
+                )));
+            }
+            if threshold.is_none() {
+                return Err(SspryError::from(format!(
+                    "{kind} node requires a threshold"
+                )));
+            }
+            if !children.is_empty() {
+                return Err(SspryError::from(format!(
+                    "{kind} node must not have children"
+                )));
             }
         }
         "metadata_eq" => {
@@ -5650,19 +5671,19 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
         }
         "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" => {
             if pattern_id.as_deref().unwrap_or_default().is_empty() {
-                return Err(SspryError::from(
-                    format!("{kind} node requires a non-empty pattern_id"),
-                ));
+                return Err(SspryError::from(format!(
+                    "{kind} node requires a non-empty pattern_id"
+                )));
             }
             if threshold.is_some() {
-                return Err(SspryError::from(
-                    format!("{kind} node must not use threshold"),
-                ));
+                return Err(SspryError::from(format!(
+                    "{kind} node must not use threshold"
+                )));
             }
             if !children.is_empty() {
-                return Err(SspryError::from(
-                    format!("{kind} node must not have children"),
-                ));
+                return Err(SspryError::from(format!(
+                    "{kind} node must not have children"
+                )));
             }
         }
         _ => {
@@ -6181,8 +6202,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -6862,8 +6883,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -6983,8 +7004,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -7590,8 +7611,8 @@ mod tests {
                 alternatives: vec![vec![0x01020304]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -7913,8 +7934,8 @@ mod tests {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -8119,6 +8140,17 @@ mod tests {
         assert_eq!(filesize_eq.pattern_id.as_deref(), Some("filesize"));
         assert_eq!(filesize_eq.threshold, Some(8));
 
+        let filesize_lt = query_node_from_wire(&serde_json::json!({
+            "kind": "filesize_lt",
+            "pattern_id": "filesize",
+            "threshold": 1024,
+            "children": []
+        }))
+        .expect("filesize_lt");
+        assert_eq!(filesize_lt.kind, "filesize_lt");
+        assert_eq!(filesize_lt.pattern_id.as_deref(), Some("filesize"));
+        assert_eq!(filesize_lt.threshold, Some(1024));
+
         let metadata_eq = query_node_from_wire(&serde_json::json!({
             "kind": "metadata_eq",
             "pattern_id": "PE.Machine",
@@ -8154,6 +8186,16 @@ mod tests {
         );
         assert_eq!(verifier_only_eq.threshold, None);
 
+        let not_node = query_node_from_wire(&serde_json::json!({
+            "kind": "not",
+            "children": [
+                { "kind": "pattern", "pattern_id": "$a", "children": [] }
+            ]
+        }))
+        .expect("not");
+        assert_eq!(not_node.kind, "not");
+        assert_eq!(not_node.children.len(), 1);
+
         let verifier_only_at = query_node_from_wire(&serde_json::json!({
             "kind": "verifier_only_at",
             "pattern_id": "$a@0",
@@ -8185,6 +8227,18 @@ mod tests {
                 "children": []
             }))
             .expect_err("bad filesize_eq id")
+            .to_string()
+            .contains("pattern_id=filesize")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "filesize_lt",
+                "pattern_id": "size",
+                "threshold": 8,
+                "children": []
+            }))
+            .expect_err("bad filesize_lt id")
             .to_string()
             .contains("pattern_id=filesize")
         );
@@ -8903,8 +8957,8 @@ rule q {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),
@@ -9182,8 +9236,8 @@ rule q {
                         alternatives: vec![vec![gram]],
                         tier2_alternatives: vec![Vec::new()],
                         fixed_literals: vec![Vec::new()],
-                    fixed_literal_wide: vec![false],
-                    fixed_literal_fullword: vec![false],
+                        fixed_literal_wide: vec![false],
+                        fixed_literal_fullword: vec![false],
                     }],
                     root: QueryNode {
                         kind: "pattern".to_owned(),
@@ -9289,8 +9343,8 @@ rule q {
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
             }],
             root: QueryNode {
                 kind: "pattern".to_owned(),

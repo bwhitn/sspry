@@ -1448,7 +1448,66 @@ rule CountRule {
     assert!(search_at.contains("verified_matched: 2"), "{search_at}");
 
     let search_count = wait_for_matched(&rule_count, 1);
-    assert!(search_count.contains("verified_matched: 1"), "{search_count}");
+    assert!(
+        search_count.contains("verified_matched: 1"),
+        "{search_count}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_supports_filesize_comparisons_and_not() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("filesize_not_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("hit.bin"), b"ABCD1234").expect("write hit");
+    fs::write(sample_dir.join("miss_has_b.bin"), b"ABCDWXYZ").expect("write miss b");
+    fs::write(sample_dir.join("miss_small.bin"), b"ABCD").expect("write miss small");
+
+    fs::write(
+        &rule,
+        r#"
+rule FilesizeNotRule {
+  strings:
+    $a = "ABCD"
+    $b = "WXYZ"
+  condition:
+    $a and not $b and filesize >= 8B and filesize < 9B
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 3"));
+    wait_for_search_candidates(&addr, &rule, 1);
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+    ]);
+    assert!(search.contains("candidates: 1"), "{search}");
 
     let _ = child.kill();
     let _ = child.wait();
@@ -1582,8 +1641,11 @@ fn search_verifies_fullword_and_regex_literal_anchors() {
     fs::write(sample_dir.join("fullword-miss.bin"), b"xWORDx").expect("write fullword miss");
     fs::write(sample_dir.join("regex-match.bin"), b"ZZapplesause123").expect("write regex match");
     fs::write(sample_dir.join("regex-miss.bin"), b"applesauseABC").expect("write regex miss");
-    fs::write(sample_dir.join("grouped-regex-match.bin"), b"xxfoobabarquxzz")
-        .expect("write grouped regex match");
+    fs::write(
+        sample_dir.join("grouped-regex-match.bin"),
+        b"xxfoobabarquxzz",
+    )
+    .expect("write grouped regex match");
     fs::write(sample_dir.join("grouped-regex-miss.bin"), b"xxfoobatquxzz")
         .expect("write grouped regex miss");
 
@@ -1648,7 +1710,10 @@ rule GroupedRegexLiteral {
         fullword_rule.to_str().expect("rule"),
         "--verify",
     ]);
-    assert!(fullword_search.contains("candidates: 2"), "{fullword_search}");
+    assert!(
+        fullword_search.contains("candidates: 2"),
+        "{fullword_search}"
+    );
     assert!(
         fullword_search.contains("verified_checked: 2"),
         "{fullword_search}"
@@ -1668,8 +1733,14 @@ rule GroupedRegexLiteral {
         "--verify",
     ]);
     assert!(regex_search.contains("candidates: 2"), "{regex_search}");
-    assert!(regex_search.contains("verified_checked: 2"), "{regex_search}");
-    assert!(regex_search.contains("verified_matched: 1"), "{regex_search}");
+    assert!(
+        regex_search.contains("verified_checked: 2"),
+        "{regex_search}"
+    );
+    assert!(
+        regex_search.contains("verified_matched: 1"),
+        "{regex_search}"
+    );
 
     wait_for_verified_matches(&addr, &grouped_regex_rule, 2, 1);
     let grouped_regex_search = run_ok(&[
