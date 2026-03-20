@@ -607,11 +607,110 @@ fn grams_tier2_from_bytes(blob: &[u8], tier2_gram_size: usize) -> Vec<u64> {
     grams_from_bytes(blob, tier2_gram_size)
 }
 
+fn strip_rule_comments(rule_text: &str) -> String {
+    let chars = rule_text.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(rule_text.len());
+    let mut index = 0usize;
+    let mut in_block_comment = false;
+    let mut in_line_comment = false;
+    let mut in_string = false;
+    let mut in_regex = false;
+    let mut regex_in_class = false;
+    let mut escaped = false;
+    let mut after_assignment = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        let next = chars.get(index + 1).copied();
+
+        if in_block_comment {
+            if ch == '\n' {
+                out.push('\n');
+            } else if ch == '*' && next == Some('/') {
+                in_block_comment = false;
+                index += 1;
+            }
+            index += 1;
+            continue;
+        }
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            }
+            index += 1;
+            continue;
+        }
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_regex {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '[' {
+                regex_in_class = true;
+            } else if ch == ']' && regex_in_class {
+                regex_in_class = false;
+            } else if ch == '/' && !regex_in_class {
+                in_regex = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '/' && next == Some('*') {
+            in_block_comment = true;
+            index += 2;
+            continue;
+        }
+        if ch == '/' && next == Some('/') {
+            in_line_comment = true;
+            index += 2;
+            continue;
+        }
+
+        out.push(ch);
+        if ch == '"' {
+            in_string = true;
+        } else if ch == '=' && next != Some('=') {
+            after_assignment = true;
+        } else if after_assignment {
+            if ch.is_whitespace() {
+                // Keep waiting for the first value token after assignment.
+            } else {
+                if ch == '/' {
+                    in_regex = true;
+                }
+                after_assignment = false;
+            }
+        }
+        if ch == '\n' {
+            after_assignment = false;
+        }
+        index += 1;
+    }
+
+    out
+}
+
 fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
+    let sanitized = strip_rule_comments(rule_text);
     let mut strings_lines = Vec::new();
     let mut condition_lines = Vec::new();
     let mut state = "none";
-    for raw_line in rule_text.lines() {
+    for raw_line in sanitized.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with("//") {
             continue;
@@ -2444,6 +2543,27 @@ rule sample {
         .expect("rule sections");
         assert_eq!(strings.len(), 1);
         assert_eq!(condition.trim(), "$a");
+        let (strings, condition) = parse_rule_sections(
+            r#"
+rule commented {
+  /*
+    header comment
+  */
+  strings:
+    $a = "ABCD" /* inline string comment */
+    /* block between strings */
+    $b = /foo\/bar/ /* regex comment */
+  condition:
+    /* condition comment */
+    $a or $b
+}
+"#,
+        )
+        .expect("rule sections");
+        assert_eq!(strings.len(), 2);
+        assert!(strings[0].contains(r#"$a = "ABCD""#));
+        assert!(strings[1].contains(r#"$b = /foo\/bar/"#));
+        assert_eq!(condition.trim(), "$a or $b");
         assert!(
             parse_rule_sections("rule empty { condition: true }")
                 .expect_err("missing strings")
