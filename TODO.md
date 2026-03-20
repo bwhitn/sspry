@@ -672,14 +672,64 @@ Current local shard-fanout probe:
   - `867.62 files/min`
   - `20,869` shard touches over `25,000` docs
   - `store_append_sidecars_us = 1,521,043,873`
-- current partial `32`-shard read:
-  - at `6,075 / 25,000` docs:
-    - about `1,145 files/min`
-    - `2,857` shard touches over `6,075` docs
-    - `store_append_sidecars_us = 257,043,523`
+  - current partial `32`-shard read:
+    - at `6,075 / 25,000` docs:
+      - about `1,145 files/min`
+      - `2,857` shard touches over `6,075` docs
+      - `store_append_sidecars_us = 257,043,523`
   - read:
     - fewer shards materially densify shard-local payloads
     - this is the first ingest lever since many-tree+drain that still looks structurally right under load
+
+Current full `100k` balanced forest rerun at `32` shards:
+- artifact:
+  - `/root/pertest/results/sspry_forest_100k_balanced_drain_32shards_20260320_r1`
+- ingest result:
+  - `tree_00`: `990.145 s`, `1514.93 files/min`
+  - `tree_01`: `1928.102 s`, `777.97 files/min`
+  - `tree_02`: `1955.872 s`, `766.92 files/min`
+  - `tree_03`: `1995.522 s`, `751.68 files/min`
+  - overall forest ingest: `6869.640 s`, `873.41 files/min`
+  - total DB bytes: `82,936,300,250`
+- comparison vs prior balanced forest (`64` shards):
+  - old overall ingest: `6990.135 s`, `858.35 files/min`
+  - new overall ingest: `6869.640 s`, `873.41 files/min`
+  - delta: about `+1.75%` files/min and `+0.87%` DB bytes
+- search result:
+  - `01`: timed out at the `600s` forest search timeout on three trees; one tree finished at `563.2s` query time
+  - `08`: `396.535 s`
+  - `09`: `316.611 s`
+  - `10`: `88.383 s`
+  - `11`: `264.048 s`
+  - `12`: `181.229 s`
+  - supported queries still scanned about `85.6k-87.2k` docs and read about `53 GiB` of tier1 bloom data
+- read:
+  - `32` shards are a modest ingest win and are acceptable as the current many-tree ingest baseline
+  - they do not solve the current large-corpus search problem
+
+Accepted whole-tree search gate prototype:
+- implementation:
+  - persisted whole-tree tier1/tier2 bloom-union gates
+  - search now checks the tree gate before any block scan
+  - publish persists the tree-gate snapshots alongside the tier2 superblock snapshot
+- harness fixes:
+  - forest search now passes CLI `--timeout`
+  - per-tree search artifacts now use safe address filenames instead of `Path.with_suffix()` collisions
+  - non-balanced forest runs no longer force a per-file size scan just to split manifests
+- supported-rule `200`-file `4 x 50` smoke:
+  - artifact:
+    - `/root/pertest/results/sspry_forest_smoke_0200_treegate_supported_20260320_r1/search_summary.json`
+  - `01`: `74.39 ms`, `docs_scanned = 0`, `tier1_bloom_bytes = 0`
+  - `08`: `75.35 ms`, `docs_scanned = 24`, `tier1_bloom_bytes = 25,635,840`
+  - `09`: `110.61 ms`, `docs_scanned = 26`, `tier1_bloom_bytes = 22,824,960`
+  - `10`: `75.66 ms`, `docs_scanned = 0`, `tier1_bloom_bytes = 0`
+  - `11`: `165.52 ms`, `docs_scanned = 9`, `tier1_bloom_bytes = 14,351,360`
+  - `12`: `75.64 ms`, `docs_scanned = 4`, `tier1_bloom_bytes = 6,992,896`
+- read:
+  - the whole-tree gate is real
+  - it fully rejects `01` and `10` before any per-doc bloom I/O
+  - it also rejects some trees completely for `11` and `12`
+  - it is not sufficient by itself for `08` and `09`, which still need stronger within-tree selectivity
 
 ### 0a. Bloom-only cutover and dead-code removal
 

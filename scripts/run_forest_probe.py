@@ -334,6 +334,18 @@ def split_manifest(
 ) -> list[dict]:
     manifests_dir.mkdir(parents=True, exist_ok=True)
     lines = [line.strip() for line in dataset.read_text().splitlines() if line.strip()]
+    if not balance_bytes:
+        out = []
+        for idx in range(0, len(lines), chunk_size):
+            chunk_lines = lines[idx: idx + chunk_size]
+            path = manifests_dir / f'chunk_{idx // chunk_size:02d}.txt'
+            path.write_text(''.join(line + '\n' for line in chunk_lines))
+            out.append({
+                'path': path,
+                'files': len(chunk_lines),
+                'bytes': 0,
+            })
+        return out
     if chunk_count is None:
         chunk_count = max(1, math.ceil(len(lines) / max(chunk_size, 1)))
     indexed = []
@@ -344,18 +356,6 @@ def split_manifest(
             size = 0
         indexed.append((idx, line, size))
     out = []
-    if not balance_bytes:
-        for idx in range(0, len(indexed), chunk_size):
-            chunk = indexed[idx: idx + chunk_size]
-            path = manifests_dir / f'chunk_{idx // chunk_size:02d}.txt'
-            path.write_text(''.join(item[1] + '\n' for item in chunk))
-            out.append({
-                'path': path,
-                'files': len(chunk),
-                'bytes': sum(item[2] for item in chunk),
-            })
-        return out
-
     buckets = [{'items': [], 'bytes': 0} for _ in range(chunk_count)]
     for item in sorted(indexed, key=lambda entry: entry[2], reverse=True):
         bucket_idx = min(
@@ -570,10 +570,11 @@ def main() -> int:
                 for future in concurrent.futures.as_completed(future_map):
                     addr, tree_run_dir = future_map[future]
                     proc, elapsed_ms = future.result()
-                    tree_prefix = searches_dir / rule.stem / addr.replace(':', '_')
-                    tree_prefix.parent.mkdir(parents=True, exist_ok=True)
-                    tree_prefix.with_suffix('.stdout').write_text(proc.stdout or '')
-                    tree_prefix.with_suffix('.stderr').write_text(proc.stderr or '')
+                    tree_dir = searches_dir / rule.stem
+                    tree_dir.mkdir(parents=True, exist_ok=True)
+                    safe_addr = addr.replace(':', '_').replace('.', '_')
+                    (tree_dir / f'{safe_addr}.stdout').write_text(proc.stdout or '')
+                    (tree_dir / f'{safe_addr}.stderr').write_text(proc.stderr or '')
                     record = parse_search_result(rule, proc, elapsed_ms)
                     record['addr'] = addr
                     record['tree'] = tree_run_dir.name

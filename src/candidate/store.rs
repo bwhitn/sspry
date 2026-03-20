@@ -30,6 +30,7 @@ use crate::{Result, SspryError};
 
 const STORE_VERSION: u32 = 2;
 const TIER2_SUPERBLOCKS_SNAPSHOT_VERSION: u32 = 2;
+const TREE_BLOOM_GATES_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_FILTER_BYTES: usize = 2048;
 const DEFAULT_BLOOM_HASHES: usize = 7;
 const DEFAULT_FILTER_MIN_BYTES: usize = 1;
@@ -657,6 +658,14 @@ impl Default for Tier2SuperblockIndex {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct TreeBloomGateIndex {
+    bucket_for_key: BTreeMap<(usize, usize), (usize, usize)>,
+    summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
+    masks_by_bucket: BTreeMap<(usize, usize), Vec<u8>>,
+    summary_memory_bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CandidateCompactionSnapshot {
     root: PathBuf,
@@ -943,6 +952,74 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
     }
 }
 
+fn merge_bloom_bytes_into_tree_gate(gate: &mut [u8], bloom_bytes: &[u8]) {
+    let shared_len = gate.len().min(bloom_bytes.len());
+    let word_len = shared_len / 8;
+    for word_idx in 0..word_len {
+        let start = word_idx * 8;
+        let end = start + 8;
+        let merged = u64::from_le_bytes(
+            gate[start..end]
+                .try_into()
+                .expect("word-sized tree gate chunk"),
+        ) | u64::from_le_bytes(
+            bloom_bytes[start..end]
+                .try_into()
+                .expect("word-sized bloom chunk"),
+        );
+        gate[start..end].copy_from_slice(&merged.to_le_bytes());
+    }
+    for idx in (word_len * 8)..shared_len {
+        gate[idx] |= bloom_bytes[idx];
+    }
+}
+
+fn ensure_tree_gate_capacity_for(
+    index: &mut TreeBloomGateIndex,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+) {
+    let filter_key = (filter_bytes, bloom_hashes);
+    let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+    let summary_bytes = align_filter_bytes(bucket_key.0.max(1));
+    index.bucket_for_key.insert(filter_key, bucket_key);
+    if index
+        .summary_bytes_by_bucket
+        .insert(bucket_key, summary_bytes)
+        .is_none()
+    {
+        index.summary_memory_bytes = index
+            .summary_memory_bytes
+            .saturating_add(summary_bytes as u64);
+    }
+    index
+        .masks_by_bucket
+        .entry(bucket_key)
+        .or_insert_with(|| vec![0u8; summary_bytes]);
+}
+
+fn update_tree_gate_for_doc_bytes_inner(
+    index: &mut TreeBloomGateIndex,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+    bloom_bytes: &[u8],
+) {
+    ensure_tree_gate_capacity_for(index, filter_bytes, bloom_hashes);
+    let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+    if let Some(mask) = index.masks_by_bucket.get_mut(&bucket_key) {
+        merge_bloom_bytes_into_tree_gate(mask, bloom_bytes);
+    }
+}
+
+fn update_tree_gate_for_doc_bytes_batch<'a>(
+    index: &mut TreeBloomGateIndex,
+    updates: &[(usize, usize, usize, &'a [u8])],
+) {
+    for (_, filter_bytes, bloom_hashes, bloom_bytes) in updates {
+        update_tree_gate_for_doc_bytes_inner(index, *filter_bytes, *bloom_hashes, bloom_bytes);
+    }
+}
+
 #[derive(Debug)]
 pub struct CandidateStore {
     root: PathBuf,
@@ -957,6 +1034,8 @@ pub struct CandidateStore {
     compaction_generation: u64,
     retired_generation_roots: Vec<String>,
     last_write_activity_monotonic: Option<Instant>,
+    tree_tier1_gates: TreeBloomGateIndex,
+    tree_tier2_gates: TreeBloomGateIndex,
     tier2_superblocks: Tier2SuperblockIndex,
     tier2_pattern_superblocks: Tier2SuperblockIndex,
     tier2_telemetry: Tier2Telemetry,
@@ -1209,6 +1288,8 @@ impl CandidateStore {
             let _ = fs::remove_file(&tier2_blooms_path);
             let _ = fs::remove_file(&external_ids_path);
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
+            let _ = fs::remove_file(&tree_tier1_gates_path(&config.root));
+            let _ = fs::remove_file(&tree_tier2_gates_path(&config.root));
         }
 
         let mut store = Self {
@@ -1236,6 +1317,8 @@ impl CandidateStore {
             compaction_generation: 1,
             retired_generation_roots: Vec::new(),
             last_write_activity_monotonic: None,
+            tree_tier1_gates: TreeBloomGateIndex::default(),
+            tree_tier2_gates: TreeBloomGateIndex::default(),
             tier2_superblocks: Tier2SuperblockIndex::default(),
             tier2_pattern_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
@@ -1304,6 +1387,8 @@ impl CandidateStore {
             compaction_generation: compaction_manifest.current_generation,
             retired_generation_roots: compaction_manifest.retired_roots,
             last_write_activity_monotonic: None,
+            tree_tier1_gates: TreeBloomGateIndex::default(),
+            tree_tier2_gates: TreeBloomGateIndex::default(),
             tier2_superblocks: Tier2SuperblockIndex::default(),
             tier2_pattern_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
@@ -1732,6 +1817,8 @@ impl CandidateStore {
                 self.write_doc_row(snapshot.doc_id, row)?;
                 self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
             }
+            self.update_tree_tier1_gates_for_doc_bytes_inner(existing_pos, bloom_filter)?;
+            self.update_tree_tier2_gates_for_doc_bytes_inner(existing_pos, tier2_bloom_filter)?;
             self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
             self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
                 existing_pos,
@@ -1779,6 +1866,11 @@ impl CandidateStore {
             self.docs.push(doc.clone());
             self.sha_to_pos
                 .insert(sha256_hex.clone(), self.docs.len() - 1);
+            self.update_tree_tier1_gates_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
+            self.update_tree_tier2_gates_for_doc_bytes_inner(
+                self.docs.len() - 1,
+                tier2_bloom_filter,
+            )?;
             self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
             self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
                 self.docs.len() - 1,
@@ -2172,6 +2264,8 @@ impl CandidateStore {
 
         if modified {
             let tier2_update_started = Instant::now();
+            self.update_tree_tier1_gates_for_doc_bytes_batch(&tier2_updates)?;
+            self.update_tree_tier2_gates_for_doc_bytes_batch(&tier2_pattern_updates)?;
             self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
             self.update_tier2_pattern_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
             insert_profile.tier2_update_us = insert_profile
@@ -2217,6 +2311,7 @@ impl CandidateStore {
             row.flags |= DOC_FLAG_DELETED;
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
+            self.rebuild_tree_gates()?;
             self.rebuild_tier2_superblocks()?;
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
@@ -2592,6 +2687,8 @@ impl CandidateStore {
                 .try_into()
                 .unwrap_or(u64::MAX);
             let tier2_update_started = Instant::now();
+            self.update_tree_tier1_gates_for_doc_bytes_batch(&tier2_updates)?;
+            self.update_tree_tier2_gates_for_doc_bytes_batch(&tier2_pattern_updates)?;
             self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
             self.update_tier2_pattern_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
             import_profile.tier2_update_ms = tier2_update_started
@@ -2759,6 +2856,20 @@ impl CandidateStore {
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
+        let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
+        if !tree_maybe_matches_node(
+            &plan.root,
+            &prepared.mask_cache,
+            &self.tree_tier1_gates,
+            &self.tree_tier2_gates,
+            allow_block_skip,
+        )? {
+            return Ok((
+                Vec::new(),
+                TierFlags::default(),
+                CandidateQueryProfile::default(),
+            ));
+        }
         let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
         let block_count = self.tier2_superblocks.keys_per_block.len();
         if block_count == 0 {
@@ -2768,7 +2879,6 @@ impl CandidateStore {
                 CandidateQueryProfile::default(),
             ));
         }
-        let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
         let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
         let query_now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3359,6 +3469,63 @@ impl CandidateStore {
         tier2_superblock_summary_bytes(filter_bytes, self.meta.tier2_superblock_summary_cap_bytes)
     }
 
+    fn update_tree_tier1_gates_for_doc_bytes_inner(
+        &mut self,
+        pos: usize,
+        bloom_bytes: &[u8],
+    ) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
+            return Ok(());
+        }
+        let filter_bytes = self.docs[pos].filter_bytes;
+        let bloom_hashes = self.docs[pos].bloom_hashes;
+        update_tree_gate_for_doc_bytes_inner(
+            &mut self.tree_tier1_gates,
+            filter_bytes,
+            bloom_hashes,
+            bloom_bytes,
+        );
+        Ok(())
+    }
+
+    fn update_tree_tier1_gates_for_doc_bytes_batch(
+        &mut self,
+        updates: &[(usize, usize, usize, &[u8])],
+    ) -> Result<()> {
+        update_tree_gate_for_doc_bytes_batch(&mut self.tree_tier1_gates, updates);
+        Ok(())
+    }
+
+    fn update_tree_tier2_gates_for_doc_bytes_inner(
+        &mut self,
+        pos: usize,
+        bloom_bytes: &[u8],
+    ) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
+            return Ok(());
+        }
+        let filter_bytes = self.docs[pos].tier2_filter_bytes;
+        let bloom_hashes = self.docs[pos].tier2_bloom_hashes;
+        if filter_bytes == 0 || bloom_hashes == 0 || bloom_bytes.is_empty() {
+            return Ok(());
+        }
+        update_tree_gate_for_doc_bytes_inner(
+            &mut self.tree_tier2_gates,
+            filter_bytes,
+            bloom_hashes,
+            bloom_bytes,
+        );
+        Ok(())
+    }
+
+    fn update_tree_tier2_gates_for_doc_bytes_batch(
+        &mut self,
+        updates: &[(usize, usize, usize, &[u8])],
+    ) -> Result<()> {
+        update_tree_gate_for_doc_bytes_batch(&mut self.tree_tier2_gates, updates);
+        Ok(())
+    }
+
     fn update_tier2_superblocks_for_doc_bytes_inner(
         &mut self,
         pos: usize,
@@ -3467,6 +3634,51 @@ impl CandidateStore {
         self.update_tier2_pattern_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
     }
 
+    fn update_tree_tier1_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
+            return Ok(());
+        }
+        let doc_id = self.docs[pos].doc_id;
+        let row = self.doc_rows[pos];
+        let bloom_bytes = self.sidecars.blooms.read_bytes(
+            row.bloom_offset,
+            row.bloom_len as usize,
+            "bloom",
+            doc_id,
+        )?;
+        let owned_bloom_bytes = bloom_bytes.into_owned();
+        self.update_tree_tier1_gates_for_doc_bytes_inner(pos, &owned_bloom_bytes)
+    }
+
+    fn update_tree_tier2_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted {
+            return Ok(());
+        }
+        let doc_id = self.docs[pos].doc_id;
+        let row = self.tier2_doc_rows[pos];
+        if row.bloom_len == 0 {
+            return Ok(());
+        }
+        let bloom_bytes = self.sidecars.tier2_blooms.read_bytes(
+            row.bloom_offset,
+            row.bloom_len as usize,
+            "tier2_bloom",
+            doc_id,
+        )?;
+        let owned_bloom_bytes = bloom_bytes.into_owned();
+        self.update_tree_tier2_gates_for_doc_bytes_inner(pos, &owned_bloom_bytes)
+    }
+
+    fn rebuild_tree_gates(&mut self) -> Result<()> {
+        self.tree_tier1_gates = TreeBloomGateIndex::default();
+        self.tree_tier2_gates = TreeBloomGateIndex::default();
+        for pos in 0..self.docs.len() {
+            self.update_tree_tier1_gates_for_doc_inner(pos)?;
+            self.update_tree_tier2_gates_for_doc_inner(pos)?;
+        }
+        Ok(())
+    }
+
     fn rebuild_tier2_superblocks_with_docs_per_block(
         &mut self,
         docs_per_block: usize,
@@ -3551,6 +3763,30 @@ impl CandidateStore {
             .unwrap_or(u64::MAX);
         let load_tier2_started = Instant::now();
         let expected_active_doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
+        let maybe_tree_tier1_snapshot = self
+            .load_tree_gate_snapshot(
+                &tree_tier1_gates_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
+            .ok()
+            .flatten();
+        let maybe_tree_tier2_snapshot = self
+            .load_tree_gate_snapshot(
+                &tree_tier2_gates_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
+            .ok()
+            .flatten();
+        if let (Some(tree_tier1_snapshot), Some(tree_tier2_snapshot)) =
+            (maybe_tree_tier1_snapshot, maybe_tree_tier2_snapshot)
+        {
+            self.tree_tier1_gates = tree_tier1_snapshot;
+            self.tree_tier2_gates = tree_tier2_snapshot;
+        } else {
+            self.rebuild_tree_gates()?;
+        }
         let maybe_snapshot = self
             .load_tier2_superblocks_snapshot(self.docs.len(), expected_active_doc_count)
             .ok()
@@ -3740,6 +3976,121 @@ impl CandidateStore {
         }))
     }
 
+    pub(crate) fn persist_tree_gate_snapshots(&self) -> Result<()> {
+        fs::create_dir_all(&self.root)?;
+        self.persist_tree_gate_snapshot(
+            &tree_tier1_gates_path(&self.root),
+            &self.tree_tier1_gates,
+        )?;
+        self.persist_tree_gate_snapshot(
+            &tree_tier2_gates_path(&self.root),
+            &self.tree_tier2_gates,
+        )?;
+        Ok(())
+    }
+
+    fn persist_tree_gate_snapshot(&self, path: &Path, index: &TreeBloomGateIndex) -> Result<()> {
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut payload = Vec::<u8>::new();
+        append_u32(&mut payload, TREE_BLOOM_GATES_SNAPSHOT_VERSION);
+        append_u64(&mut payload, self.docs.len() as u64);
+        append_u64(
+            &mut payload,
+            self.docs.iter().filter(|doc| !doc.deleted).count() as u64,
+        );
+        append_u64(&mut payload, index.bucket_for_key.len() as u64);
+        for ((filter_bytes, bloom_hashes), (filter_bucket, bucket_hashes)) in &index.bucket_for_key
+        {
+            append_u64(&mut payload, *filter_bytes as u64);
+            append_u64(&mut payload, *bloom_hashes as u64);
+            append_u64(&mut payload, *filter_bucket as u64);
+            append_u64(&mut payload, *bucket_hashes as u64);
+        }
+        append_u64(&mut payload, index.masks_by_bucket.len() as u64);
+        for ((filter_bucket, bloom_hashes), mask) in &index.masks_by_bucket {
+            append_u64(&mut payload, *filter_bucket as u64);
+            append_u64(&mut payload, *bloom_hashes as u64);
+            append_u64(&mut payload, mask.len() as u64);
+            payload.extend_from_slice(mask);
+        }
+        fs::write(&tmp_path, payload)?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    fn load_tree_gate_snapshot(
+        &self,
+        path: &Path,
+        expected_doc_count: usize,
+        expected_active_doc_count: usize,
+    ) -> Result<Option<TreeBloomGateIndex>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        let mut cursor = 0usize;
+        let version = read_u32(&bytes, &mut cursor)?;
+        if version != TREE_BLOOM_GATES_SNAPSHOT_VERSION {
+            return Ok(None);
+        }
+        let stored_doc_count = read_u64(&bytes, &mut cursor)? as usize;
+        let stored_active_doc_count = read_u64(&bytes, &mut cursor)? as usize;
+        if stored_doc_count != expected_doc_count
+            || stored_active_doc_count != expected_active_doc_count
+        {
+            return Ok(None);
+        }
+        let key_count = read_u64(&bytes, &mut cursor)? as usize;
+        let mut bucket_for_key = BTreeMap::new();
+        for _ in 0..key_count {
+            let filter_bytes = read_u64(&bytes, &mut cursor)? as usize;
+            let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
+            let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
+            let bucket_hashes = read_u64(&bytes, &mut cursor)? as usize;
+            let expected_bucket = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+            if expected_bucket != (filter_bucket, bucket_hashes) {
+                return Ok(None);
+            }
+            bucket_for_key.insert((filter_bytes, bloom_hashes), expected_bucket);
+        }
+        let bucket_count = read_u64(&bytes, &mut cursor)? as usize;
+        let mut summary_bytes_by_bucket = BTreeMap::new();
+        let mut masks_by_bucket = BTreeMap::new();
+        let mut summary_memory_bytes = 0u64;
+        for _ in 0..bucket_count {
+            let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
+            let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
+            let mask_len = read_u64(&bytes, &mut cursor)? as usize;
+            let expected_len = align_filter_bytes(filter_bucket.max(1));
+            if mask_len != expected_len {
+                return Ok(None);
+            }
+            let end = cursor.saturating_add(mask_len);
+            if end > bytes.len() {
+                return Ok(None);
+            }
+            let bucket_key = (filter_bucket, bloom_hashes);
+            masks_by_bucket.insert(bucket_key, bytes[cursor..end].to_vec());
+            summary_bytes_by_bucket.insert(bucket_key, mask_len);
+            summary_memory_bytes = summary_memory_bytes.saturating_add(mask_len as u64);
+            cursor = end;
+        }
+        for bucket_key in bucket_for_key.values() {
+            if !masks_by_bucket.contains_key(bucket_key) {
+                return Ok(None);
+            }
+        }
+        if cursor != bytes.len() {
+            return Ok(None);
+        }
+        Ok(Some(TreeBloomGateIndex {
+            bucket_for_key,
+            summary_bytes_by_bucket,
+            masks_by_bucket,
+            summary_memory_bytes,
+        }))
+    }
+
     fn prepared_query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
         serde_json::to_string(plan).map_err(SspryError::from)
     }
@@ -3910,6 +4261,14 @@ fn external_ids_path(root: &Path) -> PathBuf {
 
 fn tier2_superblocks_path(root: &Path) -> PathBuf {
     root.join("tier2_superblocks.bin")
+}
+
+fn tree_tier1_gates_path(root: &Path) -> PathBuf {
+    root.join("tree_tier1_gates.bin")
+}
+
+fn tree_tier2_gates_path(root: &Path) -> PathBuf {
+    root.join("tree_tier2_gates.bin")
 }
 
 pub fn candidate_shard_manifest_path(root: &Path) -> PathBuf {
@@ -4621,6 +4980,139 @@ fn block_matches_required_masks(
         };
         raw_filter_matches_word_masks(block, required)
     })
+}
+
+fn tree_gate_matches_required_masks(
+    by_key: &RequiredMasksByKey,
+    gates: &TreeBloomGateIndex,
+) -> bool {
+    if by_key.is_empty() {
+        return true;
+    }
+    by_key.iter().any(|(filter_key, required)| {
+        let Some(bucket_key) = gates.bucket_for_key.get(filter_key) else {
+            return false;
+        };
+        let Some(mask) = gates.masks_by_bucket.get(bucket_key) else {
+            return false;
+        };
+        raw_filter_matches_word_masks(mask, required)
+    })
+}
+
+fn tree_gate_matches_shifted_required_masks(
+    shifted: &ShiftedRequiredMasks,
+    gates: &TreeBloomGateIndex,
+) -> bool {
+    shifted
+        .shifts
+        .iter()
+        .any(|by_key| tree_gate_matches_required_masks(by_key, gates))
+}
+
+fn tree_gate_matches_pattern(
+    pattern_id: &str,
+    mask_cache: &PatternMaskCache,
+    tier1_gates: &TreeBloomGateIndex,
+    tier2_gates: &TreeBloomGateIndex,
+    allow_tier2: bool,
+) -> bool {
+    let Some(pattern_masks) = mask_cache.get(pattern_id) else {
+        return false;
+    };
+    pattern_masks
+        .tier1
+        .iter()
+        .enumerate()
+        .any(|(alt_index, tier1_by_key)| {
+            if !tree_gate_matches_shifted_required_masks(tier1_by_key, tier1_gates) {
+                return false;
+            }
+            let Some(tier2_by_key) = pattern_masks.tier2.get(alt_index) else {
+                return true;
+            };
+            if !allow_tier2 || tier2_by_key.is_empty() {
+                return true;
+            }
+            tree_gate_matches_shifted_required_masks(tier2_by_key, tier2_gates)
+        })
+}
+
+fn tree_maybe_matches_node(
+    node: &QueryNode,
+    mask_cache: &PatternMaskCache,
+    tier1_gates: &TreeBloomGateIndex,
+    tier2_gates: &TreeBloomGateIndex,
+    allow_tier2: bool,
+) -> Result<bool> {
+    match node.kind.as_str() {
+        "pattern" => {
+            let pattern_id = node
+                .pattern_id
+                .as_ref()
+                .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
+            Ok(tree_gate_matches_pattern(
+                pattern_id,
+                mask_cache,
+                tier1_gates,
+                tier2_gates,
+                allow_tier2,
+            ))
+        }
+        "verifier_only_eq" | "filesize_eq" | "metadata_eq" | "time_now_eq" => Ok(true),
+        "and" => {
+            for child in &node.children {
+                if !tree_maybe_matches_node(
+                    child,
+                    mask_cache,
+                    tier1_gates,
+                    tier2_gates,
+                    allow_tier2,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "or" => {
+            for child in &node.children {
+                if tree_maybe_matches_node(
+                    child,
+                    mask_cache,
+                    tier1_gates,
+                    tier2_gates,
+                    allow_tier2,
+                )? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "n_of" => {
+            let threshold = node
+                .threshold
+                .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
+            let mut matched = 0usize;
+            for child in &node.children {
+                if tree_maybe_matches_node(
+                    child,
+                    mask_cache,
+                    tier1_gates,
+                    tier2_gates,
+                    allow_tier2,
+                )? {
+                    matched += 1;
+                    if matched >= threshold {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        other => Err(SspryError::from(format!(
+            "Unsupported ast node kind: {other}"
+        ))),
+    }
 }
 
 fn block_matches_shifted_required_masks(
