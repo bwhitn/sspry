@@ -6,6 +6,7 @@ use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -444,36 +445,54 @@ struct Tier2Telemetry {
 #[derive(Debug, Default)]
 struct BlobSidecar {
     path: PathBuf,
-    mmap: Option<Mmap>,
+    mmap: OnceLock<std::result::Result<Option<Mmap>, String>>,
 }
 
 impl BlobSidecar {
     fn new(path: PathBuf) -> Self {
-        Self { path, mmap: None }
+        Self {
+            path,
+            mmap: OnceLock::new(),
+        }
     }
 
-    fn map_if_exists(&mut self) -> Result<()> {
-        self.mmap = None;
-        if !self.path.exists() {
-            return Ok(());
-        }
-        let file = fs::File::open(&self.path)?;
-        if file.metadata()?.len() == 0 {
-            return Ok(());
-        }
-        let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-            SspryError::from(format!("Failed to mmap {}: {err}", self.path.display()))
-        })?;
-        self.mmap = Some(mmap);
+    fn map_if_exists(&self) -> Result<()> {
+        let _ = self.mmap_if_exists()?;
         Ok(())
     }
 
+    fn mmap_if_exists(&self) -> Result<Option<&Mmap>> {
+        self.mmap
+            .get_or_init(|| {
+                if !self.path.exists() {
+                    return Ok(None);
+                }
+                let file = fs::File::open(&self.path)
+                    .map_err(|err| format!("Failed to open {}: {err}", self.path.display()))?;
+                if file
+                    .metadata()
+                    .map_err(|err| format!("Failed to stat {}: {err}", self.path.display()))?
+                    .len()
+                    == 0
+                {
+                    return Ok(None);
+                }
+                let mmap = unsafe { MmapOptions::new().map(&file) }
+                    .map_err(|err| format!("Failed to mmap {}: {err}", self.path.display()))?;
+                Ok(Some(mmap))
+            })
+            .as_ref()
+            .map_err(|err: &String| SspryError::from(err.clone()))
+            .map(|mmap: &Option<Mmap>| mmap.as_ref())
+    }
+
     fn invalidate(&mut self) {
-        self.mmap = None;
+        self.mmap = OnceLock::new();
     }
 
     fn retarget(&mut self, path: PathBuf) {
         self.path = path;
+        self.mmap = OnceLock::new();
     }
 
     fn read_bytes<'a>(
@@ -486,7 +505,7 @@ impl BlobSidecar {
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
-        if let Some(mmap) = &self.mmap {
+        if let Some(mmap) = self.mmap_if_exists()? {
             let start = offset as usize;
             let end = start.saturating_add(len);
             if end > mmap.len() {
@@ -512,7 +531,7 @@ impl BlobSidecar {
         if len == 0 {
             return Ok(Some(&[]));
         }
-        let Some(mmap) = &self.mmap else {
+        let Some(mmap) = self.mmap_if_exists()? else {
             return Ok(None);
         };
         let start = offset as usize;
@@ -528,8 +547,10 @@ impl BlobSidecar {
 
     fn mapped_bytes(&self) -> u64 {
         self.mmap
-            .as_ref()
-            .map(|mmap| mmap.len() as u64)
+            .get()
+            .and_then(|result: &std::result::Result<Option<Mmap>, String>| result.as_ref().ok())
+            .and_then(|mmap: &Option<Mmap>| mmap.as_ref())
+            .map(|mmap: &Mmap| mmap.len() as u64)
             .unwrap_or(0)
     }
 }
@@ -553,9 +574,7 @@ impl StoreSidecars {
     }
 
     fn map_existing(root: &Path) -> Result<Self> {
-        let mut sidecars = Self::new(root);
-        sidecars.refresh_maps()?;
-        Ok(sidecars)
+        Ok(Self::new(root))
     }
 
     fn refresh_maps(&mut self) -> Result<()> {
@@ -704,8 +723,10 @@ struct Tier2SuperblockIndex {
     bucket_for_key: BTreeMap<(usize, usize), (usize, usize)>,
     summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
     masks_by_bucket: BTreeMap<(usize, usize), Vec<Vec<u8>>>,
-    positions_by_bucket: BTreeMap<(usize, usize), Vec<Vec<usize>>>,
+    mapped_block_ranges_by_bucket: BTreeMap<(usize, usize), Vec<(usize, usize)>>,
+    positions_by_bucket: BTreeMap<(usize, usize), Vec<Vec<u32>>>,
     summary_memory_bytes: u64,
+    snapshot_mmap: Option<Arc<Mmap>>,
 }
 
 impl Default for Tier2SuperblockIndex {
@@ -715,8 +736,10 @@ impl Default for Tier2SuperblockIndex {
             bucket_for_key: BTreeMap::new(),
             summary_bytes_by_bucket: BTreeMap::new(),
             masks_by_bucket: BTreeMap::new(),
+            mapped_block_ranges_by_bucket: BTreeMap::new(),
             positions_by_bucket: BTreeMap::new(),
             summary_memory_bytes: 0,
+            snapshot_mmap: None,
         }
     }
 }
@@ -744,9 +767,29 @@ impl Tier2SuperblockIndex {
             .values()
             .flat_map(|blocks| blocks.iter())
             .map(|positions| {
-                (positions.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64)
+                (positions.len() as u64).saturating_mul(std::mem::size_of::<u32>() as u64)
             })
             .sum()
+    }
+
+    fn block_bytes<'a>(
+        &'a self,
+        bucket_key: &(usize, usize),
+        block_idx: usize,
+    ) -> Option<&'a [u8]> {
+        if let Some(blocks) = self.masks_by_bucket.get(bucket_key) {
+            if let Some(block) = blocks.get(block_idx) {
+                return Some(block.as_slice());
+            }
+        }
+        let ranges = self.mapped_block_ranges_by_bucket.get(bucket_key)?;
+        let (start, len) = *ranges.get(block_idx)?;
+        let mmap = self.snapshot_mmap.as_ref()?;
+        let end = start.saturating_add(len);
+        if end > mmap.len() {
+            return None;
+        }
+        Some(&mmap[start..end])
     }
 }
 
@@ -848,6 +891,7 @@ fn locate_or_assign_superblock_for_pos(
     bloom_hashes: usize,
     pos: usize,
 ) -> usize {
+    let pos_u32 = u32::try_from(pos).unwrap_or(u32::MAX);
     let filter_key = (filter_bytes, bloom_hashes);
     let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
     index.bucket_for_key.insert(filter_key, bucket_key);
@@ -855,7 +899,7 @@ fn locate_or_assign_superblock_for_pos(
         if let Some((block_idx, _)) = blocks
             .iter()
             .enumerate()
-            .find(|(_, positions)| positions.contains(&pos))
+            .find(|(_, positions)| positions.contains(&pos_u32))
         {
             return block_idx;
         }
@@ -880,8 +924,8 @@ fn locate_or_assign_superblock_for_pos(
         .positions_by_bucket
         .get_mut(&bucket_key)
         .expect("positions bucket");
-    if !blocks[block_idx].contains(&pos) {
-        blocks[block_idx].push(pos);
+    if !blocks[block_idx].contains(&pos_u32) {
+        blocks[block_idx].push(pos_u32);
     }
     block_idx
 }
@@ -1283,6 +1327,7 @@ impl CandidateStore {
             let _ = fs::remove_file(&tier2_blooms_path);
             let _ = fs::remove_file(&external_ids_path);
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
+            let _ = fs::remove_file(&tier2_pattern_superblocks_path(&config.root));
             let _ = fs::remove_file(&tree_tier1_gates_path(&config.root));
             let _ = fs::remove_file(&tree_tier2_gates_path(&config.root));
         }
@@ -3134,11 +3179,16 @@ impl CandidateStore {
                 .map(|positions| positions.as_slice())
                 .unwrap_or(&[]);
             let mut prefetched_tier1 = if prefetch_tier1_by_block {
-                self.prefetch_positions_tier1_blooms(positions)?
+                let positions_usize = positions
+                    .iter()
+                    .map(|pos| *pos as usize)
+                    .collect::<Vec<_>>();
+                self.prefetch_positions_tier1_blooms(&positions_usize)?
             } else {
                 Vec::new()
             };
             for (prefetched_idx, pos) in positions.iter().copied().enumerate() {
+                let pos = pos as usize;
                 let doc = &self.docs[pos];
                 if doc.deleted || doc.special_population {
                     continue;
@@ -3957,7 +4007,19 @@ impl CandidateStore {
         self.tree_tier1_gates = TreeBloomGateIndex::default();
         self.tree_tier2_gates = TreeBloomGateIndex::default();
         let maybe_snapshot = self
-            .load_tier2_superblocks_snapshot(self.docs.len(), expected_active_doc_count)
+            .load_superblocks_snapshot(
+                &tier2_superblocks_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
+            .ok()
+            .flatten();
+        let maybe_pattern_snapshot = self
+            .load_superblocks_snapshot(
+                &tier2_pattern_superblocks_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
             .ok()
             .flatten();
         let load_tier2_superblocks_ms = load_tier2_started
@@ -3966,16 +4028,12 @@ impl CandidateStore {
             .try_into()
             .unwrap_or(u64::MAX);
         let (loaded_tier2_superblocks_from_snapshot, tier2_superblocks_ms) =
-            if let Some(snapshot) = maybe_snapshot {
-                self.tier2_superblocks = snapshot;
+            if let (Some(snapshot), Some(pattern_snapshot)) =
+                (maybe_snapshot, maybe_pattern_snapshot)
+            {
                 let tier2_started = Instant::now();
-                self.tier2_pattern_superblocks = Tier2SuperblockIndex {
-                    docs_per_block: self.tier2_superblocks.docs_per_block,
-                    ..Tier2SuperblockIndex::default()
-                };
-                for pos in 0..self.docs.len() {
-                    self.update_tier2_pattern_superblocks_for_doc_inner(pos)?;
-                }
+                self.tier2_superblocks = snapshot;
+                self.tier2_pattern_superblocks = pattern_snapshot;
                 let tier2_superblocks_ms = tier2_started
                     .elapsed()
                     .as_millis()
@@ -4006,8 +4064,22 @@ impl CandidateStore {
     }
 
     pub(crate) fn persist_tier2_superblocks_snapshot(&self) -> Result<()> {
+        self.persist_superblocks_snapshot(
+            &self.tier2_superblocks,
+            &tier2_superblocks_path(&self.root),
+        )?;
+        self.persist_superblocks_snapshot(
+            &self.tier2_pattern_superblocks,
+            &tier2_pattern_superblocks_path(&self.root),
+        )
+    }
+
+    fn persist_superblocks_snapshot(
+        &self,
+        index: &Tier2SuperblockIndex,
+        path: &Path,
+    ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        let path = tier2_superblocks_path(&self.root);
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         let mut payload = Vec::<u8>::new();
         append_u32(&mut payload, TIER2_SUPERBLOCKS_SNAPSHOT_VERSION);
@@ -4016,24 +4088,19 @@ impl CandidateStore {
             &mut payload,
             self.docs.iter().filter(|doc| !doc.deleted).count() as u64,
         );
-        append_u64(&mut payload, self.tier2_superblocks.docs_per_block as u64);
-        append_u64(
-            &mut payload,
-            self.tier2_superblocks.masks_by_bucket.len() as u64,
-        );
-        for ((filter_bucket, bloom_hashes), blocks) in &self.tier2_superblocks.masks_by_bucket {
+        append_u64(&mut payload, index.docs_per_block as u64);
+        append_u64(&mut payload, index.masks_by_bucket.len() as u64);
+        for ((filter_bucket, bloom_hashes), blocks) in &index.masks_by_bucket {
             append_u64(&mut payload, *filter_bucket as u64);
             append_u64(&mut payload, *bloom_hashes as u64);
-            let summary_bytes = self
-                .tier2_superblocks
+            let summary_bytes = index
                 .summary_bytes_by_bucket
                 .get(&(*filter_bucket, *bloom_hashes))
                 .copied()
                 .unwrap_or_else(|| self.tier2_superblock_summary_bytes(*filter_bucket));
             append_u64(&mut payload, summary_bytes as u64);
             append_u64(&mut payload, blocks.len() as u64);
-            let position_blocks = self
-                .tier2_superblocks
+            let position_blocks = index
                 .positions_by_bucket
                 .get(&(*filter_bucket, *bloom_hashes))
                 .cloned()
@@ -4053,16 +4120,26 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn load_tier2_superblocks_snapshot(
+    fn load_superblocks_snapshot(
         &self,
+        path: &Path,
         expected_doc_count: usize,
         expected_active_doc_count: usize,
     ) -> Result<Option<Tier2SuperblockIndex>> {
-        let path = tier2_superblocks_path(&self.root);
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path)?;
+        let file = fs::File::open(&path)?;
+        if file.metadata()?.len() == 0 {
+            return Ok(None);
+        }
+        let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
+            SspryError::from(format!(
+                "Failed to mmap tier2 superblocks snapshot {}: {err}",
+                path.display()
+            ))
+        })?;
+        let bytes = &mmap[..];
         let mut cursor = 0usize;
         let version = read_u32(&bytes, &mut cursor)?;
         if version != TIER2_SUPERBLOCKS_SNAPSHOT_VERSION {
@@ -4079,7 +4156,8 @@ impl CandidateStore {
         let mut bucket_for_key = BTreeMap::new();
         let bucket_count = read_u64(&bytes, &mut cursor)? as usize;
         let mut summary_bytes_by_bucket = BTreeMap::new();
-        let mut masks_by_bucket = BTreeMap::new();
+        let masks_by_bucket = BTreeMap::new();
+        let mut mapped_block_ranges_by_bucket = BTreeMap::new();
         let mut positions_by_bucket = BTreeMap::new();
         let mut summary_memory_bytes = 0u64;
         for _ in 0..bucket_count {
@@ -4091,23 +4169,24 @@ impl CandidateStore {
                 return Ok(None);
             }
             let blocks_len = read_u64(&bytes, &mut cursor)? as usize;
-            let mut blocks = Vec::with_capacity(blocks_len);
+            let mut block_ranges = Vec::with_capacity(blocks_len);
             let mut position_blocks = Vec::with_capacity(blocks_len);
             for _ in 0..blocks_len {
                 let block_len = read_u64(&bytes, &mut cursor)? as usize;
                 if block_len != summary_bytes {
                     return Ok(None);
                 }
+                let start = cursor;
                 let end = cursor.saturating_add(block_len);
                 if end > bytes.len() {
                     return Ok(None);
                 }
-                blocks.push(bytes[cursor..end].to_vec());
+                block_ranges.push((start, block_len));
                 cursor = end;
                 let position_count = read_u64(&bytes, &mut cursor)? as usize;
                 let mut positions = Vec::with_capacity(position_count);
                 for _ in 0..position_count {
-                    let pos = read_u64(&bytes, &mut cursor)? as usize;
+                    let pos = read_u64(&bytes, &mut cursor)? as u32;
                     positions.push(pos);
                 }
                 position_blocks.push(positions);
@@ -4115,7 +4194,7 @@ impl CandidateStore {
             summary_memory_bytes = summary_memory_bytes
                 .saturating_add((summary_bytes as u64).saturating_mul(blocks_len as u64));
             summary_bytes_by_bucket.insert((filter_bucket, bloom_hashes), summary_bytes);
-            masks_by_bucket.insert((filter_bucket, bloom_hashes), blocks);
+            mapped_block_ranges_by_bucket.insert((filter_bucket, bloom_hashes), block_ranges);
             positions_by_bucket.insert((filter_bucket, bloom_hashes), position_blocks);
             bucket_for_key.insert((filter_bucket, bloom_hashes), (filter_bucket, bloom_hashes));
         }
@@ -4127,8 +4206,10 @@ impl CandidateStore {
             bucket_for_key,
             summary_bytes_by_bucket,
             masks_by_bucket,
+            mapped_block_ranges_by_bucket,
             positions_by_bucket,
             summary_memory_bytes,
+            snapshot_mmap: Some(Arc::new(mmap)),
         }))
     }
 
@@ -4316,6 +4397,10 @@ fn external_ids_path(root: &Path) -> PathBuf {
 
 fn tier2_superblocks_path(root: &Path) -> PathBuf {
     root.join("tier2_superblocks.bin")
+}
+
+fn tier2_pattern_superblocks_path(root: &Path) -> PathBuf {
+    root.join("tier2_pattern_superblocks.bin")
 }
 
 fn tree_tier1_gates_path(root: &Path) -> PathBuf {
@@ -4994,10 +5079,7 @@ fn block_matches_required_masks(
     let Some(required) = by_key.get(&bucket_key) else {
         return false;
     };
-    let Some(blocks) = superblocks.masks_by_bucket.get(&bucket_key) else {
-        return false;
-    };
-    let Some(block) = blocks.get(block_idx) else {
+    let Some(block) = superblocks.block_bytes(&bucket_key, block_idx) else {
         return false;
     };
     raw_filter_matches_word_masks(block, required)
@@ -5014,11 +5096,16 @@ fn tree_superblocks_match_required_masks(
         let Some(bucket_key) = superblocks.bucket_for_key.get(filter_key).copied() else {
             return false;
         };
-        let Some(blocks) = superblocks.masks_by_bucket.get(&bucket_key) else {
-            return false;
-        };
         let mut merged = vec![0u64; required.len()];
-        for block in blocks {
+        let block_count = superblocks
+            .positions_by_bucket
+            .get(&bucket_key)
+            .map(|blocks| blocks.len())
+            .unwrap_or(0);
+        for block_idx in 0..block_count {
+            let Some(block) = superblocks.block_bytes(&bucket_key, block_idx) else {
+                continue;
+            };
             for (idx, (word_idx, _)) in required.iter().enumerate() {
                 let start = word_idx.saturating_mul(8);
                 let end = start.saturating_add(8);

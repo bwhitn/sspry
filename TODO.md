@@ -1363,3 +1363,35 @@ Read:
 - removing persisted tree-gate snapshots is the right disk-side default move
 - it gets the `25k` DB back to the top edge of the target size band without losing the homogeneous-block search win
 - the next bottleneck is now reopen memory, not DB bytes
+
+Week-slice reopen follow-up after snapshotting `tier2_pattern_superblocks` and shrinking in-memory block positions to `u32`:
+- code:
+  - lazy-open sidecars remain in place
+  - `tier2_pattern_superblocks` now persist/load as snapshots
+  - block-position vectors are stored as `u32` instead of `usize`
+- fast control run:
+  - artifact: `/root/pertest/results/sspry_weekslice_lazycompact_20260320_r2`
+  - files: `3322`
+  - index wall: `193.069 s`
+  - index rate: `1032.376 files/min`
+- search-start state:
+  - `startup.total_ms = 991`
+  - `startup.current.total_ms = 776`
+  - `current_rss_kb = 1395768`
+  - `peak_rss_kb = 1396164`
+- startup-side mapping/state after reopen:
+  - `mapped_bloom_bytes = 619526144`
+  - `mapped_tier2_bloom_bytes = 167189504`
+  - `tier1_superblock_summary_bytes = 1077685248`
+  - `tier2_superblock_summary_bytes = 1632401408`
+  - `tier1_superblock_positions_bytes = 12456`
+  - `tier2_pattern_superblock_positions_bytes = 12456`
+  - `store_open_loaded_tier2_superblocks_from_snapshot_shards = 256`
+  - `store_open_rebuild_tier2_superblocks_ms = 0`
+- comparison to the prior week-slice control:
+  - startup fell from `1640 ms` to `991 ms`
+  - search-start RSS fell from `1760720 KB` to `1395768 KB`
+  - `tier2_blooms` startup mapping fell from `1193964544` bytes to `167189504`
+- remaining read:
+  - the new pattern snapshot removed the all-shards `tier2_blooms.bin` startup mmap
+  - a subset of shards still mmap `blooms.bin` at startup, so tier1 startup mapping is the next remaining reopen-memory target
