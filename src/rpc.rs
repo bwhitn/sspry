@@ -2072,7 +2072,7 @@ impl ServerState {
             };
             match store_lock.try_lock() {
                 Ok(store) => {
-                    store.persist_tree_gate_snapshots()?;
+                    store.remove_tree_gate_snapshots()?;
                     store.persist_tier2_superblocks_snapshot()?;
                     Ok((1, 0))
                 }

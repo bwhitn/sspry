@@ -1333,3 +1333,33 @@ Read:
   - tier1 bytes still rose on the broad rules even while scan count fell
 - next step is not another size-tuning run
 - next step is to keep the homogeneous-block selectivity win while compressing or externalizing the block-membership/layout cost
+
+Tree-gate snapshot externalization follow-up on the existing `25k` homogeneous-block DB:
+- change:
+  - stop persisting `tree_tier1_gates.bin` and `tree_tier2_gates.bin`
+  - always rebuild tree gates on open from the DB
+- reclaimed from the existing `25k` DB by deleting those snapshots:
+  - `6,471,423,856` bytes
+- DB after removal:
+  - `25,246,597,390` bytes
+  - about `40.2%` of the `62,770,713,136` source bytes
+
+Search behavior after reopening without tree-gate snapshots:
+- query shape stayed the same:
+  - `01`: `15952` docs, `4227` skipped blocks, `12.15 GiB`
+  - `08`: `20389`, `3195`, `13.86 GiB`
+  - `09`: `18178`, `4000`, `13.34 GiB`
+  - `10`: `9216`, `1994`, `10.63 GiB`
+  - `11`: `18813`, `3838`, `13.26 GiB`
+  - `12`: `19657`, `3567`, `13.40 GiB`
+- wall time moved only slightly versus the stored-tree-gate run
+
+Reopen cost without tree-gate snapshots:
+- published startup total: about `20.1s`
+- current-root startup: about `19.9s`
+- peak RSS during reopen/search: about `34.1 GB`
+
+Read:
+- removing persisted tree-gate snapshots is the right disk-side default move
+- it gets the `25k` DB back to the top edge of the target size band without losing the homogeneous-block search win
+- the next bottleneck is now reopen memory, not DB bytes
