@@ -1305,3 +1305,31 @@ Read:
   - DB grew about `14.6%`
   - broad-rule tier1 bytes stayed roughly flat while scan count collapsed
 - this is worth keeping and scaling up to `25k`
+
+`25k` scale-up on the same single-tree manifest:
+- baseline: `sspry_specialpop_25000_20260320_r2`
+  - ingest: `1011.07 files/min`
+  - DB: `19,257,503,209` bytes
+  - peak RSS: `2,051,136 KB`
+- homogeneous tier1 blocks: `sspry_homoblocks_25000_20260320_r1`
+  - ingest: `1359.27 files/min`
+  - DB: `31,718,020,877` bytes
+  - peak RSS: `13,269,124 KB`
+
+Search deltas:
+- `01`: `1173 -> 680 ms`, `24984 -> 15952` docs, `6 -> 4227` skipped blocks, `11.30 -> 12.15 GiB`
+- `08`: `263 -> 175 ms`, `24997 -> 20389`, `2 -> 3195`, `11.30 -> 13.86 GiB`
+- `09`: `797 -> 402 ms`, `24990 -> 18178`, `4 -> 4000`, `11.30 -> 13.34 GiB`
+- `10`: `1277 -> 1081 ms`, `24716 -> 9216`, `17 -> 1994`, `11.28 -> 10.63 GiB`
+- `11`: `998 -> 577 ms`, `24989 -> 18813`, `4 -> 3838`, `11.30 -> 13.26 GiB`
+- `12`: `969 -> 527 ms`, `24991 -> 19657`, `3 -> 3567`, `11.30 -> 13.40 GiB`
+
+Read:
+- the within-tree gate is now doing real work at `25k`
+- search wall time improved across all supported rules
+- the price is too high in the current layout:
+  - DB grew about `64.7%`
+  - ingest peak RSS grew about `6.5x`
+  - tier1 bytes still rose on the broad rules even while scan count fell
+- next step is not another size-tuning run
+- next step is to keep the homogeneous-block selectivity win while compressing or externalizing the block-membership/layout cost
