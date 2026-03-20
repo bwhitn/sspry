@@ -705,111 +705,12 @@ pub(crate) struct PreparedQueryArtifacts {
     impossible_query: bool,
 }
 
-fn tier2_superblock_summary_bytes(filter_bytes: usize, summary_cap_bytes: usize) -> usize {
-    align_filter_bytes(filter_bytes.max(1).min(summary_cap_bytes.max(1)))
-}
-
-const TIER2_SUPERBLOCK_FILTER_BUCKETS: &[usize] = &[
-    1 << 10,
-    2 << 10,
-    4 << 10,
-    8 << 10,
-    12 << 10,
-    16 << 10,
-    24 << 10,
-    32 << 10,
-    48 << 10,
-    64 << 10,
-    96 << 10,
-    128 << 10,
-    192 << 10,
-    256 << 10,
-    384 << 10,
-    512 << 10,
-    768 << 10,
-    1 << 20,
-];
-
-fn tier2_superblock_filter_bucket(filter_bytes: usize) -> usize {
-    let filter_bytes = filter_bytes.max(1);
-    for bucket in TIER2_SUPERBLOCK_FILTER_BUCKETS {
-        if filter_bytes <= *bucket {
-            return *bucket;
-        }
-    }
-    let mut bucket = *TIER2_SUPERBLOCK_FILTER_BUCKETS.last().unwrap_or(&(1 << 20));
-    while bucket < filter_bytes {
-        bucket = bucket.saturating_mul(2);
-        if bucket == usize::MAX {
-            break;
-        }
-    }
-    bucket.max(filter_bytes.next_power_of_two())
+fn tier2_superblock_summary_bytes(filter_bytes: usize, _summary_cap_bytes: usize) -> usize {
+    align_filter_bytes(filter_bytes.max(1))
 }
 
 fn tier2_superblock_bucket_key(filter_bytes: usize, bloom_hashes: usize) -> (usize, usize) {
-    (tier2_superblock_filter_bucket(filter_bytes), bloom_hashes)
-}
-
-fn tier2_superblock_summary_word_stride(filter_bytes: usize, summary_bytes: usize) -> usize {
-    let total_words = align_filter_bytes(filter_bytes.max(1)) / 8;
-    let summary_words = align_filter_bytes(summary_bytes.max(1)) / 8;
-    total_words.div_ceil(summary_words).max(1)
-}
-
-fn tier2_superblock_sample_word_index(
-    word_idx: usize,
-    filter_bytes: usize,
-    summary_bytes: usize,
-) -> Option<usize> {
-    let summary_words = align_filter_bytes(summary_bytes.max(1)) / 8;
-    let stride_words = tier2_superblock_summary_word_stride(filter_bytes, summary_bytes);
-    if word_idx % stride_words != 0 {
-        return None;
-    }
-    let summary_word_idx = word_idx / stride_words;
-    (summary_word_idx < summary_words).then_some(summary_word_idx)
-}
-
-fn merge_sampled_bloom_words_into_summary(
-    summary: &mut [u8],
-    bloom_bytes: &[u8],
-    filter_bytes: usize,
-) {
-    let summary_bytes = align_filter_bytes(summary.len().max(1));
-    for (word_idx, chunk) in bloom_bytes.chunks_exact(8).enumerate() {
-        let Some(summary_word_idx) =
-            tier2_superblock_sample_word_index(word_idx, filter_bytes, summary_bytes)
-        else {
-            continue;
-        };
-        let start = summary_word_idx * 8;
-        let end = start + 8;
-        let src = u64::from_le_bytes(chunk.try_into().expect("word-sized bloom chunk"));
-        let dst = u64::from_le_bytes(
-            summary[start..end]
-                .try_into()
-                .expect("word-sized summary chunk"),
-        ) | src;
-        summary[start..end].copy_from_slice(&dst.to_le_bytes());
-    }
-}
-
-fn sample_bloom_word_masks_for_superblock(
-    required_masks: &[(usize, u64)],
-    filter_bytes: usize,
-    summary_bytes: usize,
-) -> Vec<(usize, u64)> {
-    let mut sampled = BTreeMap::<usize, u64>::new();
-    for (word_idx, mask) in required_masks {
-        let Some(summary_word_idx) =
-            tier2_superblock_sample_word_index(*word_idx, filter_bytes, summary_bytes)
-        else {
-            continue;
-        };
-        *sampled.entry(summary_word_idx).or_insert(0) |= *mask;
-    }
-    sampled.into_iter().collect()
+    (align_filter_bytes(filter_bytes.max(1)), bloom_hashes)
 }
 
 fn ensure_superblock_capacity_for(
@@ -867,7 +768,7 @@ fn update_superblocks_for_doc_bytes_inner(
     let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
     if let Some(blocks) = index.masks_by_bucket.get_mut(&bucket_key) {
         if let Some(block) = blocks.get_mut(block_idx) {
-            merge_sampled_bloom_words_into_summary(block, bloom_bytes, filter_bytes);
+            merge_bloom_bytes_into_tree_gate(block, bloom_bytes);
         }
     }
 }
@@ -900,7 +801,7 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
         let folded = aggregated
             .entry((block_idx, filter_key))
             .or_insert_with(|| vec![0u8; summary_bytes]);
-        merge_sampled_bloom_words_into_summary(folded, bloom_bytes, *filter_bytes);
+        merge_bloom_bytes_into_tree_gate(folded, bloom_bytes);
     }
 
     if index.keys_per_block.len() < max_needed_blocks {
@@ -947,9 +848,7 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
         let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
         if let Some(blocks) = index.masks_by_bucket.get_mut(&bucket_key) {
             if let Some(block) = blocks.get_mut(block_idx) {
-                for (dst, src) in block.iter_mut().zip(folded.iter()) {
-                    *dst |= *src;
-                }
+                merge_bloom_bytes_into_tree_gate(block, &folded);
             }
         }
     }
@@ -4924,7 +4823,7 @@ fn build_pattern_mask_cache(
     tier2_filter_keys: &[(usize, usize)],
     tier1_gram_size: usize,
     tier2_gram_size: usize,
-    tier2_superblock_summary_cap_bytes: usize,
+    _tier2_superblock_summary_cap_bytes: usize,
 ) -> Result<PatternMaskCache> {
     let mut out = HashMap::with_capacity(patterns.len());
     let mut tier1_gram_cache =
@@ -4964,19 +4863,7 @@ fn build_pattern_mask_cache(
                         DEFAULT_BLOOM_POSITION_LANES,
                         &mut tier1_gram_cache,
                     )?;
-                    let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-                    let summary_bytes = tier2_superblock_summary_bytes(
-                        summary_bucket.0,
-                        tier2_superblock_summary_cap_bytes,
-                    );
-                    superblock_by_key.insert(
-                        (*filter_bytes, *bloom_hashes),
-                        sample_bloom_word_masks_for_superblock(
-                            &required,
-                            *filter_bytes,
-                            summary_bytes,
-                        ),
-                    );
+                    superblock_by_key.insert((*filter_bytes, *bloom_hashes), required.clone());
                     by_key.insert((*filter_bytes, *bloom_hashes), required);
                 }
                 shifted_tier1.shifts.push(by_key);
@@ -5018,19 +4905,7 @@ fn build_pattern_mask_cache(
                         DEFAULT_BLOOM_POSITION_LANES,
                         &mut tier2_gram_cache,
                     )?;
-                    let summary_bucket = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-                    let summary_bytes = tier2_superblock_summary_bytes(
-                        summary_bucket.0,
-                        tier2_superblock_summary_cap_bytes,
-                    );
-                    superblock_by_key.insert(
-                        (*filter_bytes, *bloom_hashes),
-                        sample_bloom_word_masks_for_superblock(
-                            &required,
-                            *filter_bytes,
-                            summary_bytes,
-                        ),
-                    );
+                    superblock_by_key.insert((*filter_bytes, *bloom_hashes), required.clone());
                     by_key.insert((*filter_bytes, *bloom_hashes), required);
                 }
                 shifted_tier2.shifts.push(by_key);
@@ -7589,21 +7464,20 @@ rule q {
     }
 
     #[test]
-    fn sampled_superblock_masks_preserve_selected_words() {
-        let required = vec![
-            (0usize, 0b0000_0011u64),
-            (4usize, 0b0000_0100u64),
-            (7usize, 0b1000_0000u64),
-        ];
-        let sampled = sample_bloom_word_masks_for_superblock(&required, 64, 16);
-        let sampled_map = sampled.into_iter().collect::<BTreeMap<_, _>>();
-        assert_eq!(sampled_map.get(&0).copied(), Some(0b0000_0011));
-        assert_eq!(sampled_map.get(&1).copied(), Some(0b0000_0100));
-        assert!(!sampled_map.contains_key(&7));
+    fn exact_superblock_masks_preserve_word_positions() {
+        let mut block = vec![0u8; 64];
+        let mut bloom = vec![0u8; 64];
+        bloom[0] = 0b0000_0011;
+        bloom[32] = 0b0000_0100;
+        bloom[63] = 0b1000_0000;
+        merge_bloom_bytes_into_tree_gate(&mut block, &bloom);
+        assert_eq!(block[0], 0b0000_0011);
+        assert_eq!(block[32], 0b0000_0100);
+        assert_eq!(block[63], 0b1000_0000);
     }
 
     #[test]
-    fn tier2_superblocks_use_bounded_summary_bytes() {
+    fn tier2_superblocks_use_exact_filter_bytes() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let mut store = CandidateStore::init(
@@ -7620,7 +7494,6 @@ rule q {
         let filter_bytes = store
             .resolve_filter_bytes_for_file_size(file_size, Some(bloom_item_estimate))
             .expect("large primary filter bytes");
-        assert!(filter_bytes > DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES);
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(filter_bytes, Some(bloom_item_estimate), None);
         let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
@@ -7654,7 +7527,7 @@ rule q {
             .expect("insert");
 
         let key = (filter_bytes, bloom_hashes);
-        let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+        let bucket_key = (align_filter_bytes(filter_bytes), bloom_hashes);
         assert_eq!(
             store.tier2_superblocks.bucket_for_key.get(&key).copied(),
             Some(bucket_key)
@@ -7665,7 +7538,7 @@ rule q {
                 .summary_bytes_by_bucket
                 .get(&bucket_key)
                 .copied(),
-            Some(DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES)
+            Some(align_filter_bytes(filter_bytes))
         );
         let blocks = store
             .tier2_superblocks
@@ -7673,11 +7546,11 @@ rule q {
             .get(&bucket_key)
             .expect("superblock masks");
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].len(), DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES);
+        assert_eq!(blocks[0].len(), align_filter_bytes(filter_bytes));
     }
 
     #[test]
-    fn tier2_superblocks_respect_custom_summary_cap() {
+    fn tier2_superblocks_ignore_summary_cap_for_exact_unions() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let cap_bytes = 8 * 1024;
@@ -7696,7 +7569,6 @@ rule q {
         let filter_bytes = store
             .resolve_filter_bytes_for_file_size(file_size, Some(bloom_item_estimate))
             .expect("large primary filter bytes");
-        assert!(filter_bytes > cap_bytes);
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(filter_bytes, Some(bloom_item_estimate), None);
         let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
@@ -7736,7 +7608,7 @@ rule q {
             .get(&bucket_key)
             .expect("superblock masks");
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].len(), cap_bytes);
+        assert_eq!(blocks[0].len(), align_filter_bytes(filter_bytes));
         assert_eq!(store.config().tier2_superblock_summary_cap_bytes, cap_bytes);
     }
 
