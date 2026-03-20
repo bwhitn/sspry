@@ -2,59 +2,70 @@
 
 This file is the short-horizon worklist.
 
-It contains the items to finish before going back to the broader performance backlog in
-[TODO.md](/root/pertest/repos/yaya/TODO.md).
+It reflects the current state after the `100k` balanced forest ingest/search experiment.
 
 ## Immediate Priorities
 
-### 1. Finish the bloom-only cutover
+### 1. Keep the many-tree ingest direction, but only for ingest
 
 Current state:
-- the normal ingest/search path is bloom-only
-- retired exact-gram / DF runtime plumbing has been removed from the live path
-- the remaining work is cleanup of stale docs, help text, and any last compatibility-only surfaces
+- `4 x 25k` byte-balanced trees with explicit writeback drain kept `100k` ingest in a tight `844-875 files/min` band
+- this is materially better evidence than the earlier collapsing single-tree and naive forest runs
+- the drain phase is doing real work; it reliably clears dirty/writeback backlog before the next tree
 
 Work:
-- remove any remaining public references to exact grams / DF in docs, help text, and metrics
-- keep pruning compatibility-only code that no longer protects a supported format or protocol
-- keep the current workspace layout documented as `current/`, `work_a/`, `work_b/`, and `retired/`
+- treat `older trees immutable` as the leading storage direction
+- keep one active mutable tree and roll to a new tree at the measured writeback knee
+- preserve the writeback-aware forest harness as the evaluation path for larger ingest runs
 
 Exit criteria:
-- public docs and help match the bloom-only runtime
-- no live-path metrics or help strings still describe the retired exact-gram / DF model
+- the many-tree ingest shape is the default scaling experiment for `100k+`
+- tree rollover and drain behavior are documented as the current ingest strategy
 
-### 2. Improve bloom-only search latency
+### 2. Fix large-corpus search on the many-tree shape
 
-Current baseline:
-- `32 KiB` Tier2 superblock summaries are the best measured point so far on the `50k` corpus
-- some supported searches are already fast
-- the heaviest supported rules still spend too long in the query path and can still hit the RPC timeout
+Current state:
+- the `100k` forest fanout fixed the old `01` timeout case
+- other supported rules are still too slow:
+  - `08`: `289.914 s`
+  - `09`: `251.910 s`
+  - `10`: `73.704 s`
+  - `11`: `205.955 s`
+  - `12`: `209.681 s`
+- queries still scan almost the full corpus and read about `53 GiB` of tier1 bloom data per search
 
 Work:
-- profile the slow supported search rules from the `8/16/32 KiB` comparison
-- reduce candidate and block scans before considering higher summary sizes
-- keep search improvements recall-safe and compatible with optional local verification
+- reduce reopened-tree full-scan behavior before touching more corpus size
+- focus on:
+  - tree-level / block-level prefilters that actually reject work
+  - reopened-search locality
+  - tier1 bloom I/O reduction
+- keep forest fanout measurements as the main search benchmark for this architecture
 
 Exit criteria:
-- heavy supported searches improve materially from the current `32 KiB` baseline
-- no regression in the already-fast supported searches
+- supported forest searches at `100k` stop behaving like near-full scans
+- heavy rules no longer sit in the multi-minute range
 
-### 3. Close the current test / coverage gaps
+### 3. Continue reducing the write-path slope
+
+Current state:
+- `append_sidecars` is still the dominant ingest hot bucket
+- exact-capacity payload assembly is a real improvement and should remain the baseline
 
 Work:
-- keep `cargo test --workspace --all-targets` green during the cutover cleanup
-- run a fresh coverage pass from the bloom-only baseline
-- use that report to target the next low-value uncovered branches
+- keep attacking `append_sidecars`
+- keep `append_doc_records_us` and `tier2_update_us` secondary targets
+- prefer changes that improve sustained large-corpus throughput, not short synthetic wins
 
 Exit criteria:
-- one fresh repeatable coverage result on the current tree
-- clear next test targets from the coverage report
+- the next `100k+` ingest run improves sustained files/min materially from the current forest baseline
+- writeback pressure is lower or easier to drain between trees
 
 ## Order
 
 Work these in this order:
-1. finish bloom-only cutover cleanup
-2. tighten bloom-only search performance
-3. refresh tests and coverage
+1. keep the many-tree ingest direction
+2. fix large-corpus search on top of it
+3. continue reducing the write-path slope
 
-Only after these are done do we return to [TODO.md](/root/pertest/repos/yaya/TODO.md).
+Only after these are stable do we return to broader cleanup or new feature work.

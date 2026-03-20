@@ -473,6 +473,54 @@ Future storage direction to evaluate after the current ingest/search slope work:
 - only trees affected by deletes or compaction need rewriting
 - goal: cap rewrite pressure and keep large-corpus ingest closer to linear as total history grows
 
+Current `100k` forest result on the accepted exact-capacity baseline:
+- artifact:
+  - `/root/pertest/results/sspry_forest_100k_balanced_drain_20260319_r2`
+- dataset:
+  - `100,000` files
+  - `291,807,903,886` bytes input
+- setup:
+  - `4` trees
+  - byte-balanced manifests
+  - explicit `sync` + writeback drain between trees
+  - `1` search worker per tree
+- ingest result:
+  - `tree_00`: `1,728.867 s`, `867.62 files/min`, `72,951,975,973` raw bytes
+  - `tree_01`: `1,770.417 s`, `847.26 files/min`, `72,951,975,972` raw bytes
+  - `tree_02`: `1,776.392 s`, `844.41 files/min`, `72,951,975,971` raw bytes
+  - `tree_03`: `1,714.458 s`, `874.91 files/min`, `72,951,975,970` raw bytes
+  - overall forest ingest: `6,990.135 s`, `858.35 files/min`
+  - total DB bytes: `82,221,359,978`
+- writeback result:
+  - post-publish dirty pages remained high after each tree
+  - drain phases completed in about `22.67s` to `28.96s`
+  - each drain returned to near-zero dirty/writeback pages before the next tree
+- read:
+  - this is the strongest current evidence that writeback carryover was a real part of the later-tree slowdown
+  - balanced trees plus explicit drain kept ingest in a tight `844-875 files/min` band instead of collapsing tree-over-tree
+  - keep the many-tree storage direction as the leading ingest-scaling path
+  - do not call the search side ready yet
+
+Current `100k` forest search result:
+- artifact:
+  - `/root/pertest/results/sspry_forest_100k_balanced_drain_20260319_r2/search_summary.json`
+- supported-rule fanout wall times:
+  - `01`: `1.390 s`, `2` candidates
+  - `08`: `289.914 s`, `1,692` candidates
+  - `09`: `251.910 s`, `926` candidates
+  - `10`: `73.704 s`, `0` candidates
+  - `11`: `205.955 s`, `296` candidates
+  - `12`: `209.681 s`, `203` candidates
+- query shape:
+  - docs scanned stayed near full corpus: `98,325` to `99,919`
+  - superblocks skipped stayed tiny: `40` to `275`
+  - tier1 bloom bytes per query stayed around `52.8-53.0 GiB`
+- read:
+  - forest fanout fixes the old `01` timeout case decisively
+  - the general search path is still not good enough at `100k`
+  - reopened trees still full-scan too much and move too much tier1 bloom data
+  - many-tree storage is promising for ingest, but search still needs structural work before this can be the default large-corpus shape
+
 Current local `26k` smoke check for the lazy-load search patch:
 - artifact:
   - `/root/pertest/results/sspry_searchopt_26000_32k_20260318_r1`

@@ -274,9 +274,19 @@ def run_search_one(sspry: Path, addr: str, rule: Path, timeout_s: int) -> tuple[
         attempts += 1
         try:
             proc = run(
-                [str(sspry), 'search', '--addr', addr, '--rule', str(rule), '--verbose'],
+                [
+                    str(sspry),
+                    'search',
+                    '--addr',
+                    addr,
+                    '--timeout',
+                    str(timeout_s),
+                    '--rule',
+                    str(rule),
+                    '--verbose',
+                ],
                 capture_output=True,
-                timeout=timeout_s,
+                timeout=timeout_s + 30,
             )
         except subprocess.TimeoutExpired as e:
             proc = subprocess.CompletedProcess(e.cmd, 124, e.stdout or '', (e.stderr or '') + '\nTIMEOUT')
@@ -393,6 +403,7 @@ def main() -> int:
     parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--search-timeout-s', type=int, default=240)
+    parser.add_argument('--search-server-start-attempts', type=int, default=1200)
     parser.add_argument('--drain-between-trees', action='store_true')
     parser.add_argument('--drain-sync', action='store_true')
     parser.add_argument('--drain-max-seconds', type=int, default=900)
@@ -532,7 +543,12 @@ def main() -> int:
                 stdout=(tree_run_dir / 'search.server.stdout').open('w'),
                 stderr=(tree_run_dir / 'search.server.stderr').open('w'),
             )
-            wait_for_server(sspry, addr, tree_run_dir / 'search.start.info.light.json')
+            wait_for_server(
+                sspry,
+                addr,
+                tree_run_dir / 'search.start.info.light.json',
+                attempts=args.search_server_start_attempts,
+            )
             search_servers.append((addr, server, tree_run_dir))
 
         searches_dir.mkdir(parents=True, exist_ok=True)
