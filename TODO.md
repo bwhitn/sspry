@@ -1275,3 +1275,33 @@ Read:
 - tier1 size classes reduce key fragmentation and help ingest materially
 - they do not fix within-tree search selectivity by themselves
 - keep this simplification, but the next search win still has to come from block layout/gating rather than size-class collapse alone
+
+Homogeneous tier1-block follow-up on the same `2k` classed baseline:
+- change:
+  - form within-tree blocks per exact tier1 `(filter_bytes, bloom_hashes)` key instead of mixing keys inside one block
+  - keep the tree gate in front
+  - keep tier2 block gating out of this experiment
+- prior classed baseline:
+  - ingest: `1566.57 files/min`
+  - DB: `3,081,642,712` bytes
+- homogeneous tier1 blocks:
+  - ingest: `1336.20 files/min`
+  - DB: `3,530,003,476` bytes
+
+Search result:
+- broad rules improved materially:
+  - `08`: `1898 -> 454` docs, `1.069 -> 1.051 GiB`, `12 -> 554` skipped blocks
+  - `09`: `1613 -> 254`, `1.011 -> 1.058 GiB`, `26 -> 364`
+  - `11`: `1122 -> 213`, `0.882 -> 0.998 GiB`, `40 -> 222`
+  - `12`: `1235 -> 269`, `0.890 -> 0.969 GiB`, `34 -> 278`
+- narrower negatives also improved in scan count but still paid more bytes per surviving doc:
+  - `01`: `109 -> 91` docs, `0.617 -> 0.926 GiB`, `31 -> 18`
+  - `10`: `79 -> 79`, `0.608 -> 0.923 GiB`, `4 -> 0`
+
+Read:
+- homogeneous tier1 blocks are the first within-tree layout change that materially reduced `docs_scanned`
+- the cost moved in the expected direction:
+  - ingest slowed about `14.7%`
+  - DB grew about `14.6%`
+  - broad-rule tier1 bytes stayed roughly flat while scan count collapsed
+- this is worth keeping and scaling up to `25k`

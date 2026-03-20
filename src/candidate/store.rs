@@ -30,7 +30,7 @@ use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
 
 const STORE_VERSION: u32 = 2;
-const TIER2_SUPERBLOCKS_SNAPSHOT_VERSION: u32 = 2;
+const TIER2_SUPERBLOCKS_SNAPSHOT_VERSION: u32 = 3;
 const TREE_BLOOM_GATES_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_FILTER_BYTES: usize = 2048;
 const DEFAULT_BLOOM_HASHES: usize = 7;
@@ -672,10 +672,10 @@ impl StoreAppendWriters {
 #[derive(Clone, Debug)]
 struct Tier2SuperblockIndex {
     docs_per_block: usize,
-    keys_per_block: Vec<Vec<(usize, usize)>>,
     bucket_for_key: BTreeMap<(usize, usize), (usize, usize)>,
     summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
     masks_by_bucket: BTreeMap<(usize, usize), Vec<Vec<u8>>>,
+    positions_by_bucket: BTreeMap<(usize, usize), Vec<Vec<usize>>>,
     summary_memory_bytes: u64,
 }
 
@@ -683,12 +683,31 @@ impl Default for Tier2SuperblockIndex {
     fn default() -> Self {
         Self {
             docs_per_block: DEFAULT_TIER2_SUPERBLOCK_DOCS,
-            keys_per_block: Vec::new(),
             bucket_for_key: BTreeMap::new(),
             summary_bytes_by_bucket: BTreeMap::new(),
             masks_by_bucket: BTreeMap::new(),
+            positions_by_bucket: BTreeMap::new(),
             summary_memory_bytes: 0,
         }
+    }
+}
+
+impl Tier2SuperblockIndex {
+    fn total_block_count(&self) -> usize {
+        self.positions_by_bucket
+            .values()
+            .map(|blocks| blocks.len())
+            .sum::<usize>()
+    }
+
+    fn block_refs(&self) -> Vec<((usize, usize), usize)> {
+        let mut out = Vec::new();
+        for (bucket_key, blocks) in &self.positions_by_bucket {
+            for block_idx in 0..blocks.len() {
+                out.push((*bucket_key, block_idx));
+            }
+        }
+        out
     }
 }
 
@@ -746,19 +765,12 @@ fn tier2_superblock_bucket_key(filter_bytes: usize, bloom_hashes: usize) -> (usi
 
 fn ensure_superblock_capacity_for(
     index: &mut Tier2SuperblockIndex,
+    bucket_key: (usize, usize),
     block_idx: usize,
-    filter_bytes: usize,
-    bloom_hashes: usize,
     summary_cap_bytes: usize,
 ) {
     let needed_blocks = block_idx + 1;
-    if index.keys_per_block.len() < needed_blocks {
-        index.keys_per_block.resize_with(needed_blocks, Vec::new);
-    }
-    let filter_key = (filter_bytes, bloom_hashes);
-    let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
     let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes);
-    index.bucket_for_key.insert(filter_key, bucket_key);
     index
         .summary_bytes_by_bucket
         .insert(bucket_key, summary_bytes);
@@ -772,29 +784,74 @@ fn ensure_superblock_capacity_for(
             .summary_memory_bytes
             .saturating_add(summary_bytes as u64);
     }
-    let keys = &mut index.keys_per_block[block_idx];
-    if !keys.contains(&filter_key) {
-        keys.push(filter_key);
-        keys.sort_unstable();
+    let positions = index
+        .positions_by_bucket
+        .entry(bucket_key)
+        .or_insert_with(Vec::new);
+    while positions.len() < needed_blocks {
+        positions.push(Vec::new());
     }
+}
+
+fn locate_or_assign_superblock_for_pos(
+    index: &mut Tier2SuperblockIndex,
+    summary_cap_bytes: usize,
+    filter_bytes: usize,
+    bloom_hashes: usize,
+    pos: usize,
+) -> usize {
+    let filter_key = (filter_bytes, bloom_hashes);
+    let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
+    index.bucket_for_key.insert(filter_key, bucket_key);
+    if let Some(blocks) = index.positions_by_bucket.get(&bucket_key) {
+        if let Some((block_idx, _)) = blocks
+            .iter()
+            .enumerate()
+            .find(|(_, positions)| positions.contains(&pos))
+        {
+            return block_idx;
+        }
+    }
+    let docs_per_block = index.docs_per_block.max(1);
+    let block_idx = {
+        let blocks = index
+            .positions_by_bucket
+            .entry(bucket_key)
+            .or_insert_with(Vec::new);
+        let needs_new = blocks
+            .last()
+            .map(|positions| positions.len() >= docs_per_block)
+            .unwrap_or(true);
+        if needs_new {
+            blocks.push(Vec::new());
+        }
+        blocks.len() - 1
+    };
+    ensure_superblock_capacity_for(index, bucket_key, block_idx, summary_cap_bytes);
+    let blocks = index
+        .positions_by_bucket
+        .get_mut(&bucket_key)
+        .expect("positions bucket");
+    if !blocks[block_idx].contains(&pos) {
+        blocks[block_idx].push(pos);
+    }
+    block_idx
 }
 
 fn update_superblocks_for_doc_bytes_inner(
     index: &mut Tier2SuperblockIndex,
     summary_cap_bytes: usize,
-    docs_per_block: usize,
     pos: usize,
     filter_bytes: usize,
     bloom_hashes: usize,
     bloom_bytes: &[u8],
 ) {
-    let block_idx = pos / docs_per_block.max(1);
-    ensure_superblock_capacity_for(
+    let block_idx = locate_or_assign_superblock_for_pos(
         index,
-        block_idx,
+        summary_cap_bytes,
         filter_bytes,
         bloom_hashes,
-        summary_cap_bytes,
+        pos,
     );
     let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
     if let Some(blocks) = index.masks_by_bucket.get_mut(&bucket_key) {
@@ -812,67 +869,23 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
     if updates.is_empty() {
         return;
     }
-    let docs_per_block = index.docs_per_block.max(1);
-    let mut max_needed_blocks = index.keys_per_block.len();
-    let mut keys_by_block = BTreeMap::<usize, Vec<(usize, usize)>>::new();
-    let mut max_block_by_bucket = BTreeMap::<(usize, usize), usize>::new();
     let mut aggregated = BTreeMap::<(usize, (usize, usize)), Vec<u8>>::new();
 
     for (pos, filter_bytes, bloom_hashes, bloom_bytes) in updates {
-        let block_idx = *pos / docs_per_block;
-        max_needed_blocks = max_needed_blocks.max(block_idx + 1);
+        let block_idx = locate_or_assign_superblock_for_pos(
+            index,
+            summary_cap_bytes,
+            *filter_bytes,
+            *bloom_hashes,
+            *pos,
+        );
         let filter_key = (*filter_bytes, *bloom_hashes);
         let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
         let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes).max(1);
-        keys_by_block.entry(block_idx).or_default().push(filter_key);
-        max_block_by_bucket
-            .entry(bucket_key)
-            .and_modify(|value| *value = (*value).max(block_idx))
-            .or_insert(block_idx);
         let folded = aggregated
             .entry((block_idx, filter_key))
             .or_insert_with(|| vec![0u8; summary_bytes]);
         merge_bloom_bytes_into_tree_gate(folded, bloom_bytes);
-    }
-
-    if index.keys_per_block.len() < max_needed_blocks {
-        index
-            .keys_per_block
-            .resize_with(max_needed_blocks, Vec::new);
-    }
-
-    for (bucket_key, max_block_idx) in max_block_by_bucket {
-        let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes);
-        index
-            .summary_bytes_by_bucket
-            .insert(bucket_key, summary_bytes);
-        let blocks = index
-            .masks_by_bucket
-            .entry(bucket_key)
-            .or_insert_with(Vec::new);
-        while blocks.len() <= max_block_idx {
-            blocks.push(vec![0u8; summary_bytes]);
-            index.summary_memory_bytes = index
-                .summary_memory_bytes
-                .saturating_add(summary_bytes as u64);
-        }
-    }
-
-    for (block_idx, mut filter_keys) in keys_by_block {
-        filter_keys.sort_unstable();
-        filter_keys.dedup();
-        let keys = &mut index.keys_per_block[block_idx];
-        let before_len = keys.len();
-        for filter_key in filter_keys {
-            let bucket_key = tier2_superblock_bucket_key(filter_key.0, filter_key.1);
-            index.bucket_for_key.insert(filter_key, bucket_key);
-            if !keys.contains(&filter_key) {
-                keys.push(filter_key);
-            }
-        }
-        if keys.len() != before_len {
-            keys.sort_unstable();
-        }
     }
 
     for ((block_idx, filter_key), folded) in aggregated {
@@ -2893,8 +2906,8 @@ impl CandidateStore {
                 CandidateQueryProfile::default(),
             ));
         }
-        let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
-        let block_count = self.tier2_superblocks.keys_per_block.len();
+        let block_refs = self.tier2_superblocks.block_refs();
+        let block_count = block_refs.len();
         let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
         let query_now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2910,8 +2923,7 @@ impl CandidateStore {
                 let (hits, tiers, profile) = self.scan_query_hits_worker(
                     plan,
                     prepared,
-                    docs_per_block,
-                    block_count,
+                    &block_refs,
                     allow_block_skip,
                     prefetch_tier1_by_block,
                     query_now_unix,
@@ -2926,12 +2938,12 @@ impl CandidateStore {
                     let mut handles = Vec::with_capacity(worker_count);
                     for _ in 0..worker_count {
                         let next_block = &next_block;
+                        let block_refs = &block_refs;
                         handles.push(scope.spawn(move || {
                             self.scan_query_hits_worker(
                                 plan,
                                 prepared,
-                                docs_per_block,
-                                block_count,
+                                block_refs,
                                 allow_block_skip,
                                 prefetch_tier1_by_block,
                                 query_now_unix,
@@ -3019,8 +3031,7 @@ impl CandidateStore {
         &self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-        docs_per_block: usize,
-        block_count: usize,
+        block_refs: &[((usize, usize), usize)],
         allow_block_skip: bool,
         prefetch_tier1_by_block: bool,
         query_now_unix: u64,
@@ -3034,25 +3045,26 @@ impl CandidateStore {
         loop {
             let block_idx = if let Some(next_block) = next_block {
                 let idx = next_block.fetch_add(1, Ordering::Relaxed);
-                if idx >= block_count {
+                if idx >= block_refs.len() {
                     break;
                 }
                 idx
             } else {
-                if next_sequential_block >= block_count {
+                if next_sequential_block >= block_refs.len() {
                     break;
                 }
                 let idx = next_sequential_block;
                 next_sequential_block += 1;
                 idx
             };
+            let (bucket_key, local_block_idx) = block_refs[block_idx];
             if allow_block_skip
                 && !block_maybe_matches_node(
-                    block_idx,
+                    bucket_key,
+                    local_block_idx,
                     &plan.root,
                     &prepared.mask_cache,
                     &self.tier2_superblocks,
-                    &self.tier2_pattern_superblocks,
                     true,
                 )?
             {
@@ -3060,14 +3072,19 @@ impl CandidateStore {
                     query_profile.superblocks_skipped.saturating_add(1);
                 continue;
             }
-            let start = block_idx * docs_per_block;
-            let end = (start + docs_per_block).min(self.docs.len());
+            let positions = self
+                .tier2_superblocks
+                .positions_by_bucket
+                .get(&bucket_key)
+                .and_then(|blocks| blocks.get(local_block_idx))
+                .map(|positions| positions.as_slice())
+                .unwrap_or(&[]);
             let mut prefetched_tier1 = if prefetch_tier1_by_block {
-                self.prefetch_block_tier1_blooms(start, end)?
+                self.prefetch_positions_tier1_blooms(positions)?
             } else {
                 Vec::new()
             };
-            for pos in start..end {
+            for (prefetched_idx, pos) in positions.iter().copied().enumerate() {
                 let doc = &self.docs[pos];
                 if doc.deleted || doc.special_population {
                     continue;
@@ -3075,7 +3092,7 @@ impl CandidateStore {
                 query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
                 let mut doc_inputs = if prefetch_tier1_by_block {
                     let prefetched = prefetched_tier1
-                        .get_mut(pos - start)
+                        .get_mut(prefetched_idx)
                         .and_then(Option::take)
                         .unwrap_or_else(|| Cow::Borrowed(&[]));
                     LazyDocQueryInputs::from_prefetched_tier1(doc, prefetched)
@@ -3145,7 +3162,7 @@ impl CandidateStore {
             tier2_docs_matched_total: self.tier2_telemetry.tier2_docs_matched_total,
             tier2_superblocks_skipped_total: self.tier2_telemetry.tier2_superblocks_skipped_total,
             tier2_match_ratio,
-            tier2_superblock_count: self.tier2_superblocks.keys_per_block.len(),
+            tier2_superblock_count: self.tier2_superblocks.total_block_count(),
             tier2_superblock_docs: self.tier2_superblocks.docs_per_block,
             tier2_superblock_summary_bytes: self
                 .tier2_superblocks
@@ -3217,16 +3234,16 @@ impl CandidateStore {
         )
     }
 
-    fn prefetch_block_tier1_blooms<'a>(
+    fn prefetch_positions_tier1_blooms<'a>(
         &'a self,
-        start: usize,
-        end: usize,
+        positions: &[usize],
     ) -> Result<Vec<Option<Cow<'a, [u8]>>>> {
         let mut total_len = 0usize;
         let mut span_start = u64::MAX;
         let mut span_end = 0u64;
         let mut has_live = false;
-        for pos in start..end {
+        for pos in positions {
+            let pos = *pos;
             if self.docs[pos].deleted {
                 continue;
             }
@@ -3248,8 +3265,9 @@ impl CandidateStore {
                     .blooms
                     .mmap_slice(span_start, span_len, "bloom")?
                 {
-                    let mut out = Vec::with_capacity(end.saturating_sub(start));
-                    for pos in start..end {
+                    let mut out = Vec::with_capacity(positions.len());
+                    for pos in positions {
+                        let pos = *pos;
                         if self.docs[pos].deleted {
                             out.push(None);
                             continue;
@@ -3263,8 +3281,9 @@ impl CandidateStore {
                 }
             }
         }
-        let mut out = Vec::with_capacity(end.saturating_sub(start));
-        for pos in start..end {
+        let mut out = Vec::with_capacity(positions.len());
+        for pos in positions {
+            let pos = *pos;
             if self.docs[pos].deleted {
                 out.push(None);
             } else {
@@ -3634,11 +3653,9 @@ impl CandidateStore {
         }
         let filter_bytes = self.docs[pos].filter_bytes;
         let bloom_hashes = self.docs[pos].bloom_hashes;
-        let docs_per_block = self.tier2_superblocks.docs_per_block;
         update_superblocks_for_doc_bytes_inner(
             &mut self.tier2_superblocks,
             self.meta.tier2_superblock_summary_cap_bytes,
-            docs_per_block,
             pos,
             filter_bytes,
             bloom_hashes,
@@ -3672,11 +3689,9 @@ impl CandidateStore {
         if filter_bytes == 0 || bloom_hashes == 0 || bloom_bytes.is_empty() {
             return Ok(());
         }
-        let docs_per_block = self.tier2_pattern_superblocks.docs_per_block;
         update_superblocks_for_doc_bytes_inner(
             &mut self.tier2_pattern_superblocks,
             self.meta.tier2_superblock_summary_cap_bytes,
-            docs_per_block,
             pos,
             filter_bytes,
             bloom_hashes,
@@ -3952,17 +3967,6 @@ impl CandidateStore {
         append_u64(&mut payload, self.tier2_superblocks.docs_per_block as u64);
         append_u64(
             &mut payload,
-            self.tier2_superblocks.keys_per_block.len() as u64,
-        );
-        for keys in &self.tier2_superblocks.keys_per_block {
-            append_u64(&mut payload, keys.len() as u64);
-            for (filter_bytes, bloom_hashes) in keys {
-                append_u64(&mut payload, *filter_bytes as u64);
-                append_u64(&mut payload, *bloom_hashes as u64);
-            }
-        }
-        append_u64(
-            &mut payload,
             self.tier2_superblocks.masks_by_bucket.len() as u64,
         );
         for ((filter_bucket, bloom_hashes), blocks) in &self.tier2_superblocks.masks_by_bucket {
@@ -3976,9 +3980,20 @@ impl CandidateStore {
                 .unwrap_or_else(|| self.tier2_superblock_summary_bytes(*filter_bucket));
             append_u64(&mut payload, summary_bytes as u64);
             append_u64(&mut payload, blocks.len() as u64);
-            for block in blocks {
+            let position_blocks = self
+                .tier2_superblocks
+                .positions_by_bucket
+                .get(&(*filter_bucket, *bloom_hashes))
+                .cloned()
+                .unwrap_or_default();
+            for (block_idx, block) in blocks.iter().enumerate() {
                 append_u64(&mut payload, block.len() as u64);
                 payload.extend_from_slice(block);
+                let positions = position_blocks.get(block_idx).cloned().unwrap_or_default();
+                append_u64(&mut payload, positions.len() as u64);
+                for pos in positions {
+                    append_u64(&mut payload, pos as u64);
+                }
             }
         }
         fs::write(&tmp_path, payload)?;
@@ -4009,26 +4024,11 @@ impl CandidateStore {
             return Ok(None);
         }
         let docs_per_block = read_u64(&bytes, &mut cursor)? as usize;
-        let block_count = read_u64(&bytes, &mut cursor)? as usize;
-        let mut keys_per_block = Vec::with_capacity(block_count);
         let mut bucket_for_key = BTreeMap::new();
-        for _ in 0..block_count {
-            let key_count = read_u64(&bytes, &mut cursor)? as usize;
-            let mut keys = Vec::with_capacity(key_count);
-            for _ in 0..key_count {
-                let filter_bytes = read_u64(&bytes, &mut cursor)? as usize;
-                let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
-                keys.push((filter_bytes, bloom_hashes));
-                bucket_for_key.insert(
-                    (filter_bytes, bloom_hashes),
-                    tier2_superblock_bucket_key(filter_bytes, bloom_hashes),
-                );
-            }
-            keys_per_block.push(keys);
-        }
         let bucket_count = read_u64(&bytes, &mut cursor)? as usize;
         let mut summary_bytes_by_bucket = BTreeMap::new();
         let mut masks_by_bucket = BTreeMap::new();
+        let mut positions_by_bucket = BTreeMap::new();
         let mut summary_memory_bytes = 0u64;
         for _ in 0..bucket_count {
             let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
@@ -4040,6 +4040,7 @@ impl CandidateStore {
             }
             let blocks_len = read_u64(&bytes, &mut cursor)? as usize;
             let mut blocks = Vec::with_capacity(blocks_len);
+            let mut position_blocks = Vec::with_capacity(blocks_len);
             for _ in 0..blocks_len {
                 let block_len = read_u64(&bytes, &mut cursor)? as usize;
                 if block_len != summary_bytes {
@@ -4051,29 +4052,30 @@ impl CandidateStore {
                 }
                 blocks.push(bytes[cursor..end].to_vec());
                 cursor = end;
+                let position_count = read_u64(&bytes, &mut cursor)? as usize;
+                let mut positions = Vec::with_capacity(position_count);
+                for _ in 0..position_count {
+                    let pos = read_u64(&bytes, &mut cursor)? as usize;
+                    positions.push(pos);
+                }
+                position_blocks.push(positions);
             }
             summary_memory_bytes = summary_memory_bytes
                 .saturating_add((summary_bytes as u64).saturating_mul(blocks_len as u64));
             summary_bytes_by_bucket.insert((filter_bucket, bloom_hashes), summary_bytes);
             masks_by_bucket.insert((filter_bucket, bloom_hashes), blocks);
-        }
-        for keys in &keys_per_block {
-            for (filter_bytes, bloom_hashes) in keys {
-                let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-                if !masks_by_bucket.contains_key(&bucket_key) {
-                    return Ok(None);
-                }
-            }
+            positions_by_bucket.insert((filter_bucket, bloom_hashes), position_blocks);
+            bucket_for_key.insert((filter_bucket, bloom_hashes), (filter_bucket, bloom_hashes));
         }
         if cursor != bytes.len() {
             return Ok(None);
         }
         Ok(Some(Tier2SuperblockIndex {
             docs_per_block: docs_per_block.max(1),
-            keys_per_block,
             bucket_for_key,
             summary_bytes_by_bucket,
             masks_by_bucket,
+            positions_by_bucket,
             summary_memory_bytes,
         }))
     }
@@ -4761,7 +4763,6 @@ struct PreparedPatternMasks {
     tier1: Vec<ShiftedRequiredMasks>,
     tier1_superblocks: Vec<ShiftedRequiredMasks>,
     tier2: Vec<ShiftedRequiredMasks>,
-    tier2_superblocks: Vec<ShiftedRequiredMasks>,
 }
 
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
@@ -4958,7 +4959,6 @@ fn build_pattern_mask_cache(
         }
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
-        let mut tier2_superblock_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
         for (alt_index, alternative) in pattern.tier2_alternatives.iter().enumerate() {
             let fixed_literal = pattern
                 .fixed_literals
@@ -4974,12 +4974,8 @@ fn build_pattern_mask_cache(
             let mut shifted_tier2 = ShiftedRequiredMasks {
                 shifts: Vec::with_capacity(lane_variants.len()),
             };
-            let mut shifted_tier2_superblocks = ShiftedRequiredMasks {
-                shifts: Vec::with_capacity(lane_variants.len()),
-            };
             for lanes in &lane_variants {
                 let mut by_key = RequiredMasksByKey::new();
-                let mut superblock_by_key = RequiredMasksByKey::new();
                 for (filter_bytes, bloom_hashes) in tier2_filter_keys {
                     let required = merge_cached_lane_bloom_word_masks(
                         alternative,
@@ -4989,14 +4985,11 @@ fn build_pattern_mask_cache(
                         DEFAULT_BLOOM_POSITION_LANES,
                         &mut tier2_gram_cache,
                     )?;
-                    superblock_by_key.insert((*filter_bytes, *bloom_hashes), required.clone());
                     by_key.insert((*filter_bytes, *bloom_hashes), required);
                 }
                 shifted_tier2.shifts.push(by_key);
-                shifted_tier2_superblocks.shifts.push(superblock_by_key);
             }
             tier2_masks.push(shifted_tier2);
-            tier2_superblock_masks.push(shifted_tier2_superblocks);
         }
 
         out.insert(
@@ -5005,7 +4998,6 @@ fn build_pattern_mask_cache(
                 tier1: tier1_masks,
                 tier1_superblocks: tier1_superblock_masks,
                 tier2: tier2_masks,
-                tier2_superblocks: tier2_superblock_masks,
             },
         );
     }
@@ -5040,6 +5032,7 @@ pub(crate) fn build_prepared_query_artifacts(
 }
 
 fn block_matches_required_masks(
+    bucket_key: (usize, usize),
     block_idx: usize,
     by_key: &RequiredMasksByKey,
     superblocks: &Tier2SuperblockIndex,
@@ -5047,24 +5040,16 @@ fn block_matches_required_masks(
     if by_key.is_empty() {
         return true;
     }
-    let Some(keys) = superblocks.keys_per_block.get(block_idx) else {
+    let Some(required) = by_key.get(&bucket_key) else {
         return false;
     };
-    keys.iter().any(|filter_key| {
-        let Some(required) = by_key.get(filter_key) else {
-            return false;
-        };
-        let Some(bucket_key) = superblocks.bucket_for_key.get(filter_key) else {
-            return false;
-        };
-        let Some(blocks) = superblocks.masks_by_bucket.get(bucket_key) else {
-            return false;
-        };
-        let Some(block) = blocks.get(block_idx) else {
-            return false;
-        };
-        raw_filter_matches_word_masks(block, required)
-    })
+    let Some(blocks) = superblocks.masks_by_bucket.get(&bucket_key) else {
+        return false;
+    };
+    let Some(block) = blocks.get(block_idx) else {
+        return false;
+    };
+    raw_filter_matches_word_masks(block, required)
 }
 
 fn tree_gate_matches_required_masks(
@@ -5201,6 +5186,7 @@ fn tree_maybe_matches_node(
 }
 
 fn block_matches_shifted_required_masks(
+    bucket_key: (usize, usize),
     block_idx: usize,
     shifted: &ShiftedRequiredMasks,
     superblocks: &Tier2SuperblockIndex,
@@ -5208,16 +5194,15 @@ fn block_matches_shifted_required_masks(
     shifted
         .shifts
         .iter()
-        .any(|by_key| block_matches_required_masks(block_idx, by_key, superblocks))
+        .any(|by_key| block_matches_required_masks(bucket_key, block_idx, by_key, superblocks))
 }
 
 fn block_matches_pattern(
+    bucket_key: (usize, usize),
     block_idx: usize,
     pattern_id: &str,
     mask_cache: &PatternMaskCache,
     tier1_superblocks: &Tier2SuperblockIndex,
-    tier2_superblocks: &Tier2SuperblockIndex,
-    allow_tier2: bool,
 ) -> bool {
     let Some(pattern_masks) = mask_cache.get(pattern_id) else {
         return false;
@@ -5227,26 +5212,26 @@ fn block_matches_pattern(
         .iter()
         .enumerate()
         .any(|(alt_index, tier1_by_key)| {
-            if !block_matches_shifted_required_masks(block_idx, tier1_by_key, tier1_superblocks) {
+            if !block_matches_shifted_required_masks(
+                bucket_key,
+                block_idx,
+                tier1_by_key,
+                tier1_superblocks,
+            ) {
                 return false;
             }
-            let Some(tier2_by_key) = pattern_masks.tier2_superblocks.get(alt_index) else {
-                return true;
-            };
-            if !allow_tier2 || tier2_by_key.is_empty() {
-                return true;
-            }
-            block_matches_shifted_required_masks(block_idx, tier2_by_key, tier2_superblocks)
+            let _ = alt_index;
+            true
         })
 }
 
 fn block_maybe_matches_node(
+    bucket_key: (usize, usize),
     block_idx: usize,
     node: &QueryNode,
     mask_cache: &PatternMaskCache,
     tier1_superblocks: &Tier2SuperblockIndex,
-    tier2_superblocks: &Tier2SuperblockIndex,
-    allow_tier2: bool,
+    _allow_tier2: bool,
 ) -> Result<bool> {
     match node.kind.as_str() {
         "pattern" => {
@@ -5255,12 +5240,11 @@ fn block_maybe_matches_node(
                 .as_ref()
                 .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
             Ok(block_matches_pattern(
+                bucket_key,
                 block_idx,
                 pattern_id,
                 mask_cache,
                 tier1_superblocks,
-                tier2_superblocks,
-                allow_tier2,
             ))
         }
         "verifier_only_eq" => Ok(true),
@@ -5270,12 +5254,12 @@ fn block_maybe_matches_node(
         "and" => {
             for child in &node.children {
                 if !block_maybe_matches_node(
+                    bucket_key,
                     block_idx,
                     child,
                     mask_cache,
                     tier1_superblocks,
-                    tier2_superblocks,
-                    allow_tier2,
+                    _allow_tier2,
                 )? {
                     return Ok(false);
                 }
@@ -5285,12 +5269,12 @@ fn block_maybe_matches_node(
         "or" => {
             for child in &node.children {
                 if block_maybe_matches_node(
+                    bucket_key,
                     block_idx,
                     child,
                     mask_cache,
                     tier1_superblocks,
-                    tier2_superblocks,
-                    allow_tier2,
+                    _allow_tier2,
                 )? {
                     return Ok(true);
                 }
@@ -5304,12 +5288,12 @@ fn block_maybe_matches_node(
             let mut matched = 0usize;
             for child in &node.children {
                 if block_maybe_matches_node(
+                    bucket_key,
                     block_idx,
                     child,
                     mask_cache,
                     tier1_superblocks,
-                    tier2_superblocks,
-                    allow_tier2,
+                    _allow_tier2,
                 )? {
                     matched += 1;
                     if matched >= threshold {
