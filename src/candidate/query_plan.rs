@@ -64,6 +64,7 @@ struct PatternDef {
     alternatives: Vec<Vec<u8>>,
     wide_flags: Vec<bool>,
     fullword_flags: Vec<bool>,
+    nocase_flags: Vec<bool>,
     exact_literals: bool,
 }
 
@@ -105,6 +106,7 @@ enum NumericReadKind {
 
 const NUMERIC_READ_ANCHOR_PREFIX: &str = "__numeric_eq_anchor_";
 const MAX_HEX_GROUP_ALTERNATIVES: usize = 16;
+const MAX_NOCASE_LITERAL_VARIANTS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RangeBoundExpr {
@@ -1119,7 +1121,7 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
             .collect()
     };
     for flag in &flags {
-        if flag != "ascii" && flag != "wide" && flag != "fullword" {
+        if flag != "ascii" && flag != "wide" && flag != "fullword" && flag != "nocase" {
             return Err(SspryError::from(format!(
                 "Unsupported literal flag(s) for {pattern_id}: {flag}"
             )));
@@ -1134,10 +1136,12 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
     let mut alternatives = Vec::new();
     let mut wide_flags = Vec::new();
     let mut fullword_flags = Vec::new();
+    let mut nocase_flags = Vec::new();
     if flags.contains("ascii") {
         alternatives.push(literal_text.as_bytes().to_vec());
         wide_flags.push(false);
         fullword_flags.push(flags.contains("fullword"));
+        nocase_flags.push(flags.contains("nocase"));
     }
     if flags.contains("wide") {
         let mut wide = Vec::with_capacity(literal_text.len() * 2);
@@ -1147,6 +1151,7 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
         alternatives.push(wide);
         wide_flags.push(true);
         fullword_flags.push(flags.contains("fullword"));
+        nocase_flags.push(flags.contains("nocase"));
     }
 
     Ok(Some(PatternDef {
@@ -1154,7 +1159,8 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
         alternatives,
         wide_flags,
         fullword_flags,
-        exact_literals: true,
+        nocase_flags,
+        exact_literals: !flags.contains("nocase"),
     }))
 }
 
@@ -1255,12 +1261,14 @@ fn parse_regex_line(line: &str, gram_sizes: GramSizes) -> Result<Option<PatternD
             "Regex {pattern_id} does not contain an anchorable mandatory literal for the active gram sizes."
         )));
     }
+    let alt_count = alternatives.len();
 
     Ok(Some(PatternDef {
         pattern_id: pattern_id.to_owned(),
         alternatives,
         wide_flags,
         fullword_flags,
+        nocase_flags: vec![false; alt_count],
         exact_literals: false,
     }))
 }
@@ -1613,13 +1621,91 @@ enum HexToken {
     Group(Vec<Vec<u8>>),
 }
 
+fn nocase_toggle_positions(bytes: &[u8]) -> Vec<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, byte)| byte.is_ascii_alphabetic().then_some(idx))
+        .collect()
+}
+
+fn expand_ascii_nocase_variants(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let positions = nocase_toggle_positions(bytes);
+    if positions.is_empty() {
+        return vec![bytes.to_vec()];
+    }
+    let mut out = Vec::with_capacity(1usize << positions.len().min(12));
+    let total = 1usize << positions.len();
+    for mask in 0..total {
+        let mut variant = bytes.to_vec();
+        for (bit, pos) in positions.iter().enumerate() {
+            variant[*pos] = if (mask >> bit) & 1 == 1 {
+                variant[*pos].to_ascii_uppercase()
+            } else {
+                variant[*pos].to_ascii_lowercase()
+            };
+        }
+        out.push(variant);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn derive_nocase_search_alternatives(
+    literal: &[u8],
+    wide: bool,
+    gram_sizes: GramSizes,
+) -> Result<Vec<Vec<u8>>> {
+    if literal.len() < gram_sizes.tier1 {
+        return Err(SspryError::from(
+            "nocase literal does not contain an anchorable window for the active gram sizes",
+        ));
+    }
+    if nocase_toggle_positions(literal).is_empty() {
+        return Ok(vec![literal.to_vec()]);
+    }
+    let step = if wide { 2 } else { 1 };
+    let mut best: Option<(usize, usize, usize)> = None;
+    for start in (0..=literal.len() - gram_sizes.tier1).step_by(step) {
+        let mut end = start + gram_sizes.tier1;
+        while end <= literal.len() {
+            if wide && (end - start) % 2 != 0 {
+                end += 1;
+                continue;
+            }
+            let slice = &literal[start..end];
+            let alpha_count = nocase_toggle_positions(slice).len();
+            let variant_count = 1usize << alpha_count.min(usize::BITS as usize - 1);
+            if variant_count <= MAX_NOCASE_LITERAL_VARIANTS {
+                let score = (slice.len(), usize::MAX - variant_count, usize::MAX - start);
+                if best.map(|current| score > current).unwrap_or(true) {
+                    best = Some((slice.len(), usize::MAX - variant_count, usize::MAX - start));
+                }
+            }
+            end += step;
+        }
+    }
+    let Some((best_len, _inverse_variants, best_start_inverse)) = best else {
+        return Err(SspryError::from(
+            "nocase literal expands too broadly for the active gram sizes",
+        ));
+    };
+    let best_start = usize::MAX - best_start_inverse;
+    let window = &literal[best_start..best_start + best_len];
+    Ok(expand_ascii_nocase_variants(window))
+}
+
 fn parse_hex_bytes_token(token: &str) -> Result<Vec<u8>> {
-    let compact = token.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
-    if compact.is_empty() || compact.len() % 2 != 0 || !compact.chars().all(|ch| ch.is_ascii_hexdigit())
+    let compact = token
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact.is_empty()
+        || compact.len() % 2 != 0
+        || !compact.chars().all(|ch| ch.is_ascii_hexdigit())
     {
-        return Err(SspryError::from(format!(
-            "Invalid hex byte token: {token}"
-        )));
+        return Err(SspryError::from(format!("Invalid hex byte token: {token}")));
     }
     let mut out = Vec::with_capacity(compact.len() / 2);
     for index in (0..compact.len()).step_by(2) {
@@ -1840,7 +1926,12 @@ fn parse_hex_line_to_grams(
         all_tier2_alts.push(tier2_grams);
         all_fixed_literals.push(fixed_literal);
     }
-    Ok(Some((pattern_id.to_owned(), all_alts, all_tier2_alts, all_fixed_literals)))
+    Ok(Some((
+        pattern_id.to_owned(),
+        all_alts,
+        all_tier2_alts,
+        all_fixed_literals,
+    )))
 }
 
 fn is_gap_token(token: &str) -> bool {
@@ -2398,26 +2489,41 @@ pub fn compile_query_plan_with_gram_sizes(
     let mut pattern_fixed_literal_fullword = BTreeMap::<String, Vec<bool>>::new();
     for line in strings_lines {
         if let Some(def) = parse_literal_line(&line)? {
-            let alternatives = def
+            let mut alternatives = Vec::new();
+            let mut tier2_alternatives = Vec::new();
+            let mut fixed_literals = Vec::new();
+            let mut wide_flags = Vec::new();
+            let mut fullword_flags = Vec::new();
+            for (((alt, wide), fullword), nocase) in def
                 .alternatives
                 .iter()
-                .map(|alt| grams_tier1_from_bytes(alt, gram_sizes.tier1))
-                .collect::<Vec<_>>();
-            let tier2_alternatives = def
-                .alternatives
-                .iter()
-                .map(|alt| grams_tier2_from_bytes(alt, gram_sizes.tier2))
-                .collect::<Vec<_>>();
-            let fixed_literals = if def.exact_literals {
-                def.alternatives.clone()
-            } else {
-                vec![Vec::new(); def.alternatives.len()]
-            };
+                .zip(def.wide_flags.iter())
+                .zip(def.fullword_flags.iter())
+                .zip(def.nocase_flags.iter())
+            {
+                let effective_nocase = *nocase && alt.iter().any(u8::is_ascii_alphabetic);
+                let search_variants = if effective_nocase {
+                    derive_nocase_search_alternatives(alt, *wide, gram_sizes)?
+                } else {
+                    vec![alt.clone()]
+                };
+                for search_alt in search_variants {
+                    alternatives.push(grams_tier1_from_bytes(&search_alt, gram_sizes.tier1));
+                    tier2_alternatives.push(grams_tier2_from_bytes(&search_alt, gram_sizes.tier2));
+                    fixed_literals.push(if def.exact_literals && !effective_nocase {
+                        alt.clone()
+                    } else {
+                        Vec::new()
+                    });
+                    wide_flags.push(*wide);
+                    fullword_flags.push(*fullword);
+                }
+            }
             pattern_alternatives.insert(def.pattern_id.clone(), alternatives);
             pattern_tier2_alternatives.insert(def.pattern_id.clone(), tier2_alternatives);
             pattern_fixed_literals.insert(def.pattern_id.clone(), fixed_literals);
-            pattern_fixed_literal_wide.insert(def.pattern_id.clone(), def.wide_flags);
-            pattern_fixed_literal_fullword.insert(def.pattern_id, def.fullword_flags);
+            pattern_fixed_literal_wide.insert(def.pattern_id.clone(), wide_flags);
+            pattern_fixed_literal_fullword.insert(def.pattern_id, fullword_flags);
             continue;
         }
         if let Some(def) = parse_regex_line(&line, gram_sizes)? {
@@ -2455,7 +2561,7 @@ pub fn compile_query_plan_with_gram_sizes(
             continue;
         }
         return Err(SspryError::from(format!(
-            "Unsupported strings declaration: {:?}. Supported forms: $id = \"...\" [ascii|wide|fullword], $id = /.../ [ascii|wide|fullword], $id = {{ ... }}",
+            "Unsupported strings declaration: {:?}. Supported forms: $id = \"...\" [ascii|wide|fullword|nocase], $id = /.../ [ascii|wide|fullword], $id = {{ ... }}",
             line.trim()
         )));
     }
@@ -3218,12 +3324,12 @@ rule empty {
             .expect("literal")
             .expect("pattern");
         assert_eq!(fullword.fullword_flags, vec![true]);
-        assert!(
-            parse_literal_line(r#"$a = "Ab" nocase"#)
-                .expect_err("unsupported flag")
-                .to_string()
-                .contains("Unsupported literal flag")
-        );
+        let nocase = parse_literal_line(r#"$a = "AbCd" nocase"#)
+            .expect("literal")
+            .expect("pattern");
+        assert_eq!(nocase.alternatives, vec![b"AbCd".to_vec()]);
+        assert_eq!(nocase.nocase_flags, vec![true]);
+        assert!(!nocase.exact_literals);
         assert!(
             parse_literal_line(r#"$a = "unterminated"#)
                 .expect_err("unterminated literal")
@@ -3241,13 +3347,14 @@ rule empty {
                 .is_none()
         );
 
-        let (pattern_id, alternatives, tier2_alternatives, fixed_literals) = parse_hex_line_to_grams(
-            "$h = { 41 42 43 44 ?? 45 46 47 48 [2-4] 49 4A 4B 4C }",
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("hex line")
-        .expect("parsed hex");
+        let (pattern_id, alternatives, tier2_alternatives, fixed_literals) =
+            parse_hex_line_to_grams(
+                "$h = { 41 42 43 44 ?? 45 46 47 48 [2-4] 49 4A 4B 4C }",
+                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                    .expect("default gram sizes"),
+            )
+            .expect("hex line")
+            .expect("parsed hex");
         assert_eq!(pattern_id, "$h");
         assert_eq!(alternatives.len(), 1);
         assert_eq!(alternatives[0].len(), 3);
@@ -3269,7 +3376,10 @@ rule empty {
         .expect("parsed grouped");
         assert_eq!(grouped_hex.0, "$g");
         assert_eq!(grouped_hex.1.len(), 2);
-        assert_eq!(grouped_hex.3, vec![vec![0x41, 0x42, 0x44], vec![0x41, 0x43, 0x44]]);
+        assert_eq!(
+            grouped_hex.3,
+            vec![vec![0x41, 0x42, 0x44], vec![0x41, 0x43, 0x44]]
+        );
         assert!(
             parse_hex_line_to_grams(
                 "$g = { 41 (42|4344) 45 }",
@@ -3497,6 +3607,25 @@ rule verifier_constraints {
                     .iter()
                     .any(|grandchild| grandchild.kind == "verifier_only_count")
         }));
+
+        let nocase = compile_query_plan_default(
+            r#"
+rule nocase_anchor {
+  strings:
+    $a = "AbCd" nocase
+  condition:
+    $a
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile nocase");
+        assert_eq!(nocase.patterns.len(), 1);
+        assert!(nocase.patterns[0].alternatives.len() > 1);
+        assert!(nocase.patterns[0].fixed_literals.iter().all(Vec::is_empty));
 
         assert!(
             compile_query_plan_with_gram_sizes(

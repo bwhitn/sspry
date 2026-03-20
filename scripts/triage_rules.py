@@ -169,7 +169,6 @@ def analyze_static(path: Path) -> dict:
         or heavy_module
         or has_condition_offset_reads
         or string_defs == 0
-        or nocase_count
     ):
         bucket = "unsupported_or_manual_review"
     elif module_loop or matches_regex or regex_strings or xor_count or base64_count:

@@ -1591,6 +1591,82 @@ rule RangeRule {
 }
 
 #[test]
+fn search_verify_supports_nocase_literals() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("nocase_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("hit.bin"), b"--AbCd--").expect("write hit");
+    fs::write(sample_dir.join("miss.bin"), b"--wxyz--").expect("write miss");
+
+    fs::write(
+        &rule,
+        r#"
+rule NocaseRule {
+  strings:
+    $a = "abcd" nocase
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write nocase rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 2"));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_output = String::new();
+    while Instant::now() < deadline {
+        let output = Command::new(bin_path())
+            .args([
+                "search",
+                "--addr",
+                &addr,
+                "--rule",
+                rule.to_str().expect("rule"),
+                "--verify",
+            ])
+            .output()
+            .expect("run verified search");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            if stdout.contains("verified_matched: 1") {
+                last_output = stdout;
+                break;
+            }
+            last_output = stdout;
+        } else {
+            last_output = format!(
+                "stdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(last_output.contains("verified_matched: 1"), "{last_output}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn search_supports_time_now_and_wide_literal_conditions() {
     let tmp = tempdir().expect("tmp");
     let base = tmp.path();
