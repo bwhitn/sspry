@@ -12,6 +12,10 @@ use crate::{Result, SspryError};
 
 pub const HLL_DEFAULT_PRECISION: u8 = 14;
 const U64_MASK: u64 = u64::MAX;
+const SPECIAL_POPULATION_MIN_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const SPECIAL_POPULATION_MAX_SAMPLE_BYTES: u64 = 256 * 1024;
+const SPECIAL_POPULATION_MIN_SAMPLED_BYTES: u64 = 16 * 1024;
+const SPECIAL_POPULATION_MIN_ENTROPY_BITS_PER_BYTE: f64 = 7.75;
 
 #[derive(Clone, Debug)]
 pub struct DocumentFeatures {
@@ -19,6 +23,28 @@ pub struct DocumentFeatures {
     pub file_size: u64,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
+    pub special_population: bool,
+}
+
+fn sampled_entropy_bits_per_byte(sample_counts: &[u32; 256], sampled_bytes: u64) -> f64 {
+    if sampled_bytes == 0 {
+        return 0.0;
+    }
+    let total = sampled_bytes as f64;
+    let mut entropy = 0.0;
+    for count in sample_counts {
+        if *count == 0 {
+            continue;
+        }
+        let probability = *count as f64 / total;
+        entropy -= probability * probability.log2();
+    }
+    entropy
+}
+
+fn classify_special_population(file_size: u64, sampled_entropy_bits_per_byte: f64) -> bool {
+    file_size >= SPECIAL_POPULATION_MIN_FILE_BYTES
+        && sampled_entropy_bits_per_byte >= SPECIAL_POPULATION_MIN_ENTROPY_BITS_PER_BYTE
 }
 
 #[cfg(test)]
@@ -280,6 +306,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
 
     let file_path = path.as_ref();
     let mut file = File::open(file_path)?;
+    let declared_file_size = file.metadata()?.len();
     let mut digest = Sha256::new();
     let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes)?;
     let mut tier2_bloom = if tier2_filter_bytes > 0 && tier2_bloom_hashes > 0 {
@@ -297,6 +324,13 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     let mut buf = vec![0u8; chunk_size];
     let mut gram_windows = 0u64;
     let mut processed_bytes = 0u64;
+    let sample_stride = (declared_file_size
+        .saturating_add(SPECIAL_POPULATION_MAX_SAMPLE_BYTES - 1)
+        / SPECIAL_POPULATION_MAX_SAMPLE_BYTES)
+        .max(1);
+    let mut sample_counts = [0u32; 256];
+    let mut sampled_bytes = 0u64;
+    let mut next_sample_offset = 0u64;
 
     loop {
         let read_len = file.read(&mut buf)?;
@@ -304,6 +338,18 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
             break;
         }
         let chunk = &buf[..read_len];
+        while sampled_bytes < SPECIAL_POPULATION_MAX_SAMPLE_BYTES
+            && next_sample_offset < processed_bytes.saturating_add(read_len as u64)
+        {
+            let rel = next_sample_offset.saturating_sub(processed_bytes) as usize;
+            if rel >= chunk.len() {
+                break;
+            }
+            sample_counts[chunk[rel] as usize] =
+                sample_counts[chunk[rel] as usize].saturating_add(1);
+            sampled_bytes = sampled_bytes.saturating_add(1);
+            next_sample_offset = next_sample_offset.saturating_add(sample_stride);
+        }
         file_size = file_size.saturating_add(read_len as u64);
         digest.update(chunk);
         let mut data = trailing.clone();
@@ -337,6 +383,11 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     let digest_bytes = digest.finalize();
     let mut sha256 = [0u8; 32];
     sha256.copy_from_slice(&digest_bytes);
+    let sampled_entropy = if sampled_bytes >= SPECIAL_POPULATION_MIN_SAMPLED_BYTES {
+        sampled_entropy_bits_per_byte(&sample_counts, sampled_bytes)
+    } else {
+        0.0
+    };
 
     total_scope.add_bytes(file_size);
     total_scope.add_items(gram_windows);
@@ -349,6 +400,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
         file_size,
         bloom_filter: bloom.into_bytes(),
         tier2_bloom_filter: tier2_bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
+        special_population: classify_special_population(file_size, sampled_entropy),
     })
 }
 
@@ -402,6 +454,7 @@ mod tests {
             file_size: 0,
             bloom_filter: Vec::new(),
             tier2_bloom_filter: Vec::new(),
+            special_population: false,
         };
         assert_eq!(hex::encode(features.sha256), hex::encode([0xAB; 32]));
     }
@@ -441,6 +494,13 @@ mod tests {
         assert_eq!(features.file_size, 16);
         assert!(!features.bloom_filter.is_empty());
         assert!(!features.tier2_bloom_filter.is_empty());
+    }
+
+    #[test]
+    fn sampled_entropy_classifier_distinguishes_special_population() {
+        assert!(!super::classify_special_population(1024, 8.0));
+        assert!(!super::classify_special_population(16 * 1024 * 1024, 7.0));
+        assert!(super::classify_special_population(16 * 1024 * 1024, 7.9));
     }
 
     #[test]

@@ -184,6 +184,8 @@ pub struct CandidateDocumentWire {
     pub tier2_bloom_filter_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier2_bloom_item_estimate: Option<i64>,
+    #[serde(default)]
+    pub special_population: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +239,7 @@ type ParsedCandidateInsertDocument = (
     Vec<u8>,
     Option<usize>,
     Vec<u8>,
+    bool,
     Vec<u8>,
     Option<String>,
 );
@@ -4152,6 +4155,7 @@ impl ServerState {
             bloom_filter,
             tier2_bloom_item_estimate,
             tier2_bloom_filter,
+            document.special_population,
             metadata,
             document.external_id.clone(),
         ))
@@ -4199,8 +4203,9 @@ impl ServerState {
             &parsed.3,
             parsed.5.len(),
             &parsed.5,
-            parsed.6.as_slice(),
-            parsed.7,
+            parsed.7.as_slice(),
+            parsed.6,
+            parsed.8,
         )?;
         drop(store);
         self.mark_work_mutation();
@@ -4268,8 +4273,9 @@ impl ServerState {
                         row.3.clone(),
                         row.5.len(),
                         row.5.clone(),
-                        row.6.clone(),
                         row.7.clone(),
+                        row.6,
+                        row.8.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4371,8 +4377,9 @@ impl ServerState {
                             row.3.clone(),
                             row.5.len(),
                             row.5.clone(),
-                            row.6.clone(),
                             row.7.clone(),
+                            row.6,
+                            row.8.clone(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -5972,6 +5979,7 @@ mod tests {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: None,
         }
@@ -6066,6 +6074,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             })
@@ -6168,6 +6177,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             })
@@ -6275,6 +6285,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -6286,6 +6297,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -6707,6 +6719,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("work-doc".to_owned()),
             })
@@ -6819,6 +6832,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("auto-publish-doc".to_owned()),
             })
@@ -6899,6 +6913,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("pressure-doc".to_owned()),
             })
@@ -7020,6 +7035,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("inc-a".to_owned()),
             })
@@ -7038,6 +7054,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("inc-b".to_owned()),
             })
@@ -7562,6 +7579,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -7572,6 +7590,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -7670,6 +7689,7 @@ mod tests {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: None,
         })
@@ -8200,6 +8220,7 @@ rule q {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
@@ -8211,6 +8232,7 @@ rule q {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
@@ -8497,6 +8519,7 @@ rule q {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("doc".to_owned()),
             }])
@@ -8540,6 +8563,7 @@ rule q {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: Some(cand_a.display().to_string()),
         };
@@ -8551,6 +8575,7 @@ rule q {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: Some(cand_b.display().to_string()),
         };
@@ -8630,6 +8655,7 @@ rule q {
             bloom_item_estimate: None,
             tier2_bloom_filter_b64: None,
             tier2_bloom_item_estimate: None,
+            special_population: false,
             metadata_b64: None,
             external_id: None,
         })
@@ -8642,6 +8668,7 @@ rule q {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             }],
@@ -8716,6 +8743,7 @@ rule q {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("shard-a".to_owned()),
             },
@@ -8726,6 +8754,7 @@ rule q {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("shard-b".to_owned()),
             },
@@ -8789,6 +8818,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -8805,6 +8835,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -8819,6 +8850,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: None,
                 })
@@ -8947,6 +8979,7 @@ rule q {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: None,
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("single-shard-id".to_owned()),
             })
@@ -9059,6 +9092,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: Some(format!("parallel-{index}")),
                 })
@@ -9176,6 +9210,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
@@ -9267,6 +9302,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })
@@ -9343,6 +9379,7 @@ rule q {
                     bloom_item_estimate: None,
                     tier2_bloom_filter_b64: None,
                     tier2_bloom_item_estimate: None,
+                    special_population: false,
                     metadata_b64: None,
                     external_id: Some(format!("doc-{byte:02x}")),
                 })

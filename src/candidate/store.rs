@@ -165,6 +165,7 @@ pub struct ImportedCandidateDocument {
     pub tier2_bloom_hashes: usize,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
+    pub special_population: bool,
     pub metadata_bytes: Vec<u8>,
     pub external_id: Option<String>,
 }
@@ -296,6 +297,7 @@ struct CandidateDoc {
     bloom_hashes: usize,
     tier2_filter_bytes: usize,
     tier2_bloom_hashes: usize,
+    special_population: bool,
     deleted: bool,
 }
 
@@ -305,6 +307,7 @@ const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_DELETED: u8 = 0x02;
+const DOC_FLAG_SPECIAL_POPULATION: u8 = 0x04;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct DocMetaRow {
@@ -1030,6 +1033,7 @@ pub struct CandidateStore {
     sidecars: StoreSidecars,
     append_writers: StoreAppendWriters,
     sha_to_pos: HashMap<String, usize>,
+    special_doc_positions: Vec<usize>,
     mutation_counter: u64,
     compaction_generation: u64,
     retired_generation_roots: Vec<String>,
@@ -1313,6 +1317,7 @@ impl CandidateStore {
             sidecars: StoreSidecars::new(&config.root),
             append_writers: StoreAppendWriters::new(&config.root)?,
             sha_to_pos: HashMap::new(),
+            special_doc_positions: Vec::new(),
             mutation_counter: 0,
             compaction_generation: 1,
             retired_generation_roots: Vec::new(),
@@ -1383,6 +1388,7 @@ impl CandidateStore {
             sidecars: StoreSidecars::map_existing(root.as_path())?,
             append_writers: StoreAppendWriters::new(root.as_path())?,
             sha_to_pos: HashMap::new(),
+            special_doc_positions: Vec::new(),
             mutation_counter: 0,
             compaction_generation: compaction_manifest.current_generation,
             retired_generation_roots: compaction_manifest.retired_roots,
@@ -1474,6 +1480,21 @@ impl CandidateStore {
         self.mutation_counter = self.mutation_counter.saturating_add(1);
         self.last_write_activity_monotonic = Some(Instant::now());
         self.prepared_query_cache.clear();
+    }
+
+    fn remember_special_doc_position(&mut self, pos: usize) {
+        if !self.special_doc_positions.contains(&pos) {
+            self.special_doc_positions.push(pos);
+        }
+    }
+
+    fn has_live_special_docs(&self) -> bool {
+        self.special_doc_positions.iter().any(|pos| {
+            self.docs
+                .get(*pos)
+                .map(|doc| doc.special_population && !doc.deleted)
+                .unwrap_or(false)
+        })
     }
 
     pub fn deleted_storage_bytes(&self) -> u64 {
@@ -1706,6 +1727,7 @@ impl CandidateStore {
             tier2_filter_bytes,
             tier2_bloom_filter,
             &[],
+            false,
             external_id,
         )
     }
@@ -1723,6 +1745,7 @@ impl CandidateStore {
         tier2_filter_bytes: usize,
         tier2_bloom_filter: &[u8],
         metadata: &[u8],
+        special_population: bool,
         external_id: Option<String>,
     ) -> Result<CandidateInsertResult> {
         let mut total_scope = scope("candidate.insert_document");
@@ -1791,6 +1814,7 @@ impl CandidateStore {
                 } else {
                     expected_tier2_bloom_hashes
                 };
+                existing.special_population = special_population;
                 existing.deleted = false;
                 existing.clone()
             };
@@ -1799,6 +1823,7 @@ impl CandidateStore {
                 snapshot.filter_bytes,
                 snapshot.bloom_hashes,
                 snapshot.deleted,
+                snapshot.special_population,
                 metadata,
                 external_id.as_deref(),
                 bloom_filter,
@@ -1816,6 +1841,9 @@ impl CandidateStore {
                 self.tier2_doc_rows[existing_pos] = tier2_row;
                 self.write_doc_row(snapshot.doc_id, row)?;
                 self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
+            }
+            if snapshot.special_population {
+                self.remember_special_doc_position(existing_pos);
             }
             self.update_tree_tier1_gates_for_doc_bytes_inner(existing_pos, bloom_filter)?;
             self.update_tree_tier2_gates_for_doc_bytes_inner(existing_pos, tier2_bloom_filter)?;
@@ -1840,6 +1868,7 @@ impl CandidateStore {
                 } else {
                     expected_tier2_bloom_hashes
                 },
+                special_population,
                 deleted: false,
             };
             {
@@ -1849,6 +1878,7 @@ impl CandidateStore {
                     doc.filter_bytes,
                     doc.bloom_hashes,
                     doc.deleted,
+                    doc.special_population,
                     metadata,
                     external_id.as_deref(),
                     bloom_filter,
@@ -1864,18 +1894,15 @@ impl CandidateStore {
                 self.tier2_doc_rows.push(tier2_row);
             }
             self.docs.push(doc.clone());
-            self.sha_to_pos
-                .insert(sha256_hex.clone(), self.docs.len() - 1);
-            self.update_tree_tier1_gates_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
-            self.update_tree_tier2_gates_for_doc_bytes_inner(
-                self.docs.len() - 1,
-                tier2_bloom_filter,
-            )?;
-            self.update_tier2_superblocks_for_doc_bytes_inner(self.docs.len() - 1, bloom_filter)?;
-            self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
-                self.docs.len() - 1,
-                tier2_bloom_filter,
-            )?;
+            let new_pos = self.docs.len() - 1;
+            self.sha_to_pos.insert(sha256_hex.clone(), new_pos);
+            if doc.special_population {
+                self.remember_special_doc_position(new_pos);
+            }
+            self.update_tree_tier1_gates_for_doc_bytes_inner(new_pos, bloom_filter)?;
+            self.update_tree_tier2_gates_for_doc_bytes_inner(new_pos, tier2_bloom_filter)?;
+            self.update_tier2_superblocks_for_doc_bytes_inner(new_pos, bloom_filter)?;
+            self.update_tier2_pattern_superblocks_for_doc_bytes_inner(new_pos, tier2_bloom_filter)?;
             self.maybe_rebalance_tier2_superblocks()?;
             status = "inserted".to_owned();
         }
@@ -1904,6 +1931,7 @@ impl CandidateStore {
             usize,
             Vec<u8>,
             Vec<u8>,
+            bool,
             Option<String>,
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
@@ -1944,6 +1972,7 @@ impl CandidateStore {
                 tier2_filter_bytes,
                 tier2_bloom_filter,
                 metadata,
+                special_population,
                 external_id,
             ) = document;
             total_scope.add_bytes(*file_size);
@@ -2024,6 +2053,7 @@ impl CandidateStore {
                     } else {
                         expected_tier2_bloom_hashes
                     };
+                    existing.special_population = *special_population;
                     existing.deleted = false;
                     existing.clone()
                 };
@@ -2032,6 +2062,7 @@ impl CandidateStore {
                     snapshot.filter_bytes,
                     snapshot.bloom_hashes,
                     snapshot.deleted,
+                    snapshot.special_population,
                     metadata,
                     external_id.as_deref(),
                     bloom_filter,
@@ -2048,13 +2079,15 @@ impl CandidateStore {
                 insert_profile.write_existing_us = insert_profile
                     .write_existing_us
                     .saturating_add(elapsed_us(write_existing_started));
-                tier2_updates.push((
-                    existing_pos,
-                    *filter_bytes,
-                    expected_bloom_hashes,
-                    bloom_filter,
-                ));
-                if !tier2_bloom_filter.is_empty() {
+                if !snapshot.special_population {
+                    tier2_updates.push((
+                        existing_pos,
+                        *filter_bytes,
+                        expected_bloom_hashes,
+                        bloom_filter,
+                    ));
+                }
+                if !snapshot.special_population && !tier2_bloom_filter.is_empty() {
                     tier2_pattern_updates.push((
                         existing_pos,
                         *tier2_filter_bytes,
@@ -2088,6 +2121,7 @@ impl CandidateStore {
                 } else {
                     expected_tier2_bloom_hashes
                 },
+                special_population: *special_population,
                 deleted: false,
             };
             modified = true;
@@ -2177,6 +2211,7 @@ impl CandidateStore {
                     pending.doc.filter_bytes,
                     pending.doc.bloom_hashes,
                     pending.doc.deleted,
+                    pending.doc.special_population,
                     pending.metadata,
                     pending.external_id,
                     bloom_offset,
@@ -2232,16 +2267,21 @@ impl CandidateStore {
                 self.tier2_doc_rows.push(tier2_row);
                 self.docs.push(pending.doc.clone());
                 self.sha_to_pos.insert(pending.sha256_hex, pos);
+                if pending.doc.special_population {
+                    self.remember_special_doc_position(pos);
+                }
                 insert_profile.install_docs_us = insert_profile
                     .install_docs_us
                     .saturating_add(elapsed_us(install_docs_started));
-                tier2_updates.push((
-                    pos,
-                    pending.doc.filter_bytes,
-                    pending.doc.bloom_hashes,
-                    pending.bloom_filter,
-                ));
-                if !pending.tier2_bloom_filter.is_empty() {
+                if !pending.doc.special_population {
+                    tier2_updates.push((
+                        pos,
+                        pending.doc.filter_bytes,
+                        pending.doc.bloom_hashes,
+                        pending.bloom_filter,
+                    ));
+                }
+                if !pending.doc.special_population && !pending.tier2_bloom_filter.is_empty() {
                     tier2_pattern_updates.push((
                         pos,
                         pending.doc.tier2_filter_bytes,
@@ -2344,6 +2384,7 @@ impl CandidateStore {
                 tier2_bloom_hashes: doc.tier2_bloom_hashes,
                 bloom_filter: self.doc_bloom_bytes(pos)?.into_owned(),
                 tier2_bloom_filter: self.doc_tier2_bloom_bytes(pos)?.into_owned(),
+                special_population: doc.special_population,
                 metadata_bytes: self.doc_metadata_bytes(pos)?.into_owned(),
                 external_id: self.doc_external_id(pos)?,
             });
@@ -2430,6 +2471,7 @@ impl CandidateStore {
                         existing.bloom_hashes = document.bloom_hashes;
                         existing.tier2_filter_bytes = document.tier2_filter_bytes;
                         existing.tier2_bloom_hashes = document.tier2_bloom_hashes;
+                        existing.special_population = document.special_population;
                         existing.deleted = false;
                         existing.clone()
                     };
@@ -2438,6 +2480,7 @@ impl CandidateStore {
                         snapshot.filter_bytes,
                         snapshot.bloom_hashes,
                         snapshot.deleted,
+                        snapshot.special_population,
                         &document.metadata_bytes,
                         document.external_id.as_deref(),
                         &document.bloom_filter,
@@ -2451,6 +2494,9 @@ impl CandidateStore {
                     self.tier2_doc_rows[existing_pos] = tier2_row;
                     self.write_doc_row(snapshot.doc_id, row)?;
                     self.write_tier2_doc_row(snapshot.doc_id, tier2_row)?;
+                    if snapshot.special_population {
+                        self.remember_special_doc_position(existing_pos);
+                    }
                     self.update_tier2_superblocks_for_doc_bytes_inner(
                         existing_pos,
                         &document.bloom_filter,
@@ -2576,7 +2622,7 @@ impl CandidateStore {
                 let row = DocMetaRow {
                     file_size: document.file_size,
                     filter_bytes: document.filter_bytes as u32,
-                    flags: 0,
+                    flags: u8::from(document.special_population) * DOC_FLAG_SPECIAL_POPULATION,
                     bloom_hashes: document.bloom_hashes.min(u8::MAX as usize) as u8,
                     bloom_offset,
                     bloom_len: document.bloom_filter.len() as u32,
@@ -2594,6 +2640,7 @@ impl CandidateStore {
                     bloom_hashes: document.bloom_hashes,
                     tier2_filter_bytes: document.tier2_filter_bytes,
                     tier2_bloom_hashes: document.tier2_bloom_hashes,
+                    special_population: document.special_population,
                     deleted: false,
                 };
 
@@ -2664,8 +2711,13 @@ impl CandidateStore {
                 let pos = self.docs.len();
                 self.docs.push(doc.clone());
                 self.sha_to_pos.insert(sha256_hex.clone(), pos);
-                tier2_updates.push((pos, filter_bytes, bloom_hashes, bloom_filter));
-                if !tier2_bloom_filter.is_empty() {
+                if doc.special_population {
+                    self.remember_special_doc_position(pos);
+                }
+                if !doc.special_population {
+                    tier2_updates.push((pos, filter_bytes, bloom_hashes, bloom_filter));
+                }
+                if !doc.special_population && !tier2_bloom_filter.is_empty() {
                     tier2_pattern_updates.push((
                         pos,
                         tier2_filter_bytes,
@@ -2857,13 +2909,15 @@ impl CandidateStore {
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
-        if !tree_maybe_matches_node(
+        let normal_tree_match = tree_maybe_matches_node(
             &plan.root,
             &prepared.mask_cache,
             &self.tree_tier1_gates,
             &self.tree_tier2_gates,
             allow_block_skip,
-        )? {
+        )?;
+        let has_special_docs = self.has_live_special_docs();
+        if !normal_tree_match && !has_special_docs {
             return Ok((
                 Vec::new(),
                 TierFlags::default(),
@@ -2872,71 +2926,122 @@ impl CandidateStore {
         }
         let docs_per_block = self.tier2_superblocks.docs_per_block.max(1);
         let block_count = self.tier2_superblocks.keys_per_block.len();
-        if block_count == 0 {
-            return Ok((
-                Vec::new(),
-                TierFlags::default(),
-                CandidateQueryProfile::default(),
-            ));
-        }
         let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
         let query_now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let worker_count = query_scan_worker_count(block_count);
-
-        if worker_count <= 1 {
-            return self.scan_query_hits_worker(
-                plan,
-                prepared,
-                docs_per_block,
-                block_count,
-                allow_block_skip,
-                prefetch_tier1_by_block,
-                query_now_unix,
-                None,
-            );
-        }
-
-        let next_block = AtomicUsize::new(0);
-        let partials = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
-                let next_block = &next_block;
-                handles.push(scope.spawn(move || {
-                    self.scan_query_hits_worker(
-                        plan,
-                        prepared,
-                        docs_per_block,
-                        block_count,
-                        allow_block_skip,
-                        prefetch_tier1_by_block,
-                        query_now_unix,
-                        Some(next_block),
-                    )
-                }));
-            }
-
-            let mut merged = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let partial = handle
-                    .join()
-                    .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
-                merged.push(partial);
-            }
-            Ok::<Vec<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)>, SspryError>(merged)
-        })?;
-
         let mut matched_hits = Vec::<(String, u32)>::new();
         let mut used_tiers = TierFlags::default();
         let mut query_profile = CandidateQueryProfile::default();
-        for (hits, tiers, profile) in partials {
+
+        if normal_tree_match && block_count > 0 {
+            let worker_count = query_scan_worker_count(block_count);
+            if worker_count <= 1 {
+                let (hits, tiers, profile) = self.scan_query_hits_worker(
+                    plan,
+                    prepared,
+                    docs_per_block,
+                    block_count,
+                    allow_block_skip,
+                    prefetch_tier1_by_block,
+                    query_now_unix,
+                    None,
+                )?;
+                matched_hits.extend(hits);
+                used_tiers.merge(tiers);
+                query_profile.merge_from(&profile);
+            } else {
+                let next_block = AtomicUsize::new(0);
+                let partials = thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(worker_count);
+                    for _ in 0..worker_count {
+                        let next_block = &next_block;
+                        handles.push(scope.spawn(move || {
+                            self.scan_query_hits_worker(
+                                plan,
+                                prepared,
+                                docs_per_block,
+                                block_count,
+                                allow_block_skip,
+                                prefetch_tier1_by_block,
+                                query_now_unix,
+                                Some(next_block),
+                            )
+                        }));
+                    }
+
+                    let mut merged = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        let partial = handle
+                            .join()
+                            .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
+                        merged.push(partial);
+                    }
+                    Ok::<Vec<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)>, SspryError>(
+                        merged,
+                    )
+                })?;
+
+                for (hits, tiers, profile) in partials {
+                    matched_hits.extend(hits);
+                    used_tiers.merge(tiers);
+                    query_profile.merge_from(&profile);
+                }
+            }
+        }
+
+        if has_special_docs {
+            let (hits, tiers, profile) =
+                self.scan_query_hits_special_lane(plan, prepared, query_now_unix)?;
             matched_hits.extend(hits);
             used_tiers.merge(tiers);
             query_profile.merge_from(&profile);
         }
 
+        Ok((matched_hits, used_tiers, query_profile))
+    }
+
+    fn scan_query_hits_special_lane(
+        &self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+        query_now_unix: u64,
+    ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<(String, u32)>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for pos in &self.special_doc_positions {
+            let Some(doc) = self.docs.get(*pos) else {
+                continue;
+            };
+            if doc.deleted || !doc.special_population {
+                continue;
+            }
+            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+            let mut doc_inputs = LazyDocQueryInputs::new(doc);
+            let mut load_metadata = || self.doc_metadata_bytes(*pos);
+            let mut load_tier1 = || self.doc_bloom_bytes(*pos);
+            let mut load_tier2 = || self.doc_tier2_bloom_bytes(*pos);
+            let mut eval_cache = QueryEvalCache::default();
+            let outcome = evaluate_node(
+                &plan.root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                &prepared.patterns,
+                &prepared.mask_cache,
+                plan,
+                query_now_unix,
+                &mut eval_cache,
+            )?;
+            if outcome.matched {
+                matched_hits.push((doc.sha256.clone(), outcome.score));
+                used_tiers.merge(outcome.tiers);
+            }
+            query_profile.merge_from(&doc_inputs.into_profile());
+        }
         Ok((matched_hits, used_tiers, query_profile))
     }
 
@@ -2995,7 +3100,7 @@ impl CandidateStore {
             };
             for pos in start..end {
                 let doc = &self.docs[pos];
-                if doc.deleted {
+                if doc.deleted || doc.special_population {
                     continue;
                 }
                 query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
@@ -3084,11 +3189,21 @@ impl CandidateStore {
     }
 
     pub(crate) fn tier1_superblock_filter_keys(&self) -> Vec<(usize, usize)> {
-        self.tier2_superblocks
+        let mut keys = self
+            .tier2_superblocks
             .bucket_for_key
             .keys()
             .copied()
-            .collect::<Vec<_>>()
+            .collect::<HashSet<_>>();
+        keys.extend(
+            self.docs
+                .iter()
+                .filter(|doc| !doc.deleted)
+                .map(|doc| (doc.filter_bytes, doc.bloom_hashes)),
+        );
+        let mut ordered = keys.into_iter().collect::<Vec<_>>();
+        ordered.sort_unstable();
+        ordered
     }
 
     pub(crate) fn tier2_doc_filter_keys(&self) -> Vec<(usize, usize)> {
@@ -3251,6 +3366,7 @@ impl CandidateStore {
         filter_bytes: usize,
         bloom_hashes: usize,
         deleted: bool,
+        special_population: bool,
         metadata: &[u8],
         external_id: Option<&str>,
         bloom_filter: &[u8],
@@ -3261,6 +3377,7 @@ impl CandidateStore {
                 filter_bytes,
                 bloom_hashes,
                 deleted,
+                special_population,
                 metadata,
                 external_id,
                 bloom_filter,
@@ -3274,6 +3391,7 @@ impl CandidateStore {
         filter_bytes: usize,
         bloom_hashes: usize,
         deleted: bool,
+        special_population: bool,
         metadata: &[u8],
         external_id: Option<&str>,
         bloom_offset: u64,
@@ -3310,7 +3428,8 @@ impl CandidateStore {
             DocMetaRow {
                 file_size,
                 filter_bytes: filter_bytes as u32,
-                flags: u8::from(deleted) * DOC_FLAG_DELETED,
+                flags: (u8::from(deleted) * DOC_FLAG_DELETED)
+                    | (u8::from(special_population) * DOC_FLAG_SPECIAL_POPULATION),
                 bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
                 bloom_offset,
                 bloom_len: bloom_len as u32,
@@ -3329,6 +3448,7 @@ impl CandidateStore {
         filter_bytes: usize,
         bloom_hashes: usize,
         deleted: bool,
+        special_population: bool,
         metadata: &[u8],
         external_id: Option<&str>,
         bloom_filter: &[u8],
@@ -3367,7 +3487,8 @@ impl CandidateStore {
         let row = DocMetaRow {
             file_size,
             filter_bytes: filter_bytes as u32,
-            flags: u8::from(deleted) * DOC_FLAG_DELETED,
+            flags: (u8::from(deleted) * DOC_FLAG_DELETED)
+                | (u8::from(special_population) * DOC_FLAG_SPECIAL_POPULATION),
             bloom_hashes: bloom_hashes.min(u8::MAX as usize) as u8,
             bloom_offset,
             bloom_len: bloom_filter.len() as u32,
@@ -3474,7 +3595,7 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
         let filter_bytes = self.docs[pos].filter_bytes;
@@ -3501,7 +3622,7 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
         let filter_bytes = self.docs[pos].tier2_filter_bytes;
@@ -3531,7 +3652,7 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
         let filter_bytes = self.docs[pos].filter_bytes;
@@ -3566,7 +3687,7 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
         let filter_bytes = self.docs[pos].tier2_filter_bytes;
@@ -3635,7 +3756,7 @@ impl CandidateStore {
     }
 
     fn update_tree_tier1_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
         let doc_id = self.docs[pos].doc_id;
@@ -3651,7 +3772,7 @@ impl CandidateStore {
     }
 
     fn update_tree_tier2_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
         let doc_id = self.docs[pos].doc_id;
@@ -3746,6 +3867,7 @@ impl CandidateStore {
     fn rebuild_indexes_profiled(&mut self) -> Result<CandidateStoreRebuildProfile> {
         let started_total = Instant::now();
         self.sha_to_pos.clear();
+        self.special_doc_positions.clear();
         let sha_started = Instant::now();
         for (index, doc) in self.docs.iter_mut().enumerate() {
             if doc.bloom_hashes == 0 {
@@ -3755,6 +3877,9 @@ impl CandidateStore {
                 }
             }
             self.sha_to_pos.insert(doc.sha256.clone(), index);
+            if doc.special_population {
+                self.special_doc_positions.push(index);
+            }
         }
         let sha_index_ms = sha_started
             .elapsed()
@@ -4553,6 +4678,7 @@ fn load_candidate_binary_store(
             bloom_hashes: usize::from(row.bloom_hashes.max(1)),
             tier2_filter_bytes: tier2_row.filter_bytes as usize,
             tier2_bloom_hashes: usize::from(tier2_row.bloom_hashes),
+            special_population: (row.flags & DOC_FLAG_SPECIAL_POPULATION) != 0,
             deleted: (row.flags & DOC_FLAG_DELETED) != 0,
         });
         rows.push(row);
@@ -6879,6 +7005,7 @@ rule q {
             bloom_hashes: 2,
             tier2_filter_bytes: 0,
             tier2_bloom_hashes: 0,
+            special_population: false,
             deleted: false,
         };
         let patterns_vec = vec![
@@ -7199,6 +7326,7 @@ rule q {
             bloom_hashes: 2,
             tier2_filter_bytes: 8,
             tier2_bloom_hashes: 2,
+            special_population: false,
             deleted: false,
         };
         let patterns = HashMap::<String, PatternPlan>::new();
@@ -7388,6 +7516,76 @@ rule q {
 
         let _third = store.query_candidates(&plan, 0, 64).expect("third query");
         assert_eq!(store.prepared_query_cache.len(), 1);
+    }
+
+    #[test]
+    fn query_candidates_scans_special_population_when_normal_tree_gate_is_empty() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root,
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let sha256 = [0x5a; 32];
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(123, None)
+            .expect("filter bytes");
+        let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, None, None);
+        let gram = pack_exact_gram(&[1, 2, 3, 4]);
+        let bloom_bytes = lane_bloom_bytes(filter_bytes, bloom_hashes, &[gram]);
+        store
+            .insert_document_with_metadata(
+                sha256,
+                123,
+                None,
+                None,
+                None,
+                None,
+                filter_bytes,
+                &bloom_bytes,
+                0,
+                &[],
+                &[],
+                true,
+                None,
+            )
+            .expect("insert special doc");
+
+        assert!(store.tree_tier1_gates.bucket_for_key.is_empty());
+        assert_eq!(store.special_doc_positions, vec![0]);
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "tier1".to_owned(),
+                alternatives: vec![vec![gram]],
+                tier2_alternatives: vec![Vec::new()],
+                fixed_literals: vec![vec![1, 2, 3, 4]],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("tier1".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+
+        let result = store.query_candidates(&plan, 0, 8).expect("query");
+        assert_eq!(result.total_candidates, 1);
+        assert_eq!(result.returned_count, 1);
+        assert_eq!(result.sha256, vec![hex::encode(sha256)]);
+        assert_eq!(result.query_profile.docs_scanned, 1);
+        assert_eq!(result.query_profile.tier1_bloom_loads, 1);
+        assert_eq!(result.query_profile.superblocks_skipped, 0);
     }
 
     #[test]

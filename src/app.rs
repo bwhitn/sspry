@@ -951,6 +951,7 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
             base64::engine::general_purpose::STANDARD.encode(row.tier2_bloom_filter)
         }),
         tier2_bloom_item_estimate: row.tier2_bloom_item_estimate.map(|value| value as i64),
+        special_population: row.special_population,
         metadata_b64: Some({
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(row.metadata)
@@ -1108,6 +1109,7 @@ fn flush_local_pending_rows(
             row.tier2_filter_bytes,
             &row.tier2_bloom_filter,
             &row.metadata,
+            row.special_population,
             row.external_id,
         )?;
         *submit_time += started_submit.elapsed();
@@ -1264,6 +1266,7 @@ struct IndexBatchRow {
     tier2_filter_bytes: usize,
     tier2_bloom_item_estimate: Option<usize>,
     tier2_bloom_filter: Vec<u8>,
+    special_population: bool,
     metadata: Vec<u8>,
     external_id: Option<String>,
 }
@@ -1400,6 +1403,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_filter_bytes,
         tier2_bloom_item_estimate,
         tier2_bloom_filter: features.tier2_bloom_filter,
+        special_population: features.special_population,
         metadata: extract_compact_document_metadata(scan_path)?,
         external_id: resolved_path.map(|path| path.display().to_string()),
     })
@@ -1723,6 +1727,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 row.tier2_filter_bytes,
                 &row.tier2_bloom_filter,
                 &row.metadata,
+                row.special_population,
                 row.external_id,
             )?;
             rpc::CandidateInsertResponse {
@@ -3551,6 +3556,7 @@ mod tests {
                 bloom_item_estimate: Some(3),
                 tier2_bloom_filter_b64: Some("BAUG".to_owned()),
                 tier2_bloom_item_estimate: Some(2),
+                special_population: false,
                 metadata_b64: None,
                 external_id: Some("doc-1".to_owned()),
             },
@@ -3561,6 +3567,7 @@ mod tests {
                 bloom_item_estimate: None,
                 tier2_bloom_filter_b64: Some("DQ4P".to_owned()),
                 tier2_bloom_item_estimate: None,
+                special_population: false,
                 metadata_b64: None,
                 external_id: None,
             },
@@ -3741,6 +3748,7 @@ mod tests {
             tier2_filter_bytes: 0,
             tier2_bloom_item_estimate: None,
             tier2_bloom_filter: Vec::new(),
+            special_population: false,
             metadata: vec![9, 8, 7],
             external_id: Some("x".to_owned()),
         });
