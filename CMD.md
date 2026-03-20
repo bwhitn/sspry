@@ -57,7 +57,7 @@ Options:
       --root <ROOT>
           Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path. [default: candidate_db]
       --layout-profile <LAYOUT_PROFILE>
-          Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 64 shards for lower publish fanout. [default: standard] [possible values: standard, incremental]
+          Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 32 shards for denser ingest batches and lower publish fanout. [default: standard] [possible values: standard, incremental]
       --shards <SHARDS>
           Number of independent candidate shards (lock stripes) for ingest/write paths. Overrides --layout-profile when set.
       --set-fp <FILTER_TARGET_FP>

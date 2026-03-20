@@ -660,6 +660,9 @@ Current ingest-slope hypothesis after the balanced-forest work:
 Current local shard-fanout probe:
 - harness change:
   - `scripts/run_forest_probe.py` now accepts `--shards` and forwards it to both index and search servers
+- layout change:
+  - the `incremental` serve layout now defaults to `32` candidate shards instead of `64`
+  - the standard layout remains `256`
 - active probe:
   - `/root/pertest/results/sspry_treeprobe_chunk00_shards32_20260320_r1`
   - same balanced `tree_00` manifest as the earlier `100k` forest:

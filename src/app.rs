@@ -54,7 +54,7 @@ pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB: usize =
     DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES / 1024;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
-pub const DEFAULT_INCREMENTAL_SHARDS: usize = 64;
+pub const DEFAULT_INCREMENTAL_SHARDS: usize = 32;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
@@ -3271,7 +3271,7 @@ struct ServeArgs {
         long = "layout-profile",
         value_enum,
         default_value_t = ServeLayoutProfile::Standard,
-        help = "Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 64 shards for lower publish fanout."
+        help = "Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 32 shards for denser ingest batches and lower publish fanout."
     )]
     layout_profile: ServeLayoutProfile,
     #[arg(
