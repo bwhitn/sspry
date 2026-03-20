@@ -19,6 +19,7 @@ use crate::candidate::bloom::{
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
     align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
+    normalize_tier1_filter_class_bytes,
 };
 use crate::candidate::grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
@@ -1617,14 +1618,19 @@ impl CandidateStore {
         file_size: u64,
         bloom_item_estimate: Option<usize>,
     ) -> Result<usize> {
-        choose_filter_bytes_for_file_size(
+        let selected = choose_filter_bytes_for_file_size(
             file_size,
             DEFAULT_FILTER_BYTES,
             Some(DEFAULT_FILTER_MIN_BYTES),
             Some(DEFAULT_FILTER_MAX_BYTES),
             self.meta.resolved_tier1_filter_target_fp(),
             bloom_item_estimate,
-        )
+        )?;
+        Ok(if self.meta.resolved_tier1_filter_target_fp().is_some() {
+            normalize_tier1_filter_class_bytes(selected)
+        } else {
+            selected
+        })
     }
 
     fn resolve_tier2_filter_bytes_for_file_size(
@@ -1642,6 +1648,7 @@ impl CandidateStore {
         )
     }
 
+    #[cfg(test)]
     fn resolve_filter_bytes_for_file_size(
         &self,
         file_size: u64,

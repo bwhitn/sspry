@@ -1252,3 +1252,26 @@ Read:
   - peak RSS grew about `28.1%`
 - the search selectivity gain is real on the broad rules, but not large enough to offset the ingest/storage hit yet
 - the abandoned `25k` run reinforced that read early; the write path slowed too sharply to justify finishing it
+
+Tier1 size-class follow-up on the same `2k` exact-block baseline:
+- change:
+  - collapse tier1 variable FP sizes onto power-of-two classes
+  - leave tier2 sizing unchanged
+- baseline `0.35/0.35`:
+  - ingest: `1124.29 files/min`
+  - DB: `3,069,946,592` bytes
+- classed tier1 `0.35/0.35`:
+  - ingest: `1566.57 files/min`
+  - DB: `3,081,642,712` bytes
+
+Search result:
+- essentially unchanged
+  - `08`: `1900 -> 1898` docs, `1.069 -> 1.069 GiB`
+  - `09`: `1644 -> 1613`, `1.018 -> 1.011 GiB`
+  - `11`: `1091 -> 1122`, `0.881 -> 0.882 GiB`
+  - `12`: `1234 -> 1235`, `0.891 -> 0.890 GiB`
+
+Read:
+- tier1 size classes reduce key fragmentation and help ingest materially
+- they do not fix within-tree search selectivity by themselves
+- keep this simplification, but the next search win still has to come from block layout/gating rather than size-class collapse alone

@@ -29,7 +29,8 @@ use crate::candidate::{
     GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
     choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
+    estimate_unique_grams_pair_hll, extract_compact_document_metadata,
+    normalize_tier1_filter_class_bytes, read_candidate_shard_count,
     scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::perf;
@@ -1384,14 +1385,19 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         align_filter_bytes(value)
     } else {
-        choose_filter_bytes_for_file_size(
+        let selected = choose_filter_bytes_for_file_size(
             file_size,
             INTERNAL_FILTER_BYTES,
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
             policy.tier1_filter_target_fp,
             bloom_item_estimate,
-        )?
+        )?;
+        if policy.tier1_filter_target_fp.is_some() {
+            normalize_tier1_filter_class_bytes(selected)
+        } else {
+            selected
+        }
     };
     let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         align_filter_bytes(value)

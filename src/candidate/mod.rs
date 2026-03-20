@@ -15,6 +15,7 @@ pub use features::{
 };
 pub use filter_policy::{
     choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,
+    normalize_tier1_filter_class_bytes,
 };
 pub use grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram};
 pub use metadata::{

@@ -25,6 +25,10 @@ fn round_to_nearest_kib(value: usize) -> usize {
     ((value + 512) / 1024) * 1024
 }
 
+pub fn normalize_tier1_filter_class_bytes(filter_bytes: usize) -> usize {
+    round_up_power_of_two(align_filter_bytes(filter_bytes.max(1024)))
+}
+
 fn normalize_filter_policy(
     base_filter_bytes: usize,
     filter_min_bytes: Option<usize>,
@@ -117,6 +121,7 @@ mod tests {
     use super::{
         align_filter_bytes, choose_filter_bytes_for_file_size, derive_bloom_hash_count,
         derive_document_bloom_hash_count, normalize_filter_policy,
+        normalize_tier1_filter_class_bytes,
     };
 
     #[test]
@@ -195,5 +200,8 @@ mod tests {
         assert_eq!(align_filter_bytes(1), 8);
         assert_eq!(align_filter_bytes(9), 16);
         assert_eq!(selected % 8, 0);
+        assert_eq!(normalize_tier1_filter_class_bytes(1024), 1024);
+        assert_eq!(normalize_tier1_filter_class_bytes(2056), 4096);
+        assert_eq!(normalize_tier1_filter_class_bytes(600_000), 1_048_576);
     }
 }
