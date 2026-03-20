@@ -1395,3 +1395,27 @@ Week-slice reopen follow-up after snapshotting `tier2_pattern_superblocks` and s
 - remaining read:
   - the new pattern snapshot removed the all-shards `tier2_blooms.bin` startup mmap
   - a subset of shards still mmap `blooms.bin` at startup, so tier1 startup mapping is the next remaining reopen-memory target
+
+Startup budget coarsening follow-up on the same week-slice DB:
+- change:
+  - when runtime memory limits require larger superblocks, coarsen existing block unions in memory instead of rebuilding from per-doc blooms
+  - this avoids startup reads of `blooms.bin` / `tier2_blooms.bin`
+- direct reopen probe against `/root/pertest/db/tree_00` after the new code:
+  - `startup.total_ms = 775`
+  - `startup.current.total_ms = 556`
+  - `current_rss_kb = 605928`
+  - `peak_rss_kb = 605928`
+  - `mapped_bloom_bytes = 0`
+  - `mapped_tier2_bloom_bytes = 0`
+- comparison versus the prior `r2` search-start state:
+  - startup: `991 ms -> 775 ms`
+  - RSS: `1395768 KB -> 605928 KB`
+  - startup sidecar maps: both bloom sidecars now `0`
+- direct cold query sanity check on `08_extra_maks_ascii_only`:
+  - elapsed: `118.853 ms`
+  - candidates: `57`
+
+Read:
+- the remaining startup-tier1 mmap problem was the budget rebalance path, not normal store open
+- coarsening the existing block unions is the right fix
+- reopen memory is now in a much better place on the fast control dataset

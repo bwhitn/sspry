@@ -990,6 +990,59 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
     }
 }
 
+fn coarsen_superblocks(
+    index: &Tier2SuperblockIndex,
+    target_docs_per_block: usize,
+) -> Tier2SuperblockIndex {
+    let current_docs_per_block = index.docs_per_block.max(1);
+    let target_docs_per_block = target_docs_per_block.max(current_docs_per_block);
+    let merge_factor = (target_docs_per_block / current_docs_per_block).max(1);
+    if merge_factor <= 1 {
+        return index.clone();
+    }
+
+    let mut out = Tier2SuperblockIndex {
+        docs_per_block: target_docs_per_block,
+        bucket_for_key: index.bucket_for_key.clone(),
+        summary_bytes_by_bucket: index.summary_bytes_by_bucket.clone(),
+        ..Tier2SuperblockIndex::default()
+    };
+
+    for (bucket_key, blocks) in &index.positions_by_bucket {
+        let summary_bytes = index
+            .summary_bytes_by_bucket
+            .get(bucket_key)
+            .copied()
+            .unwrap_or(bucket_key.0);
+        let mut merged_blocks = Vec::<Vec<u8>>::new();
+        let mut merged_positions = Vec::<Vec<u32>>::new();
+
+        for start_idx in (0..blocks.len()).step_by(merge_factor) {
+            let mut merged_mask = vec![0u8; summary_bytes];
+            let mut positions = Vec::<u32>::new();
+            for block_idx in start_idx..(start_idx + merge_factor).min(blocks.len()) {
+                if let Some(block) = index.block_bytes(bucket_key, block_idx) {
+                    merge_bloom_bytes_into_tree_gate(&mut merged_mask, block);
+                }
+                if let Some(block_positions) = blocks.get(block_idx) {
+                    positions.extend_from_slice(block_positions);
+                }
+            }
+            out.summary_memory_bytes = out
+                .summary_memory_bytes
+                .saturating_add(merged_mask.len() as u64);
+            merged_blocks.push(merged_mask);
+            merged_positions.push(positions);
+        }
+
+        out.masks_by_bucket.insert(*bucket_key, merged_blocks);
+        out.positions_by_bucket
+            .insert(*bucket_key, merged_positions);
+    }
+
+    out
+}
+
 fn merge_bloom_bytes_into_tree_gate(gate: &mut [u8], bloom_bytes: &[u8]) {
     let shared_len = gate.len().min(bloom_bytes.len());
     let word_len = shared_len / 8;
@@ -3952,7 +4005,11 @@ impl CandidateStore {
         if target_docs_per_block <= self.tier2_superblocks.docs_per_block {
             return Ok(());
         }
-        self.rebuild_tier2_superblocks_with_docs_per_block(target_docs_per_block)
+        self.tier2_superblocks =
+            coarsen_superblocks(&self.tier2_superblocks, target_docs_per_block);
+        self.tier2_pattern_superblocks =
+            coarsen_superblocks(&self.tier2_pattern_superblocks, target_docs_per_block);
+        Ok(())
     }
 
     fn rebuild_tier2_superblocks(&mut self) -> Result<()> {
