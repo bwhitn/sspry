@@ -49,6 +49,8 @@ pub struct CandidateConfig {
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
     pub tier2_superblock_summary_cap_bytes: usize,
+    pub tier1_filter_target_fp: Option<f64>,
+    pub tier2_filter_target_fp: Option<f64>,
     pub filter_target_fp: Option<f64>,
     pub compaction_idle_cooldown_s: f64,
 }
@@ -62,9 +64,21 @@ impl Default for CandidateConfig {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
             filter_target_fp: Some(0.35),
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
+    }
+}
+
+impl CandidateConfig {
+    pub fn resolved_tier1_filter_target_fp(&self) -> Option<f64> {
+        self.tier1_filter_target_fp.or(self.filter_target_fp)
+    }
+
+    pub fn resolved_tier2_filter_target_fp(&self) -> Option<f64> {
+        self.tier2_filter_target_fp.or(self.filter_target_fp)
     }
 }
 
@@ -223,6 +237,8 @@ pub struct CandidateStats {
     pub deleted_doc_count: usize,
     pub id_source: String,
     pub store_path: bool,
+    pub tier1_filter_target_fp: Option<f64>,
+    pub tier2_filter_target_fp: Option<f64>,
     pub filter_target_fp: Option<f64>,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
@@ -252,6 +268,8 @@ struct StoreMeta {
     tier2_gram_size: usize,
     tier1_gram_size: usize,
     tier2_superblock_summary_cap_bytes: usize,
+    tier1_filter_target_fp: Option<f64>,
+    tier2_filter_target_fp: Option<f64>,
     filter_target_fp: Option<f64>,
     compaction_idle_cooldown_s: f64,
 }
@@ -282,9 +300,21 @@ impl Default for StoreMeta {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
             filter_target_fp: Some(0.35),
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
+    }
+}
+
+impl StoreMeta {
+    fn resolved_tier1_filter_target_fp(&self) -> Option<f64> {
+        self.tier1_filter_target_fp.or(self.filter_target_fp)
+    }
+
+    fn resolved_tier2_filter_target_fp(&self) -> Option<f64> {
+        self.tier2_filter_target_fp.or(self.filter_target_fp)
     }
 }
 
@@ -1207,7 +1237,9 @@ impl CandidateStore {
                 tier2_superblock_summary_cap_bytes: config
                     .tier2_superblock_summary_cap_bytes
                     .max(1),
-                filter_target_fp: config.filter_target_fp,
+                tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
+                tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
+                filter_target_fp: None,
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
             },
             docs: Vec::new(),
@@ -1356,6 +1388,8 @@ impl CandidateStore {
     }
 
     pub fn config(&self) -> CandidateConfig {
+        let tier1_filter_target_fp = self.meta.resolved_tier1_filter_target_fp();
+        let tier2_filter_target_fp = self.meta.resolved_tier2_filter_target_fp();
         CandidateConfig {
             root: self.root.clone(),
             id_source: self.meta.id_source.clone(),
@@ -1363,7 +1397,13 @@ impl CandidateStore {
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
-            filter_target_fp: self.meta.filter_target_fp,
+            tier1_filter_target_fp,
+            tier2_filter_target_fp,
+            filter_target_fp: if tier1_filter_target_fp == tier2_filter_target_fp {
+                tier1_filter_target_fp
+            } else {
+                None
+            },
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
         }
     }
@@ -1572,7 +1612,7 @@ impl CandidateStore {
         (cooldown_s - last_write.elapsed().as_secs_f64()).max(0.0)
     }
 
-    fn resolve_filter_bytes_for_file_size(
+    fn resolve_tier1_filter_bytes_for_file_size(
         &self,
         file_size: u64,
         bloom_item_estimate: Option<usize>,
@@ -1582,9 +1622,32 @@ impl CandidateStore {
             DEFAULT_FILTER_BYTES,
             Some(DEFAULT_FILTER_MIN_BYTES),
             Some(DEFAULT_FILTER_MAX_BYTES),
-            self.meta.filter_target_fp,
+            self.meta.resolved_tier1_filter_target_fp(),
             bloom_item_estimate,
         )
+    }
+
+    fn resolve_tier2_filter_bytes_for_file_size(
+        &self,
+        file_size: u64,
+        bloom_item_estimate: Option<usize>,
+    ) -> Result<usize> {
+        choose_filter_bytes_for_file_size(
+            file_size,
+            DEFAULT_FILTER_BYTES,
+            Some(DEFAULT_FILTER_MIN_BYTES),
+            Some(DEFAULT_FILTER_MAX_BYTES),
+            self.meta.resolved_tier2_filter_target_fp(),
+            bloom_item_estimate,
+        )
+    }
+
+    fn resolve_filter_bytes_for_file_size(
+        &self,
+        file_size: u64,
+        bloom_item_estimate: Option<usize>,
+    ) -> Result<usize> {
+        self.resolve_tier1_filter_bytes_for_file_size(file_size, bloom_item_estimate)
     }
 
     fn resolve_bloom_hashes_for_document(
@@ -1653,7 +1716,7 @@ impl CandidateStore {
             return Err(SspryError::from("filter_bytes must be > 0"));
         }
         let expected_filter_bytes =
-            self.resolve_filter_bytes_for_file_size(file_size, bloom_item_estimate)?;
+            self.resolve_tier1_filter_bytes_for_file_size(file_size, bloom_item_estimate)?;
         let expected_bloom_hashes = self.resolve_bloom_hashes_for_document(
             expected_filter_bytes,
             bloom_item_estimate,
@@ -1670,7 +1733,7 @@ impl CandidateStore {
             )));
         }
         let expected_tier2_filter_bytes =
-            self.resolve_filter_bytes_for_file_size(file_size, tier2_bloom_item_estimate)?;
+            self.resolve_tier2_filter_bytes_for_file_size(file_size, tier2_bloom_item_estimate)?;
         let expected_tier2_bloom_hashes = self.resolve_bloom_hashes_for_document(
             expected_tier2_filter_bytes,
             tier2_bloom_item_estimate,
@@ -1879,7 +1942,7 @@ impl CandidateStore {
                 return Err(SspryError::from("filter_bytes must be > 0"));
             }
             let expected_filter_bytes =
-                self.resolve_filter_bytes_for_file_size(*file_size, *bloom_item_estimate)?;
+                self.resolve_tier1_filter_bytes_for_file_size(*file_size, *bloom_item_estimate)?;
             let expected_bloom_hashes = self.resolve_bloom_hashes_for_document(
                 expected_filter_bytes,
                 *bloom_item_estimate,
@@ -1897,8 +1960,8 @@ impl CandidateStore {
                     "bloom_filter length must equal filter_bytes ({expected_filter_bytes})"
                 )));
             }
-            let expected_tier2_filter_bytes =
-                self.resolve_filter_bytes_for_file_size(*file_size, *tier2_bloom_item_estimate)?;
+            let expected_tier2_filter_bytes = self
+                .resolve_tier2_filter_bytes_for_file_size(*file_size, *tier2_bloom_item_estimate)?;
             let expected_tier2_bloom_hashes = self.resolve_bloom_hashes_for_document(
                 expected_tier2_filter_bytes,
                 *tier2_bloom_item_estimate,
@@ -3054,7 +3117,15 @@ impl CandidateStore {
             deleted_doc_count,
             id_source: self.meta.id_source.clone(),
             store_path: self.meta.store_path,
-            filter_target_fp: self.meta.filter_target_fp,
+            tier1_filter_target_fp: self.meta.resolved_tier1_filter_target_fp(),
+            tier2_filter_target_fp: self.meta.resolved_tier2_filter_target_fp(),
+            filter_target_fp: if self.meta.resolved_tier1_filter_target_fp()
+                == self.meta.resolved_tier2_filter_target_fp()
+            {
+                self.meta.resolved_tier1_filter_target_fp()
+            } else {
+                None
+            },
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
@@ -4641,9 +4712,15 @@ fn validate_config(config: &CandidateConfig) -> Result<()> {
             "compaction_idle_cooldown_s must be finite and >= 0",
         ));
     }
-    if let Some(value) = config.filter_target_fp {
-        if !(0.0 < value && value < 1.0) {
-            return Err(SspryError::from("filter_target_fp must be in range (0, 1)"));
+    for (field, value) in [
+        ("filter_target_fp", config.filter_target_fp),
+        ("tier1_filter_target_fp", config.tier1_filter_target_fp),
+        ("tier2_filter_target_fp", config.tier2_filter_target_fp),
+    ] {
+        if let Some(value) = value {
+            if !(0.0 < value && value < 1.0) {
+                return Err(SspryError::from(format!("{field} must be in range (0, 1)")));
+            }
         }
     }
     Ok(())

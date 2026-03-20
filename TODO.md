@@ -1214,3 +1214,41 @@ Next likely steps:
 - decide whether to allow new index sessions during publish or keep only the active-session overlap
 - narrow the publish gate further if we want search to stay live through more of publish
 - add targeted perf runs to measure whether double-buffering changes publish latency or long-ingest throughput
+
+## Tier-Specific Bloom FP Targets
+
+Landed:
+- separate `tier1_filter_target_fp` and `tier2_filter_target_fp` config/stat surfaces
+- CLI fallback behavior:
+  - `--set-fp` still seeds both tiers
+  - `--tier1-set-fp` and `--tier2-set-fp` now override individually
+- forest probe now accepts the same FP knobs for reproducible sweeps
+
+`2k` exact-block A/B on the current baseline:
+- baseline `tier1=0.35`, `tier2=0.35`
+  - ingest: `1124.29 files/min`
+  - DB: `3,069,946,592` bytes
+  - peak RSS: `1,930,736 KB`
+- variant `tier1=0.20`, `tier2=0.35`
+  - ingest: `793.62 files/min`
+  - DB: `4,250,078,872` bytes
+  - peak RSS: `2,472,692 KB`
+
+Search deltas on the same `2k` slice:
+- broad-string rules got materially fewer scans, but more bytes per scanned doc:
+  - `08`: `1900 -> 1096` docs, `1.069 -> 1.298 GiB` tier1 bytes
+  - `09`: `1644 -> 848` docs, `1.018 -> 1.296 GiB`
+  - `11`: `1091 -> 535` docs, `0.881 -> 1.121 GiB`
+  - `12`: `1234 -> 462` docs, `0.891 -> 1.041 GiB`
+- exact negative/near-negative rules did not improve:
+  - `01`: `79` docs both runs, `0.608 -> 0.931 GiB`
+  - `10`: `79` docs both runs, `0.608 -> 0.931 GiB`
+
+Read:
+- tier-specific FP control is worth keeping
+- `tier1=0.20` is not a good default:
+  - ingest regressed about `29.4%`
+  - DB grew about `38.4%`
+  - peak RSS grew about `28.1%`
+- the search selectivity gain is real on the broad rules, but not large enough to offset the ingest/storage hit yet
+- the abandoned `25k` run reinforced that read early; the write path slowed too sharply to justify finishing it

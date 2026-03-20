@@ -402,6 +402,9 @@ def main() -> int:
     parser.add_argument('--summary-cap-kib', type=int, default=32)
     parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--shards', type=int)
+    parser.add_argument('--set-fp', type=float)
+    parser.add_argument('--tier1-set-fp', type=float)
+    parser.add_argument('--tier2-set-fp', type=float)
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--search-timeout-s', type=int, default=240)
     parser.add_argument('--search-server-start-attempts', type=int, default=1200)
@@ -464,12 +467,20 @@ def main() -> int:
             f"files={manifest['files']} bytes={manifest['bytes']}",
             flush=True,
         )
+        fp_args = []
+        if args.set_fp is not None:
+            fp_args.extend(['--set-fp', str(args.set_fp)])
+        if args.tier1_set_fp is not None:
+            fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
+        if args.tier2_set_fp is not None:
+            fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
         server = subprocess.Popen(
             [
                 str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',
                 '--memory-budget-gb', str(args.memory_budget_gb),
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                 '--search-workers', str(args.search_workers),
+                *fp_args,
                 *(['--shards', str(args.shards)] if args.shards else []),
             ],
             stdout=(tree_run_dir / 'server.stdout').open('w'),
@@ -538,10 +549,18 @@ def main() -> int:
             tree_run_dir = trees_dir / tree_name
             db_root = db_base / tree_name
             addr = f'127.0.0.1:{args.base_port + idx}'
+            fp_args = []
+            if args.set_fp is not None:
+                fp_args.extend(['--set-fp', str(args.set_fp)])
+            if args.tier1_set_fp is not None:
+                fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
+            if args.tier2_set_fp is not None:
+                fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
             server = subprocess.Popen(
                 [
                     str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
                     '--search-workers', str(args.search_workers),
+                    *fp_args,
                     *(['--shards', str(args.shards)] if args.shards else []),
                 ],
                 stdout=(tree_run_dir / 'search.server.stdout').open('w'),

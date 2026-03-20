@@ -842,13 +842,15 @@ const INTERNAL_BLOOM_HASHES: usize = 7;
 struct ServerScanPolicy {
     id_source: CandidateIdSource,
     store_path: bool,
-    filter_target_fp: Option<f64>,
+    tier1_filter_target_fp: Option<f64>,
+    tier2_filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
     memory_budget_bytes: u64,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
     let stats = rpc_client(connection).candidate_stats()?;
+    let legacy_filter_target_fp = json_f64_opt(&stats, "filter_target_fp");
     let gram_sizes = GramSizes::new(
         stats
             .get("tier2_gram_size")
@@ -873,7 +875,10 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
             .get("store_path")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
-        filter_target_fp: json_f64_opt(&stats, "filter_target_fp"),
+        tier1_filter_target_fp: json_f64_opt(&stats, "tier1_filter_target_fp")
+            .or(legacy_filter_target_fp),
+        tier2_filter_target_fp: json_f64_opt(&stats, "tier2_filter_target_fp")
+            .or(legacy_filter_target_fp),
         gram_sizes,
         memory_budget_bytes: stats
             .get("memory_budget_bytes")
@@ -1155,7 +1160,8 @@ fn store_config_from_parts(
     root: PathBuf,
     id_source: CandidateIdSource,
     store_path: bool,
-    filter_target_fp: f64,
+    tier1_filter_target_fp: f64,
+    tier2_filter_target_fp: f64,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
     tier2_superblock_summary_cap_kib: usize,
@@ -1170,20 +1176,45 @@ fn store_config_from_parts(
         tier2_superblock_summary_cap_bytes: tier2_superblock_summary_cap_kib
             .max(1)
             .saturating_mul(1024),
-        filter_target_fp: Some(filter_target_fp),
+        tier1_filter_target_fp: Some(tier1_filter_target_fp),
+        tier2_filter_target_fp: Some(tier2_filter_target_fp),
+        filter_target_fp: if (tier1_filter_target_fp - tier2_filter_target_fp).abs() < f64::EPSILON
+        {
+            Some(tier1_filter_target_fp)
+        } else {
+            None
+        },
         compaction_idle_cooldown_s: compaction_idle_cooldown_s.max(0.0),
         ..CandidateConfig::default()
     }
 }
 
+fn resolve_filter_target_fps(
+    filter_target_fp: Option<f64>,
+    tier1_filter_target_fp: Option<f64>,
+    tier2_filter_target_fp: Option<f64>,
+) -> (f64, f64) {
+    let shared = filter_target_fp.unwrap_or(0.35);
+    (
+        tier1_filter_target_fp.unwrap_or(shared),
+        tier2_filter_target_fp.unwrap_or(shared),
+    )
+}
+
 fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible serve args");
+    let (tier1_filter_target_fp, tier2_filter_target_fp) = resolve_filter_target_fps(
+        args.filter_target_fp,
+        args.tier1_filter_target_fp,
+        args.tier2_filter_target_fp,
+    );
     store_config_from_parts(
         PathBuf::from(&args.root),
         args.id_source,
         args.store_path,
-        args.filter_target_fp,
+        tier1_filter_target_fp,
+        tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier2_superblock_summary_cap_kib,
@@ -1195,11 +1226,17 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
 fn store_config_from_init_args(args: &InternalInitArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible init args");
+    let (tier1_filter_target_fp, tier2_filter_target_fp) = resolve_filter_target_fps(
+        args.filter_target_fp,
+        args.tier1_filter_target_fp,
+        args.tier2_filter_target_fp,
+    );
     store_config_from_parts(
         PathBuf::from(&args.root),
         CandidateIdSource::Sha256,
         false,
-        args.filter_target_fp,
+        tier1_filter_target_fp,
+        tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier2_superblock_summary_cap_kib,
@@ -1305,7 +1342,8 @@ impl CandidateIdSource {
 #[derive(Clone, Copy)]
 struct ScanPolicy {
     fixed_filter_bytes: Option<usize>,
-    filter_target_fp: Option<f64>,
+    tier1_filter_target_fp: Option<f64>,
+    tier2_filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
     chunk_size: usize,
     store_path: bool,
@@ -1320,28 +1358,29 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     };
     let scan_path = resolved_path.as_deref().unwrap_or(file_path);
     let file_size = scan_path.metadata()?.len();
-    let (bloom_item_estimate, tier2_bloom_item_estimate) = if policy.filter_target_fp.is_some() {
-        if policy.gram_sizes.tier1 == policy.gram_sizes.tier2 {
-            let estimate = estimate_unique_grams_for_size_hll(
-                scan_path,
-                policy.gram_sizes.tier1,
-                policy.chunk_size,
-                HLL_DEFAULT_PRECISION,
-            )?;
-            (Some(estimate), Some(estimate))
+    let (bloom_item_estimate, tier2_bloom_item_estimate) =
+        if policy.tier1_filter_target_fp.is_some() || policy.tier2_filter_target_fp.is_some() {
+            if policy.gram_sizes.tier1 == policy.gram_sizes.tier2 {
+                let estimate = estimate_unique_grams_for_size_hll(
+                    scan_path,
+                    policy.gram_sizes.tier1,
+                    policy.chunk_size,
+                    HLL_DEFAULT_PRECISION,
+                )?;
+                (Some(estimate), Some(estimate))
+            } else {
+                let (tier1_estimate, tier2_estimate) = estimate_unique_grams_pair_hll(
+                    scan_path,
+                    policy.gram_sizes.tier1,
+                    policy.gram_sizes.tier2,
+                    policy.chunk_size,
+                    HLL_DEFAULT_PRECISION,
+                )?;
+                (Some(tier1_estimate), Some(tier2_estimate))
+            }
         } else {
-            let (tier1_estimate, tier2_estimate) = estimate_unique_grams_pair_hll(
-                scan_path,
-                policy.gram_sizes.tier1,
-                policy.gram_sizes.tier2,
-                policy.chunk_size,
-                HLL_DEFAULT_PRECISION,
-            )?;
-            (Some(tier1_estimate), Some(tier2_estimate))
-        }
-    } else {
-        (None, None)
-    };
+            (None, None)
+        };
     let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         align_filter_bytes(value)
     } else {
@@ -1350,7 +1389,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
             INTERNAL_FILTER_BYTES,
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
-            policy.filter_target_fp,
+            policy.tier1_filter_target_fp,
             bloom_item_estimate,
         )?
     };
@@ -1362,7 +1401,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
             INTERNAL_FILTER_BYTES,
             Some(INTERNAL_FILTER_MIN_BYTES),
             Some(INTERNAL_FILTER_MAX_BYTES),
-            policy.filter_target_fp,
+            policy.tier2_filter_target_fp,
             tier2_bloom_item_estimate,
         )?
     };
@@ -1671,9 +1710,16 @@ fn cmd_internal_init(args: &InternalInitArgs) -> i32 {
             stats.tier2_gram_size, stats.tier1_gram_size
         );
         println!(
-            "filter_target_fp: {}",
+            "tier1_filter_target_fp: {}",
             stats
-                .filter_target_fp
+                .tier1_filter_target_fp
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        );
+        println!(
+            "tier2_filter_target_fp: {}",
+            stats
+                .tier2_filter_target_fp
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned())
         );
@@ -1706,7 +1752,8 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 Path::new(&args.file_path),
                 ScanPolicy {
                     fixed_filter_bytes: None,
-                    filter_target_fp: config.filter_target_fp,
+                    tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
+                    tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                     gram_sizes,
                     chunk_size: args.chunk_size,
                     store_path: false,
@@ -1741,7 +1788,8 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 Path::new(&args.file_path),
                 ScanPolicy {
                     fixed_filter_bytes: None,
-                    filter_target_fp: server_policy.filter_target_fp,
+                    tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
+                    tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
                     gram_sizes: server_policy.gram_sizes,
                     chunk_size: args.chunk_size,
                     store_path: server_policy.store_path,
@@ -1809,7 +1857,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let gram_sizes = GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
             let policy = ScanPolicy {
                 fixed_filter_bytes: None,
-                filter_target_fp: config.filter_target_fp,
+                tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
+                tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                 gram_sizes,
                 chunk_size: args.chunk_size,
                 store_path: args.external_id_from_path,
@@ -1945,7 +1994,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let server_policy = server_scan_policy(&args.connection)?;
             let policy = ScanPolicy {
                 fixed_filter_bytes: None,
-                filter_target_fp: server_policy.filter_target_fp,
+                tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
+                tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
                 gram_sizes: server_policy.gram_sizes,
                 chunk_size: args.chunk_size,
                 store_path: server_policy.store_path,
@@ -3286,10 +3336,19 @@ struct ServeArgs {
     shards: Option<usize>,
     #[arg(
         long = "set-fp",
-        default_value_t = 0.35,
-        help = "Target Bloom false-positive rate (default: 0.35)."
+        help = "Fallback Bloom false-positive rate applied to both tiers when tier-specific values are not set."
     )]
-    filter_target_fp: f64,
+    filter_target_fp: Option<f64>,
+    #[arg(
+        long = "tier1-set-fp",
+        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+    )]
+    tier1_filter_target_fp: Option<f64>,
+    #[arg(
+        long = "tier2-set-fp",
+        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+    )]
+    tier2_filter_target_fp: Option<f64>,
     #[arg(
         long = "id-source",
         value_enum,
@@ -3326,10 +3385,19 @@ struct InternalInitArgs {
     force: bool,
     #[arg(
         long = "set-fp",
-        default_value_t = 0.35,
-        help = "Optional bloom false-positive target used to size variable filters."
+        help = "Fallback Bloom false-positive rate applied to both tiers when tier-specific values are not set."
     )]
-    filter_target_fp: f64,
+    filter_target_fp: Option<f64>,
+    #[arg(
+        long = "tier1-set-fp",
+        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+    )]
+    tier1_filter_target_fp: Option<f64>,
+    #[arg(
+        long = "tier2-set-fp",
+        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+    )]
+    tier2_filter_target_fp: Option<f64>,
     #[arg(
         long = "gram-sizes",
         default_value = "3,4",
@@ -3495,7 +3563,9 @@ mod tests {
             root: root.display().to_string(),
             candidate_shards,
             force,
-            filter_target_fp: 0.35,
+            filter_target_fp: Some(0.35),
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
@@ -3594,7 +3664,9 @@ mod tests {
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
-            filter_target_fp: 0.35,
+            filter_target_fp: Some(0.35),
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
             id_source: CandidateIdSource::Sha256,
             store_path: false,
             gram_sizes: "3,4".to_owned(),
@@ -3706,6 +3778,7 @@ mod tests {
             CandidateIdSource::Sha256,
             true,
             0.001,
+            0.002,
             3,
             4,
             8,
@@ -3717,13 +3790,16 @@ mod tests {
         assert_eq!(fixed.tier2_gram_size, 3);
         assert_eq!(fixed.tier1_gram_size, 4);
         assert_eq!(fixed.tier2_superblock_summary_cap_bytes, 8 * 1024);
-        assert_eq!(fixed.filter_target_fp, Some(0.001));
+        assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
+        assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
+        assert_eq!(fixed.filter_target_fp, None);
         assert_eq!(fixed.compaction_idle_cooldown_s, 33.5);
 
         let variable = store_config_from_parts(
             PathBuf::from("root"),
             CandidateIdSource::Sha256,
             false,
+            0.01,
             0.01,
             5,
             4,
@@ -3733,6 +3809,8 @@ mod tests {
         assert_eq!(variable.root, PathBuf::from("root"));
         assert_eq!(variable.id_source, "sha256");
         assert!(!variable.store_path);
+        assert_eq!(variable.tier1_filter_target_fp, Some(0.01));
+        assert_eq!(variable.tier2_filter_target_fp, Some(0.01));
         assert_eq!(variable.filter_target_fp, Some(0.01));
         assert_eq!(variable.tier2_gram_size, 5);
         assert_eq!(variable.tier1_gram_size, 4);
@@ -3854,7 +3932,8 @@ mod tests {
             &sample,
             ScanPolicy {
                 fixed_filter_bytes: Some(2048),
-                filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: true,
@@ -3877,7 +3956,8 @@ mod tests {
             &sample,
             ScanPolicy {
                 fixed_filter_bytes: Some(2048),
-                filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: false,
@@ -3897,7 +3977,8 @@ mod tests {
             &sample,
             ScanPolicy {
                 fixed_filter_bytes: Some(2051),
-                filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: false,
@@ -4287,7 +4368,8 @@ rule remote_q {
         let policy = server_scan_policy(&connection).expect("scan policy from server");
         assert_eq!(policy.id_source, CandidateIdSource::Sha256);
         assert!(!policy.store_path);
-        assert_eq!(policy.filter_target_fp, Some(0.35));
+        assert_eq!(policy.tier1_filter_target_fp, Some(0.35));
+        assert_eq!(policy.tier2_filter_target_fp, Some(0.35));
         assert_eq!(policy.gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
 
         assert_eq!(

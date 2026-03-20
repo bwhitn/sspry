@@ -1353,6 +1353,20 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(compaction_generation),
     );
     out.insert(
+        "tier1_filter_target_fp".to_owned(),
+        stats
+            .tier1_filter_target_fp
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    out.insert(
+        "tier2_filter_target_fp".to_owned(),
+        stats
+            .tier2_filter_target_fp
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    out.insert(
         "filter_target_fp".to_owned(),
         stats
             .filter_target_fp
@@ -7371,6 +7385,14 @@ mod tests {
         assert_eq!(
             stats.get("tier1_gram_size").and_then(Value::as_u64),
             Some(4)
+        );
+        assert_eq!(
+            stats.get("tier1_filter_target_fp").and_then(Value::as_f64),
+            Some(0.35)
+        );
+        assert_eq!(
+            stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
+            Some(0.35)
         );
         assert_eq!(
             stats.get("filter_target_fp").and_then(Value::as_f64),
