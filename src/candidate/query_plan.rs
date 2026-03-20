@@ -74,8 +74,11 @@ enum Token {
     Comma,
     EqEq,
     And,
+    Any,
+    All,
     Or,
     Of,
+    Them,
     Int(usize),
     Float(f64),
     Bool(bool),
@@ -95,6 +98,7 @@ struct ConditionParser {
     tokens: Vec<Token>,
     index: usize,
     known_patterns: HashSet<String>,
+    known_pattern_names: Vec<String>,
 }
 
 fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
@@ -111,10 +115,13 @@ fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&
 
 impl ConditionParser {
     fn new(text: &str, known_patterns: HashSet<String>) -> Result<Self> {
+        let mut known_pattern_names = known_patterns.iter().cloned().collect::<Vec<_>>();
+        known_pattern_names.sort();
         Ok(Self {
             tokens: tokenize_condition(text)?,
             index: 0,
             known_patterns,
+            known_pattern_names,
         })
     }
 
@@ -210,6 +217,16 @@ impl ConditionParser {
                     threshold: None,
                     children: Vec::new(),
                 })
+            }
+            Some(Token::Any) => {
+                self.consume(Some(&Token::Any))?;
+                self.consume(Some(&Token::Of))?;
+                self.parse_n_of_expression(1)
+            }
+            Some(Token::All) => {
+                self.consume(Some(&Token::All))?;
+                self.consume(Some(&Token::Of))?;
+                self.parse_n_of_expression(usize::MAX)
             }
             Some(Token::Name(_)) => {
                 let Token::Name(field_name) = self.consume(None)? else {
@@ -314,51 +331,126 @@ impl ConditionParser {
                     return Err(SspryError::from("N-of threshold must be > 0."));
                 }
                 self.consume(Some(&Token::Of))?;
-                self.consume(Some(&Token::LParen))?;
-                let mut children = Vec::new();
-                loop {
-                    let Token::Id(raw_id) = self.consume(None)? else {
-                        return Err(SspryError::from("Expected pattern id in N-of expression."));
-                    };
-                    if !self.known_patterns.contains(&raw_id) {
-                        return Err(SspryError::from(format!(
-                            "Condition references unknown string id: {raw_id}"
-                        )));
-                    }
-                    children.push(QueryNode {
-                        kind: "pattern".to_owned(),
-                        pattern_id: Some(raw_id),
-                        threshold: None,
-                        children: Vec::new(),
-                    });
-                    match self.peek() {
-                        Some(Token::Comma) => {
-                            self.consume(Some(&Token::Comma))?;
-                        }
-                        Some(Token::RParen) => {
-                            self.consume(Some(&Token::RParen))?;
-                            break;
-                        }
-                        Some(token) => {
-                            return Err(SspryError::from(format!(
-                                "Expected ',' or ')' in N-of list, got {token:?}"
-                            )));
-                        }
-                        None => return Err(SspryError::from("Unterminated N-of expression.")),
-                    }
-                }
-                Ok(QueryNode {
-                    kind: "n_of".to_owned(),
-                    pattern_id: None,
-                    threshold: Some(threshold),
-                    children,
-                })
+                self.parse_n_of_expression(threshold)
             }
             Some(token) => Err(SspryError::from(format!(
                 "Unsupported condition token: {token:?}"
             ))),
             None => Err(SspryError::from("Unexpected end of condition.")),
         }
+    }
+
+    fn parse_n_of_expression(&mut self, threshold: usize) -> Result<QueryNode> {
+        let children = self.parse_n_of_targets()?;
+        let resolved_threshold = if threshold == usize::MAX {
+            children.len()
+        } else {
+            threshold
+        };
+        if resolved_threshold == 0 {
+            return Err(SspryError::from(
+                "N-of expression matched zero candidate patterns.",
+            ));
+        }
+        Ok(QueryNode {
+            kind: "n_of".to_owned(),
+            pattern_id: None,
+            threshold: Some(resolved_threshold),
+            children,
+        })
+    }
+
+    fn parse_n_of_targets(&mut self) -> Result<Vec<QueryNode>> {
+        let pattern_ids = match self.peek() {
+            Some(Token::LParen) => self.parse_n_of_target_list()?,
+            Some(Token::Them) => {
+                self.consume(Some(&Token::Them))?;
+                self.known_pattern_names.clone()
+            }
+            Some(Token::Id(_)) => {
+                let Token::Id(raw_id) = self.consume(None)? else {
+                    unreachable!();
+                };
+                self.expand_pattern_selector(&raw_id)?
+            }
+            Some(token) => {
+                return Err(SspryError::from(format!(
+                    "Expected pattern selector after 'of', got {token:?}."
+                )));
+            }
+            None => return Err(SspryError::from("Unexpected end of N-of expression.")),
+        };
+        if pattern_ids.is_empty() {
+            return Err(SspryError::from(
+                "N-of expression matched zero candidate patterns.",
+            ));
+        }
+        Ok(pattern_ids
+            .into_iter()
+            .map(|pattern_id| QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some(pattern_id),
+                threshold: None,
+                children: Vec::new(),
+            })
+            .collect())
+    }
+
+    fn parse_n_of_target_list(&mut self) -> Result<Vec<String>> {
+        self.consume(Some(&Token::LParen))?;
+        let mut pattern_ids = Vec::<String>::new();
+        let mut seen = HashSet::<String>::new();
+        loop {
+            let selector_matches = match self.consume(None)? {
+                Token::Id(raw_id) => self.expand_pattern_selector(&raw_id)?,
+                Token::Them => self.known_pattern_names.clone(),
+                _ => return Err(SspryError::from("Expected pattern id in N-of expression.")),
+            };
+            for pattern_id in selector_matches {
+                if seen.insert(pattern_id.clone()) {
+                    pattern_ids.push(pattern_id);
+                }
+            }
+            match self.peek() {
+                Some(Token::Comma) => {
+                    self.consume(Some(&Token::Comma))?;
+                }
+                Some(Token::RParen) => {
+                    self.consume(Some(&Token::RParen))?;
+                    break;
+                }
+                Some(token) => {
+                    return Err(SspryError::from(format!(
+                        "Expected ',' or ')' in N-of list, got {token:?}"
+                    )));
+                }
+                None => return Err(SspryError::from("Unterminated N-of expression.")),
+            }
+        }
+        Ok(pattern_ids)
+    }
+
+    fn expand_pattern_selector(&self, raw_id: &str) -> Result<Vec<String>> {
+        if let Some(prefix) = raw_id.strip_suffix('*') {
+            let matches = self
+                .known_pattern_names
+                .iter()
+                .filter(|pattern_id| pattern_id.starts_with(prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(SspryError::from(format!(
+                    "Condition wildcard selector matched no string ids: {raw_id}"
+                )));
+            }
+            return Ok(matches);
+        }
+        if !self.known_patterns.contains(raw_id) {
+            return Err(SspryError::from(format!(
+                "Condition references unknown string id: {raw_id}"
+            )));
+        }
+        Ok(vec![raw_id.to_owned()])
     }
 }
 
@@ -402,6 +494,9 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 while index < chars.len()
                     && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
                 {
+                    index += 1;
+                }
+                if index < chars.len() && chars[index] == '*' {
                     index += 1;
                 }
                 tokens.push(Token::Id(chars[start..index].iter().collect()));
@@ -468,8 +563,11 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
             let raw: String = chars[start..index].iter().collect();
             match raw.to_ascii_lowercase().as_str() {
                 "and" => tokens.push(Token::And),
+                "any" => tokens.push(Token::Any),
+                "all" => tokens.push(Token::All),
                 "or" => tokens.push(Token::Or),
                 "of" => tokens.push(Token::Of),
+                "them" => tokens.push(Token::Them),
                 "true" => tokens.push(Token::Bool(true)),
                 "false" => tokens.push(Token::Bool(false)),
                 _ => tokens.push(Token::Name(raw.to_ascii_lowercase())),
@@ -2008,6 +2106,12 @@ rule numeric_only_unanchorable {
                 > 4
         );
         assert!(
+            tokenize_condition("any of them and all of $a*")
+                .expect("tokenize any/all condition")
+                .len()
+                > 4
+        );
+        assert!(
             tokenize_condition("filesize == 32 or $a")
                 .expect("tokenize filesize condition")
                 .len()
@@ -2106,6 +2210,45 @@ rule numeric_only_unanchorable {
                 .expect_err("missing comma")
                 .to_string()
                 .contains("Expected ',' or ')'")
+        );
+
+        let mut parser = ConditionParser::new(
+            "all of $a*",
+            HashSet::from([
+                "$a1".to_owned(),
+                "$a2".to_owned(),
+                "$b1".to_owned(),
+            ]),
+        )
+        .expect("parser");
+        let wildcard = parser.parse().expect("wildcard parse");
+        assert_eq!(wildcard.kind, "n_of");
+        assert_eq!(wildcard.threshold, Some(2));
+        assert_eq!(wildcard.children.len(), 2);
+        assert_eq!(wildcard.children[0].pattern_id.as_deref(), Some("$a1"));
+        assert_eq!(wildcard.children[1].pattern_id.as_deref(), Some("$a2"));
+
+        let mut parser = ConditionParser::new(
+            "any of them",
+            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+        )
+        .expect("parser");
+        let them = parser.parse().expect("them parse");
+        assert_eq!(them.kind, "n_of");
+        assert_eq!(them.threshold, Some(1));
+        assert_eq!(them.children.len(), 2);
+
+        let mut parser = ConditionParser::new(
+            "1 of $missing*",
+            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+        )
+        .expect("parser");
+        assert!(
+            parser
+                .parse()
+                .expect_err("missing wildcard selector")
+                .to_string()
+                .contains("matched no string ids")
         );
 
         let mut parser =
@@ -2339,6 +2482,28 @@ rule numeric_only {
                 .iter()
                 .any(|pattern| { pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX) })
         );
+
+        let wildcard_sets = compile_query_plan_default(
+            r#"
+rule wildcard_sets {
+  strings:
+    $ruleA = "ABCD"
+    $ruleB = "BCDE"
+    $other = "CDEF"
+  condition:
+    any of ($ruleA, $ruleB) and all of $rule*
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("wildcard/set search support");
+        assert_eq!(wildcard_sets.patterns.len(), 3);
+        assert_eq!(wildcard_sets.root.kind, "and");
+        assert_eq!(wildcard_sets.root.children.len(), 2);
+        assert!(wildcard_sets.root.children.iter().all(|child| child.kind == "n_of"));
 
         assert!(
             compile_query_plan_with_gram_sizes(

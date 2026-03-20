@@ -170,7 +170,6 @@ def analyze_static(path: Path) -> dict:
         or has_condition_offset_reads
         or string_defs == 0
         or nocase_count
-        or has_any_of_them
         or has_string_decl_comment
     ):
         bucket = "unsupported_or_manual_review"

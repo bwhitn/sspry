@@ -1558,6 +1558,67 @@ rule RegexLiteral {
 }
 
 #[test]
+fn search_supports_any_all_them_and_wildcard_sets() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule = base.join("set_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("hit.bin"), b"ALPHA BETA GAMMA").expect("write hit");
+    fs::write(sample_dir.join("miss_partial.bin"), b"ALPHA BETA").expect("write partial");
+    fs::write(sample_dir.join("miss_other.bin"), b"DELTA").expect("write miss");
+
+    fs::write(
+        &rule,
+        r#"
+rule SetSupport {
+  strings:
+    $ruleA = "ALPHA"
+    $ruleB = "BETA"
+    $ruleC = "GAMMA"
+  condition:
+    any of ($ruleA, $ruleB) and all of $rule*
+}
+"#,
+    )
+    .expect("write rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 3"));
+    wait_for_published_doc_count(&addr, 3, 1);
+    wait_for_verified_matches(&addr, &rule, 1, 1);
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        rule.to_str().expect("rule"),
+        "--verify",
+    ]);
+    assert!(search.contains("candidates: 1"), "{search}");
+    assert!(search.contains("verified_checked: 1"), "{search}");
+    assert!(search.contains("verified_matched: 1"), "{search}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn shutdown_command_drains_server() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("candidate_db");
