@@ -401,6 +401,7 @@ def main() -> int:
     parser.add_argument('--balance-bytes', action='store_true')
     parser.add_argument('--summary-cap-kib', type=int, default=32)
     parser.add_argument('--memory-budget-gb', type=int, default=16)
+    parser.add_argument('--shards', type=int)
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--search-timeout-s', type=int, default=240)
     parser.add_argument('--search-server-start-attempts', type=int, default=1200)
@@ -444,6 +445,7 @@ def main() -> int:
         'balance_bytes': args.balance_bytes,
         'tree_count': len(manifests),
         'summary_cap_kib': args.summary_cap_kib,
+        'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'drain_between_trees': args.drain_between_trees,
         'trees': [],
@@ -468,6 +470,7 @@ def main() -> int:
                 '--memory-budget-gb', str(args.memory_budget_gb),
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                 '--search-workers', str(args.search_workers),
+                *(['--shards', str(args.shards)] if args.shards else []),
             ],
             stdout=(tree_run_dir / 'server.stdout').open('w'),
             stderr=(tree_run_dir / 'server.stderr').open('w'),
@@ -539,6 +542,7 @@ def main() -> int:
                 [
                     str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
                     '--search-workers', str(args.search_workers),
+                    *(['--shards', str(args.shards)] if args.shards else []),
                 ],
                 stdout=(tree_run_dir / 'search.server.stdout').open('w'),
                 stderr=(tree_run_dir / 'search.server.stderr').open('w'),

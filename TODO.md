@@ -630,6 +630,54 @@ Rejected follow-ups on top of the worker path:
   - deriving block gates from the existing per-doc bloom bytes is not strong enough
   - the next credible search move is a dedicated block-gate signature built from the scan path itself, not another transformation of the stored per-doc blooms
 
+Rejected per-doc tier1 gate prefilter:
+- change:
+  - added a fixed-size per-doc tier1 gate sidecar and required it to pass before loading the full tier1 bloom
+- `2000`-file published smoke artifact:
+  - `/root/pertest/results/sspry_smoke_gateprefilter_2000_20260320_r2`
+- result:
+  - the path was functionally correct after fixing the default all-ones compatibility gate
+  - but it was not strong enough to justify the extra read
+  - gate rejections were only `66-161` docs per query
+  - full tier1 bloom bytes per query stayed around `0.96-1.08 GiB`
+  - every supported rule regressed versus the worker-path baseline:
+    - `01`: `0.166 s -> 0.349 s`
+    - `08`: `0.122 s -> 0.151 s`
+    - `09`: `0.172 s -> 0.271 s`
+    - `10`: `0.172 s -> 0.399 s`
+    - `11`: `0.146 s -> 0.299 s`
+    - `12`: `0.147 s -> 0.274 s`
+- read:
+  - an extra per-doc gate derived from the same gram stream is not the right search lever
+  - it adds more I/O without rejecting enough work
+  - this path was dropped rather than carried forward
+
+Current ingest-slope hypothesis after the balanced-forest work:
+- the dominant write-path problem is shard fanout, not just file size growth
+- with `256` candidate shards and `64` docs per client batch, the server sprays tiny shard-local insert batches across many store roots
+- that shape keeps `append_sidecars` expensive even when each per-store append path is locally efficient
+
+Current local shard-fanout probe:
+- harness change:
+  - `scripts/run_forest_probe.py` now accepts `--shards` and forwards it to both index and search servers
+- active probe:
+  - `/root/pertest/results/sspry_treeprobe_chunk00_shards32_20260320_r1`
+  - same balanced `tree_00` manifest as the earlier `100k` forest:
+    - `25,000` files
+    - `72,951,975,973` bytes
+- earlier `256`-shard baseline on the same chunk:
+  - `867.62 files/min`
+  - `20,869` shard touches over `25,000` docs
+  - `store_append_sidecars_us = 1,521,043,873`
+- current partial `32`-shard read:
+  - at `6,075 / 25,000` docs:
+    - about `1,145 files/min`
+    - `2,857` shard touches over `6,075` docs
+    - `store_append_sidecars_us = 257,043,523`
+  - read:
+    - fewer shards materially densify shard-local payloads
+    - this is the first ingest lever since many-tree+drain that still looks structurally right under load
+
 ### 0a. Bloom-only cutover and dead-code removal
 
 Accepted direction:
