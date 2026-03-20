@@ -88,6 +88,18 @@ struct ConditionParser {
     known_patterns: HashSet<String>,
 }
 
+fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
+    match (name, offset, value) {
+        ("uint16", 0, 0x5a4d) | ("uint16be", 0, 0x4d5a) => Some("pe.is_pe"),
+        ("uint16", 0, 0x457f)
+        | ("uint16be", 0, 0x7f45)
+        | ("uint32", 0, 0x464c457f)
+        | ("uint32be", 0, 0x7f454c46) => Some("elf.is_elf"),
+        ("uint32", 0, 0x04034b50) | ("uint32be", 0, 0x504b0304) => Some("zip.is_zip"),
+        _ => None,
+    }
+}
+
 impl ConditionParser {
     fn new(text: &str, known_patterns: HashSet<String>) -> Result<Self> {
         Ok(Self {
@@ -194,9 +206,7 @@ impl ConditionParser {
                 let Token::Name(field_name) = self.consume(None)? else {
                     unreachable!();
                 };
-                if let Some(read_kind) = numeric_read_kind(&field_name)
-                    && matches!(self.peek(), Some(Token::LParen))
-                {
+                if matches!(self.peek(), Some(Token::LParen)) {
                     self.consume(Some(&Token::LParen))?;
                     let Token::Int(offset) = self.consume(None)? else {
                         return Err(SspryError::from(format!(
@@ -205,22 +215,39 @@ impl ConditionParser {
                     };
                     self.consume(Some(&Token::RParen))?;
                     self.consume(Some(&Token::EqEq))?;
-                    let literal_text = match (read_kind, self.consume(None)?) {
-                        (NumericReadKind::Integer, Token::Int(value)) => value.to_string(),
-                        (NumericReadKind::Float, Token::Int(value)) => value.to_string(),
-                        (NumericReadKind::Float, Token::Float(value)) => value.to_string(),
-                        _ => {
-                            return Err(SspryError::from(format!(
-                                "{field_name} requires equality against a literal constant."
-                            )));
-                        }
-                    };
-                    return Ok(QueryNode {
-                        kind: "verifier_only_eq".to_owned(),
-                        pattern_id: Some(format!("{field_name}({offset})=={literal_text}")),
-                        threshold: None,
-                        children: Vec::new(),
-                    });
+                    let literal_token = self.consume(None)?;
+                    if let Token::Int(value) = literal_token
+                        && let Some(metadata_field) =
+                            magic_numeric_eq_rewrite(&field_name, offset, value)
+                    {
+                        return Ok(QueryNode {
+                            kind: "metadata_eq".to_owned(),
+                            pattern_id: Some(metadata_field.to_owned()),
+                            threshold: Some(1),
+                            children: Vec::new(),
+                        });
+                    }
+                    if let Some(read_kind) = numeric_read_kind(&field_name) {
+                        let literal_text = match (read_kind, literal_token) {
+                            (NumericReadKind::Integer, Token::Int(value)) => value.to_string(),
+                            (NumericReadKind::Float, Token::Int(value)) => value.to_string(),
+                            (NumericReadKind::Float, Token::Float(value)) => value.to_string(),
+                            _ => {
+                                return Err(SspryError::from(format!(
+                                    "{field_name} requires equality against a literal constant."
+                                )));
+                            }
+                        };
+                        return Ok(QueryNode {
+                            kind: "verifier_only_eq".to_owned(),
+                            pattern_id: Some(format!("{field_name}({offset})=={literal_text}")),
+                            threshold: None,
+                            children: Vec::new(),
+                        });
+                    }
+                    return Err(SspryError::from(format!(
+                        "Unsupported condition field: {field_name}"
+                    )));
                 }
                 let normalized = normalize_query_metadata_field(&field_name)
                     .or_else(|| {
@@ -1436,6 +1463,39 @@ rule module_meta {
             child.kind == "time_now_eq"
                 && child.pattern_id.as_deref() == Some("time.now")
                 && child.threshold == Some(42)
+        }));
+    }
+
+    #[test]
+    fn compile_rule_rewrites_header_magic_numeric_reads_to_metadata() {
+        let rule = r#"
+rule header_magic {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and uint16(0) == 0x5A4D and uint32(4) == 0x14c and uint32(0) == 0x464c457f and uint32(0) == 0x04034b50
+}
+"#;
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.root.kind, "and");
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("pe.is_pe")
+                && child.threshold == Some(1)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("elf.is_elf")
+                && child.threshold == Some(1)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_eq"
+                && child.pattern_id.as_deref() == Some("zip.is_zip")
+                && child.threshold == Some(1)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "and"
+                && child.children.iter().any(|grandchild| grandchild.kind == "verifier_only_eq")
         }));
     }
 

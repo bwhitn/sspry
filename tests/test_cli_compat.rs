@@ -216,6 +216,13 @@ fn write_minimal_crx(path: &Path, anchor: &[u8]) {
     fs::write(path, crx).expect("write crx");
 }
 
+fn write_minimal_zip(path: &Path, anchor: &[u8]) {
+    let mut zip = b"PK\x03\x04".to_vec();
+    zip.resize(32, 0);
+    zip.extend_from_slice(anchor);
+    fs::write(path, zip).expect("write zip");
+}
+
 fn write_minimal_elf64(path: &Path, anchor: &[u8]) {
     let mut elf = vec![0u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");
@@ -797,6 +804,103 @@ rule ModuleMacho {
     assert!(ingest.contains("processed_documents: 4"));
 
     for rule in [&pe_rule, &crx_rule, &macho_rule] {
+        wait_for_search_candidates(&addr, rule, 1);
+        let search = run_ok(&[
+            "search",
+            "--addr",
+            &addr,
+            "--rule",
+            rule.to_str().expect("rule"),
+        ]);
+        assert!(search.contains("candidates: 1"), "{rule:?}: {search}");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn search_rewrites_header_magic_numeric_conditions_to_metadata() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let pe_rule = base.join("pe_magic_rule.yar");
+    let pe_be_rule = base.join("pe_magic_be_rule.yar");
+    let elf_rule = base.join("elf_magic_rule.yar");
+    let zip_rule = base.join("zip_magic_rule.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    write_minimal_pe64_dotnet(&sample_dir.join("sample.exe"), b"pe-hit");
+    write_minimal_elf64(&sample_dir.join("sample.elf"), b"elf-hit");
+    write_minimal_zip(&sample_dir.join("sample.zip"), b"zip-hit");
+    fs::write(sample_dir.join("decoy.bin"), b"not-a-magic-hit").expect("write decoy");
+
+    fs::write(
+        &pe_rule,
+        r#"
+rule MagicPeLe {
+  strings:
+    $unused = "UNUSED-ANCHOR"
+  condition:
+    $unused or uint16(0) == 0x5A4D
+}
+"#,
+    )
+    .expect("write pe rule");
+    fs::write(
+        &pe_be_rule,
+        r#"
+rule MagicPeBe {
+  strings:
+    $unused = "UNUSED-ANCHOR"
+  condition:
+    $unused or uint16be(0) == 0x4D5A
+}
+"#,
+    )
+    .expect("write pe be rule");
+    fs::write(
+        &elf_rule,
+        r#"
+rule MagicElf {
+  strings:
+    $unused = "UNUSED-ANCHOR"
+  condition:
+    $unused or uint32(0) == 0x464C457F
+}
+"#,
+    )
+    .expect("write elf rule");
+    fs::write(
+        &zip_rule,
+        r#"
+rule MagicZip {
+  strings:
+    $unused = "UNUSED-ANCHOR"
+  condition:
+    $unused or uint32(0) == 0x04034B50
+}
+"#,
+    )
+    .expect("write zip rule");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 4"));
+
+    for rule in [&pe_rule, &pe_be_rule, &elf_rule, &zip_rule] {
         wait_for_search_candidates(&addr, rule, 1);
         let search = run_ok(&[
             "search",

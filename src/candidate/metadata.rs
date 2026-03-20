@@ -21,6 +21,7 @@ enum BoolField {
     LnkIsLnk = 8,
     ElfIsElf = 9,
     MachoIsMacho = 10,
+    ZipIsZip = 11,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +243,10 @@ fn filetime_to_unix_timestamp(filetime: u64) -> Option<u64> {
 
 fn extract_crx_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     builder.set_bool(BoolField::CrxIsCrx, prefix.starts_with(b"Cr24"));
+}
+
+fn extract_zip_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
+    builder.set_bool(BoolField::ZipIsZip, prefix.starts_with(b"PK\x03\x04"));
 }
 
 fn extract_dex_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
@@ -489,6 +494,7 @@ pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
     let prefix = read_prefix(&mut file, 4096)?;
     let mut builder = MetadataBuilder::default();
     extract_crx_metadata(&prefix, &mut builder);
+    extract_zip_metadata(&prefix, &mut builder);
     extract_dex_metadata(&prefix, &mut builder);
     extract_lnk_metadata(&prefix, &mut builder);
     extract_elf_metadata(&prefix, &mut builder);
@@ -508,6 +514,7 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
         "pe.machine" => Some("pe.machine"),
         "pe.subsystem" => Some("pe.subsystem"),
         "pe.timestamp" => Some("pe.timestamp"),
+        "elf.is_elf" => Some("elf.is_elf"),
         "elf.type" => Some("elf.type"),
         "elf.os_abi" | "elf.osabi" => Some("elf.os_abi"),
         "elf.machine" => Some("elf.machine"),
@@ -517,6 +524,7 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
         "dex.is_dex" => Some("dex.is_dex"),
         "dex.version" => Some("dex.version"),
         "lnk.is_lnk" => Some("lnk.is_lnk"),
+        "zip.is_zip" => Some("zip.is_zip"),
         "lnk.creation_time" => Some("lnk.creation_time"),
         "lnk.access_time" => Some("lnk.access_time"),
         "lnk.write_time" => Some("lnk.write_time"),
@@ -542,6 +550,8 @@ pub fn metadata_field_is_boolean(raw: &str) -> bool {
                 | "dotnet.is_dotnet"
                 | "dex.is_dex"
                 | "lnk.is_lnk"
+                | "elf.is_elf"
+                | "zip.is_zip"
         )
     )
 }
@@ -578,6 +588,8 @@ fn bool_field_for_name(field: &str) -> Option<BoolField> {
         "dotnet.is_dotnet" => Some(BoolField::DotnetIsDotnet),
         "dex.is_dex" => Some(BoolField::DexIsDex),
         "lnk.is_lnk" => Some(BoolField::LnkIsLnk),
+        "elf.is_elf" => Some(BoolField::ElfIsElf),
+        "zip.is_zip" => Some(BoolField::ZipIsZip),
         _ => None,
     }
 }
@@ -681,7 +693,13 @@ mod tests {
             normalize_query_metadata_field("ELF.OSABI"),
             Some("elf.os_abi")
         );
+        assert_eq!(
+            normalize_query_metadata_field("zip.is_zip"),
+            Some("zip.is_zip")
+        );
         assert!(metadata_field_is_boolean("pe.is_dll"));
+        assert!(metadata_field_is_boolean("elf.is_elf"));
+        assert!(metadata_field_is_boolean("zip.is_zip"));
         assert!(metadata_field_is_integer("macho.device_type"));
     }
 
@@ -701,6 +719,10 @@ mod tests {
         assert_eq!(
             metadata_field_matches_eq(&bytes, "pe.is_pe", 1).expect("match"),
             Some(false)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&bytes, "zip.is_zip", 1).expect("match"),
+            None
         );
         assert_eq!(
             metadata_field_matches_eq(&[], "pe.machine", 0x14c).expect("unknown"),
@@ -789,6 +811,14 @@ mod tests {
         let crx_bytes = extract_compact_document_metadata(&crx_path).expect("metadata");
         assert_eq!(
             metadata_field_matches_eq(&crx_bytes, "crx.is_crx", 1).expect("crx"),
+            Some(true)
+        );
+
+        let zip_path = tmp.path().join("sample.zip");
+        fs::write(&zip_path, b"PK\x03\x04payload").expect("write zip");
+        let zip_bytes = extract_compact_document_metadata(&zip_path).expect("metadata");
+        assert_eq!(
+            metadata_field_matches_eq(&zip_bytes, "zip.is_zip", 1).expect("zip"),
             Some(true)
         );
 
