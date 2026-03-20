@@ -30,8 +30,9 @@ HEADER_HINTS = {
     "rtf_magic": re.compile(r'(?:"\{\\\\rtf"|"\{\\rtf")', re.I),
 }
 MODULE_NAMES = ("pe", "elf", "dotnet", "math", "hash")
-UNSUPPORTED_MODULES = {"dotnet", "math", "hash"}
-SUPPORTED_IMPORTS = {"pe", "elf"}
+UNSUPPORTED_MODULES = {"math", "hash"}
+SUPPORTED_IMPORTS = {"pe", "elf", "dotnet"}
+SUPPORTED_DOTNET_FIELDS = {"is_dotnet"}
 TEMPORARY_SEARCH_MARKERS = (
     "Resource temporarily unavailable",
     "busy during query scan; retry later",
@@ -91,6 +92,10 @@ def analyze_static(path: Path) -> dict:
         modules.append("hash")
 
     hints = sorted(name for name, pattern in HEADER_HINTS.items() if pattern.search(text))
+    dotnet_fields = sorted(set(re.findall(r"\bdotnet\.([A-Za-z_][A-Za-z0-9_]*)", low)))
+    unsupported_dotnet_fields = sorted(
+        field for field in dotnet_fields if field not in SUPPORTED_DOTNET_FIELDS
+    )
     if re.search(r"\bpe\.is_pe\b", low) and "mz_magic" not in hints:
         hints.append("mz_magic")
     if re.search(r"\belf\.", low) and "elf_magic" not in hints:
@@ -133,7 +138,9 @@ def analyze_static(path: Path) -> dict:
     if "rtf_magic" in hints:
         rewrite_hints.append("normalize_rtf_magic_to_is_rtf")
 
-    heavy_module = any(module in UNSUPPORTED_MODULES for module in modules)
+    heavy_module = any(module in UNSUPPORTED_MODULES for module in modules) or bool(
+        unsupported_dotnet_fields
+    )
     unknown_imports = sorted(import_name for import_name in imports if import_name not in SUPPORTED_IMPORTS)
     module_loop = bool(modules) and (for_any or for_all)
     wide_or_burst = or_count >= 12 and string_defs >= 12
@@ -144,6 +151,8 @@ def analyze_static(path: Path) -> dict:
         notes.append("uses unknown import")
     if heavy_module:
         notes.append("uses unsupported-heavy module path")
+    if unsupported_dotnet_fields:
+        notes.append("uses unsupported dotnet field")
     if module_loop:
         notes.append("module loop present")
     if matches_regex or regex_strings:
@@ -211,6 +220,8 @@ def analyze_static(path: Path) -> dict:
         "has_any_of_them": has_any_of_them,
         "has_string_decl_comment": has_string_decl_comment,
         "unknown_imports": unknown_imports,
+        "dotnet_fields": dotnet_fields,
+        "unsupported_dotnet_fields": unsupported_dotnet_fields,
         "static_bucket": bucket,
         "notes": notes,
     }
