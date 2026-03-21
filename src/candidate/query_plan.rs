@@ -2305,6 +2305,14 @@ fn derive_nocase_search_alternatives(
     wide: bool,
     gram_sizes: GramSizes,
 ) -> Result<Vec<Vec<u8>>> {
+    fn gram_count_for_len(len: usize, gram_size: usize) -> usize {
+        if len < gram_size {
+            0
+        } else {
+            len - gram_size + 1
+        }
+    }
+
     let min_search_len = [gram_sizes.tier2, gram_sizes.tier1]
         .into_iter()
         .filter(|size| !wide || size % 2 == 0)
@@ -2319,7 +2327,7 @@ fn derive_nocase_search_alternatives(
         return Ok(vec![literal.to_vec()]);
     }
     let step = if wide { 2 } else { 1 };
-    let mut best: Option<(usize, usize, usize)> = None;
+    let mut best: Option<(u128, u128, usize, usize, usize)> = None;
     for start in (0..=literal.len() - min_search_len).step_by(step) {
         let mut end = start + min_search_len;
         while end <= literal.len() {
@@ -2331,15 +2339,30 @@ fn derive_nocase_search_alternatives(
             let alpha_count = nocase_toggle_positions(slice).len();
             let variant_count = 1usize << alpha_count.min(usize::BITS as usize - 1);
             if variant_count <= MAX_NOCASE_LITERAL_VARIANTS {
-                let score = (slice.len(), usize::MAX - variant_count, usize::MAX - start);
+                let tier1_grams = gram_count_for_len(slice.len(), gram_sizes.tier1);
+                let tier2_grams = gram_count_for_len(slice.len(), gram_sizes.tier2);
+                let search_weight = (tier1_grams as u128) * 8 + tier2_grams as u128;
+                let weighted_score = search_weight
+                    .saturating_mul(search_weight)
+                    .saturating_mul(search_weight)
+                    / variant_count.max(1) as u128;
+                let score = (
+                    weighted_score,
+                    search_weight,
+                    usize::MAX - variant_count,
+                    slice.len(),
+                    usize::MAX - start,
+                );
                 if best.map(|current| score > current).unwrap_or(true) {
-                    best = Some((slice.len(), usize::MAX - variant_count, usize::MAX - start));
+                    best = Some(score);
                 }
             }
             end += step;
         }
     }
-    let Some((best_len, _inverse_variants, best_start_inverse)) = best else {
+    let Some((_weighted_score, _search_weight, _inverse_variants, best_len, best_start_inverse)) =
+        best
+    else {
         return Err(SspryError::from(
             "nocase literal expands too broadly for the active gram sizes",
         ));
@@ -5074,6 +5097,17 @@ rule nocase_anchor {
         assert!(nocase.patterns[0].alternatives.len() > 1);
         assert!(nocase.patterns[0].fixed_literals.iter().all(Vec::is_empty));
 
+        let balanced_nocase = derive_nocase_search_alternatives(
+            b"AbCdE-00!!",
+            false,
+            GramSizes {
+                tier2: DEFAULT_TIER2_GRAM_SIZE,
+                tier1: DEFAULT_TIER1_GRAM_SIZE,
+            },
+        )
+        .expect("balanced nocase");
+        assert_eq!(balanced_nocase.len(), 4);
+
         let short_nocase = compile_query_plan_default(
             r#"
 rule short_nocase_anchor {
@@ -5464,6 +5498,7 @@ rule parent_rule {
             u128::MAX
         );
     }
+
 
     #[test]
     fn tier2_gram_size_wrapper_helpers_work() {
