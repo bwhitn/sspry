@@ -5015,6 +5015,7 @@ type RequiredMasksByKey = BTreeMap<(usize, usize), Vec<(usize, u64)>>;
 struct ShiftedRequiredMasks {
     shifts: Vec<RequiredMasksByKey>,
     any_lane_values: Vec<Vec<RequiredMasksByKey>>,
+    any_lane_grams: Vec<u64>,
 }
 
 impl ShiftedRequiredMasks {
@@ -5024,6 +5025,7 @@ impl ShiftedRequiredMasks {
                 .any_lane_values
                 .iter()
                 .all(|lanes| lanes.iter().all(BTreeMap::is_empty))
+            && self.any_lane_grams.is_empty()
     }
 }
 
@@ -5036,6 +5038,7 @@ struct PreparedPatternMasks {
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
 
 const MAX_LANE_POSITION_VARIANTS: usize = 64;
+const PREPARED_QUERY_MASK_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
 fn required_masks_by_key_memory_bytes(masks: &RequiredMasksByKey) -> u64 {
     (masks.len() as u64)
@@ -5091,6 +5094,10 @@ fn shifted_required_masks_memory_bytes(masks: &ShiftedRequiredMasks) -> u64 {
                         )
                 })
                 .sum::<u64>(),
+        )
+        .saturating_add(
+            (masks.any_lane_grams.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<u64>() as u64),
         )
 }
 
@@ -5370,6 +5377,25 @@ fn build_any_lane_required_masks(
     Ok(out)
 }
 
+fn maybe_compact_any_lane_masks(
+    shifted: &mut ShiftedRequiredMasks,
+    values: &[u64],
+    current_budget_bytes: &mut u64,
+) {
+    let current_bytes = shifted_required_masks_memory_bytes(shifted);
+    if shifted.any_lane_values.is_empty()
+        || current_budget_bytes.saturating_add(current_bytes)
+            <= PREPARED_QUERY_MASK_CACHE_BUDGET_BYTES
+    {
+        *current_budget_bytes = current_budget_bytes.saturating_add(current_bytes);
+        return;
+    }
+    shifted.any_lane_values.clear();
+    shifted.any_lane_grams = values.to_vec();
+    *current_budget_bytes =
+        current_budget_bytes.saturating_add(shifted_required_masks_memory_bytes(shifted));
+}
+
 fn node_structurally_impossible(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "pattern" => false,
@@ -5437,6 +5463,7 @@ fn build_pattern_mask_cache(
         HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
     let mut tier2_gram_cache =
         HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
+    let mut current_budget_bytes = 0u64;
     for pattern in patterns {
         let mut tier1_masks = Vec::with_capacity(pattern.alternatives.len());
         for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
@@ -5484,6 +5511,11 @@ fn build_pattern_mask_cache(
                     shifted_tier1.shifts.push(by_key);
                 }
             }
+            maybe_compact_any_lane_masks(
+                &mut shifted_tier1,
+                alternative,
+                &mut current_budget_bytes,
+            );
             tier1_masks.push(shifted_tier1);
         }
 
@@ -5533,6 +5565,11 @@ fn build_pattern_mask_cache(
                     shifted_tier2.shifts.push(by_key);
                 }
             }
+            maybe_compact_any_lane_masks(
+                &mut shifted_tier2,
+                alternative,
+                &mut current_budget_bytes,
+            );
             tier2_masks.push(shifted_tier2);
         }
 
@@ -5671,6 +5708,56 @@ fn tree_gate_matches_shifted_required_masks(
 ) -> bool {
     if shifted.is_empty() {
         return true;
+    }
+    if !shifted.any_lane_grams.is_empty() {
+        if gates.masks_by_bucket.is_empty() {
+            if let Some(superblocks) = fallback_superblocks {
+                return shifted.any_lane_grams.iter().all(|value| {
+                    superblocks
+                        .bucket_for_key
+                        .keys()
+                        .any(|(filter_bytes, bloom_hashes)| {
+                            (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                                bloom_word_masks_in_lane(
+                                    &[*value],
+                                    *filter_bytes,
+                                    *bloom_hashes,
+                                    lane,
+                                    DEFAULT_BLOOM_POSITION_LANES,
+                                )
+                                .ok()
+                                .is_some_and(|required| {
+                                    let mut by_key = RequiredMasksByKey::new();
+                                    by_key.insert((*filter_bytes, *bloom_hashes), required);
+                                    tree_superblocks_match_required_masks(&by_key, superblocks)
+                                })
+                            })
+                        })
+                });
+            }
+            return true;
+        }
+        return shifted.any_lane_grams.iter().all(|value| {
+            gates
+                .bucket_for_key
+                .iter()
+                .any(|((filter_bytes, bloom_hashes), bucket_key)| {
+                    let Some(mask) = gates.masks_by_bucket.get(bucket_key) else {
+                        return false;
+                    };
+                    (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                        bloom_word_masks_in_lane(
+                            &[*value],
+                            *filter_bytes,
+                            *bloom_hashes,
+                            lane,
+                            DEFAULT_BLOOM_POSITION_LANES,
+                        )
+                        .ok()
+                        .is_some_and(|required| raw_filter_matches_word_masks(mask, &required))
+                    })
+                })
+        });
     }
     if !shifted.any_lane_values.is_empty() {
         return shifted.any_lane_values.iter().all(|lanes| {
@@ -5827,6 +5914,24 @@ fn block_matches_shifted_required_masks(
 ) -> bool {
     if shifted.is_empty() {
         return true;
+    }
+    if !shifted.any_lane_grams.is_empty() {
+        let Some(block) = superblocks.block_bytes(&bucket_key, block_idx) else {
+            return false;
+        };
+        return shifted.any_lane_grams.iter().all(|value| {
+            (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                bloom_word_masks_in_lane(
+                    &[*value],
+                    bucket_key.0,
+                    bucket_key.1,
+                    lane,
+                    DEFAULT_BLOOM_POSITION_LANES,
+                )
+                .ok()
+                .is_some_and(|required| raw_filter_matches_word_masks(block, &required))
+            })
+        });
     }
     if !shifted.any_lane_values.is_empty() {
         return shifted.any_lane_values.iter().all(|lanes| {
@@ -6031,7 +6136,23 @@ where
         if !alternative.is_empty() {
             let bloom_bytes = doc_inputs.tier1_bloom_bytes(load_tier1)?;
             let primary_match = pattern_masks.tier1.get(alt_index).is_some_and(|shifted| {
-                if !shifted.any_lane_values.is_empty() {
+                if !shifted.any_lane_grams.is_empty() {
+                    shifted.any_lane_grams.iter().all(|value| {
+                        (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                            bloom_word_masks_in_lane(
+                                &[*value],
+                                doc.filter_bytes,
+                                doc.bloom_hashes,
+                                lane,
+                                DEFAULT_BLOOM_POSITION_LANES,
+                            )
+                            .ok()
+                            .is_some_and(|required| {
+                                raw_filter_matches_word_masks(bloom_bytes, &required)
+                            })
+                        })
+                    })
+                } else if !shifted.any_lane_values.is_empty() {
                     shifted.any_lane_values.iter().all(|lanes| {
                         lanes.iter().any(|by_key| {
                             by_key
@@ -6067,7 +6188,23 @@ where
                 continue;
             }
             let tier2_match = pattern_masks.tier2.get(alt_index).is_some_and(|shifted| {
-                if !shifted.any_lane_values.is_empty() {
+                if !shifted.any_lane_grams.is_empty() {
+                    shifted.any_lane_grams.iter().all(|value| {
+                        (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                            bloom_word_masks_in_lane(
+                                &[*value],
+                                doc.tier2_filter_bytes,
+                                doc.tier2_bloom_hashes,
+                                lane,
+                                DEFAULT_BLOOM_POSITION_LANES,
+                            )
+                            .ok()
+                            .is_some_and(|required| {
+                                raw_filter_matches_word_masks(tier2_bloom_bytes, &required)
+                            })
+                        })
+                    })
+                } else if !shifted.any_lane_values.is_empty() {
                     shifted.any_lane_values.iter().all(|lanes| {
                         lanes.iter().any(|by_key| {
                             by_key
