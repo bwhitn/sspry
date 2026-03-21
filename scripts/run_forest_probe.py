@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -227,6 +228,73 @@ def write_snapshot(path: Path, snapshot: dict) -> dict:
     return snapshot
 
 
+def parse_smaps_rollup(pid: int) -> dict:
+    path = Path(f'/proc/{pid}/smaps_rollup')
+    out = {
+        'pid': pid,
+        'path': str(path),
+    }
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        out['error'] = str(exc)
+        return out
+    for line in lines:
+        if ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        number = value.strip().split()[0]
+        try:
+            out[key] = int(number)
+        except ValueError:
+            continue
+    return out
+
+
+def capture_server_sample(sspry: Path, addr: str, pid: int) -> dict:
+    sample = {
+        'timestamp_unix_s': time.time(),
+        'pid': pid,
+        'addr': addr,
+        'smaps_rollup': parse_smaps_rollup(pid),
+    }
+    proc = run([str(sspry), 'info', '--addr', addr, '--light'], capture_output=True)
+    sample['info_exit_code'] = proc.returncode
+    if proc.returncode == 0 and proc.stdout.strip():
+        try:
+            sample['info_light'] = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            sample['info_error'] = f'json decode failed: {exc}'
+            sample['info_stdout'] = proc.stdout
+    elif proc.stderr:
+        sample['info_stderr'] = proc.stderr
+    return sample
+
+
+def start_server_sampler(path: Path, sspry: Path, addr: str, pid: int, interval_s: float):
+    stop = threading.Event()
+    samples = []
+
+    def worker() -> None:
+        while True:
+            samples.append(capture_server_sample(sspry, addr, pid))
+            if stop.wait(interval_s):
+                break
+        path.write_text(json.dumps(samples, indent=2, sort_keys=True))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def stop_server_sampler(sampler) -> None:
+    if sampler is None:
+        return
+    stop, thread = sampler
+    stop.set()
+    thread.join(timeout=30)
+
+
 def drain_writeback(
     run_dir: Path,
     max_seconds: int,
@@ -417,6 +485,9 @@ def main() -> int:
     parser.add_argument('--drain-sleep-s', type=float, default=2.0)
     parser.add_argument('--drain-max-dirty-pages', type=int, default=131072)
     parser.add_argument('--drain-max-writeback-pages', type=int, default=8192)
+    parser.add_argument('--server-sample-interval-s', type=float, default=0.0)
+    parser.add_argument('--per-rule-server-snapshots', action='store_true')
+    parser.add_argument('--reuse-existing-db', action='store_true')
     args = parser.parse_args()
 
     sspry = Path(args.sspry)
@@ -432,8 +503,12 @@ def main() -> int:
 
     shutil.rmtree(run_dir, ignore_errors=True)
     run_dir.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(db_base, ignore_errors=True)
-    db_base.mkdir(parents=True, exist_ok=True)
+    if args.reuse_existing_db:
+        if not db_base.exists():
+            raise RuntimeError(f'--reuse-existing-db requested but DB base does not exist: {db_base}')
+    else:
+        shutil.rmtree(db_base, ignore_errors=True)
+        db_base.mkdir(parents=True, exist_ok=True)
 
     manifests = split_manifest(
         dataset_manifest,
@@ -454,6 +529,7 @@ def main() -> int:
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'drain_between_trees': args.drain_between_trees,
+        'reused_existing_db': args.reuse_existing_db,
         'trees': [],
     }
 
@@ -464,6 +540,29 @@ def main() -> int:
         tree_run_dir.mkdir(parents=True, exist_ok=True)
         db_root = db_base / tree_name
         addr = f'127.0.0.1:{args.base_port + idx}'
+        if args.reuse_existing_db:
+            tree_record = {
+                'tree': tree_name,
+                'addr': addr,
+                'manifest': str(manifest['path']),
+                'index_wall_seconds': 0.0,
+                'files': manifest['files'],
+                'manifest_bytes': manifest['bytes'],
+                'index_files_per_minute': 0.0,
+                'index_metrics': {},
+                'post_publish_info': {},
+                'dir_stats': dir_stats(db_root),
+                'system_before_index': {},
+                'system_after_publish': {},
+                'reused_existing_db': True,
+            }
+            forest_summary['trees'].append(tree_record)
+            print(
+                f"index.reuse tree={tree_name} addr={addr} manifest={manifest['path']} "
+                f"files={manifest['files']} db_bytes={tree_record['dir_stats']['db_bytes']}",
+                flush=True,
+            )
+            continue
         before_index = write_snapshot(tree_run_dir / 'system.before_index.json', system_snapshot())
         print(
             f"index.start tree={tree_name} addr={addr} manifest={manifest['path']} "
@@ -489,8 +588,17 @@ def main() -> int:
             stdout=(tree_run_dir / 'server.stdout').open('w'),
             stderr=(tree_run_dir / 'server.stderr').open('w'),
         )
+        sampler = None
         try:
             wait_for_server(sspry, addr, tree_run_dir / 'start.info.light.json')
+            if args.server_sample_interval_s > 0:
+                sampler = start_server_sampler(
+                    tree_run_dir / 'index.server_samples.json',
+                    sspry,
+                    addr,
+                    server.pid,
+                    args.server_sample_interval_s,
+                )
             started = time.monotonic()
             proc = run(
                 [
@@ -543,6 +651,7 @@ def main() -> int:
                 flush=True,
             )
         finally:
+            stop_server_sampler(sampler)
             shutdown_server(sspry, addr, server, tree_run_dir)
 
     search_servers = []
@@ -575,7 +684,16 @@ def main() -> int:
                 tree_run_dir / 'search.start.info.light.json',
                 attempts=args.search_server_start_attempts,
             )
-            search_servers.append((addr, server, tree_run_dir))
+            sampler = None
+            if args.server_sample_interval_s > 0:
+                sampler = start_server_sampler(
+                    tree_run_dir / 'search.server_samples.json',
+                    sspry,
+                    addr,
+                    server.pid,
+                    args.server_sample_interval_s,
+                )
+            search_servers.append((addr, server, tree_run_dir, sampler))
 
         searches_dir.mkdir(parents=True, exist_ok=True)
         search_summary = []
@@ -586,17 +704,22 @@ def main() -> int:
             print(f'search.rule.start rule={rule.name}', flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(search_servers)) as pool:
                 future_map = {
-                    pool.submit(run_search_one, sspry, addr, rule, args.search_timeout_s): (addr, tree_run_dir)
-                    for addr, _, tree_run_dir in search_servers
+                    pool.submit(run_search_one, sspry, addr, rule, args.search_timeout_s): (addr, tree_run_dir, server)
+                    for addr, server, tree_run_dir, _ in search_servers
                 }
                 for future in concurrent.futures.as_completed(future_map):
-                    addr, tree_run_dir = future_map[future]
+                    addr, tree_run_dir, server = future_map[future]
                     proc, elapsed_ms = future.result()
                     tree_dir = searches_dir / rule.stem
                     tree_dir.mkdir(parents=True, exist_ok=True)
                     safe_addr = addr.replace(':', '_').replace('.', '_')
                     (tree_dir / f'{safe_addr}.stdout').write_text(proc.stdout or '')
                     (tree_dir / f'{safe_addr}.stderr').write_text(proc.stderr or '')
+                    if args.per_rule_server_snapshots:
+                        sample = capture_server_sample(sspry, addr, server.pid)
+                        (tree_dir / f'{safe_addr}.server.sample.json').write_text(
+                            json.dumps(sample, indent=2, sort_keys=True)
+                        )
                     record = parse_search_result(rule, proc, elapsed_ms)
                     record['addr'] = addr
                     record['tree'] = tree_run_dir.name
@@ -611,7 +734,8 @@ def main() -> int:
             )
         (run_dir / 'search_summary.json').write_text(json.dumps(search_summary, indent=2, sort_keys=True))
     finally:
-        for addr, server, tree_run_dir in search_servers:
+        for addr, server, tree_run_dir, sampler in search_servers:
+            stop_server_sampler(sampler)
             shutdown_server(sspry, addr, server, tree_run_dir)
 
     forest_summary['total_index_wall_seconds'] = total_index_wall_s
