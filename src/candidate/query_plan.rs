@@ -112,6 +112,7 @@ const MAX_HEX_GROUP_ALTERNATIVES: usize = 16;
 const MAX_NOCASE_LITERAL_VARIANTS: usize = 32;
 const IGNORED_MODULE_PLACEHOLDER_PREFIX: &str = "ignoredmodulepred";
 const IGNORED_SEARCH_MODULES: &[&str] = &["androguard", "console", "cuckoo"];
+const RULE_DEP_PATTERN_PREFIX: &str = "__ruledep::";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RangeBoundExpr {
@@ -126,7 +127,26 @@ struct ConditionParser {
     index: usize,
     known_patterns: HashSet<String>,
     known_pattern_names: Vec<String>,
+    known_rule_names: HashSet<String>,
     active_identity_source: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedRuleBlock {
+    name: String,
+    is_private: bool,
+    strings_lines: Vec<String>,
+    condition_text: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RulePlanFragment {
+    pattern_alternatives: BTreeMap<String, Vec<Vec<u64>>>,
+    pattern_tier2_alternatives: BTreeMap<String, Vec<Vec<u64>>>,
+    pattern_fixed_literals: BTreeMap<String, Vec<Vec<u8>>>,
+    pattern_fixed_literal_wide: BTreeMap<String, Vec<bool>>,
+    pattern_fixed_literal_fullword: BTreeMap<String, Vec<bool>>,
+    root: Option<QueryNode>,
 }
 
 fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
@@ -192,9 +212,19 @@ fn ignored_search_module_name(name: &str) -> bool {
 }
 
 impl ConditionParser {
+    #[cfg(test)]
     fn new(
         text: &str,
         known_patterns: HashSet<String>,
+        active_identity_source: Option<&str>,
+    ) -> Result<Self> {
+        Self::new_with_rules(text, known_patterns, HashSet::new(), active_identity_source)
+    }
+
+    fn new_with_rules(
+        text: &str,
+        known_patterns: HashSet<String>,
+        known_rule_names: HashSet<String>,
         active_identity_source: Option<&str>,
     ) -> Result<Self> {
         let mut known_pattern_names = known_patterns.iter().cloned().collect::<Vec<_>>();
@@ -204,6 +234,7 @@ impl ConditionParser {
             index: 0,
             known_patterns,
             known_pattern_names,
+            known_rule_names,
             active_identity_source: active_identity_source.map(str::to_ascii_lowercase),
         })
     }
@@ -439,6 +470,14 @@ impl ConditionParser {
                         "Unsupported condition field: {field_name}"
                     )));
                 }
+                if self.known_rule_names.contains(&field_name) {
+                    return Ok(QueryNode {
+                        kind: "rule_ref".to_owned(),
+                        pattern_id: Some(field_name),
+                        threshold: None,
+                        children: Vec::new(),
+                    });
+                }
                 let normalized = normalize_query_metadata_field(&field_name)
                     .or_else(|| {
                         if field_name == "filesize" {
@@ -448,7 +487,15 @@ impl ConditionParser {
                         }
                     })
                     .ok_or_else(|| {
-                        SspryError::from(format!("Unsupported condition field: {field_name}"))
+                        if !field_name.contains('.') {
+                            SspryError::from(format!(
+                                "Condition references unknown rule: {field_name}"
+                            ))
+                        } else {
+                            SspryError::from(format!(
+                                "Unsupported condition field: {field_name}"
+                            ))
+                        }
                     })?;
                 if matches!(self.peek(), Some(Token::EqEq)) {
                     self.consume(Some(&Token::EqEq))?;
@@ -1268,6 +1315,124 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
             &condition_lines.join(" "),
         )),
     ))
+}
+
+fn match_rule_brace_span(text: &str, open_idx: usize) -> Result<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut index = open_idx;
+    let mut in_string = false;
+    let mut in_regex = false;
+    let mut regex_in_class = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        let next = bytes.get(index + 1).copied().map(char::from);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_regex {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '[' {
+                regex_in_class = true;
+            } else if ch == ']' && regex_in_class {
+                regex_in_class = false;
+            } else if ch == '/' && !regex_in_class {
+                in_regex = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                index += 1;
+            }
+            '/' if next != Some('/') && next != Some('*') => {
+                in_regex = true;
+                regex_in_class = false;
+                index += 1;
+            }
+            '{' => {
+                depth += 1;
+                index += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+                if depth == 0 {
+                    return Ok(index);
+                }
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    Err(SspryError::from("Unterminated rule block."))
+}
+
+fn parse_rule_blocks(rule_text: &str) -> Result<Vec<ParsedRuleBlock>> {
+    let sanitized = strip_rule_comments(rule_text);
+    let mut blocks = Vec::<ParsedRuleBlock>::new();
+    let mut offset = 0usize;
+    for line in sanitized.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        let Some(rule_idx) = tokens.iter().position(|token| *token == "rule") else {
+            continue;
+        };
+        if rule_idx + 1 >= tokens.len() {
+            continue;
+        }
+        if !tokens[..rule_idx]
+            .iter()
+            .all(|token| *token == "private" || *token == "global")
+        {
+            continue;
+        }
+        let name = tokens[rule_idx + 1].trim_end_matches('{').to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let open_idx = sanitized[line_start..]
+            .find('{')
+            .map(|value| line_start + value)
+            .ok_or_else(|| {
+                SspryError::from(format!("Rule {name} is missing an opening brace."))
+            })?;
+        let end_idx = match_rule_brace_span(&sanitized, open_idx)?;
+        let block_text = &sanitized[line_start..end_idx];
+        let (strings_lines, condition_text) = parse_rule_sections(block_text)?;
+        blocks.push(ParsedRuleBlock {
+            name,
+            is_private: tokens[..rule_idx].contains(&"private"),
+            strings_lines,
+            condition_text,
+        });
+    }
+    if blocks.is_empty() {
+        return Err(SspryError::from(
+            "Rule does not contain a parseable rule block.",
+        ));
+    }
+    Ok(blocks)
 }
 
 fn consume_parenthesized_span(chars: &[char], open_idx: usize) -> Option<usize> {
@@ -2979,25 +3144,215 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
     }
 }
 
-pub fn compile_query_plan_with_gram_sizes_and_identity_source(
-    rule_text: &str,
+fn namespace_pattern_id(rule_name: &str, pattern_id: &str) -> String {
+    format!("{RULE_DEP_PATTERN_PREFIX}{rule_name}::{pattern_id}")
+}
+
+fn merge_rule_fragment(into: &mut RulePlanFragment, other: &RulePlanFragment) -> Result<()> {
+    for (key, value) in &other.pattern_alternatives {
+        if let Some(existing) = into
+            .pattern_alternatives
+            .insert(key.clone(), value.clone())
+            && existing != *value
+        {
+            return Err(SspryError::from(format!(
+                "Conflicting pattern alternatives for {key}"
+            )));
+        }
+    }
+    for (key, value) in &other.pattern_tier2_alternatives {
+        if let Some(existing) = into
+            .pattern_tier2_alternatives
+            .insert(key.clone(), value.clone())
+            && existing != *value
+        {
+            return Err(SspryError::from(format!(
+                "Conflicting tier2 pattern alternatives for {key}"
+            )));
+        }
+    }
+    for (key, value) in &other.pattern_fixed_literals {
+        if let Some(existing) = into
+            .pattern_fixed_literals
+            .insert(key.clone(), value.clone())
+            && existing != *value
+        {
+            return Err(SspryError::from(format!(
+                "Conflicting fixed literals for {key}"
+            )));
+        }
+    }
+    for (key, value) in &other.pattern_fixed_literal_wide {
+        if let Some(existing) = into
+            .pattern_fixed_literal_wide
+            .insert(key.clone(), value.clone())
+            && existing != *value
+        {
+            return Err(SspryError::from(format!(
+                "Conflicting fixed literal wide flags for {key}"
+            )));
+        }
+    }
+    for (key, value) in &other.pattern_fixed_literal_fullword {
+        if let Some(existing) = into
+            .pattern_fixed_literal_fullword
+            .insert(key.clone(), value.clone())
+            && existing != *value
+        {
+            return Err(SspryError::from(format!(
+                "Conflicting fixed literal fullword flags for {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_local_pattern_ids(fragment: &RulePlanFragment) -> HashSet<String> {
+    fragment
+        .pattern_alternatives
+        .keys()
+        .filter(|key| !key.starts_with(RULE_DEP_PATTERN_PREFIX))
+        .cloned()
+        .collect()
+}
+
+fn rename_verifier_pattern_id(
+    kind: &str,
+    pattern_id: &str,
+    local_pattern_ids: &HashSet<String>,
+    rule_name: &str,
+) -> String {
+    match kind {
+        "pattern" | "identity_eq" => {
+            if local_pattern_ids.contains(pattern_id) {
+                namespace_pattern_id(rule_name, pattern_id)
+            } else {
+                pattern_id.to_owned()
+            }
+        }
+        "verifier_only_at" => {
+            if let Some((raw_id, offset)) = pattern_id.split_once('@')
+                && local_pattern_ids.contains(raw_id)
+            {
+                return format!("{}@{offset}", namespace_pattern_id(rule_name, raw_id));
+            }
+            pattern_id.to_owned()
+        }
+        "verifier_only_count" => {
+            let mut parts = pattern_id.split(':');
+            let prefix = parts.next();
+            let raw_id = parts.next();
+            let op = parts.next();
+            let value = parts.next();
+            if prefix == Some("count")
+                && let (Some(raw_id), Some(op), Some(value)) = (raw_id, op, value)
+                && local_pattern_ids.contains(raw_id)
+            {
+                return format!(
+                    "count:{}:{op}:{value}",
+                    namespace_pattern_id(rule_name, raw_id)
+                );
+            }
+            pattern_id.to_owned()
+        }
+        "verifier_only_in_range" => {
+            let mut parts = pattern_id.split(':');
+            let prefix = parts.next();
+            let raw_id = parts.next();
+            let start = parts.next();
+            let end = parts.next();
+            if prefix == Some("range")
+                && let (Some(raw_id), Some(start), Some(end)) = (raw_id, start, end)
+                && local_pattern_ids.contains(raw_id)
+            {
+                return format!(
+                    "range:{}:{start}:{end}",
+                    namespace_pattern_id(rule_name, raw_id)
+                );
+            }
+            pattern_id.to_owned()
+        }
+        "verifier_only_loop" => {
+            if local_pattern_ids.contains(pattern_id) {
+                namespace_pattern_id(rule_name, pattern_id)
+            } else {
+                pattern_id.to_owned()
+            }
+        }
+        _ => pattern_id.to_owned(),
+    }
+}
+
+fn rename_fragment_for_rule_dependency(fragment: &mut RulePlanFragment, rule_name: &str) {
+    let local_pattern_ids = collect_local_pattern_ids(fragment);
+    if local_pattern_ids.is_empty() {
+        return;
+    }
+    let rename_map = local_pattern_ids
+        .iter()
+        .map(|pattern_id| (pattern_id.clone(), namespace_pattern_id(rule_name, pattern_id)))
+        .collect::<HashMap<_, _>>();
+
+    let remap_map = |map: &mut BTreeMap<String, Vec<Vec<u64>>>| {
+        let mut next = BTreeMap::<String, Vec<Vec<u64>>>::new();
+        for (key, value) in std::mem::take(map) {
+            let new_key = rename_map.get(&key).cloned().unwrap_or(key);
+            next.insert(new_key, value);
+        }
+        *map = next;
+    };
+    remap_map(&mut fragment.pattern_alternatives);
+    remap_map(&mut fragment.pattern_tier2_alternatives);
+
+    let remap_bytes = |map: &mut BTreeMap<String, Vec<Vec<u8>>>| {
+        let mut next = BTreeMap::<String, Vec<Vec<u8>>>::new();
+        for (key, value) in std::mem::take(map) {
+            let new_key = rename_map.get(&key).cloned().unwrap_or(key);
+            next.insert(new_key, value);
+        }
+        *map = next;
+    };
+    remap_bytes(&mut fragment.pattern_fixed_literals);
+
+    let remap_bools = |map: &mut BTreeMap<String, Vec<bool>>| {
+        let mut next = BTreeMap::<String, Vec<bool>>::new();
+        for (key, value) in std::mem::take(map) {
+            let new_key = rename_map.get(&key).cloned().unwrap_or(key);
+            next.insert(new_key, value);
+        }
+        *map = next;
+    };
+    remap_bools(&mut fragment.pattern_fixed_literal_wide);
+    remap_bools(&mut fragment.pattern_fixed_literal_fullword);
+
+    fn recurse(
+        node: &mut QueryNode,
+        local_pattern_ids: &HashSet<String>,
+        rule_name: &str,
+    ) {
+        if let Some(pattern_id) = node.pattern_id.as_mut() {
+            *pattern_id =
+                rename_verifier_pattern_id(&node.kind, pattern_id, local_pattern_ids, rule_name);
+        }
+        for child in &mut node.children {
+            recurse(child, local_pattern_ids, rule_name);
+        }
+    }
+    if let Some(root) = fragment.root.as_mut() {
+        recurse(root, &local_pattern_ids, rule_name);
+    }
+}
+
+fn build_local_rule_fragment(
+    rule: &ParsedRuleBlock,
+    known_rule_names: HashSet<String>,
     gram_sizes: GramSizes,
     active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: usize,
-) -> Result<CompiledQueryPlan> {
-    let max_candidates = normalize_max_candidates(max_candidates);
-    let (strings_lines, condition_text) = parse_rule_sections(rule_text)?;
-    let mut pattern_alternatives = BTreeMap::<String, Vec<Vec<u64>>>::new();
-    let mut pattern_tier2_alternatives = BTreeMap::<String, Vec<Vec<u64>>>::new();
-    let mut pattern_fixed_literals = BTreeMap::<String, Vec<Vec<u8>>>::new();
-    let mut pattern_fixed_literal_wide = BTreeMap::<String, Vec<bool>>::new();
-    let mut pattern_fixed_literal_fullword = BTreeMap::<String, Vec<bool>>::new();
+) -> Result<RulePlanFragment> {
+    let mut fragment = RulePlanFragment::default();
     let mut next_anonymous_pattern_id = 0usize;
-    for line in strings_lines {
-        if let Some(def) = parse_literal_line(&line)? {
+    for line in &rule.strings_lines {
+        if let Some(def) = parse_literal_line(line)? {
             let pattern_id = if def.pattern_id == "$" {
                 let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
                 next_anonymous_pattern_id += 1;
@@ -3035,14 +3390,24 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
                     fullword_flags.push(*fullword);
                 }
             }
-            pattern_alternatives.insert(pattern_id.clone(), alternatives);
-            pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
-            pattern_fixed_literals.insert(pattern_id.clone(), fixed_literals);
-            pattern_fixed_literal_wide.insert(pattern_id.clone(), wide_flags);
-            pattern_fixed_literal_fullword.insert(pattern_id, fullword_flags);
+            fragment
+                .pattern_alternatives
+                .insert(pattern_id.clone(), alternatives);
+            fragment
+                .pattern_tier2_alternatives
+                .insert(pattern_id.clone(), tier2_alternatives);
+            fragment
+                .pattern_fixed_literals
+                .insert(pattern_id.clone(), fixed_literals);
+            fragment
+                .pattern_fixed_literal_wide
+                .insert(pattern_id.clone(), wide_flags);
+            fragment
+                .pattern_fixed_literal_fullword
+                .insert(pattern_id, fullword_flags);
             continue;
         }
-        if let Some(def) = parse_regex_line(&line, gram_sizes)? {
+        if let Some(def) = parse_regex_line(line, gram_sizes)? {
             let pattern_id = if def.pattern_id == "$" {
                 let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
                 next_anonymous_pattern_id += 1;
@@ -3065,15 +3430,25 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             } else {
                 vec![Vec::new(); def.alternatives.len()]
             };
-            pattern_alternatives.insert(pattern_id.clone(), alternatives);
-            pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
-            pattern_fixed_literals.insert(pattern_id.clone(), fixed_literals);
-            pattern_fixed_literal_wide.insert(pattern_id.clone(), def.wide_flags);
-            pattern_fixed_literal_fullword.insert(pattern_id, def.fullword_flags);
+            fragment
+                .pattern_alternatives
+                .insert(pattern_id.clone(), alternatives);
+            fragment
+                .pattern_tier2_alternatives
+                .insert(pattern_id.clone(), tier2_alternatives);
+            fragment
+                .pattern_fixed_literals
+                .insert(pattern_id.clone(), fixed_literals);
+            fragment
+                .pattern_fixed_literal_wide
+                .insert(pattern_id.clone(), def.wide_flags);
+            fragment
+                .pattern_fixed_literal_fullword
+                .insert(pattern_id, def.fullword_flags);
             continue;
         }
         if let Some((raw_pattern_id, alternatives, tier2_alternatives, fixed_literals)) =
-            parse_hex_line_to_grams(&line, gram_sizes)?
+            parse_hex_line_to_grams(line, gram_sizes)?
         {
             let pattern_id = if raw_pattern_id == "$" {
                 let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
@@ -3083,11 +3458,21 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
                 raw_pattern_id
             };
             let alt_count = alternatives.len();
-            pattern_alternatives.insert(pattern_id.clone(), alternatives);
-            pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
-            pattern_fixed_literals.insert(pattern_id.clone(), fixed_literals);
-            pattern_fixed_literal_wide.insert(pattern_id.clone(), vec![false; alt_count]);
-            pattern_fixed_literal_fullword.insert(pattern_id, vec![false; alt_count]);
+            fragment
+                .pattern_alternatives
+                .insert(pattern_id.clone(), alternatives);
+            fragment
+                .pattern_tier2_alternatives
+                .insert(pattern_id.clone(), tier2_alternatives);
+            fragment
+                .pattern_fixed_literals
+                .insert(pattern_id.clone(), fixed_literals);
+            fragment
+                .pattern_fixed_literal_wide
+                .insert(pattern_id.clone(), vec![false; alt_count]);
+            fragment
+                .pattern_fixed_literal_fullword
+                .insert(pattern_id, vec![false; alt_count]);
             continue;
         }
         return Err(SspryError::from(format!(
@@ -3096,30 +3481,108 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
         )));
     }
 
-    let mut parser = ConditionParser::new(
-        &condition_text,
-        pattern_alternatives.keys().cloned().collect(),
+    let mut parser = ConditionParser::new_with_rules(
+        &rule.condition_text,
+        fragment.pattern_alternatives.keys().cloned().collect(),
+        known_rule_names,
         active_identity_source,
     )?;
-    let mut root = prune_ignored_module_predicates(parser.parse()?).ok_or_else(|| {
+    fragment.root = Some(parser.parse()?);
+    Ok(fragment)
+}
+
+fn resolve_rule_refs(
+    node: &mut QueryNode,
+    fragment: &mut RulePlanFragment,
+    rules: &HashMap<String, ParsedRuleBlock>,
+    cache: &mut HashMap<String, RulePlanFragment>,
+    visiting: &mut HashSet<String>,
+    current_rule_name: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: usize,
+) -> Result<()> {
+    if node.kind == "rule_ref" {
+        let referenced = node
+            .pattern_id
+            .clone()
+            .ok_or_else(|| SspryError::from("Rule reference node is missing a rule name."))?;
+        let helper = compile_rule_fragment(
+            &referenced,
+            rules,
+            cache,
+            visiting,
+            current_rule_name,
+            gram_sizes,
+            active_identity_source,
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )?;
+        merge_rule_fragment(fragment, &helper)?;
+        *node = helper
+            .root
+            .clone()
+            .ok_or_else(|| SspryError::from(format!("Rule {referenced} compiled without a root.")))?;
+        return Ok(());
+    }
+    for child in &mut node.children {
+        resolve_rule_refs(
+            child,
+            fragment,
+            rules,
+            cache,
+            visiting,
+            current_rule_name,
+            gram_sizes,
+            active_identity_source,
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )?;
+    }
+    Ok(())
+}
+
+fn finalize_rule_fragment(
+    mut fragment: RulePlanFragment,
+    gram_sizes: GramSizes,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    _max_candidates: usize,
+) -> Result<RulePlanFragment> {
+    let mut root = prune_ignored_module_predicates(
+        fragment
+            .root
+            .take()
+            .ok_or_else(|| SspryError::from("Rule fragment is missing a root."))?,
+    )
+    .ok_or_else(|| {
         SspryError::from(
             "Rule condition does not contain searchable anchors after pruning ignored module predicates.",
         )
     })?;
+
     let mut next_numeric_anchor_id = 0usize;
     inject_numeric_read_anchor_patterns(
         &mut root,
-        &mut pattern_alternatives,
-        &mut pattern_tier2_alternatives,
-        &mut pattern_fixed_literals,
-        &mut pattern_fixed_literal_wide,
-        &mut pattern_fixed_literal_fullword,
+        &mut fragment.pattern_alternatives,
+        &mut fragment.pattern_tier2_alternatives,
+        &mut fragment.pattern_fixed_literals,
+        &mut fragment.pattern_fixed_literal_wide,
+        &mut fragment.pattern_fixed_literal_fullword,
         gram_sizes,
         &mut next_numeric_anchor_id,
     )?;
     let has_pattern = contains_pattern_node(&root);
     let has_identity = contains_identity_node(&root);
-    if pattern_alternatives.is_empty() && !has_identity {
+    if fragment.pattern_alternatives.is_empty() && !has_identity {
         return Err(SspryError::from(
             "Rule does not contain a strings section with supported entries.",
         ));
@@ -3129,23 +3592,27 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             "Verifier-only indexed conditions require an anchorable literal for the current gram sizes or another string/hex anchor.",
         ));
     }
-    reorder_or_nodes_for_selectivity(&mut root, &pattern_alternatives);
+    reorder_or_nodes_for_selectivity(&mut root, &fragment.pattern_alternatives);
     dedupe_or_nodes(&mut root);
     let mut branch_budgets = HashMap::<String, usize>::new();
     collect_or_branch_budgets(&root, max_anchors_per_alt, &mut branch_budgets);
 
     let mut patterns = Vec::new();
-    for (pattern_id, alternatives) in pattern_alternatives {
-        let tier2_alternatives = pattern_tier2_alternatives
+    for (pattern_id, alternatives) in std::mem::take(&mut fragment.pattern_alternatives) {
+        let tier2_alternatives = fragment
+            .pattern_tier2_alternatives
             .remove(&pattern_id)
             .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literals = pattern_fixed_literals
+        let fixed_literals = fragment
+            .pattern_fixed_literals
             .remove(&pattern_id)
             .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literal_wide = pattern_fixed_literal_wide
+        let fixed_literal_wide = fragment
+            .pattern_fixed_literal_wide
             .remove(&pattern_id)
             .unwrap_or_else(|| vec![false; alternatives.len()]);
-        let fixed_literal_fullword = pattern_fixed_literal_fullword
+        let fixed_literal_fullword = fragment
+            .pattern_fixed_literal_fullword
             .remove(&pattern_id)
             .unwrap_or_else(|| vec![false; alternatives.len()]);
         let (
@@ -3161,17 +3628,28 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             fixed_literal_wide,
             fixed_literal_fullword,
         );
-        let per_pattern_budget = branch_budgets
+        let budget = branch_budgets
             .get(&pattern_id)
             .copied()
-            .unwrap_or(max_anchors_per_alt);
+            .unwrap_or(max_anchors_per_alt)
+            .max(1);
         let optimized = alternatives
             .iter()
+            .zip(tier2_alternatives.iter())
             .zip(fixed_literals.iter())
-            .map(|(alt, fixed_literal)| {
-                optimize_grams(alt, fixed_literal, gram_sizes.tier1, per_pattern_budget)
+            .map(|((alt, tier2_alt), fixed_literal)| {
+                if allow_tier2_fallback
+                    && !force_tier1_only
+                    && alt.is_empty()
+                    && !tier2_alt.is_empty()
+                    && fixed_literal.is_empty()
+                {
+                    Vec::new()
+                } else {
+                    optimize_grams(alt, fixed_literal, gram_sizes.tier1, budget)
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
         patterns.push(PatternPlan {
             pattern_id,
             alternatives: optimized,
@@ -3181,7 +3659,223 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             fixed_literal_fullword,
         });
     }
+    fragment.root = Some(root);
+    fragment.pattern_alternatives = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.alternatives.clone()))
+        .collect();
+    fragment.pattern_tier2_alternatives = patterns
+        .iter()
+        .map(|pattern| {
+            (
+                pattern.pattern_id.clone(),
+                pattern.tier2_alternatives.clone(),
+            )
+        })
+        .collect();
+    fragment.pattern_fixed_literals = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literals.clone()))
+        .collect();
+    fragment.pattern_fixed_literal_wide = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literal_wide.clone()))
+        .collect();
+    fragment.pattern_fixed_literal_fullword = patterns
+        .iter()
+        .map(|pattern| {
+            (
+                pattern.pattern_id.clone(),
+                pattern.fixed_literal_fullword.clone(),
+            )
+        })
+        .collect();
+    // Rebuild the optimized patterns as maps above, then return the root-bearing fragment.
+    fragment.pattern_alternatives = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.alternatives.clone()))
+        .collect();
+    fragment.pattern_tier2_alternatives = patterns
+        .iter()
+        .map(|pattern| {
+            (
+                pattern.pattern_id.clone(),
+                pattern.tier2_alternatives.clone(),
+            )
+        })
+        .collect();
+    fragment.pattern_fixed_literals = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literals.clone()))
+        .collect();
+    fragment.pattern_fixed_literal_wide = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literal_wide.clone()))
+        .collect();
+    fragment.pattern_fixed_literal_fullword = patterns
+        .iter()
+        .map(|pattern| {
+            (
+                pattern.pattern_id.clone(),
+                pattern.fixed_literal_fullword.clone(),
+            )
+        })
+        .collect();
+    if !force_tier1_only {
+        // Keep the finalized patterns available to the outer compiler via the fragment maps.
+    }
+    Ok(fragment)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn compile_rule_fragment(
+    rule_name: &str,
+    rules: &HashMap<String, ParsedRuleBlock>,
+    cache: &mut HashMap<String, RulePlanFragment>,
+    visiting: &mut HashSet<String>,
+    root_rule_name: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: usize,
+) -> Result<RulePlanFragment> {
+    if rule_name != root_rule_name
+        && let Some(fragment) = cache.get(rule_name)
+    {
+        return Ok(fragment.clone());
+    }
+    let rule = rules.get(rule_name).ok_or_else(|| {
+        SspryError::from(format!("Condition references unknown rule: {rule_name}"))
+    })?;
+    if !visiting.insert(rule_name.to_owned()) {
+        return Err(SspryError::from(format!(
+            "Recursive rule reference cycle detected at {rule_name}"
+        )));
+    }
+    let known_rule_names = rules
+        .keys()
+        .filter(|name| name.as_str() != rule_name)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut fragment =
+        build_local_rule_fragment(rule, known_rule_names, gram_sizes, active_identity_source)?;
+    if let Some(mut root) = fragment.root.take() {
+        resolve_rule_refs(
+            &mut root,
+            &mut fragment,
+            rules,
+            cache,
+            visiting,
+            rule_name,
+            gram_sizes,
+            active_identity_source,
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )?;
+        fragment.root = Some(root);
+    }
+    let mut fragment = finalize_rule_fragment(
+        fragment,
+        gram_sizes,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )?;
+    if rule_name != root_rule_name {
+        rename_fragment_for_rule_dependency(&mut fragment, rule_name);
+        cache.insert(rule_name.to_owned(), fragment.clone());
+    }
+    visiting.remove(rule_name);
+    Ok(fragment)
+}
+
+pub fn compile_query_plan_with_gram_sizes_and_identity_source(
+    rule_text: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: usize,
+) -> Result<CompiledQueryPlan> {
+    let max_candidates = normalize_max_candidates(max_candidates);
+    let rule_blocks = parse_rule_blocks(rule_text)?;
+    let root_rule_name = rule_blocks
+        .iter()
+        .find(|rule| !rule.is_private)
+        .or_else(|| rule_blocks.first())
+        .map(|rule| rule.name.clone())
+        .ok_or_else(|| SspryError::from("Rule file does not contain a compilable rule."))?;
+    let rules = rule_blocks
+        .into_iter()
+        .map(|rule| (rule.name.clone(), rule))
+        .collect::<HashMap<_, _>>();
+    let mut cache = HashMap::<String, RulePlanFragment>::new();
+    let mut visiting = HashSet::<String>::new();
+    let fragment = compile_rule_fragment(
+        &root_rule_name,
+        &rules,
+        &mut cache,
+        &mut visiting,
+        &root_rule_name,
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )?;
+    let root = fragment
+        .root
+        .clone()
+        .ok_or_else(|| SspryError::from("Compiled rule fragment is missing a root."))?;
+    let mut pattern_ids = fragment
+        .pattern_alternatives
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    pattern_ids.sort();
+    let mut patterns = Vec::with_capacity(pattern_ids.len());
+    for pattern_id in pattern_ids {
+        let alternatives = fragment
+            .pattern_alternatives
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_default();
+        let tier2_alternatives = fragment
+            .pattern_tier2_alternatives
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let fixed_literals = fragment
+            .pattern_fixed_literals
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let fixed_literal_wide = fragment
+            .pattern_fixed_literal_wide
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![false; alternatives.len()]);
+        let fixed_literal_fullword = fragment
+            .pattern_fixed_literal_fullword
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![false; alternatives.len()]);
+        patterns.push(PatternPlan {
+            pattern_id,
+            alternatives,
+            tier2_alternatives,
+            fixed_literals,
+            fixed_literal_wide,
+            fixed_literal_fullword,
+        });
+    }
     Ok(CompiledQueryPlan {
         patterns,
         root,
@@ -4580,6 +5274,49 @@ rule disk_rule {
     }
 
     #[test]
+    fn compile_query_plan_inlines_sibling_rule_references() {
+        let rule = r#"
+rule parent_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and helper_rule
+}
+
+private rule helper_rule {
+  strings:
+    $b = "WXYZ"
+  condition:
+    $b
+}
+"#;
+        let plan = compile_query_plan_default(rule, 4, false, true, 100_000).expect("plan");
+        let pattern_ids = plan
+            .patterns
+            .iter()
+            .map(|pattern| pattern.pattern_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(pattern_ids.contains("$a"));
+        assert!(pattern_ids.contains("__ruledep::helper_rule::$b"));
+        assert!(contains_pattern_node(&plan.root));
+    }
+
+    #[test]
+    fn compile_query_plan_reports_missing_rule_reference() {
+        let rule = r#"
+rule parent_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and missing_helper
+}
+"#;
+        let err = compile_query_plan_default(rule, 4, false, true, 100_000)
+            .expect_err("missing helper should fail");
+        assert!(err.to_string().contains("Condition references unknown rule"));
+    }
+
+    #[test]
     fn parser_and_helper_edge_cases_cover_remaining_branches() {
         let mut parser =
             ConditionParser::new("$a", HashSet::from(["$a".to_owned()]), None).expect("parser");
@@ -4629,9 +5366,9 @@ rule disk_rule {
         assert!(
             parser
                 .parse()
-                .expect_err("unsupported condition field")
+                .expect_err("unknown rule")
                 .to_string()
-                .contains("Unsupported condition field")
+                .contains("Condition references unknown rule")
         );
 
         assert!(
