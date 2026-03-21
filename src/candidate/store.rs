@@ -5030,9 +5030,7 @@ impl ShiftedRequiredMasks {
 #[derive(Clone, Debug, Default)]
 struct PreparedPatternMasks {
     tier1: Vec<ShiftedRequiredMasks>,
-    tier1_superblocks: Vec<ShiftedRequiredMasks>,
     tier2: Vec<ShiftedRequiredMasks>,
-    tier2_superblocks: Vec<ShiftedRequiredMasks>,
 }
 
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
@@ -5110,34 +5108,12 @@ fn prepared_pattern_masks_memory_bytes(masks: &PreparedPatternMasks) -> u64 {
                 .sum::<u64>(),
         )
         .saturating_add(
-            (masks.tier1_superblocks.capacity() as u64)
-                .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
-        )
-        .saturating_add(
-            masks
-                .tier1_superblocks
-                .iter()
-                .map(shifted_required_masks_memory_bytes)
-                .sum::<u64>(),
-        )
-        .saturating_add(
             (masks.tier2.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
         )
         .saturating_add(
             masks
                 .tier2
-                .iter()
-                .map(shifted_required_masks_memory_bytes)
-                .sum::<u64>(),
-        )
-        .saturating_add(
-            (masks.tier2_superblocks.capacity() as u64)
-                .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
-        )
-        .saturating_add(
-            masks
-                .tier2_superblocks
                 .iter()
                 .map(shifted_required_masks_memory_bytes)
                 .sum::<u64>(),
@@ -5463,7 +5439,6 @@ fn build_pattern_mask_cache(
         HashMap::<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>::new();
     for pattern in patterns {
         let mut tier1_masks = Vec::with_capacity(pattern.alternatives.len());
-        let mut tier1_superblock_masks = Vec::with_capacity(pattern.alternatives.len());
         for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
             let fixed_literal = pattern
                 .fixed_literals
@@ -5471,7 +5446,6 @@ fn build_pattern_mask_cache(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut shifted_tier1 = ShiftedRequiredMasks::default();
-            let mut shifted_tier1_superblocks = ShiftedRequiredMasks::default();
             if fixed_literal.is_empty()
                 || fixed_literal.len() < tier1_gram_size
                 || exact_pattern_has_ambiguous_positions(
@@ -5486,12 +5460,6 @@ fn build_pattern_mask_cache(
                     DEFAULT_BLOOM_POSITION_LANES,
                     &mut tier1_gram_cache,
                 )?;
-                shifted_tier1_superblocks.any_lane_values = build_any_lane_required_masks(
-                    alternative,
-                    tier1_filter_keys,
-                    DEFAULT_BLOOM_POSITION_LANES,
-                    &mut tier1_gram_cache,
-                )?;
             } else {
                 let lane_variants = lane_position_variants_for_pattern(
                     alternative,
@@ -5500,10 +5468,8 @@ fn build_pattern_mask_cache(
                     DEFAULT_BLOOM_POSITION_LANES,
                 );
                 shifted_tier1.shifts = Vec::with_capacity(lane_variants.len());
-                shifted_tier1_superblocks.shifts = Vec::with_capacity(lane_variants.len());
                 for lanes in &lane_variants {
                     let mut by_key = RequiredMasksByKey::new();
-                    let mut superblock_by_key = RequiredMasksByKey::new();
                     for (filter_bytes, bloom_hashes) in tier1_filter_keys {
                         let required = merge_cached_lane_bloom_word_masks(
                             alternative,
@@ -5513,19 +5479,15 @@ fn build_pattern_mask_cache(
                             DEFAULT_BLOOM_POSITION_LANES,
                             &mut tier1_gram_cache,
                         )?;
-                        superblock_by_key.insert((*filter_bytes, *bloom_hashes), required.clone());
                         by_key.insert((*filter_bytes, *bloom_hashes), required);
                     }
                     shifted_tier1.shifts.push(by_key);
-                    shifted_tier1_superblocks.shifts.push(superblock_by_key);
                 }
             }
             tier1_masks.push(shifted_tier1);
-            tier1_superblock_masks.push(shifted_tier1_superblocks);
         }
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
-        let mut tier2_superblock_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
         for (alt_index, alternative) in pattern.tier2_alternatives.iter().enumerate() {
             let fixed_literal = pattern
                 .fixed_literals
@@ -5533,7 +5495,6 @@ fn build_pattern_mask_cache(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut shifted_tier2 = ShiftedRequiredMasks::default();
-            let mut shifted_tier2_superblocks = ShiftedRequiredMasks::default();
             if fixed_literal.is_empty()
                 || fixed_literal.len() < tier2_gram_size
                 || exact_pattern_has_ambiguous_positions(
@@ -5548,12 +5509,6 @@ fn build_pattern_mask_cache(
                     DEFAULT_BLOOM_POSITION_LANES,
                     &mut tier2_gram_cache,
                 )?;
-                shifted_tier2_superblocks.any_lane_values = build_any_lane_required_masks(
-                    alternative,
-                    tier2_filter_keys,
-                    DEFAULT_BLOOM_POSITION_LANES,
-                    &mut tier2_gram_cache,
-                )?;
             } else {
                 let lane_variants = lane_position_variants_for_pattern(
                     alternative,
@@ -5562,10 +5517,8 @@ fn build_pattern_mask_cache(
                     DEFAULT_BLOOM_POSITION_LANES,
                 );
                 shifted_tier2.shifts = Vec::with_capacity(lane_variants.len());
-                shifted_tier2_superblocks.shifts = Vec::with_capacity(lane_variants.len());
                 for lanes in &lane_variants {
                     let mut by_key = RequiredMasksByKey::new();
-                    let mut superblock_by_key = RequiredMasksByKey::new();
                     for (filter_bytes, bloom_hashes) in tier2_filter_keys {
                         let required = merge_cached_lane_bloom_word_masks(
                             alternative,
@@ -5575,24 +5528,19 @@ fn build_pattern_mask_cache(
                             DEFAULT_BLOOM_POSITION_LANES,
                             &mut tier2_gram_cache,
                         )?;
-                        superblock_by_key.insert((*filter_bytes, *bloom_hashes), required.clone());
                         by_key.insert((*filter_bytes, *bloom_hashes), required);
                     }
                     shifted_tier2.shifts.push(by_key);
-                    shifted_tier2_superblocks.shifts.push(superblock_by_key);
                 }
             }
             tier2_masks.push(shifted_tier2);
-            tier2_superblock_masks.push(shifted_tier2_superblocks);
         }
 
         out.insert(
             pattern.pattern_id.clone(),
             PreparedPatternMasks {
                 tier1: tier1_masks,
-                tier1_superblocks: tier1_superblock_masks,
                 tier2: tier2_masks,
-                tier2_superblocks: tier2_superblock_masks,
             },
         );
     }
@@ -5906,7 +5854,7 @@ fn block_matches_pattern(
         return false;
     };
     pattern_masks
-        .tier1_superblocks
+        .tier1
         .iter()
         .enumerate()
         .any(|(alt_index, tier1_by_key)| {
@@ -5918,7 +5866,7 @@ fn block_matches_pattern(
             ) {
                 return false;
             }
-            let Some(tier2_by_key) = pattern_masks.tier2_superblocks.get(alt_index) else {
+            let Some(tier2_by_key) = pattern_masks.tier2.get(alt_index) else {
                 return true;
             };
             if !allow_tier2 || tier2_by_key.is_empty() {
@@ -6676,7 +6624,6 @@ mod tests {
         .expect("mask cache");
         let pattern_masks = cache.get("$a").expect("pattern masks");
         assert!(pattern_masks.tier1[0].is_empty());
-        assert!(pattern_masks.tier1_superblocks[0].is_empty());
         assert!(!pattern_masks.tier2[0].is_empty());
 
         let mut tier2_gates = TreeBloomGateIndex::default();
