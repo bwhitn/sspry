@@ -107,6 +107,7 @@ enum NumericReadKind {
 }
 
 const NUMERIC_READ_ANCHOR_PREFIX: &str = "__numeric_eq_anchor_";
+const ANONYMOUS_PATTERN_PREFIX: &str = "$__anon_";
 const MAX_HEX_GROUP_ALTERNATIVES: usize = 16;
 const MAX_NOCASE_LITERAL_VARIANTS: usize = 32;
 const IGNORED_MODULE_PLACEHOLDER_PREFIX: &str = "ignoredmodulepred";
@@ -130,7 +131,7 @@ struct ConditionParser {
 
 fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
     match (name, offset, value) {
-        ("uint16", 0, 0x5a4d) | ("uint16be", 0, 0x4d5a) => Some("pe.is_pe"),
+        ("uint16", 0, 0x5a4d) | ("uint16be", 0, 0x4d5a) => Some("mz.is_mz"),
         ("uint16", 0, 0x457f)
         | ("uint16be", 0, 0x7f45)
         | ("uint32", 0, 0x464c457f)
@@ -391,6 +392,9 @@ impl ConditionParser {
                 }
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.consume(Some(&Token::LParen))?;
+                    if field_name == "verifierloop" {
+                        return self.parse_verifier_only_loop();
+                    }
                     if field_name.starts_with("hash.") {
                         return self.parse_hash_identity_equality(&field_name);
                     }
@@ -619,6 +623,39 @@ impl ConditionParser {
             ))),
             None => Err(SspryError::from("Unexpected end of condition.")),
         }
+    }
+
+    fn parse_verifier_only_loop(&mut self) -> Result<QueryNode> {
+        let Token::Id(raw_id) = self.consume(None)? else {
+            return Err(SspryError::from(
+                "verifierloop requires a string id anchor argument.",
+            ));
+        };
+        if !self.known_patterns.contains(&raw_id) {
+            return Err(SspryError::from(format!(
+                "Condition references unknown string id: {raw_id}"
+            )));
+        }
+        self.consume(Some(&Token::RParen))?;
+        Ok(QueryNode {
+            kind: "and".to_owned(),
+            pattern_id: None,
+            threshold: None,
+            children: vec![
+                QueryNode {
+                    kind: "pattern".to_owned(),
+                    pattern_id: Some(raw_id.clone()),
+                    threshold: None,
+                    children: Vec::new(),
+                },
+                QueryNode {
+                    kind: "verifier_only_loop".to_owned(),
+                    pattern_id: Some(raw_id),
+                    threshold: None,
+                    children: Vec::new(),
+                },
+            ],
+        })
     }
 
     fn parse_n_of_expression(&mut self, threshold: usize) -> Result<QueryNode> {
@@ -1227,7 +1264,9 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
     }
     Ok((
         strings_lines,
-        rewrite_ignored_module_calls(&condition_lines.join(" ")),
+        rewrite_verifier_only_for_any_loops(&rewrite_ignored_module_calls(
+            &condition_lines.join(" "),
+        )),
     ))
 }
 
@@ -1336,6 +1375,113 @@ fn rewrite_ignored_module_calls(condition_text: &str) -> String {
     out
 }
 
+fn rewrite_verifier_only_for_any_loops(condition_text: &str) -> String {
+    let chars = condition_text.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(condition_text.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        if let Some((end, pattern_id)) = consume_verifier_only_for_any_loop(&chars, index) {
+            out.push_str("verifierloop(");
+            out.push_str(&pattern_id);
+            out.push(')');
+            index = end;
+            continue;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+fn skip_condition_ws(chars: &[char], mut index: usize) -> usize {
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn consume_condition_keyword(chars: &[char], index: usize, keyword: &str) -> Option<usize> {
+    let end = index.checked_add(keyword.len())?;
+    if end > chars.len() {
+        return None;
+    }
+    if !chars[index..end]
+        .iter()
+        .collect::<String>()
+        .eq_ignore_ascii_case(keyword)
+    {
+        return None;
+    }
+    if index > 0
+        && (chars[index - 1].is_ascii_alphanumeric()
+            || chars[index - 1] == '_'
+            || chars[index - 1] == '$')
+    {
+        return None;
+    }
+    if end < chars.len()
+        && (chars[end].is_ascii_alphanumeric() || chars[end] == '_' || chars[end] == '$')
+    {
+        return None;
+    }
+    Some(end)
+}
+
+fn consume_condition_identifier(chars: &[char], index: usize) -> Option<(usize, String)> {
+    if index >= chars.len() || !(chars[index].is_ascii_alphabetic() || chars[index] == '_') {
+        return None;
+    }
+    let mut end = index + 1;
+    while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    Some((end, chars[index..end].iter().collect()))
+}
+
+fn consume_verifier_only_for_any_loop(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let mut index = consume_condition_keyword(chars, start, "for")?;
+    index = skip_condition_ws(chars, index);
+    index = consume_condition_keyword(chars, index, "any")?;
+    index = skip_condition_ws(chars, index);
+    let (next, _loop_var) = consume_condition_identifier(chars, index)?;
+    index = skip_condition_ws(chars, next);
+    index = consume_condition_keyword(chars, index, "in")?;
+    index = skip_condition_ws(chars, index);
+    if chars.get(index) != Some(&'(') {
+        return None;
+    }
+    index += 1;
+    index = skip_condition_ws(chars, index);
+    if chars.get(index) != Some(&'1') {
+        return None;
+    }
+    index += 1;
+    index = skip_condition_ws(chars, index);
+    if chars.get(index) != Some(&'.') || chars.get(index + 1) != Some(&'.') {
+        return None;
+    }
+    index += 2;
+    index = skip_condition_ws(chars, index);
+    if chars.get(index) != Some(&'#') {
+        return None;
+    }
+    index += 1;
+    let (next, pattern_name) = consume_condition_identifier(chars, index)?;
+    index = skip_condition_ws(chars, next);
+    if chars.get(index) != Some(&')') {
+        return None;
+    }
+    index += 1;
+    index = skip_condition_ws(chars, index);
+    if chars.get(index) != Some(&':') {
+        return None;
+    }
+    index += 1;
+    index = skip_condition_ws(chars, index);
+    let end = consume_parenthesized_span(chars, index)?;
+    Some((end, format!("${pattern_name}")))
+}
+
 fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
     match node.kind.as_str() {
         "ignored_module_predicate" => None,
@@ -1350,7 +1496,8 @@ fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
         | "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
-        | "verifier_only_in_range" => Some(node),
+        | "verifier_only_in_range"
+        | "verifier_only_loop" => Some(node),
         "not" => node
             .children
             .into_iter()
@@ -1907,7 +2054,11 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
                 }
                 RegexAtom::Candidate if min_repeat > 0 => {
                     flush_current(&mut current, &mut runs);
-                    runs.push(candidate_bytes);
+                    let mut repeated = Vec::with_capacity(candidate_bytes.len() * min_repeat);
+                    for _ in 0..min_repeat {
+                        repeated.extend_from_slice(&candidate_bytes);
+                    }
+                    runs.push(repeated);
                 }
                 RegexAtom::Literal(_) | RegexAtom::Variable | RegexAtom::Candidate => {
                     flush_current(&mut current, &mut runs);
@@ -1989,7 +2140,12 @@ fn derive_nocase_search_alternatives(
     wide: bool,
     gram_sizes: GramSizes,
 ) -> Result<Vec<Vec<u8>>> {
-    if literal.len() < gram_sizes.tier1 {
+    let min_search_len = [gram_sizes.tier2, gram_sizes.tier1]
+        .into_iter()
+        .filter(|size| !wide || size % 2 == 0)
+        .min()
+        .unwrap_or(gram_sizes.tier1);
+    if literal.len() < min_search_len {
         return Err(SspryError::from(
             "nocase literal does not contain an anchorable window for the active gram sizes",
         ));
@@ -1999,8 +2155,8 @@ fn derive_nocase_search_alternatives(
     }
     let step = if wide { 2 } else { 1 };
     let mut best: Option<(usize, usize, usize)> = None;
-    for start in (0..=literal.len() - gram_sizes.tier1).step_by(step) {
-        let mut end = start + gram_sizes.tier1;
+    for start in (0..=literal.len() - min_search_len).step_by(step) {
+        let mut end = start + min_search_len;
         while end <= literal.len() {
             if wide && (end - start) % 2 != 0 {
                 end += 1;
@@ -2634,7 +2790,11 @@ fn inject_numeric_read_anchor_patterns(
 fn contains_verifier_only_node(node: &QueryNode) -> bool {
     matches!(
         node.kind.as_str(),
-        "verifier_only_eq" | "verifier_only_at" | "verifier_only_count" | "verifier_only_in_range"
+        "verifier_only_eq"
+            | "verifier_only_at"
+            | "verifier_only_count"
+            | "verifier_only_in_range"
+            | "verifier_only_loop"
     ) || node.children.iter().any(contains_verifier_only_node)
 }
 
@@ -2727,6 +2887,9 @@ pub fn evaluate_fixed_literal_match(
         "verifier_only_in_range" => Err(SspryError::from(
             "verifier_only_in_range requires file verification and cannot use the fixed-literal fast path",
         )),
+        "verifier_only_loop" => Err(SspryError::from(
+            "verifier_only_loop requires file verification and cannot use the fixed-literal fast path",
+        )),
         "identity_eq" => Err(SspryError::from(
             "identity_eq requires DB identity lookup and cannot use the fixed-literal fast path",
         )),
@@ -2798,7 +2961,8 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
         | "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
-        | "verifier_only_in_range" => u128::MAX / 2,
+        | "verifier_only_in_range"
+        | "verifier_only_loop" => u128::MAX / 2,
         "or" => node
             .children
             .iter()
@@ -2831,8 +2995,16 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     let mut pattern_fixed_literals = BTreeMap::<String, Vec<Vec<u8>>>::new();
     let mut pattern_fixed_literal_wide = BTreeMap::<String, Vec<bool>>::new();
     let mut pattern_fixed_literal_fullword = BTreeMap::<String, Vec<bool>>::new();
+    let mut next_anonymous_pattern_id = 0usize;
     for line in strings_lines {
         if let Some(def) = parse_literal_line(&line)? {
+            let pattern_id = if def.pattern_id == "$" {
+                let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
+                next_anonymous_pattern_id += 1;
+                id
+            } else {
+                def.pattern_id.clone()
+            };
             let mut alternatives = Vec::new();
             let mut tier2_alternatives = Vec::new();
             let mut fixed_literals = Vec::new();
@@ -2863,14 +3035,21 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
                     fullword_flags.push(*fullword);
                 }
             }
-            pattern_alternatives.insert(def.pattern_id.clone(), alternatives);
-            pattern_tier2_alternatives.insert(def.pattern_id.clone(), tier2_alternatives);
-            pattern_fixed_literals.insert(def.pattern_id.clone(), fixed_literals);
-            pattern_fixed_literal_wide.insert(def.pattern_id.clone(), wide_flags);
-            pattern_fixed_literal_fullword.insert(def.pattern_id, fullword_flags);
+            pattern_alternatives.insert(pattern_id.clone(), alternatives);
+            pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
+            pattern_fixed_literals.insert(pattern_id.clone(), fixed_literals);
+            pattern_fixed_literal_wide.insert(pattern_id.clone(), wide_flags);
+            pattern_fixed_literal_fullword.insert(pattern_id, fullword_flags);
             continue;
         }
         if let Some(def) = parse_regex_line(&line, gram_sizes)? {
+            let pattern_id = if def.pattern_id == "$" {
+                let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
+                next_anonymous_pattern_id += 1;
+                id
+            } else {
+                def.pattern_id.clone()
+            };
             let alternatives = def
                 .alternatives
                 .iter()
@@ -2886,16 +3065,23 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             } else {
                 vec![Vec::new(); def.alternatives.len()]
             };
-            pattern_alternatives.insert(def.pattern_id.clone(), alternatives);
-            pattern_tier2_alternatives.insert(def.pattern_id.clone(), tier2_alternatives);
-            pattern_fixed_literals.insert(def.pattern_id.clone(), fixed_literals);
-            pattern_fixed_literal_wide.insert(def.pattern_id.clone(), def.wide_flags);
-            pattern_fixed_literal_fullword.insert(def.pattern_id, def.fullword_flags);
+            pattern_alternatives.insert(pattern_id.clone(), alternatives);
+            pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
+            pattern_fixed_literals.insert(pattern_id.clone(), fixed_literals);
+            pattern_fixed_literal_wide.insert(pattern_id.clone(), def.wide_flags);
+            pattern_fixed_literal_fullword.insert(pattern_id, def.fullword_flags);
             continue;
         }
-        if let Some((pattern_id, alternatives, tier2_alternatives, fixed_literals)) =
+        if let Some((raw_pattern_id, alternatives, tier2_alternatives, fixed_literals)) =
             parse_hex_line_to_grams(&line, gram_sizes)?
         {
+            let pattern_id = if raw_pattern_id == "$" {
+                let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
+                next_anonymous_pattern_id += 1;
+                id
+            } else {
+                raw_pattern_id
+            };
             let alt_count = alternatives.len();
             pattern_alternatives.insert(pattern_id.clone(), alternatives);
             pattern_tier2_alternatives.insert(pattern_id.clone(), tier2_alternatives);
@@ -3375,7 +3561,7 @@ rule header_magic {
         assert_eq!(plan.root.kind, "and");
         assert!(plan.root.children.iter().any(|child| {
             child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("pe.is_pe")
+                && child.pattern_id.as_deref() == Some("mz.is_mz")
                 && child.threshold == Some(1)
         }));
         assert!(plan.root.children.iter().any(|child| {
@@ -3743,6 +3929,37 @@ rule numeric_only_unanchorable {
                 .contains("Unexpected end of condition")
         );
 
+        let plan = compile_query_plan_default(
+            r#"
+rule anon {
+  strings:
+    $ = "AAAA"
+    $ = "BBBB"
+    $ = { 43 43 43 43 }
+  condition:
+    any of them
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("anonymous strings plan");
+        assert_eq!(plan.patterns.len(), 3);
+        assert_eq!(plan.root.kind, "n_of");
+        assert_eq!(plan.root.threshold, Some(1));
+        assert_eq!(plan.root.children.len(), 3);
+        let mut ids = plan
+            .patterns
+            .iter()
+            .map(|pattern| pattern.pattern_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| id.starts_with(ANONYMOUS_PATTERN_PREFIX)));
+
         let (strings, condition) = parse_rule_sections(
             r#"
 rule sample {
@@ -3788,6 +4005,18 @@ rule empty {
         .expect("condition-only rule");
         assert!(strings.is_empty());
         assert_eq!(condition.trim(), "true");
+        let (_strings, condition) = parse_rule_sections(
+            r#"
+rule looped {
+  strings:
+    $a = { FF 75 ?? FF 55 ?? }
+  condition:
+    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
+}
+"#,
+        )
+        .expect("for-any loop rewrite");
+        assert_eq!(condition.trim(), "verifierloop($a)");
         assert!(
             parse_rule_sections(
                 r#"
@@ -3962,6 +4191,15 @@ rule empty {
         .expect("regex parse")
         .expect("regex pattern");
         assert_eq!(grouped.alternatives, vec![b"fooba".to_vec()]);
+
+        let repeated_group = parse_regex_line(
+            r#"$r = /(90){2,20}/"#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+        )
+        .expect("regex parse")
+        .expect("regex pattern");
+        assert_eq!(repeated_group.alternatives, vec![b"9090".to_vec()]);
     }
 
     #[test]
@@ -4098,6 +4336,31 @@ rule verifier_constraints {
                     .any(|grandchild| grandchild.kind == "verifier_only_count")
         }));
 
+        let verifier_loop = compile_query_plan_default(
+            r#"
+rule verifier_loop {
+  strings:
+    $a = { FF 75 ?? FF 55 ?? }
+  condition:
+    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile verifier-only loop");
+        assert_eq!(verifier_loop.patterns.len(), 1);
+        assert_eq!(verifier_loop.root.kind, "and");
+        assert!(
+            verifier_loop
+                .root
+                .children
+                .iter()
+                .any(|child| child.kind == "verifier_only_loop")
+        );
+
         let nocase = compile_query_plan_default(
             r#"
 rule nocase_anchor {
@@ -4116,6 +4379,31 @@ rule nocase_anchor {
         assert_eq!(nocase.patterns.len(), 1);
         assert!(nocase.patterns[0].alternatives.len() > 1);
         assert!(nocase.patterns[0].fixed_literals.iter().all(Vec::is_empty));
+
+        let short_nocase = compile_query_plan_default(
+            r#"
+rule short_nocase_anchor {
+  strings:
+    $a = ".js" nocase
+  condition:
+    $a
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile short nocase");
+        assert_eq!(short_nocase.patterns.len(), 1);
+        assert!(short_nocase.patterns[0].alternatives.len() > 1);
+        assert!(short_nocase.patterns[0].alternatives.iter().all(|alt| alt.is_empty()));
+        assert!(
+            short_nocase.patterns[0]
+                .tier2_alternatives
+                .iter()
+                .all(|alt| !alt.is_empty())
+        );
 
         let ignored_modules = compile_query_plan_default(
             r#"

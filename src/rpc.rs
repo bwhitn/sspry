@@ -5685,7 +5685,8 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
         "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
-        | "verifier_only_in_range" => {
+        | "verifier_only_in_range"
+        | "verifier_only_loop" => {
             if pattern_id.as_deref().unwrap_or_default().is_empty() {
                 return Err(SspryError::from(format!(
                     "{kind} node requires a non-empty pattern_id"
@@ -8262,6 +8263,16 @@ mod tests {
         );
         assert_eq!(verifier_only_in_range.threshold, None);
 
+        let verifier_only_loop = query_node_from_wire(&serde_json::json!({
+            "kind": "verifier_only_loop",
+            "pattern_id": "$a",
+            "children": []
+        }))
+        .expect("verifier_only_loop");
+        assert_eq!(verifier_only_loop.kind, "verifier_only_loop");
+        assert_eq!(verifier_only_loop.pattern_id.as_deref(), Some("$a"));
+        assert_eq!(verifier_only_loop.threshold, None);
+
         assert!(
             query_node_from_wire(&serde_json::json!({
                 "kind": "filesize_eq",
@@ -8330,6 +8341,17 @@ mod tests {
             .expect_err("empty verifier-only-at pattern id")
             .to_string()
             .contains("verifier_only_at node requires a non-empty pattern_id")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "verifier_only_loop",
+                "pattern_id": "",
+                "children": []
+            }))
+            .expect_err("empty verifier-only-loop pattern id")
+            .to_string()
+            .contains("verifier_only_loop node requires a non-empty pattern_id")
         );
 
         assert!(

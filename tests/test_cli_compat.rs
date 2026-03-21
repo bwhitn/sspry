@@ -1498,7 +1498,7 @@ rule FilesizeNotRule {
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 3"));
-    wait_for_search_candidates(&addr, &rule, 1);
+    wait_for_search_candidates(&addr, &rule, 2);
 
     let search = run_ok(&[
         "search",
@@ -1506,8 +1506,10 @@ rule FilesizeNotRule {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--verify",
     ]);
-    assert!(search.contains("candidates: 1"), "{search}");
+    assert!(search.contains("candidates: 2"), "{search}");
+    assert!(search.contains("verified_matched: 1"), "{search}");
 
     let _ = child.kill();
     let _ = child.wait();
