@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::candidate::{
     GramSizes, metadata_field_is_boolean, normalize_query_metadata_field, pack_exact_gram,
@@ -94,6 +95,7 @@ enum Token {
     Int(usize),
     Float(f64),
     Bool(bool),
+    Quoted(String),
     Id(String),
     Name(String),
 }
@@ -123,6 +125,7 @@ struct ConditionParser {
     index: usize,
     known_patterns: HashSet<String>,
     known_pattern_names: Vec<String>,
+    active_identity_source: Option<String>,
 }
 
 fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
@@ -137,6 +140,47 @@ fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&
     }
 }
 
+fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.len() != N * 2 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(SspryError::from(format!(
+            "{label} must be exactly {} hexadecimal characters.",
+            N * 2
+        )));
+    }
+    let mut out = [0u8; N];
+    hex::decode_to_slice(text, &mut out)?;
+    Ok(out)
+}
+
+fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"sspry-identity\0");
+    digest.update(kind.as_bytes());
+    digest.update(b"\0");
+    digest.update(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest.finalize());
+    out
+}
+
+fn normalize_identity_literal(hash_kind: &str, value: &str) -> Result<String> {
+    match hash_kind {
+        "md5" => Ok(hex::encode(normalize_identity_digest(
+            "md5",
+            &decode_exact_hex::<16>(value, "md5")?,
+        ))),
+        "sha1" => Ok(hex::encode(normalize_identity_digest(
+            "sha1",
+            &decode_exact_hex::<20>(value, "sha1")?,
+        ))),
+        "sha256" => Ok(hex::encode(decode_exact_hex::<32>(value, "sha256")?)),
+        other => Err(SspryError::from(format!(
+            "Unsupported searchable hash function: {other}"
+        ))),
+    }
+}
+
 fn ignored_search_module_name(name: &str) -> bool {
     IGNORED_SEARCH_MODULES.iter().any(|module| {
         name == *module
@@ -147,7 +191,11 @@ fn ignored_search_module_name(name: &str) -> bool {
 }
 
 impl ConditionParser {
-    fn new(text: &str, known_patterns: HashSet<String>) -> Result<Self> {
+    fn new(
+        text: &str,
+        known_patterns: HashSet<String>,
+        active_identity_source: Option<&str>,
+    ) -> Result<Self> {
         let mut known_pattern_names = known_patterns.iter().cloned().collect::<Vec<_>>();
         known_pattern_names.sort();
         Ok(Self {
@@ -155,6 +203,7 @@ impl ConditionParser {
             index: 0,
             known_patterns,
             known_pattern_names,
+            active_identity_source: active_identity_source.map(str::to_ascii_lowercase),
         })
     }
 
@@ -342,6 +391,9 @@ impl ConditionParser {
                 }
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.consume(Some(&Token::LParen))?;
+                    if field_name.starts_with("hash.") {
+                        return self.parse_hash_identity_equality(&field_name);
+                    }
                     let Token::Int(offset) = self.consume(None)? else {
                         return Err(SspryError::from(format!(
                             "{field_name} requires an integer byte offset."
@@ -624,6 +676,63 @@ impl ConditionParser {
         }
     }
 
+    fn parse_hash_identity_equality(&mut self, field_name: &str) -> Result<QueryNode> {
+        let Some(hash_kind) = field_name.strip_prefix("hash.") else {
+            return Err(SspryError::from(format!(
+                "Unsupported condition field: {field_name}"
+            )));
+        };
+        match hash_kind {
+            "md5" | "sha1" | "sha256" => {}
+            other => {
+                return Err(SspryError::from(format!(
+                    "Unsupported searchable hash function: {other}"
+                )));
+            }
+        }
+        let active_identity_source = self.active_identity_source.as_deref().ok_or_else(|| {
+            SspryError::from("Whole-file hash equality search requires a known DB identity source.")
+        })?;
+        if active_identity_source != hash_kind {
+            return Err(SspryError::from(format!(
+                "hash.{hash_kind}(0, filesize) is only searchable when the DB identity source is {hash_kind}; current source is {active_identity_source}.",
+            )));
+        }
+
+        let Token::Int(offset) = self.consume(None)? else {
+            return Err(SspryError::from(format!(
+                "{field_name} requires a literal start offset."
+            )));
+        };
+        self.consume(Some(&Token::Comma))?;
+        match self.consume(None)? {
+            Token::Name(name) if name == "filesize" => {}
+            _ => {
+                return Err(SspryError::from(format!(
+                    "Only whole-file {field_name}(0, filesize) equality is searchable.",
+                )));
+            }
+        }
+        self.consume(Some(&Token::RParen))?;
+        if offset != 0 {
+            return Err(SspryError::from(format!(
+                "Only whole-file {field_name}(0, filesize) equality is searchable.",
+            )));
+        }
+        self.consume(Some(&Token::EqEq))?;
+        let Token::Quoted(literal) = self.consume(None)? else {
+            return Err(SspryError::from(format!(
+                "{field_name} equality requires a quoted hexadecimal digest.",
+            )));
+        };
+        Ok(QueryNode {
+            kind: "identity_eq".to_owned(),
+            pattern_id: Some(normalize_identity_literal(hash_kind, &literal)?),
+            threshold: None,
+            children: Vec::new(),
+        })
+    }
+
     fn parse_n_of_targets(&mut self) -> Result<Vec<QueryNode>> {
         let pattern_ids = match self.peek() {
             Some(Token::LParen) => self.parse_n_of_target_list()?,
@@ -819,6 +928,36 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                 continue;
             }
             _ => {}
+        }
+        if ch == '"' {
+            index += 1;
+            let mut value = String::new();
+            let mut escaped = false;
+            while index < chars.len() {
+                let current = chars[index];
+                if escaped {
+                    value.push(current);
+                    escaped = false;
+                    index += 1;
+                    continue;
+                }
+                if current == '\\' {
+                    escaped = true;
+                    index += 1;
+                    continue;
+                }
+                if current == '"' {
+                    index += 1;
+                    break;
+                }
+                value.push(current);
+                index += 1;
+            }
+            if escaped || index > chars.len() || chars.get(index.saturating_sub(1)) != Some(&'"') {
+                return Err(SspryError::from("Unterminated quoted string in condition."));
+            }
+            tokens.push(Token::Quoted(value));
+            continue;
         }
         if ch.is_ascii_digit() {
             let start = index;
@@ -1080,11 +1219,6 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
             "condition" => condition_lines.push(raw_line.to_owned()),
             _ => {}
         }
-    }
-    if strings_lines.is_empty() {
-        return Err(SspryError::from(
-            "Rule does not contain a strings section with supported entries.",
-        ));
     }
     if condition_lines.is_empty() {
         return Err(SspryError::from(
@@ -2504,11 +2638,18 @@ fn contains_verifier_only_node(node: &QueryNode) -> bool {
     ) || node.children.iter().any(contains_verifier_only_node)
 }
 
+fn contains_identity_node(node: &QueryNode) -> bool {
+    node.kind == "identity_eq" || node.children.iter().any(contains_identity_node)
+}
+
 fn contains_pattern_node(node: &QueryNode) -> bool {
     node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
 }
 
 pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteralMatchPlan> {
+    if contains_identity_node(&plan.root) {
+        return None;
+    }
     let mut literals = HashMap::<String, Vec<Vec<u8>>>::new();
     let mut literal_wide = HashMap::<String, Vec<bool>>::new();
     let mut literal_fullword = HashMap::<String, Vec<bool>>::new();
@@ -2586,6 +2727,9 @@ pub fn evaluate_fixed_literal_match(
         "verifier_only_in_range" => Err(SspryError::from(
             "verifier_only_in_range requires file verification and cannot use the fixed-literal fast path",
         )),
+        "identity_eq" => Err(SspryError::from(
+            "identity_eq requires DB identity lookup and cannot use the fixed-literal fast path",
+        )),
         "metadata_eq" => Err(SspryError::from(
             "metadata_eq requires stored metadata and cannot use the fixed-literal fast path",
         )),
@@ -2648,6 +2792,7 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
         | "filesize_le"
         | "filesize_gt"
         | "filesize_ge"
+        | "identity_eq"
         | "metadata_eq"
         | "time_now_eq"
         | "verifier_only_eq"
@@ -2670,9 +2815,10 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
     }
 }
 
-pub fn compile_query_plan_with_gram_sizes(
+pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     rule_text: &str,
     gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
@@ -2767,6 +2913,7 @@ pub fn compile_query_plan_with_gram_sizes(
     let mut parser = ConditionParser::new(
         &condition_text,
         pattern_alternatives.keys().cloned().collect(),
+        active_identity_source,
     )?;
     let mut root = prune_ignored_module_predicates(parser.parse()?).ok_or_else(|| {
         SspryError::from(
@@ -2784,7 +2931,14 @@ pub fn compile_query_plan_with_gram_sizes(
         gram_sizes,
         &mut next_numeric_anchor_id,
     )?;
-    if !contains_pattern_node(&root) && contains_verifier_only_node(&root) {
+    let has_pattern = contains_pattern_node(&root);
+    let has_identity = contains_identity_node(&root);
+    if pattern_alternatives.is_empty() && !has_identity {
+        return Err(SspryError::from(
+            "Rule does not contain a strings section with supported entries.",
+        ));
+    }
+    if !has_pattern && !has_identity && contains_verifier_only_node(&root) {
         return Err(SspryError::from(
             "Verifier-only indexed conditions require an anchorable literal for the current gram sizes or another string/hex anchor.",
         ));
@@ -2853,6 +3007,46 @@ pub fn compile_query_plan_with_gram_sizes(
     })
 }
 
+pub fn compile_query_plan_with_gram_sizes(
+    rule_text: &str,
+    gram_sizes: GramSizes,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: usize,
+) -> Result<CompiledQueryPlan> {
+    compile_query_plan_with_gram_sizes_and_identity_source(
+        rule_text,
+        gram_sizes,
+        None,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
+pub fn compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+    rule_path: impl AsRef<Path>,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: usize,
+) -> Result<CompiledQueryPlan> {
+    let text = fs::read_to_string(rule_path)?;
+    compile_query_plan_with_gram_sizes_and_identity_source(
+        &text,
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
 pub fn compile_query_plan_from_file_with_gram_sizes(
     rule_path: impl AsRef<Path>,
     gram_sizes: GramSizes,
@@ -2861,10 +3055,10 @@ pub fn compile_query_plan_from_file_with_gram_sizes(
     allow_tier2_fallback: bool,
     max_candidates: usize,
 ) -> Result<CompiledQueryPlan> {
-    let text = fs::read_to_string(rule_path)?;
-    compile_query_plan_with_gram_sizes(
-        &text,
+    compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        rule_path,
         gram_sizes,
+        None,
         max_anchors_per_alt,
         force_tier1_only,
         allow_tier2_fallback,
@@ -2898,6 +3092,25 @@ mod tests {
         compile_query_plan_with_gram_sizes(
             rule_text,
             default_gram_sizes(),
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        )
+    }
+
+    fn compile_query_plan_default_with_identity(
+        rule_text: &str,
+        active_identity_source: Option<&str>,
+        max_anchors_per_alt: usize,
+        force_tier1_only: bool,
+        allow_tier2_fallback: bool,
+        max_candidates: usize,
+    ) -> Result<CompiledQueryPlan> {
+        compile_query_plan_with_gram_sizes_and_identity_source(
+            rule_text,
+            default_gram_sizes(),
+            active_identity_source,
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
@@ -2995,6 +3208,66 @@ rule bad {
 }
 "#;
         assert!(compile_query_plan_default(rule, 8, false, true, 100_000).is_err());
+    }
+
+    #[test]
+    fn compile_rule_with_whole_file_hash_identity_condition() {
+        let rule = r#"
+rule hashed {
+  condition:
+    hash.sha256(0, filesize) == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+"#;
+        let plan =
+            compile_query_plan_default_with_identity(rule, Some("sha256"), 8, false, true, 100_000)
+                .expect("plan");
+        assert!(plan.patterns.is_empty());
+        assert_eq!(plan.root.kind, "identity_eq");
+        assert_eq!(
+            plan.root.pattern_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn whole_file_hash_identity_requires_matching_db_source() {
+        let rule = r#"
+rule hashed {
+  condition:
+    hash.md5(0, filesize) == "00112233445566778899aabbccddeeff"
+}
+"#;
+        assert!(
+            compile_query_plan_default_with_identity(rule, Some("sha256"), 8, false, true, 100_000)
+                .expect_err("mismatched source")
+                .to_string()
+                .contains("current source is sha256")
+        );
+        assert!(
+            compile_query_plan_default_with_identity(rule, None, 8, false, true, 100_000)
+                .expect_err("missing source")
+                .to_string()
+                .contains("requires a known DB identity source")
+        );
+    }
+
+    #[test]
+    fn compile_rule_with_md5_identity_normalizes_to_store_identity() {
+        let rule = r#"
+rule hashed {
+  condition:
+    hash.md5(0, filesize) == "00112233445566778899aabbccddeeff"
+}
+"#;
+        let plan =
+            compile_query_plan_default_with_identity(rule, Some("md5"), 8, false, true, 100_000)
+                .expect("plan");
+        let expected = hex::encode(crate::app::normalize_identity_digest(
+            "md5",
+            &hex::decode("00112233445566778899aabbccddeeff").expect("md5 bytes"),
+        ));
+        assert_eq!(plan.root.kind, "identity_eq");
+        assert_eq!(plan.root.pattern_id.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -3300,7 +3573,7 @@ rule numeric_only_unanchorable {
                 .contains("Unsupported token in condition")
         );
 
-        let mut parser = ConditionParser::new("", HashSet::new()).expect("parser");
+        let mut parser = ConditionParser::new("", HashSet::new(), None).expect("parser");
         assert!(
             parser
                 .parse()
@@ -3309,9 +3582,12 @@ rule numeric_only_unanchorable {
                 .contains("Condition section is empty")
         );
 
-        let mut parser =
-            ConditionParser::new("$a $b", HashSet::from(["$a".to_owned(), "$b".to_owned()]))
-                .expect("parser");
+        let mut parser = ConditionParser::new(
+            "$a $b",
+            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+            None,
+        )
+        .expect("parser");
         assert!(
             parser
                 .parse()
@@ -3320,8 +3596,8 @@ rule numeric_only_unanchorable {
                 .contains("Unexpected trailing token")
         );
 
-        let mut parser =
-            ConditionParser::new("$missing", HashSet::from(["$a".to_owned()])).expect("parser");
+        let mut parser = ConditionParser::new("$missing", HashSet::from(["$a".to_owned()]), None)
+            .expect("parser");
         assert!(
             parser
                 .parse()
@@ -3330,8 +3606,8 @@ rule numeric_only_unanchorable {
                 .contains("unknown string id")
         );
 
-        let mut parser =
-            ConditionParser::new("0 of ($a)", HashSet::from(["$a".to_owned()])).expect("parser");
+        let mut parser = ConditionParser::new("0 of ($a)", HashSet::from(["$a".to_owned()]), None)
+            .expect("parser");
         assert!(
             parser
                 .parse()
@@ -3343,6 +3619,7 @@ rule numeric_only_unanchorable {
         let mut parser = ConditionParser::new(
             "pe.machine",
             HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+            None,
         )
         .expect("parser");
         assert!(
@@ -3353,8 +3630,9 @@ rule numeric_only_unanchorable {
                 .contains("requires == <literal>")
         );
 
-        let mut parser = ConditionParser::new("uint32(x) == 1", HashSet::from(["$a".to_owned()]))
-            .expect("parser");
+        let mut parser =
+            ConditionParser::new("uint32(x) == 1", HashSet::from(["$a".to_owned()]), None)
+                .expect("parser");
         assert!(
             parser
                 .parse()
@@ -3366,6 +3644,7 @@ rule numeric_only_unanchorable {
         let mut parser = ConditionParser::new(
             "1 of ($a $b)",
             HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+            None,
         )
         .expect("parser");
         assert!(
@@ -3379,6 +3658,7 @@ rule numeric_only_unanchorable {
         let mut parser = ConditionParser::new(
             "all of $a*",
             HashSet::from(["$a1".to_owned(), "$a2".to_owned(), "$b1".to_owned()]),
+            None,
         )
         .expect("parser");
         let wildcard = parser.parse().expect("wildcard parse");
@@ -3391,6 +3671,7 @@ rule numeric_only_unanchorable {
         let mut parser = ConditionParser::new(
             "any of them",
             HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+            None,
         )
         .expect("parser");
         let them = parser.parse().expect("them parse");
@@ -3398,8 +3679,8 @@ rule numeric_only_unanchorable {
         assert_eq!(them.threshold, Some(1));
         assert_eq!(them.children.len(), 2);
 
-        let mut parser =
-            ConditionParser::new("$a at 0", HashSet::from(["$a".to_owned()])).expect("parser");
+        let mut parser = ConditionParser::new("$a at 0", HashSet::from(["$a".to_owned()]), None)
+            .expect("parser");
         let at_node = parser.parse().expect("at parse");
         assert_eq!(at_node.kind, "and");
         assert_eq!(at_node.children.len(), 2);
@@ -3409,7 +3690,7 @@ rule numeric_only_unanchorable {
         assert_eq!(at_node.children[1].pattern_id.as_deref(), Some("$a@0"));
 
         let mut parser =
-            ConditionParser::new("#a > 2", HashSet::from(["$a".to_owned()])).expect("parser");
+            ConditionParser::new("#a > 2", HashSet::from(["$a".to_owned()]), None).expect("parser");
         let count_node = parser.parse().expect("count parse");
         assert_eq!(count_node.kind, "and");
         assert_eq!(count_node.children.len(), 2);
@@ -3424,6 +3705,7 @@ rule numeric_only_unanchorable {
         let mut parser = ConditionParser::new(
             "$a in (filesize - 256 .. filesize)",
             HashSet::from(["$a".to_owned()]),
+            None,
         )
         .expect("parser");
         let range_node = parser.parse().expect("range parse");
@@ -3440,6 +3722,7 @@ rule numeric_only_unanchorable {
         let mut parser = ConditionParser::new(
             "1 of $missing*",
             HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+            None,
         )
         .expect("parser");
         assert!(
@@ -3451,7 +3734,7 @@ rule numeric_only_unanchorable {
         );
 
         let mut parser =
-            ConditionParser::new("( $a ", HashSet::from(["$a".to_owned()])).expect("parser");
+            ConditionParser::new("( $a ", HashSet::from(["$a".to_owned()]), None).expect("parser");
         assert!(
             parser
                 .parse()
@@ -3494,12 +3777,17 @@ rule commented {
         assert!(strings[0].contains(r#"$a = "ABCD""#));
         assert!(strings[1].contains(r#"$b = /foo\/bar/"#));
         assert_eq!(condition.trim(), "$a or $b");
-        assert!(
-            parse_rule_sections("rule empty { condition: true }")
-                .expect_err("missing strings")
-                .to_string()
-                .contains("strings section")
-        );
+        let (strings, condition) = parse_rule_sections(
+            r#"
+rule empty {
+  condition:
+    true
+}
+"#,
+        )
+        .expect("condition-only rule");
+        assert!(strings.is_empty());
+        assert_eq!(condition.trim(), "true");
         assert!(
             parse_rule_sections(
                 r#"
@@ -4006,7 +4294,7 @@ rule disk_rule {
     #[test]
     fn parser_and_helper_edge_cases_cover_remaining_branches() {
         let mut parser =
-            ConditionParser::new("$a", HashSet::from(["$a".to_owned()])).expect("parser");
+            ConditionParser::new("$a", HashSet::from(["$a".to_owned()]), None).expect("parser");
         assert!(
             parser
                 .consume(Some(&Token::LParen))
@@ -4018,6 +4306,7 @@ rule disk_rule {
         let mut parser = ConditionParser::new(
             "1 of ($a,)",
             HashSet::from(["$a".to_owned(), "$b".to_owned()]),
+            None,
         )
         .expect("parser");
         assert!(
@@ -4028,8 +4317,8 @@ rule disk_rule {
                 .contains("Expected pattern id")
         );
 
-        let mut parser =
-            ConditionParser::new("1 of ($a,", HashSet::from(["$a".to_owned()])).expect("parser");
+        let mut parser = ConditionParser::new("1 of ($a,", HashSet::from(["$a".to_owned()]), None)
+            .expect("parser");
         assert!(
             parser
                 .parse()
@@ -4039,7 +4328,7 @@ rule disk_rule {
         );
 
         let mut parser =
-            ConditionParser::new("and", HashSet::from(["$a".to_owned()])).expect("parser");
+            ConditionParser::new("and", HashSet::from(["$a".to_owned()]), None).expect("parser");
         assert!(
             parser
                 .parse()
@@ -4048,7 +4337,7 @@ rule disk_rule {
                 .contains("Unsupported condition token")
         );
 
-        let mut parser = ConditionParser::new("xor == 7", HashSet::new()).expect("parser");
+        let mut parser = ConditionParser::new("xor == 7", HashSet::new(), None).expect("parser");
         assert!(
             parser
                 .parse()

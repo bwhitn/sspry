@@ -2915,6 +2915,85 @@ impl CandidateStore {
             .unwrap_or(false)
     }
 
+    fn identity_seed_hashes(node: &QueryNode) -> Option<HashSet<String>> {
+        match node.kind.as_str() {
+            "identity_eq" => node
+                .pattern_id
+                .as_ref()
+                .map(|pattern_id| HashSet::from([pattern_id.clone()])),
+            "and" => {
+                let mut seed_sets = node.children.iter().filter_map(Self::identity_seed_hashes);
+                let mut seeds = seed_sets.next()?;
+                for child_seeds in seed_sets {
+                    seeds.retain(|hash| child_seeds.contains(hash));
+                    if seeds.is_empty() {
+                        break;
+                    }
+                }
+                Some(seeds)
+            }
+            "or" => {
+                let mut seeds = HashSet::new();
+                for child in &node.children {
+                    let child_seeds = Self::identity_seed_hashes(child)?;
+                    seeds.extend(child_seeds);
+                }
+                Some(seeds)
+            }
+            _ => None,
+        }
+    }
+
+    fn query_identity_seed_hits(
+        &self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+    ) -> Result<Option<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)>> {
+        let Some(seed_hashes) = Self::identity_seed_hashes(&plan.root) else {
+            return Ok(None);
+        };
+        let query_now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut matched_hits = Vec::<(String, u32)>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for sha256 in seed_hashes {
+            let Some(pos) = self.sha_to_pos.get(&sha256).copied() else {
+                continue;
+            };
+            let doc = &self.docs[pos];
+            if doc.deleted {
+                continue;
+            }
+            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+            let mut doc_inputs = LazyDocQueryInputs::new(doc);
+            let mut load_metadata = || self.doc_metadata_bytes(pos);
+            let mut load_tier1 = || self.doc_bloom_bytes(pos);
+            let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+            let mut eval_cache = QueryEvalCache::default();
+            let outcome = evaluate_node(
+                &plan.root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                &prepared.patterns,
+                &prepared.mask_cache,
+                plan,
+                query_now_unix,
+                &mut eval_cache,
+            )?;
+            if outcome.matched {
+                matched_hits.push((doc.sha256.clone(), outcome.score));
+                used_tiers.merge(outcome.tiers);
+            }
+            query_profile.merge_from(&doc_inputs.into_profile());
+        }
+        Ok(Some((matched_hits, used_tiers, query_profile)))
+    }
+
     pub fn query_candidates(
         &mut self,
         plan: &CompiledQueryPlan,
@@ -2969,7 +3048,12 @@ impl CandidateStore {
                 query_profile: CandidateQueryProfile::default(),
             });
         }
-        let (mut matched_hits, used_tiers, query_profile) = self.scan_query_hits(plan, prepared)?;
+        let (mut matched_hits, used_tiers, query_profile) =
+            if let Some(identity_hits) = self.query_identity_seed_hits(plan, prepared)? {
+                identity_hits
+            } else {
+                self.scan_query_hits(plan, prepared)?
+            };
         let (page, page_scores, total, start, end, next_cursor) =
             paginate_query_hits(&mut matched_hits, plan.max_candidates, cursor, chunk_size);
         total_scope.add_items(query_profile.docs_scanned);
@@ -4965,6 +5049,7 @@ fn merge_cached_lane_bloom_word_masks(
 fn node_structurally_impossible(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "pattern" => false,
+        "identity_eq" => false,
         "not" => false,
         "verifier_only_eq" => false,
         "verifier_only_at" => false,
@@ -5293,6 +5378,7 @@ fn tree_maybe_matches_node(
             ))
         }
         "not" => Ok(true),
+        "identity_eq" => Ok(true),
         "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
@@ -5428,6 +5514,7 @@ fn block_maybe_matches_node(
             ))
         }
         "not" => Ok(true),
+        "identity_eq" => Ok(true),
         "verifier_only_eq" => Ok(true),
         "verifier_only_at" => Ok(true),
         "verifier_only_count" => Ok(true),
@@ -5638,6 +5725,17 @@ where
                 .pattern_outcomes
                 .insert(pattern_id.clone(), outcome);
             Ok(outcome)
+        }
+        "identity_eq" => {
+            let expected = node
+                .pattern_id
+                .as_ref()
+                .ok_or_else(|| SspryError::from("identity_eq node requires pattern_id"))?;
+            Ok(MatchOutcome {
+                matched: doc_inputs.doc.sha256 == *expected,
+                tiers: TierFlags::default(),
+                score: 0,
+            })
         }
         "not" => {
             let child = node
@@ -5860,7 +5958,10 @@ mod tests {
     use crate::candidate::{
         DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
         extract_compact_document_metadata, pack_exact_gram,
-        query_plan::compile_query_plan_with_gram_sizes,
+        query_plan::{
+            compile_query_plan_with_gram_sizes,
+            compile_query_plan_with_gram_sizes_and_identity_source,
+        },
     };
 
     use super::*;
@@ -6010,6 +6111,68 @@ rule q {
 
         let reopened = CandidateStore::open(root).expect("open");
         assert_eq!(reopened.stats().deleted_doc_count, 1);
+    }
+
+    #[test]
+    fn whole_file_identity_queries_use_direct_lookup() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("candidate_db");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let filter_bytes = 8;
+        let bloom_hashes = DEFAULT_BLOOM_HASHES;
+        insert_primary(
+            &mut store,
+            [0x11; 32],
+            8,
+            None,
+            None,
+            filter_bytes,
+            &lane_bloom_bytes(filter_bytes, bloom_hashes, &[0x4443_4241]),
+            Some("doc-1".to_owned()),
+        )
+        .expect("insert first");
+        insert_primary(
+            &mut store,
+            [0x22; 32],
+            8,
+            None,
+            None,
+            filter_bytes,
+            &lane_bloom_bytes(filter_bytes, bloom_hashes, &[0x4443_4241]),
+            Some("doc-2".to_owned()),
+        )
+        .expect("insert second");
+
+        let plan = compile_query_plan_with_gram_sizes_and_identity_source(
+            r#"
+rule q {
+  condition:
+    hash.sha256(0, filesize) == "1111111111111111111111111111111111111111111111111111111111111111"
+}
+"#,
+            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                .expect("default gram sizes"),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            100_000,
+        )
+        .expect("plan");
+        let query = store.query_candidates(&plan, 0, 128).expect("query");
+        assert_eq!(query.sha256, vec![hex::encode([0x11; 32])]);
+        assert_eq!(query.query_profile.docs_scanned, 1);
+        assert_eq!(query.query_profile.tier1_bloom_loads, 0);
+        assert_eq!(query.query_profile.tier2_bloom_loads, 0);
     }
 
     #[test]

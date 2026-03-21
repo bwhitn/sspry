@@ -5669,6 +5669,19 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
                 return Err(SspryError::from("time_now_eq node must not have children"));
             }
         }
+        "identity_eq" => {
+            if pattern_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(SspryError::from(
+                    "identity_eq node requires a non-empty pattern_id",
+                ));
+            }
+            if threshold.is_some() {
+                return Err(SspryError::from("identity_eq node must not use threshold"));
+            }
+            if !children.is_empty() {
+                return Err(SspryError::from("identity_eq node must not have children"));
+            }
+        }
         "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
@@ -8176,6 +8189,20 @@ mod tests {
         assert_eq!(time_now_eq.pattern_id.as_deref(), Some("time.now"));
         assert_eq!(time_now_eq.threshold, Some(42));
 
+        let expected_identity = "aa".repeat(32);
+        let identity_eq = query_node_from_wire(&serde_json::json!({
+            "kind": "identity_eq",
+            "pattern_id": expected_identity,
+            "children": []
+        }))
+        .expect("identity_eq");
+        assert_eq!(identity_eq.kind, "identity_eq");
+        assert_eq!(
+            identity_eq.pattern_id.as_deref(),
+            Some(expected_identity.as_str())
+        );
+        assert_eq!(identity_eq.threshold, None);
+
         let verifier_only_eq = query_node_from_wire(&serde_json::json!({
             "kind": "verifier_only_eq",
             "pattern_id": "uint32(0)==332",
@@ -8303,6 +8330,17 @@ mod tests {
             .expect_err("empty verifier-only-at pattern id")
             .to_string()
             .contains("verifier_only_at node requires a non-empty pattern_id")
+        );
+
+        assert!(
+            query_node_from_wire(&serde_json::json!({
+                "kind": "identity_eq",
+                "pattern_id": "",
+                "children": []
+            }))
+            .expect_err("empty identity_eq pattern id")
+            .to_string()
+            .contains("identity_eq node requires a non-empty pattern_id")
         );
 
         assert!(

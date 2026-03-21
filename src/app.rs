@@ -28,6 +28,7 @@ use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
     GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
     choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
+    compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata,
     normalize_tier1_filter_class_bytes, read_candidate_shard_count,
@@ -443,7 +444,7 @@ fn path_identity_sha256(path: &Path) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"sspry-identity\0");
     digest.update(kind.as_bytes());
@@ -2768,17 +2769,21 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
     match (|| -> Result<i32> {
         let result = if let Some(root) = &args.root {
             let mut stores = open_stores(Path::new(root))?;
-            let gram_sizes = stores
+            let (gram_sizes, active_identity_source) = stores
                 .first()
                 .map(|store| {
                     let config = store.config();
-                    GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)
+                    Ok::<_, SspryError>((
+                        GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?,
+                        Some(config.id_source),
+                    ))
                 })
                 .transpose()?
-                .unwrap_or(GramSizes::new(3, 4)?);
-            let plan = compile_query_plan_from_file_with_gram_sizes(
+                .unwrap_or((GramSizes::new(3, 4)?, None));
+            let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
                 &args.rule,
                 gram_sizes,
+                active_identity_source.as_deref(),
                 args.max_anchors_per_pattern,
                 args.force_tier1_only,
                 !args.no_tier2_fallback,
@@ -2837,9 +2842,10 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             let client = search_rpc_client(&args.connection);
             let server_policy = server_scan_policy(&args.connection)?;
             // Bloom-only search compiles directly against the server's gram sizes.
-            let plan = compile_query_plan_from_file_with_gram_sizes(
+            let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
                 &args.rule,
                 server_policy.gram_sizes,
+                Some(server_policy.id_source.as_str()),
                 args.max_anchors_per_pattern,
                 args.force_tier1_only,
                 !args.no_tier2_fallback,
@@ -2975,9 +2981,10 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
 
         let started_plan = Instant::now();
         // The default search path now plans directly from the restricted rule shape.
-        let plan = compile_query_plan_from_file_with_gram_sizes(
+        let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
             &args.rule,
             server_policy.gram_sizes,
+            Some(server_policy.id_source.as_str()),
             args.max_anchors_per_pattern,
             false,
             true,

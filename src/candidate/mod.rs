@@ -24,7 +24,9 @@ pub use metadata::{
 };
 pub use query_plan::{
     CompiledQueryPlan, PatternPlan, QueryNode, compile_query_plan_from_file_with_gram_sizes,
-    compile_query_plan_with_gram_sizes, normalize_max_candidates,
+    compile_query_plan_from_file_with_gram_sizes_and_identity_source,
+    compile_query_plan_with_gram_sizes, compile_query_plan_with_gram_sizes_and_identity_source,
+    normalize_max_candidates,
 };
 pub use store::{
     CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryProfile,
