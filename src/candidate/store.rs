@@ -3324,6 +3324,11 @@ impl CandidateStore {
                     &plan.root,
                     &prepared.mask_cache,
                     &self.tier2_superblocks,
+                    if self.tier2_pattern_superblocks.masks_by_bucket.is_empty() {
+                        None
+                    } else {
+                        Some(&self.tier2_pattern_superblocks)
+                    },
                     true,
                 )?
             {
@@ -5027,6 +5032,7 @@ struct PreparedPatternMasks {
     tier1: Vec<ShiftedRequiredMasks>,
     tier1_superblocks: Vec<ShiftedRequiredMasks>,
     tier2: Vec<ShiftedRequiredMasks>,
+    tier2_superblocks: Vec<ShiftedRequiredMasks>,
 }
 
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
@@ -5121,6 +5127,17 @@ fn prepared_pattern_masks_memory_bytes(masks: &PreparedPatternMasks) -> u64 {
         .saturating_add(
             masks
                 .tier2
+                .iter()
+                .map(shifted_required_masks_memory_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            (masks.tier2_superblocks.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
+        )
+        .saturating_add(
+            masks
+                .tier2_superblocks
                 .iter()
                 .map(shifted_required_masks_memory_bytes)
                 .sum::<u64>(),
@@ -5508,6 +5525,7 @@ fn build_pattern_mask_cache(
         }
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
+        let mut tier2_superblock_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
         for (alt_index, alternative) in pattern.tier2_alternatives.iter().enumerate() {
             let fixed_literal = pattern
                 .fixed_literals
@@ -5515,6 +5533,7 @@ fn build_pattern_mask_cache(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut shifted_tier2 = ShiftedRequiredMasks::default();
+            let mut shifted_tier2_superblocks = ShiftedRequiredMasks::default();
             if fixed_literal.is_empty()
                 || fixed_literal.len() < tier2_gram_size
                 || exact_pattern_has_ambiguous_positions(
@@ -5529,6 +5548,12 @@ fn build_pattern_mask_cache(
                     DEFAULT_BLOOM_POSITION_LANES,
                     &mut tier2_gram_cache,
                 )?;
+                shifted_tier2_superblocks.any_lane_values = build_any_lane_required_masks(
+                    alternative,
+                    tier2_filter_keys,
+                    DEFAULT_BLOOM_POSITION_LANES,
+                    &mut tier2_gram_cache,
+                )?;
             } else {
                 let lane_variants = lane_position_variants_for_pattern(
                     alternative,
@@ -5537,8 +5562,10 @@ fn build_pattern_mask_cache(
                     DEFAULT_BLOOM_POSITION_LANES,
                 );
                 shifted_tier2.shifts = Vec::with_capacity(lane_variants.len());
+                shifted_tier2_superblocks.shifts = Vec::with_capacity(lane_variants.len());
                 for lanes in &lane_variants {
                     let mut by_key = RequiredMasksByKey::new();
+                    let mut superblock_by_key = RequiredMasksByKey::new();
                     for (filter_bytes, bloom_hashes) in tier2_filter_keys {
                         let required = merge_cached_lane_bloom_word_masks(
                             alternative,
@@ -5548,12 +5575,15 @@ fn build_pattern_mask_cache(
                             DEFAULT_BLOOM_POSITION_LANES,
                             &mut tier2_gram_cache,
                         )?;
+                        superblock_by_key.insert((*filter_bytes, *bloom_hashes), required.clone());
                         by_key.insert((*filter_bytes, *bloom_hashes), required);
                     }
                     shifted_tier2.shifts.push(by_key);
+                    shifted_tier2_superblocks.shifts.push(superblock_by_key);
                 }
             }
             tier2_masks.push(shifted_tier2);
+            tier2_superblock_masks.push(shifted_tier2_superblocks);
         }
 
         out.insert(
@@ -5562,6 +5592,7 @@ fn build_pattern_mask_cache(
                 tier1: tier1_masks,
                 tier1_superblocks: tier1_superblock_masks,
                 tier2: tier2_masks,
+                tier2_superblocks: tier2_superblock_masks,
             },
         );
     }
@@ -5868,6 +5899,8 @@ fn block_matches_pattern(
     pattern_id: &str,
     mask_cache: &PatternMaskCache,
     tier1_superblocks: &Tier2SuperblockIndex,
+    tier2_superblocks: Option<&Tier2SuperblockIndex>,
+    allow_tier2: bool,
 ) -> bool {
     let Some(pattern_masks) = mask_cache.get(pattern_id) else {
         return false;
@@ -5885,8 +5918,22 @@ fn block_matches_pattern(
             ) {
                 return false;
             }
-            let _ = alt_index;
-            true
+            let Some(tier2_by_key) = pattern_masks.tier2_superblocks.get(alt_index) else {
+                return true;
+            };
+            if !allow_tier2 || tier2_by_key.is_empty() {
+                return true;
+            }
+            tier2_superblocks
+                .map(|superblocks| {
+                    block_matches_shifted_required_masks(
+                        bucket_key,
+                        block_idx,
+                        tier2_by_key,
+                        superblocks,
+                    )
+                })
+                .unwrap_or(true)
         })
 }
 
@@ -5896,7 +5943,8 @@ fn block_maybe_matches_node(
     node: &QueryNode,
     mask_cache: &PatternMaskCache,
     tier1_superblocks: &Tier2SuperblockIndex,
-    _allow_tier2: bool,
+    tier2_superblocks: Option<&Tier2SuperblockIndex>,
+    allow_tier2: bool,
 ) -> Result<bool> {
     match node.kind.as_str() {
         "pattern" => {
@@ -5910,6 +5958,8 @@ fn block_maybe_matches_node(
                 pattern_id,
                 mask_cache,
                 tier1_superblocks,
+                tier2_superblocks,
+                allow_tier2,
             ))
         }
         "not" => Ok(true),
@@ -5934,7 +5984,8 @@ fn block_maybe_matches_node(
                     child,
                     mask_cache,
                     tier1_superblocks,
-                    _allow_tier2,
+                    tier2_superblocks,
+                    allow_tier2,
                 )? {
                     return Ok(false);
                 }
@@ -5949,7 +6000,8 @@ fn block_maybe_matches_node(
                     child,
                     mask_cache,
                     tier1_superblocks,
-                    _allow_tier2,
+                    tier2_superblocks,
+                    allow_tier2,
                 )? {
                     return Ok(true);
                 }
@@ -5968,7 +6020,8 @@ fn block_maybe_matches_node(
                     child,
                     mask_cache,
                     tier1_superblocks,
-                    _allow_tier2,
+                    tier2_superblocks,
+                    allow_tier2,
                 )? {
                     matched += 1;
                     if matched >= threshold {
@@ -6646,6 +6699,8 @@ mod tests {
             "$a",
             &cache,
             &Tier2SuperblockIndex::default(),
+            None,
+            true,
         ));
     }
 
