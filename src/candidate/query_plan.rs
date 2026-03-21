@@ -131,7 +131,7 @@ struct ConditionParser {
 
 fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
     match (name, offset, value) {
-        ("uint16", 0, 0x5a4d) | ("uint16be", 0, 0x4d5a) => Some("mz.is_mz"),
+        ("uint16", 0, 0x5a4d) | ("uint16be", 0, 0x4d5a) => Some("_intern.is_mz"),
         ("uint16", 0, 0x457f)
         | ("uint16be", 0, 0x7f45)
         | ("uint32", 0, 0x464c457f)
@@ -3561,7 +3561,7 @@ rule header_magic {
         assert_eq!(plan.root.kind, "and");
         assert!(plan.root.children.iter().any(|child| {
             child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("mz.is_mz")
+                && child.pattern_id.as_deref() == Some("_intern.is_mz")
                 && child.threshold == Some(1)
         }));
         assert!(plan.root.children.iter().any(|child| {

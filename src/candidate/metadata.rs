@@ -508,7 +508,7 @@ pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
 fn normalize_field(raw: &str) -> Option<&'static str> {
     match raw.to_ascii_lowercase().as_str() {
         "crx.is_crx" => Some("crx.is_crx"),
-        "mz.is_mz" => Some("mz.is_mz"),
+        "_intern.is_mz" => Some("_intern.is_mz"),
         "pe.is_pe" => Some("pe.is_pe"),
         "pe.is_32bit" => Some("pe.is_32bit"),
         "pe.is_64bit" => Some("pe.is_64bit"),
@@ -545,7 +545,7 @@ pub fn metadata_field_is_boolean(raw: &str) -> bool {
         normalize_field(raw),
         Some(
             "crx.is_crx"
-                | "mz.is_mz"
+                | "_intern.is_mz"
                 | "pe.is_pe"
                 | "pe.is_32bit"
                 | "pe.is_64bit"
@@ -584,7 +584,7 @@ pub fn metadata_field_is_integer(raw: &str) -> bool {
 fn bool_field_for_name(field: &str) -> Option<BoolField> {
     match field {
         "crx.is_crx" => Some(BoolField::CrxIsCrx),
-        "mz.is_mz" => Some(BoolField::MzIsMz),
+        "_intern.is_mz" => Some(BoolField::MzIsMz),
         "pe.is_pe" => Some(BoolField::PeIsPe),
         "pe.is_32bit" => Some(BoolField::PeIs32Bit),
         "pe.is_64bit" => Some(BoolField::PeIs64Bit),
@@ -702,11 +702,11 @@ mod tests {
             normalize_query_metadata_field("zip.is_zip"),
             Some("zip.is_zip")
         );
-        assert_eq!(normalize_query_metadata_field("mz.is_mz"), Some("mz.is_mz"));
+        assert_eq!(normalize_query_metadata_field("_intern.is_mz"), Some("_intern.is_mz"));
         assert!(metadata_field_is_boolean("pe.is_dll"));
         assert!(metadata_field_is_boolean("elf.is_elf"));
         assert!(metadata_field_is_boolean("zip.is_zip"));
-        assert!(metadata_field_is_boolean("mz.is_mz"));
+        assert!(metadata_field_is_boolean("_intern.is_mz"));
         assert!(metadata_field_is_integer("macho.device_type"));
     }
 
@@ -732,7 +732,7 @@ mod tests {
             None
         );
         assert_eq!(
-            metadata_field_matches_eq(&bytes, "mz.is_mz", 1).expect("match"),
+            metadata_field_matches_eq(&bytes, "_intern.is_mz", 1).expect("match"),
             None
         );
         assert_eq!(
@@ -770,7 +770,7 @@ mod tests {
         fs::write(&pe_path, &pe).expect("write pe");
         let pe_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
         assert_eq!(
-            metadata_field_matches_eq(&pe_bytes, "mz.is_mz", 1).expect("mz"),
+            metadata_field_matches_eq(&pe_bytes, "_intern.is_mz", 1).expect("mz"),
             Some(true)
         );
         assert_eq!(
