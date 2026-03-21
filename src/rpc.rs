@@ -61,6 +61,7 @@ const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
 const PREPARED_PLAN_CACHE_CAPACITY: usize = 4;
+const PREPARED_PLAN_CACHE_MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
@@ -4181,6 +4182,14 @@ impl ServerState {
             summary_cap_bytes
                 .unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
         )?;
+        let entry_bytes = prepared_query_artifacts_memory_bytes(entry.as_ref());
+        if entry_bytes > PREPARED_PLAN_CACHE_MAX_ENTRY_BYTES {
+            record_counter(
+                "rpc.handle_candidate_query_prepared_cache_skipped_oversize_total",
+                1,
+            );
+            return Ok(entry);
+        }
         let mut cache = self
             .prepared_plan_cache
             .lock()
