@@ -211,6 +211,14 @@ enum RangeBoundExpr {
     FilesizeMinus(usize),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AtOffsetExpr {
+    Literal(usize),
+    Field(String),
+    FieldPlus(String, usize),
+    FieldMinus(String, usize),
+}
+
 struct ConditionParser {
     tokens: Vec<Token>,
     index: usize,
@@ -425,11 +433,7 @@ impl ConditionParser {
                 }
                 if matches!(self.peek(), Some(Token::At)) {
                     self.consume(Some(&Token::At))?;
-                    let Token::Int(offset) = self.consume(None)? else {
-                        return Err(SspryError::from(format!(
-                            "{raw_id} at requires an integer byte offset."
-                        )));
-                    };
+                    let offset = self.parse_at_offset_expr(&raw_id)?;
                     return Ok(QueryNode {
                         kind: "and".to_owned(),
                         pattern_id: None,
@@ -443,7 +447,10 @@ impl ConditionParser {
                             },
                             QueryNode {
                                 kind: "verifier_only_at".to_owned(),
-                                pattern_id: Some(format!("{raw_id}@{offset}")),
+                                pattern_id: Some(format!(
+                                    "{raw_id}@{}",
+                                    encode_at_offset_expr(&offset)
+                                )),
                                 threshold: None,
                                 children: Vec::new(),
                             },
@@ -847,6 +854,41 @@ impl ConditionParser {
         }
     }
 
+    fn parse_at_offset_expr(&mut self, raw_id: &str) -> Result<AtOffsetExpr> {
+        match self.consume(None)? {
+            Token::Int(value) => Ok(AtOffsetExpr::Literal(value)),
+            Token::Name(name) => match self.peek() {
+                Some(Token::Plus) => {
+                    self.consume(Some(&Token::Plus))?;
+                    let Token::Int(value) = self.consume(None)? else {
+                        return Err(SspryError::from(format!(
+                            "{raw_id} at requires integer arithmetic after {name}."
+                        )));
+                    };
+                    Ok(AtOffsetExpr::FieldPlus(name, value))
+                }
+                Some(Token::Minus) => {
+                    self.consume(Some(&Token::Minus))?;
+                    let Token::Int(value) = self.consume(None)? else {
+                        return Err(SspryError::from(format!(
+                            "{raw_id} at requires integer arithmetic after {name}."
+                        )));
+                    };
+                    Ok(AtOffsetExpr::FieldMinus(name, value))
+                }
+                _ => Ok(AtOffsetExpr::Field(name)),
+            },
+            Token::LParen => {
+                let expr = self.parse_at_offset_expr(raw_id)?;
+                self.consume(Some(&Token::RParen))?;
+                Ok(expr)
+            }
+            _ => Err(SspryError::from(format!(
+                "{raw_id} at requires an integer or field byte offset."
+            ))),
+        }
+    }
+
     fn parse_hash_identity_equality(&mut self, field_name: &str) -> Result<QueryNode> {
         let Some(hash_kind) = field_name.strip_prefix("hash.") else {
             return Err(SspryError::from(format!(
@@ -1237,6 +1279,15 @@ fn encode_range_bound_expr(expr: &RangeBoundExpr) -> String {
         RangeBoundExpr::Filesize => "filesize".to_owned(),
         RangeBoundExpr::FilesizePlus(value) => format!("filesize+{value}"),
         RangeBoundExpr::FilesizeMinus(value) => format!("filesize-{value}"),
+    }
+}
+
+fn encode_at_offset_expr(expr: &AtOffsetExpr) -> String {
+    match expr {
+        AtOffsetExpr::Literal(value) => value.to_string(),
+        AtOffsetExpr::Field(name) => name.clone(),
+        AtOffsetExpr::FieldPlus(name, value) => format!("{name}+{value}"),
+        AtOffsetExpr::FieldMinus(name, value) => format!("{name}-{value}"),
     }
 }
 
@@ -4685,6 +4736,34 @@ rule numeric_only_unanchorable {
         assert_eq!(at_node.children[1].kind, "verifier_only_at");
         assert_eq!(at_node.children[1].pattern_id.as_deref(), Some("$a@0"));
 
+        let mut parser = ConditionParser::new(
+            "$a at pe.entry_point",
+            HashSet::from(["$a".to_owned()]),
+            None,
+        )
+        .expect("parser");
+        let at_entry = parser.parse().expect("entry at parse");
+        assert_eq!(at_entry.kind, "and");
+        assert_eq!(at_entry.children[1].kind, "verifier_only_at");
+        assert_eq!(
+            at_entry.children[1].pattern_id.as_deref(),
+            Some("$a@pe.entry_point")
+        );
+
+        let mut parser = ConditionParser::new(
+            "$a at (pe.entry_point + 4)",
+            HashSet::from(["$a".to_owned()]),
+            None,
+        )
+        .expect("parser");
+        let at_entry_plus = parser.parse().expect("entry at plus parse");
+        assert_eq!(at_entry_plus.kind, "and");
+        assert_eq!(at_entry_plus.children[1].kind, "verifier_only_at");
+        assert_eq!(
+            at_entry_plus.children[1].pattern_id.as_deref(),
+            Some("$a@pe.entry_point+4")
+        );
+
         let mut parser =
             ConditionParser::new("#a > 2", HashSet::from(["$a".to_owned()]), None).expect("parser");
         let count_node = parser.parse().expect("count parse");
@@ -5148,6 +5227,31 @@ rule verifier_constraints {
                     .iter()
                     .any(|grandchild| grandchild.kind == "verifier_only_count")
         }));
+
+        let verifier_at_entry = compile_query_plan_default(
+            r#"
+rule verifier_at_entry {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a at pe.entry_point
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile verifier-only entry-point at");
+        assert_eq!(verifier_at_entry.patterns.len(), 1);
+        assert_eq!(verifier_at_entry.root.kind, "and");
+        assert!(
+            verifier_at_entry
+                .root
+                .children
+                .iter()
+                .any(|child| child.kind == "verifier_only_at")
+        );
 
         let verifier_loop = compile_query_plan_default(
             r#"
