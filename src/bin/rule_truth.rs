@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use yara_x::{Compiler as YaraCompiler, Scanner as YaraScanner};
 
@@ -62,8 +62,7 @@ fn first_64_hex(name: &str) -> Option<String> {
 }
 
 fn sha256_file_hex(path: &Path) -> Result<String, String> {
-    let mut file =
-        fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
@@ -79,7 +78,11 @@ fn sha256_file_hex(path: &Path) -> Result<String, String> {
 }
 
 fn file_identity_hex(path: &Path) -> Result<String, String> {
-    if let Some(hex) = path.file_name().and_then(|value| value.to_str()).and_then(first_64_hex) {
+    if let Some(hex) = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(first_64_hex)
+    {
         return Ok(hex);
     }
     sha256_file_hex(path)

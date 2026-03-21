@@ -316,7 +316,10 @@ fn extract_pe_metadata(
     prefix: &[u8],
     builder: &mut MetadataBuilder,
 ) -> Result<()> {
-    builder.set_bool(BoolField::MzIsMz, prefix.len() >= 2 && &prefix[..2] == b"MZ");
+    builder.set_bool(
+        BoolField::MzIsMz,
+        prefix.len() >= 2 && &prefix[..2] == b"MZ",
+    );
     builder.set_bool(BoolField::PeIsPe, false);
     builder.set_bool(BoolField::PeIs32Bit, false);
     builder.set_bool(BoolField::PeIs64Bit, false);
@@ -706,7 +709,10 @@ mod tests {
             normalize_query_metadata_field("_intern.is_zip"),
             Some("_intern.is_zip")
         );
-        assert_eq!(normalize_query_metadata_field("_intern.is_mz"), Some("_intern.is_mz"));
+        assert_eq!(
+            normalize_query_metadata_field("_intern.is_mz"),
+            Some("_intern.is_mz")
+        );
         assert!(metadata_field_is_boolean("pe.is_dll"));
         assert!(metadata_field_is_boolean("elf.is_elf"));
         assert!(metadata_field_is_boolean("zip.is_zip"));

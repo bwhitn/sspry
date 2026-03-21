@@ -63,11 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect(),
                 tier2_grams_per_alt: pattern.tier2_alternatives.iter().map(Vec::len).collect(),
-                fixed_literals_hex: pattern
-                    .fixed_literals
-                    .iter()
-                    .map(hex::encode)
-                    .collect(),
+                fixed_literals_hex: pattern.fixed_literals.iter().map(hex::encode).collect(),
                 fixed_literal_wide: pattern.fixed_literal_wide.clone(),
                 fixed_literal_fullword: pattern.fixed_literal_fullword.clone(),
             })

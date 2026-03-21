@@ -59,9 +59,12 @@ where
         self.order.push_back(key);
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.map.iter()
     }
 }
 

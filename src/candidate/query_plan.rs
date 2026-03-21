@@ -43,6 +43,95 @@ pub struct CompiledQueryPlan {
     pub tier1_gram_size: usize,
 }
 
+fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
+    let alternatives_bytes = pattern
+        .alternatives
+        .iter()
+        .map(|alts| {
+            (std::mem::size_of::<Vec<u64>>() as u64).saturating_add(
+                (alts.capacity() as u64).saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
+        })
+        .sum::<u64>();
+    let tier2_alternatives_bytes = pattern
+        .tier2_alternatives
+        .iter()
+        .map(|alts| {
+            (std::mem::size_of::<Vec<u64>>() as u64).saturating_add(
+                (alts.capacity() as u64).saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
+        })
+        .sum::<u64>();
+    let fixed_literals_bytes = pattern
+        .fixed_literals
+        .iter()
+        .map(|literal| {
+            (std::mem::size_of::<Vec<u8>>() as u64).saturating_add(literal.capacity() as u64)
+        })
+        .sum::<u64>();
+    (std::mem::size_of::<PatternPlan>() as u64)
+        .saturating_add(pattern.pattern_id.capacity() as u64)
+        .saturating_add(
+            (pattern.alternatives.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u64>>() as u64),
+        )
+        .saturating_add(alternatives_bytes)
+        .saturating_add(
+            (pattern.tier2_alternatives.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u64>>() as u64),
+        )
+        .saturating_add(tier2_alternatives_bytes)
+        .saturating_add(
+            (pattern.fixed_literals.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u8>>() as u64),
+        )
+        .saturating_add(fixed_literals_bytes)
+        .saturating_add(
+            (pattern.fixed_literal_wide.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<bool>() as u64),
+        )
+        .saturating_add(
+            (pattern.fixed_literal_fullword.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<bool>() as u64),
+        )
+}
+
+fn query_node_memory_bytes(node: &QueryNode) -> u64 {
+    (std::mem::size_of::<QueryNode>() as u64)
+        .saturating_add(node.kind.capacity() as u64)
+        .saturating_add(
+            node.pattern_id
+                .as_ref()
+                .map(|value| value.capacity() as u64)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            (node.children.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<QueryNode>() as u64),
+        )
+        .saturating_add(
+            node.children
+                .iter()
+                .map(query_node_memory_bytes)
+                .sum::<u64>(),
+        )
+}
+
+pub(crate) fn compiled_query_plan_memory_bytes(plan: &CompiledQueryPlan) -> u64 {
+    (std::mem::size_of::<CompiledQueryPlan>() as u64)
+        .saturating_add(
+            (plan.patterns.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<PatternPlan>() as u64),
+        )
+        .saturating_add(
+            plan.patterns
+                .iter()
+                .map(pattern_plan_memory_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(query_node_memory_bytes(&plan.root))
+}
+
 pub fn normalize_max_candidates(max_candidates: usize) -> usize {
     if max_candidates == 0 {
         usize::MAX
@@ -492,9 +581,7 @@ impl ConditionParser {
                                 "Condition references unknown rule: {field_name}"
                             ))
                         } else {
-                            SspryError::from(format!(
-                                "Unsupported condition field: {field_name}"
-                            ))
+                            SspryError::from(format!("Unsupported condition field: {field_name}"))
                         }
                     })?;
                 if matches!(self.peek(), Some(Token::EqEq)) {
@@ -1414,9 +1501,7 @@ fn parse_rule_blocks(rule_text: &str) -> Result<Vec<ParsedRuleBlock>> {
         let open_idx = sanitized[line_start..]
             .find('{')
             .map(|value| line_start + value)
-            .ok_or_else(|| {
-                SspryError::from(format!("Rule {name} is missing an opening brace."))
-            })?;
+            .ok_or_else(|| SspryError::from(format!("Rule {name} is missing an opening brace.")))?;
         let end_idx = match_rule_brace_span(&sanitized, open_idx)?;
         let block_text = &sanitized[line_start..end_idx];
         let (strings_lines, condition_text) = parse_rule_sections(block_text)?;
@@ -3173,9 +3258,7 @@ fn namespace_pattern_id(rule_name: &str, pattern_id: &str) -> String {
 
 fn merge_rule_fragment(into: &mut RulePlanFragment, other: &RulePlanFragment) -> Result<()> {
     for (key, value) in &other.pattern_alternatives {
-        if let Some(existing) = into
-            .pattern_alternatives
-            .insert(key.clone(), value.clone())
+        if let Some(existing) = into.pattern_alternatives.insert(key.clone(), value.clone())
             && existing != *value
         {
             return Err(SspryError::from(format!(
@@ -3313,7 +3396,12 @@ fn rename_fragment_for_rule_dependency(fragment: &mut RulePlanFragment, rule_nam
     }
     let rename_map = local_pattern_ids
         .iter()
-        .map(|pattern_id| (pattern_id.clone(), namespace_pattern_id(rule_name, pattern_id)))
+        .map(|pattern_id| {
+            (
+                pattern_id.clone(),
+                namespace_pattern_id(rule_name, pattern_id),
+            )
+        })
         .collect::<HashMap<_, _>>();
 
     let remap_map = |map: &mut BTreeMap<String, Vec<Vec<u64>>>| {
@@ -3348,11 +3436,7 @@ fn rename_fragment_for_rule_dependency(fragment: &mut RulePlanFragment, rule_nam
     remap_bools(&mut fragment.pattern_fixed_literal_wide);
     remap_bools(&mut fragment.pattern_fixed_literal_fullword);
 
-    fn recurse(
-        node: &mut QueryNode,
-        local_pattern_ids: &HashSet<String>,
-        rule_name: &str,
-    ) {
+    fn recurse(node: &mut QueryNode, local_pattern_ids: &HashSet<String>, rule_name: &str) {
         if let Some(pattern_id) = node.pattern_id.as_mut() {
             *pattern_id =
                 rename_verifier_pattern_id(&node.kind, pattern_id, local_pattern_ids, rule_name);
@@ -3547,10 +3631,9 @@ fn resolve_rule_refs(
             max_candidates,
         )?;
         merge_rule_fragment(fragment, &helper)?;
-        *node = helper
-            .root
-            .clone()
-            .ok_or_else(|| SspryError::from(format!("Rule {referenced} compiled without a root.")))?;
+        *node = helper.root.clone().ok_or_else(|| {
+            SspryError::from(format!("Rule {referenced} compiled without a root."))
+        })?;
         return Ok(());
     }
     for child in &mut node.children {
@@ -3702,7 +3785,12 @@ fn finalize_rule_fragment(
         .collect();
     fragment.pattern_fixed_literal_wide = patterns
         .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literal_wide.clone()))
+        .map(|pattern| {
+            (
+                pattern.pattern_id.clone(),
+                pattern.fixed_literal_wide.clone(),
+            )
+        })
         .collect();
     fragment.pattern_fixed_literal_fullword = patterns
         .iter()
@@ -3733,7 +3821,12 @@ fn finalize_rule_fragment(
         .collect();
     fragment.pattern_fixed_literal_wide = patterns
         .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literal_wide.clone()))
+        .map(|pattern| {
+            (
+                pattern.pattern_id.clone(),
+                pattern.fixed_literal_wide.clone(),
+            )
+        })
         .collect();
     fragment.pattern_fixed_literal_fullword = patterns
         .iter()
@@ -4675,7 +4768,10 @@ rule anon {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 3);
-        assert!(ids.iter().all(|id| id.starts_with(ANONYMOUS_PATTERN_PREFIX)));
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with(ANONYMOUS_PATTERN_PREFIX))
+        );
 
         let (strings, condition) = parse_rule_sections(
             r#"
@@ -5125,7 +5221,12 @@ rule short_nocase_anchor {
         .expect("compile short nocase");
         assert_eq!(short_nocase.patterns.len(), 1);
         assert!(short_nocase.patterns[0].alternatives.len() > 1);
-        assert!(short_nocase.patterns[0].alternatives.iter().all(|alt| alt.is_empty()));
+        assert!(
+            short_nocase.patterns[0]
+                .alternatives
+                .iter()
+                .all(|alt| alt.is_empty())
+        );
         assert!(
             short_nocase.patterns[0]
                 .tier2_alternatives
@@ -5347,7 +5448,10 @@ rule parent_rule {
 "#;
         let err = compile_query_plan_default(rule, 4, false, true, 100_000)
             .expect_err("missing helper should fail");
-        assert!(err.to_string().contains("Condition references unknown rule"));
+        assert!(
+            err.to_string()
+                .contains("Condition references unknown rule")
+        );
     }
 
     #[test]
@@ -5498,7 +5602,6 @@ rule parent_rule {
             u128::MAX
         );
     }
-
 
     #[test]
     fn tier2_gram_size_wrapper_helpers_work() {

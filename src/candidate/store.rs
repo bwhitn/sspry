@@ -262,6 +262,15 @@ pub struct CandidateStats {
     pub tier2_pattern_superblock_positions_bytes: u64,
     pub tree_tier1_gate_bytes: u64,
     pub tree_tier2_gate_bytes: u64,
+    pub superblock_summary_bytes_total: u64,
+    pub superblock_positions_bytes_total: u64,
+    pub docs_vector_bytes: u64,
+    pub doc_rows_bytes: u64,
+    pub tier2_doc_rows_bytes: u64,
+    pub sha_index_bytes: u64,
+    pub special_doc_positions_bytes: u64,
+    pub prepared_query_cache_entries: usize,
+    pub prepared_query_cache_bytes: u64,
     pub mapped_bloom_bytes: u64,
     pub mapped_tier2_bloom_bytes: u64,
     pub mapped_metadata_bytes: u64,
@@ -340,6 +349,10 @@ struct CandidateDoc {
     tier2_bloom_hashes: usize,
     special_population: bool,
     deleted: bool,
+}
+
+fn candidate_doc_memory_bytes(doc: &CandidateDoc) -> u64 {
+    (std::mem::size_of::<CandidateDoc>() as u64).saturating_add(doc.sha256.capacity() as u64)
 }
 
 const DOC_META_ROW_BYTES: usize = 56;
@@ -3367,6 +3380,44 @@ impl CandidateStore {
         Ok((matched_hits, used_tiers, query_profile))
     }
 
+    fn docs_vector_memory_bytes(&self) -> u64 {
+        (self.docs.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<CandidateDoc>() as u64)
+            .saturating_add(
+                self.docs
+                    .iter()
+                    .map(candidate_doc_memory_bytes)
+                    .sum::<u64>()
+                    .saturating_sub(
+                        (self.docs.len() as u64)
+                            .saturating_mul(std::mem::size_of::<CandidateDoc>() as u64),
+                    ),
+            )
+    }
+
+    fn sha_index_memory_bytes(&self) -> u64 {
+        let bucket_bytes = (self.sha_to_pos.capacity() as u64).saturating_mul(
+            (std::mem::size_of::<(String, usize)>() + std::mem::size_of::<u64>()) as u64,
+        );
+        let key_bytes = self
+            .sha_to_pos
+            .keys()
+            .map(|sha| sha.capacity() as u64)
+            .sum::<u64>();
+        bucket_bytes.saturating_add(key_bytes)
+    }
+
+    fn prepared_query_cache_memory_bytes(&self) -> u64 {
+        self.prepared_query_cache
+            .iter()
+            .map(|(key, value)| {
+                (std::mem::size_of::<String>() as u64)
+                    .saturating_add(key.capacity() as u64)
+                    .saturating_add(prepared_query_artifacts_memory_bytes(value.as_ref()))
+            })
+            .sum()
+    }
+
     pub fn stats(&self) -> CandidateStats {
         let doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
         let deleted_doc_count = self.docs.iter().filter(|doc| doc.deleted).count();
@@ -3383,6 +3434,12 @@ impl CandidateStore {
             mapped_metadata_bytes,
             mapped_external_id_bytes,
         ) = self.sidecars.mapped_bytes();
+        let tier1_superblock_summary_bytes = self.tier2_superblocks.summary_memory_bytes;
+        let tier2_pattern_superblock_summary_bytes =
+            self.tier2_pattern_superblocks.summary_memory_bytes;
+        let tier1_superblock_positions_bytes = self.tier2_superblocks.positions_memory_bytes();
+        let tier2_pattern_superblock_positions_bytes =
+            self.tier2_pattern_superblocks.positions_memory_bytes();
         CandidateStats {
             doc_count,
             deleted_doc_count,
@@ -3411,20 +3468,28 @@ impl CandidateStore {
             tier2_match_ratio,
             tier2_superblock_count: self.tier2_superblocks.total_block_count(),
             tier2_superblock_docs: self.tier2_superblocks.docs_per_block,
-            tier2_superblock_summary_bytes: self
-                .tier2_superblocks
-                .summary_memory_bytes
-                .saturating_add(self.tier2_pattern_superblocks.summary_memory_bytes),
-            tier1_superblock_summary_bytes: self.tier2_superblocks.summary_memory_bytes,
-            tier2_pattern_superblock_summary_bytes: self
-                .tier2_pattern_superblocks
-                .summary_memory_bytes,
-            tier1_superblock_positions_bytes: self.tier2_superblocks.positions_memory_bytes(),
-            tier2_pattern_superblock_positions_bytes: self
-                .tier2_pattern_superblocks
-                .positions_memory_bytes(),
+            tier2_superblock_summary_bytes: tier1_superblock_summary_bytes
+                .saturating_add(tier2_pattern_superblock_summary_bytes),
+            tier1_superblock_summary_bytes,
+            tier2_pattern_superblock_summary_bytes,
+            tier1_superblock_positions_bytes,
+            tier2_pattern_superblock_positions_bytes,
             tree_tier1_gate_bytes: self.tree_tier1_gates.memory_bytes(),
             tree_tier2_gate_bytes: self.tree_tier2_gates.memory_bytes(),
+            superblock_summary_bytes_total: tier1_superblock_summary_bytes
+                .saturating_add(tier2_pattern_superblock_summary_bytes),
+            superblock_positions_bytes_total: tier1_superblock_positions_bytes
+                .saturating_add(tier2_pattern_superblock_positions_bytes),
+            docs_vector_bytes: self.docs_vector_memory_bytes(),
+            doc_rows_bytes: (self.doc_rows.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<DocMetaRow>() as u64),
+            tier2_doc_rows_bytes: (self.tier2_doc_rows.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Tier2DocMetaRow>() as u64),
+            sha_index_bytes: self.sha_index_memory_bytes(),
+            special_doc_positions_bytes: (self.special_doc_positions.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<usize>() as u64),
+            prepared_query_cache_entries: self.prepared_query_cache.len(),
+            prepared_query_cache_bytes: self.prepared_query_cache_memory_bytes(),
             mapped_bloom_bytes,
             mapped_tier2_bloom_bytes,
             mapped_metadata_bytes,
@@ -4951,6 +5016,177 @@ type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
 
 const MAX_LANE_POSITION_VARIANTS: usize = 64;
 
+fn required_masks_by_key_memory_bytes(masks: &RequiredMasksByKey) -> u64 {
+    (masks.len() as u64)
+        .saturating_mul(std::mem::size_of::<((usize, usize), Vec<(usize, u64)>)>() as u64)
+        .saturating_add(
+            masks
+                .values()
+                .map(|values| {
+                    (std::mem::size_of::<Vec<(usize, u64)>>() as u64).saturating_add(
+                        (values.capacity() as u64)
+                            .saturating_mul(std::mem::size_of::<(usize, u64)>() as u64),
+                    )
+                })
+                .sum::<u64>(),
+        )
+}
+
+fn shifted_required_masks_memory_bytes(masks: &ShiftedRequiredMasks) -> u64 {
+    (std::mem::size_of::<ShiftedRequiredMasks>() as u64)
+        .saturating_add(
+            (masks.shifts.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<RequiredMasksByKey>() as u64),
+        )
+        .saturating_add(
+            masks
+                .shifts
+                .iter()
+                .map(required_masks_by_key_memory_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            (masks.any_lane_values.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<RequiredMasksByKey>>() as u64),
+        )
+        .saturating_add(
+            masks
+                .any_lane_values
+                .iter()
+                .map(|lane_maps| {
+                    (std::mem::size_of::<Vec<RequiredMasksByKey>>() as u64)
+                        .saturating_add(
+                            (lane_maps.capacity() as u64).saturating_mul(std::mem::size_of::<
+                                RequiredMasksByKey,
+                            >(
+                            )
+                                as u64),
+                        )
+                        .saturating_add(
+                            lane_maps
+                                .iter()
+                                .map(required_masks_by_key_memory_bytes)
+                                .sum::<u64>(),
+                        )
+                })
+                .sum::<u64>(),
+        )
+}
+
+fn prepared_pattern_masks_memory_bytes(masks: &PreparedPatternMasks) -> u64 {
+    (std::mem::size_of::<PreparedPatternMasks>() as u64)
+        .saturating_add(
+            (masks.tier1.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
+        )
+        .saturating_add(
+            masks
+                .tier1
+                .iter()
+                .map(shifted_required_masks_memory_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            (masks.tier1_superblocks.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
+        )
+        .saturating_add(
+            masks
+                .tier1_superblocks
+                .iter()
+                .map(shifted_required_masks_memory_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            (masks.tier2.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ShiftedRequiredMasks>() as u64),
+        )
+        .saturating_add(
+            masks
+                .tier2
+                .iter()
+                .map(shifted_required_masks_memory_bytes)
+                .sum::<u64>(),
+        )
+}
+
+fn prepared_pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
+    let alternatives_bytes = pattern
+        .alternatives
+        .iter()
+        .map(|alts| {
+            (std::mem::size_of::<Vec<u64>>() as u64).saturating_add(
+                (alts.capacity() as u64).saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
+        })
+        .sum::<u64>();
+    let tier2_alternatives_bytes = pattern
+        .tier2_alternatives
+        .iter()
+        .map(|alts| {
+            (std::mem::size_of::<Vec<u64>>() as u64).saturating_add(
+                (alts.capacity() as u64).saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
+        })
+        .sum::<u64>();
+    let fixed_literals_bytes = pattern
+        .fixed_literals
+        .iter()
+        .map(|literal| {
+            (std::mem::size_of::<Vec<u8>>() as u64).saturating_add(literal.capacity() as u64)
+        })
+        .sum::<u64>();
+    (std::mem::size_of::<PatternPlan>() as u64)
+        .saturating_add(pattern.pattern_id.capacity() as u64)
+        .saturating_add(
+            (pattern.alternatives.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u64>>() as u64),
+        )
+        .saturating_add(alternatives_bytes)
+        .saturating_add(
+            (pattern.tier2_alternatives.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u64>>() as u64),
+        )
+        .saturating_add(tier2_alternatives_bytes)
+        .saturating_add(
+            (pattern.fixed_literals.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u8>>() as u64),
+        )
+        .saturating_add(fixed_literals_bytes)
+        .saturating_add(
+            (pattern.fixed_literal_wide.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<bool>() as u64),
+        )
+        .saturating_add(
+            (pattern.fixed_literal_fullword.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<bool>() as u64),
+        )
+}
+
+pub(crate) fn prepared_query_artifacts_memory_bytes(artifacts: &PreparedQueryArtifacts) -> u64 {
+    let patterns_bytes = artifacts
+        .patterns
+        .iter()
+        .map(|(key, pattern)| {
+            (std::mem::size_of::<String>() as u64)
+                .saturating_add(key.capacity() as u64)
+                .saturating_add(prepared_pattern_plan_memory_bytes(pattern))
+        })
+        .sum::<u64>();
+    let mask_cache_bytes = artifacts
+        .mask_cache
+        .iter()
+        .map(|(key, masks)| {
+            (std::mem::size_of::<String>() as u64)
+                .saturating_add(key.capacity() as u64)
+                .saturating_add(prepared_pattern_masks_memory_bytes(masks))
+        })
+        .sum::<u64>();
+    (std::mem::size_of::<PreparedQueryArtifacts>() as u64)
+        .saturating_add(patterns_bytes)
+        .saturating_add(mask_cache_bytes)
+}
+
 fn lane_position_variants_for_pattern(
     values: &[u64],
     fixed_literal: &[u8],
@@ -5018,7 +5254,11 @@ fn lane_position_variants_for_pattern(
     variants
 }
 
-fn exact_pattern_has_ambiguous_positions(values: &[u64], fixed_literal: &[u8], gram_size: usize) -> bool {
+fn exact_pattern_has_ambiguous_positions(
+    values: &[u64],
+    fixed_literal: &[u8],
+    gram_size: usize,
+) -> bool {
     if fixed_literal.is_empty() || fixed_literal.len() < gram_size {
         return false;
     }
@@ -5438,9 +5678,9 @@ fn tree_gate_matches_shifted_required_masks(
     }
     if !shifted.any_lane_values.is_empty() {
         return shifted.any_lane_values.iter().all(|lanes| {
-            lanes.iter().any(|by_key| {
-                tree_gate_matches_required_masks(by_key, gates, fallback_superblocks)
-            })
+            lanes
+                .iter()
+                .any(|by_key| tree_gate_matches_required_masks(by_key, gates, fallback_superblocks))
         });
     }
     shifted
@@ -5785,9 +6025,11 @@ where
                     })
                 } else {
                     shifted.shifts.iter().any(|by_key| {
-                        by_key.get(&(doc.filter_bytes, doc.bloom_hashes)).is_some_and(
-                            |required| raw_filter_matches_word_masks(bloom_bytes, required),
-                        )
+                        by_key
+                            .get(&(doc.filter_bytes, doc.bloom_hashes))
+                            .is_some_and(|required| {
+                                raw_filter_matches_word_masks(bloom_bytes, required)
+                            })
                     })
                 }
             });
@@ -6136,8 +6378,9 @@ mod tests {
     use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::{
         DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
-        extract_compact_document_metadata, pack_exact_gram,
+        extract_compact_document_metadata,
         features::scan_file_features_bloom_only_with_gram_sizes,
+        pack_exact_gram,
         query_plan::{
             compile_query_plan_with_gram_sizes,
             compile_query_plan_with_gram_sizes_and_identity_source,

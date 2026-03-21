@@ -17,11 +17,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
 use crate::candidate::store::{
     CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
     CandidateInsertBatchProfile, CandidateStoreOpenProfile, PreparedQueryArtifacts,
     build_prepared_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
-    write_compacted_snapshot,
+    prepared_query_artifacts_memory_bytes, write_compacted_snapshot,
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
@@ -58,6 +59,8 @@ const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
+const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
+const PREPARED_PLAN_CACHE_CAPACITY: usize = 4;
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
@@ -457,6 +460,22 @@ struct CachedCandidateQuery {
     ordered_hashes: Vec<String>,
     tier_used: String,
     query_profile: CandidateQueryProfile,
+}
+
+fn cached_candidate_query_memory_bytes(query: &CachedCandidateQuery) -> u64 {
+    (std::mem::size_of::<CachedCandidateQuery>() as u64)
+        .saturating_add(query.tier_used.capacity() as u64)
+        .saturating_add(
+            (query.ordered_hashes.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<String>() as u64),
+        )
+        .saturating_add(
+            query
+                .ordered_hashes
+                .iter()
+                .map(|hash| hash.capacity() as u64)
+                .sum::<u64>(),
+        )
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1366,6 +1385,42 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.tier2_superblock_memory_budget_bytes)
         .sum::<u64>();
+    let superblock_summary_bytes_total = stats_rows
+        .iter()
+        .map(|item| item.superblock_summary_bytes_total)
+        .sum::<u64>();
+    let superblock_positions_bytes_total = stats_rows
+        .iter()
+        .map(|item| item.superblock_positions_bytes_total)
+        .sum::<u64>();
+    let docs_vector_bytes = stats_rows
+        .iter()
+        .map(|item| item.docs_vector_bytes)
+        .sum::<u64>();
+    let doc_rows_bytes = stats_rows
+        .iter()
+        .map(|item| item.doc_rows_bytes)
+        .sum::<u64>();
+    let tier2_doc_rows_bytes = stats_rows
+        .iter()
+        .map(|item| item.tier2_doc_rows_bytes)
+        .sum::<u64>();
+    let sha_index_bytes = stats_rows
+        .iter()
+        .map(|item| item.sha_index_bytes)
+        .sum::<u64>();
+    let special_doc_positions_bytes = stats_rows
+        .iter()
+        .map(|item| item.special_doc_positions_bytes)
+        .sum::<u64>();
+    let prepared_query_cache_entries = stats_rows
+        .iter()
+        .map(|item| item.prepared_query_cache_entries)
+        .sum::<usize>();
+    let prepared_query_cache_bytes = stats_rows
+        .iter()
+        .map(|item| item.prepared_query_cache_bytes)
+        .sum::<u64>();
     let mut out = Map::<String, Value>::new();
     out.insert("active_doc_count".to_owned(), json!(active_doc_count));
     out.insert(
@@ -1419,6 +1474,33 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "tier2_superblock_memory_budget_bytes".to_owned(),
         json!(tier2_superblock_memory_budget_bytes),
+    );
+    out.insert(
+        "superblock_summary_bytes_total".to_owned(),
+        json!(superblock_summary_bytes_total),
+    );
+    out.insert(
+        "superblock_positions_bytes_total".to_owned(),
+        json!(superblock_positions_bytes_total),
+    );
+    out.insert("docs_vector_bytes".to_owned(), json!(docs_vector_bytes));
+    out.insert("doc_rows_bytes".to_owned(), json!(doc_rows_bytes));
+    out.insert(
+        "tier2_doc_rows_bytes".to_owned(),
+        json!(tier2_doc_rows_bytes),
+    );
+    out.insert("sha_index_bytes".to_owned(), json!(sha_index_bytes));
+    out.insert(
+        "special_doc_positions_bytes".to_owned(),
+        json!(special_doc_positions_bytes),
+    );
+    out.insert(
+        "prepared_query_cache_entries".to_owned(),
+        json!(prepared_query_cache_entries),
+    );
+    out.insert(
+        "prepared_query_cache_bytes".to_owned(),
+        json!(prepared_query_cache_bytes),
     );
     out.insert("disk_usage_bytes".to_owned(), json!(disk_usage_bytes));
     out.insert(
@@ -1743,8 +1825,8 @@ impl ServerState {
                 auto_publish_initial_idle_ms,
                 candidate_shards,
             )),
-            normalized_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
-            prepared_plan_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
+            normalized_plan_cache: Mutex::new(BoundedCache::new(NORMALIZED_PLAN_CACHE_CAPACITY)),
+            prepared_plan_cache: Mutex::new(BoundedCache::new(PREPARED_PLAN_CACHE_CAPACITY)),
             query_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             compaction_runtime: Mutex::new(CompactionRuntime::default()),
             next_compaction_shard: AtomicUsize::new(0),
@@ -2747,6 +2829,57 @@ impl ServerState {
         ))
     }
 
+    fn normalized_plan_cache_stats(&self) -> (usize, u64) {
+        self.normalized_plan_cache
+            .lock()
+            .map(|cache| {
+                let bytes = cache
+                    .iter()
+                    .map(|(key, value)| {
+                        (std::mem::size_of::<String>() as u64)
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(compiled_query_plan_memory_bytes(value.as_ref()))
+                    })
+                    .sum();
+                (cache.len(), bytes)
+            })
+            .unwrap_or((0, 0))
+    }
+
+    fn prepared_plan_cache_stats(&self) -> (usize, u64) {
+        self.prepared_plan_cache
+            .lock()
+            .map(|cache| {
+                let bytes = cache
+                    .iter()
+                    .map(|(key, value)| {
+                        (std::mem::size_of::<String>() as u64)
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(prepared_query_artifacts_memory_bytes(value.as_ref()))
+                    })
+                    .sum();
+                (cache.len(), bytes)
+            })
+            .unwrap_or((0, 0))
+    }
+
+    fn query_cache_stats(&self) -> (usize, u64) {
+        self.query_cache
+            .lock()
+            .map(|cache| {
+                let bytes = cache
+                    .iter()
+                    .map(|(key, value)| {
+                        (std::mem::size_of::<String>() as u64)
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(cached_candidate_query_memory_bytes(value.as_ref()))
+                    })
+                    .sum();
+                (cache.len(), bytes)
+            })
+            .unwrap_or((0, 0))
+    }
+
     fn current_stats_json(&self) -> Result<Map<String, Value>> {
         let started_total = Instant::now();
         let now_unix_ms = current_unix_ms();
@@ -2821,8 +2954,31 @@ impl ServerState {
             json!(self.config.tier2_superblock_budget_divisor),
         );
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
+        let (normalized_plan_cache_entries, normalized_plan_cache_bytes) =
+            self.normalized_plan_cache_stats();
+        let (prepared_plan_cache_entries, prepared_plan_cache_bytes) =
+            self.prepared_plan_cache_stats();
+        let (query_cache_entries, query_cache_bytes) = self.query_cache_stats();
         stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
         stats.insert("peak_rss_kb".to_owned(), json!(peak_rss_kb));
+        stats.insert(
+            "normalized_plan_cache_entries".to_owned(),
+            json!(normalized_plan_cache_entries),
+        );
+        stats.insert(
+            "normalized_plan_cache_bytes".to_owned(),
+            json!(normalized_plan_cache_bytes),
+        );
+        stats.insert(
+            "prepared_plan_cache_entries".to_owned(),
+            json!(prepared_plan_cache_entries),
+        );
+        stats.insert(
+            "prepared_plan_cache_bytes".to_owned(),
+            json!(prepared_plan_cache_bytes),
+        );
+        stats.insert("query_cache_entries".to_owned(), json!(query_cache_entries));
+        stats.insert("query_cache_bytes".to_owned(), json!(query_cache_bytes));
         stats.insert(
             "startup_cleanup_removed_roots".to_owned(),
             json!(self.startup_cleanup_removed_roots),
@@ -3416,8 +3572,31 @@ impl ServerState {
             json!(self.config.tier2_superblock_budget_divisor),
         );
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
+        let (normalized_plan_cache_entries, normalized_plan_cache_bytes) =
+            self.normalized_plan_cache_stats();
+        let (prepared_plan_cache_entries, prepared_plan_cache_bytes) =
+            self.prepared_plan_cache_stats();
+        let (query_cache_entries, query_cache_bytes) = self.query_cache_stats();
         stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
         stats.insert("peak_rss_kb".to_owned(), json!(peak_rss_kb));
+        stats.insert(
+            "normalized_plan_cache_entries".to_owned(),
+            json!(normalized_plan_cache_entries),
+        );
+        stats.insert(
+            "normalized_plan_cache_bytes".to_owned(),
+            json!(normalized_plan_cache_bytes),
+        );
+        stats.insert(
+            "prepared_plan_cache_entries".to_owned(),
+            json!(prepared_plan_cache_entries),
+        );
+        stats.insert(
+            "prepared_plan_cache_bytes".to_owned(),
+            json!(prepared_plan_cache_bytes),
+        );
+        stats.insert("query_cache_entries".to_owned(), json!(query_cache_entries));
+        stats.insert("query_cache_bytes".to_owned(), json!(query_cache_bytes));
         stats.insert(
             "startup_cleanup_removed_roots".to_owned(),
             json!(self.startup_cleanup_removed_roots),
