@@ -136,7 +136,7 @@ fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&
         | ("uint16be", 0, 0x7f45)
         | ("uint32", 0, 0x464c457f)
         | ("uint32be", 0, 0x7f454c46) => Some("elf.is_elf"),
-        ("uint32", 0, 0x04034b50) | ("uint32be", 0, 0x504b0304) => Some("zip.is_zip"),
+        ("uint32", 0, 0x04034b50) | ("uint32be", 0, 0x504b0304) => Some("_intern.is_zip"),
         _ => None,
     }
 }
@@ -3571,7 +3571,7 @@ rule header_magic {
         }));
         assert!(plan.root.children.iter().any(|child| {
             child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("zip.is_zip")
+                && child.pattern_id.as_deref() == Some("_intern.is_zip")
                 && child.threshold == Some(1)
         }));
         assert!(plan.root.children.iter().any(|child| {

@@ -527,7 +527,7 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
         "dex.is_dex" => Some("dex.is_dex"),
         "dex.version" => Some("dex.version"),
         "lnk.is_lnk" => Some("lnk.is_lnk"),
-        "zip.is_zip" => Some("zip.is_zip"),
+        "_intern.is_zip" | "zip.is_zip" => Some("_intern.is_zip"),
         "lnk.creation_time" => Some("lnk.creation_time"),
         "lnk.access_time" => Some("lnk.access_time"),
         "lnk.write_time" => Some("lnk.write_time"),
@@ -555,7 +555,7 @@ pub fn metadata_field_is_boolean(raw: &str) -> bool {
                 | "dex.is_dex"
                 | "lnk.is_lnk"
                 | "elf.is_elf"
-                | "zip.is_zip"
+                | "_intern.is_zip"
         )
     )
 }
@@ -594,7 +594,7 @@ fn bool_field_for_name(field: &str) -> Option<BoolField> {
         "dex.is_dex" => Some(BoolField::DexIsDex),
         "lnk.is_lnk" => Some(BoolField::LnkIsLnk),
         "elf.is_elf" => Some(BoolField::ElfIsElf),
-        "zip.is_zip" => Some(BoolField::ZipIsZip),
+        "_intern.is_zip" => Some(BoolField::ZipIsZip),
         _ => None,
     }
 }
@@ -700,12 +700,17 @@ mod tests {
         );
         assert_eq!(
             normalize_query_metadata_field("zip.is_zip"),
-            Some("zip.is_zip")
+            Some("_intern.is_zip")
+        );
+        assert_eq!(
+            normalize_query_metadata_field("_intern.is_zip"),
+            Some("_intern.is_zip")
         );
         assert_eq!(normalize_query_metadata_field("_intern.is_mz"), Some("_intern.is_mz"));
         assert!(metadata_field_is_boolean("pe.is_dll"));
         assert!(metadata_field_is_boolean("elf.is_elf"));
         assert!(metadata_field_is_boolean("zip.is_zip"));
+        assert!(metadata_field_is_boolean("_intern.is_zip"));
         assert!(metadata_field_is_boolean("_intern.is_mz"));
         assert!(metadata_field_is_integer("macho.device_type"));
     }
@@ -834,6 +839,10 @@ mod tests {
         let zip_bytes = extract_compact_document_metadata(&zip_path).expect("metadata");
         assert_eq!(
             metadata_field_matches_eq(&zip_bytes, "zip.is_zip", 1).expect("zip"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&zip_bytes, "_intern.is_zip", 1).expect("zip intern"),
             Some(true)
         );
 
