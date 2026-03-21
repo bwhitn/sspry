@@ -1393,6 +1393,18 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.superblock_positions_bytes_total)
         .sum::<u64>();
+    let mapped_superblock_snapshot_bytes_total = stats_rows
+        .iter()
+        .map(|item| item.mapped_superblock_snapshot_bytes_total)
+        .sum::<u64>();
+    let mapped_tier1_superblock_snapshot_bytes = stats_rows
+        .iter()
+        .map(|item| item.mapped_tier1_superblock_snapshot_bytes)
+        .sum::<u64>();
+    let mapped_tier2_pattern_superblock_snapshot_bytes = stats_rows
+        .iter()
+        .map(|item| item.mapped_tier2_pattern_superblock_snapshot_bytes)
+        .sum::<u64>();
     let docs_vector_bytes = stats_rows
         .iter()
         .map(|item| item.docs_vector_bytes)
@@ -1482,6 +1494,18 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "superblock_positions_bytes_total".to_owned(),
         json!(superblock_positions_bytes_total),
+    );
+    out.insert(
+        "mapped_superblock_snapshot_bytes_total".to_owned(),
+        json!(mapped_superblock_snapshot_bytes_total),
+    );
+    out.insert(
+        "mapped_tier1_superblock_snapshot_bytes".to_owned(),
+        json!(mapped_tier1_superblock_snapshot_bytes),
+    );
+    out.insert(
+        "mapped_tier2_pattern_superblock_snapshot_bytes".to_owned(),
+        json!(mapped_tier2_pattern_superblock_snapshot_bytes),
     );
     out.insert("docs_vector_bytes".to_owned(), json!(docs_vector_bytes));
     out.insert("doc_rows_bytes".to_owned(), json!(doc_rows_bytes));
@@ -4884,6 +4908,7 @@ impl ServerState {
         } else {
             None
         };
+        let _ = self.invalidate_published_stats_cache();
         Ok(CandidateQueryResponse {
             returned_count: page.len(),
             sha256: page,

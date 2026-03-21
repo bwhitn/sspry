@@ -264,6 +264,9 @@ pub struct CandidateStats {
     pub tree_tier2_gate_bytes: u64,
     pub superblock_summary_bytes_total: u64,
     pub superblock_positions_bytes_total: u64,
+    pub mapped_superblock_snapshot_bytes_total: u64,
+    pub mapped_tier1_superblock_snapshot_bytes: u64,
+    pub mapped_tier2_pattern_superblock_snapshot_bytes: u64,
     pub docs_vector_bytes: u64,
     pub doc_rows_bytes: u64,
     pub tier2_doc_rows_bytes: u64,
@@ -783,6 +786,13 @@ impl Tier2SuperblockIndex {
                 (positions.len() as u64).saturating_mul(std::mem::size_of::<u32>() as u64)
             })
             .sum()
+    }
+
+    fn snapshot_mapped_bytes(&self) -> u64 {
+        self.snapshot_mmap
+            .as_ref()
+            .map(|mmap| mmap.len() as u64)
+            .unwrap_or(0)
     }
 
     fn block_bytes<'a>(
@@ -3440,6 +3450,9 @@ impl CandidateStore {
         let tier1_superblock_positions_bytes = self.tier2_superblocks.positions_memory_bytes();
         let tier2_pattern_superblock_positions_bytes =
             self.tier2_pattern_superblocks.positions_memory_bytes();
+        let mapped_tier1_superblock_snapshot_bytes = self.tier2_superblocks.snapshot_mapped_bytes();
+        let mapped_tier2_pattern_superblock_snapshot_bytes =
+            self.tier2_pattern_superblocks.snapshot_mapped_bytes();
         CandidateStats {
             doc_count,
             deleted_doc_count,
@@ -3480,6 +3493,10 @@ impl CandidateStore {
                 .saturating_add(tier2_pattern_superblock_summary_bytes),
             superblock_positions_bytes_total: tier1_superblock_positions_bytes
                 .saturating_add(tier2_pattern_superblock_positions_bytes),
+            mapped_superblock_snapshot_bytes_total: mapped_tier1_superblock_snapshot_bytes
+                .saturating_add(mapped_tier2_pattern_superblock_snapshot_bytes),
+            mapped_tier1_superblock_snapshot_bytes,
+            mapped_tier2_pattern_superblock_snapshot_bytes,
             docs_vector_bytes: self.docs_vector_memory_bytes(),
             doc_rows_bytes: (self.doc_rows.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<DocMetaRow>() as u64),
