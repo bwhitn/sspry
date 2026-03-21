@@ -263,6 +263,16 @@ fn normalize_rule_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+fn pattern_has_searchable_anchor(
+    alternatives: &[Vec<u64>],
+    tier2_alternatives: &[Vec<u64>],
+    fixed_literals: &[Vec<u8>],
+) -> bool {
+    alternatives.iter().any(|alt| !alt.is_empty())
+        || tier2_alternatives.iter().any(|alt| !alt.is_empty())
+        || fixed_literals.iter().any(|literal| !literal.is_empty())
+}
+
 fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != N * 2 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -442,6 +452,13 @@ impl ConditionParser {
                 if !self.known_patterns.contains(&raw_id) {
                     return Err(SspryError::from(format!(
                         "Condition references unknown string id: {raw_id}"
+                    )));
+                }
+                if self.verifier_only_pattern_ids.contains(&raw_id)
+                    && matches!(self.peek(), Some(Token::At | Token::In))
+                {
+                    return Err(SspryError::from(format!(
+                        "Pattern {raw_id} requires an anchorable literal for at/in search use."
                     )));
                 }
                 if self.verifier_only_pattern_ids.contains(&raw_id)
@@ -797,6 +814,11 @@ impl ConditionParser {
         if !self.known_patterns.contains(&raw_id) {
             return Err(SspryError::from(format!(
                 "Condition references unknown string id: {raw_id}"
+            )));
+        }
+        if self.verifier_only_pattern_ids.contains(&raw_id) {
+            return Err(SspryError::from(format!(
+                "Pattern {raw_id} requires an anchorable literal for verifier-loop search use."
             )));
         }
         self.consume(Some(&Token::RParen))?;
@@ -3733,6 +3755,14 @@ fn build_local_rule_fragment(
                     fullword_flags.push(*fullword);
                 }
             }
+            if !pattern_has_searchable_anchor(
+                &alternatives,
+                &tier2_alternatives,
+                &fixed_literals,
+            ) {
+                verifier_only_pattern_ids.insert(pattern_id);
+                continue;
+            }
             fragment
                 .pattern_alternatives
                 .insert(pattern_id.clone(), alternatives);
@@ -3774,6 +3804,14 @@ fn build_local_rule_fragment(
                 } else {
                     vec![Vec::new(); def.alternatives.len()]
                 };
+                if !pattern_has_searchable_anchor(
+                    &alternatives,
+                    &tier2_alternatives,
+                    &fixed_literals,
+                ) {
+                    verifier_only_pattern_ids.insert(pattern_id);
+                    continue;
+                }
                 fragment
                     .pattern_alternatives
                     .insert(pattern_id.clone(), alternatives);
@@ -3822,6 +3860,14 @@ fn build_local_rule_fragment(
                 raw_pattern_id
             };
             let alt_count = alternatives.len();
+            if !pattern_has_searchable_anchor(
+                &alternatives,
+                &tier2_alternatives,
+                &fixed_literals,
+            ) {
+                verifier_only_pattern_ids.insert(pattern_id);
+                continue;
+            }
             fragment
                 .pattern_alternatives
                 .insert(pattern_id.clone(), alternatives);
@@ -3845,7 +3891,14 @@ fn build_local_rule_fragment(
         )));
     }
 
-    let known_pattern_names = fragment.pattern_alternatives.keys().cloned().collect::<Vec<_>>();
+    let mut known_pattern_names = fragment
+        .pattern_alternatives
+        .keys()
+        .cloned()
+        .chain(verifier_only_pattern_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    known_pattern_names.sort();
+    known_pattern_names.dedup();
     let rewritten_condition = rewrite_verifier_only_for_of_at_loops(
         &rule.condition_text,
         &known_pattern_names,
@@ -5526,7 +5579,7 @@ rule verifier_for_of_at {
             r#"
 rule verifier_loop {
   strings:
-    $a = { FF 75 ?? FF 55 ?? }
+    $a = { 41 42 43 44 }
   condition:
     for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
 }
@@ -5545,6 +5598,63 @@ rule verifier_loop {
                 .children
                 .iter()
                 .any(|child| child.kind == "verifier_only_loop")
+        );
+        assert!(
+            compile_query_plan_default(
+                r#"
+rule bad_unanchorable_pattern {
+  strings:
+    $a = { 41 ?? 42 }
+  condition:
+    $a
+}
+"#,
+                8,
+                false,
+                true,
+                100,
+            )
+            .expect_err("unanchorable direct hex should fail")
+            .to_string()
+            .contains("requires an anchorable literal for direct search use")
+        );
+        assert!(
+            compile_query_plan_default(
+                r#"
+rule bad_unanchorable_at {
+  strings:
+    $a = { E8 ?? ?? ?? ?? 5D }
+  condition:
+    $a at pe.entry_point
+}
+"#,
+                8,
+                false,
+                true,
+                100,
+            )
+            .expect_err("unanchorable at should fail")
+            .to_string()
+            .contains("requires an anchorable literal for at/in search use")
+        );
+        assert!(
+            compile_query_plan_default(
+                r#"
+rule bad_unanchorable_loop {
+  strings:
+    $a = { FF 75 ?? FF 55 ?? }
+  condition:
+    verifierloop($a)
+}
+"#,
+                8,
+                false,
+                true,
+                100,
+            )
+            .expect_err("unanchorable verifier loop should fail")
+            .to_string()
+            .contains("requires an anchorable literal for verifier-loop search use")
         );
 
         let nocase = compile_query_plan_default(
