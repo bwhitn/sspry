@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1330,7 +1328,6 @@ fn open_stores(root: &Path) -> Result<Vec<CandidateStore>> {
         .collect()
 }
 
-#[cfg(test)]
 fn merge_tier_used<I>(values: I) -> String
 where
     I: IntoIterator<Item = String>,
@@ -1350,6 +1347,264 @@ where
     } else {
         "tier1+tier2".to_owned()
     }
+}
+
+#[derive(Debug)]
+struct TreeStoreGroup {
+    stores: Vec<CandidateStore>,
+}
+
+#[derive(Debug, Default)]
+struct LocalTreeQueryAggregate {
+    hashes: BTreeSet<String>,
+    external_ids: HashMap<String, Option<String>>,
+    tier_used: Vec<String>,
+    query_profile: crate::candidate::CandidateQueryProfile,
+}
+
+#[derive(Debug)]
+struct LocalForestQueryAggregate {
+    hashes: Vec<String>,
+    total_candidates: usize,
+    tier_used: String,
+    query_profile: crate::candidate::CandidateQueryProfile,
+    external_ids: Option<Vec<Option<String>>>,
+}
+
+fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    let direct_current = root.join("current");
+    if direct_current.is_dir() {
+        return Ok(vec![direct_current]);
+    }
+    let mut tree_roots = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            let current = path.join("current");
+            if current.is_dir() { current } else { path }
+        })
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .parent()
+                    .and_then(|value| value.file_name().or_else(|| path.file_name()))
+                    .and_then(|value| value.to_str())
+                    .map(|name| name.starts_with("tree_"))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    tree_roots.sort();
+    if tree_roots.is_empty() {
+        Ok(vec![root.to_path_buf()])
+    } else {
+        Ok(tree_roots)
+    }
+}
+
+fn open_forest_tree_groups(root: &Path) -> Result<Vec<TreeStoreGroup>> {
+    forest_tree_roots(root)?
+        .into_iter()
+        .map(|tree_root| {
+            Ok(TreeStoreGroup {
+                stores: open_stores(&tree_root)?,
+            })
+        })
+        .collect()
+}
+
+fn validate_forest_search_policy(
+    tree_groups: &[TreeStoreGroup],
+) -> Result<(GramSizes, Option<String>, usize)> {
+    let mut gram_sizes = None::<GramSizes>;
+    let mut id_source = None::<String>;
+    let mut summary_cap_bytes = None::<usize>;
+    for group in tree_groups {
+        for store in &group.stores {
+            let config = store.config();
+            let candidate_gram_sizes =
+                GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
+            if let Some(existing) = gram_sizes {
+                if existing != candidate_gram_sizes {
+                    return Err(SspryError::from(
+                        "candidate stores use mixed gram-size pairs across the forest",
+                    ));
+                }
+            } else {
+                gram_sizes = Some(candidate_gram_sizes);
+            }
+            if let Some(existing) = &id_source {
+                if existing != &config.id_source {
+                    return Err(SspryError::from(
+                        "candidate stores use mixed identity sources across the forest",
+                    ));
+                }
+            } else {
+                id_source = Some(config.id_source.clone());
+            }
+            if let Some(existing) = summary_cap_bytes {
+                if existing != config.tier2_superblock_summary_cap_bytes {
+                    return Err(SspryError::from(
+                        "candidate stores use mixed tier2 superblock summary caps across the forest",
+                    ));
+                }
+            } else {
+                summary_cap_bytes = Some(config.tier2_superblock_summary_cap_bytes);
+            }
+        }
+    }
+    Ok((
+        gram_sizes.unwrap_or(GramSizes::new(3, 4)?),
+        id_source,
+        summary_cap_bytes.unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
+    ))
+}
+
+fn forest_prepared_query_profile(
+    tree_groups: &[TreeStoreGroup],
+    plan: &crate::candidate::CompiledQueryPlan,
+    summary_cap_bytes: usize,
+) -> Result<crate::candidate::CandidatePreparedQueryProfile> {
+    let mut tier1_filter_keys = HashSet::<(usize, usize)>::new();
+    let mut tier2_filter_keys = HashSet::<(usize, usize)>::new();
+    for group in tree_groups {
+        for store in &group.stores {
+            tier1_filter_keys.extend(store.tier1_superblock_filter_keys());
+            tier2_filter_keys.extend(store.tier2_doc_filter_keys());
+        }
+    }
+    let mut ordered_tier1_filter_keys = tier1_filter_keys.into_iter().collect::<Vec<_>>();
+    ordered_tier1_filter_keys.sort_unstable();
+    let mut ordered_tier2_filter_keys = tier2_filter_keys.into_iter().collect::<Vec<_>>();
+    ordered_tier2_filter_keys.sort_unstable();
+    Ok(crate::candidate::store::prepared_query_artifacts_profile(
+        crate::candidate::store::build_prepared_query_artifacts(
+            plan,
+            &ordered_tier1_filter_keys,
+            &ordered_tier2_filter_keys,
+            summary_cap_bytes,
+        )?
+        .as_ref(),
+    ))
+}
+
+fn query_store_group_all_candidates(
+    stores: &mut [CandidateStore],
+    plan: &crate::candidate::CompiledQueryPlan,
+    include_external_ids: bool,
+) -> Result<LocalTreeQueryAggregate> {
+    let mut out = LocalTreeQueryAggregate::default();
+    let collect_chunk = plan.max_candidates.max(1).min(4096);
+    for store in stores {
+        let mut cursor = 0usize;
+        loop {
+            let local = store.query_candidates(plan, cursor, collect_chunk)?;
+            out.tier_used.push(local.tier_used.clone());
+            out.query_profile.merge_from(&local.query_profile);
+            if include_external_ids {
+                let external_ids = store.external_ids_for_sha256(&local.sha256);
+                for (sha256, external_id) in local.sha256.into_iter().zip(external_ids.into_iter())
+                {
+                    out.hashes.insert(sha256.clone());
+                    out.external_ids.entry(sha256).or_insert(external_id);
+                }
+            } else {
+                out.hashes.extend(local.sha256);
+            }
+            if let Some(next) = local.next_cursor {
+                cursor = next;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn query_local_forest_all_candidates(
+    tree_groups: &mut Vec<TreeStoreGroup>,
+    plan: &crate::candidate::CompiledQueryPlan,
+    include_external_ids: bool,
+    tree_search_workers: usize,
+) -> Result<LocalForestQueryAggregate> {
+    let worker_count = tree_search_workers.max(1).min(tree_groups.len().max(1));
+    let mut partials = Vec::<LocalTreeQueryAggregate>::new();
+    if tree_groups.len() <= 1 || worker_count <= 1 {
+        for group in tree_groups {
+            partials.push(query_store_group_all_candidates(
+                &mut group.stores,
+                plan,
+                include_external_ids,
+            )?);
+        }
+    } else {
+        let chunk_size = tree_groups.len().div_ceil(worker_count);
+        let scoped = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in tree_groups.chunks_mut(chunk_size) {
+                handles.push(scope.spawn(move || -> Result<LocalTreeQueryAggregate> {
+                    let mut merged = LocalTreeQueryAggregate::default();
+                    for group in chunk {
+                        let partial = query_store_group_all_candidates(
+                            &mut group.stores,
+                            plan,
+                            include_external_ids,
+                        )?;
+                        merged.hashes.extend(partial.hashes);
+                        merged.tier_used.extend(partial.tier_used);
+                        merged.query_profile.merge_from(&partial.query_profile);
+                        for (sha256, external_id) in partial.external_ids {
+                            merged.external_ids.entry(sha256).or_insert(external_id);
+                        }
+                    }
+                    Ok(merged)
+                }));
+            }
+            let mut merged = Vec::with_capacity(handles.len());
+            for handle in handles {
+                merged.push(
+                    handle
+                        .join()
+                        .map_err(|_| SspryError::from("Forest search worker panicked."))??,
+                );
+            }
+            Ok::<Vec<LocalTreeQueryAggregate>, SspryError>(merged)
+        })?;
+        partials = scoped;
+    }
+
+    let mut hashes = BTreeSet::<String>::new();
+    let mut external_id_map = HashMap::<String, Option<String>>::new();
+    let mut tier_used = Vec::<String>::new();
+    let mut query_profile = crate::candidate::CandidateQueryProfile::default();
+    for partial in partials {
+        hashes.extend(partial.hashes);
+        tier_used.extend(partial.tier_used);
+        query_profile.merge_from(&partial.query_profile);
+        for (sha256, external_id) in partial.external_ids {
+            external_id_map.entry(sha256).or_insert(external_id);
+        }
+    }
+    let mut ordered = hashes.into_iter().collect::<Vec<_>>();
+    if ordered.len() > plan.max_candidates {
+        ordered.truncate(plan.max_candidates);
+    }
+    let external_ids = if include_external_ids {
+        Some(
+            ordered
+                .iter()
+                .map(|sha256| external_id_map.get(sha256).cloned().flatten())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    Ok(LocalForestQueryAggregate {
+        total_candidates: ordered.len(),
+        tier_used: merge_tier_used(tier_used),
+        query_profile,
+        external_ids,
+        hashes: ordered,
+    })
 }
 
 #[derive(Debug)]
@@ -3136,140 +3391,200 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut query_time = Duration::ZERO;
         let mut verify_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
-        let client = search_rpc_client(&args.connection);
         let verify_yara_files = args.verify_yara_files;
-        let server_policy = server_scan_policy(&args.connection)?;
+        let mut tree_count = None::<usize>;
+        let mut tree_search_workers = None::<usize>;
 
         let started_plan = Instant::now();
-        // The default search path now plans directly from the restricted rule shape.
-        let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-            &args.rule,
-            server_policy.gram_sizes,
-            Some(server_policy.id_source.as_str()),
-            args.max_anchors_per_pattern,
-            false,
-            true,
-            args.max_candidates,
-        )?;
-        plan_time += started_plan.elapsed();
+        let (plan, total, tier_used, rows, query_profile, prepared_query_profile, mut external_ids) =
+            if let Some(root) = &args.root {
+                let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
+                tree_count = Some(tree_groups.len());
+                let (gram_sizes, active_identity_source, summary_cap_bytes) =
+                    validate_forest_search_policy(&tree_groups)?;
+                let worker_count = args
+                    .tree_search_workers
+                    .max(1)
+                    .min(tree_groups.len().max(1));
+                tree_search_workers = Some(worker_count);
+                let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+                    &args.rule,
+                    gram_sizes,
+                    active_identity_source.as_deref(),
+                    args.max_anchors_per_pattern,
+                    false,
+                    true,
+                    args.max_candidates,
+                )?;
+                let prepared_query_profile =
+                    forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
+                plan_time += started_plan.elapsed();
+                let started_query = Instant::now();
+                let local = query_local_forest_all_candidates(
+                    &mut tree_groups,
+                    &plan,
+                    verify_yara_files,
+                    worker_count,
+                )?;
+                query_time += started_query.elapsed();
+                (
+                    plan,
+                    local.total_candidates,
+                    local.tier_used,
+                    local.hashes,
+                    local.query_profile,
+                    prepared_query_profile,
+                    local.external_ids.unwrap_or_default(),
+                )
+            } else {
+                let client = search_rpc_client(&args.connection);
+                let server_policy = server_scan_policy(&args.connection)?;
+                let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+                    &args.rule,
+                    server_policy.gram_sizes,
+                    Some(server_policy.id_source.as_str()),
+                    args.max_anchors_per_pattern,
+                    false,
+                    true,
+                    args.max_candidates,
+                )?;
+                plan_time += started_plan.elapsed();
+                let mut cursor = 0usize;
+                let mut rows = Vec::<String>::new();
+                let mut query_profile = None::<crate::candidate::CandidateQueryProfile>;
+                let mut prepared_query_profile =
+                    None::<crate::candidate::CandidatePreparedQueryProfile>;
+                let mut external_ids = Vec::<Option<String>>::new();
+                let (total, tier_used) = loop {
+                    let started_query = Instant::now();
+                    let result = client.candidate_query_plan_with_options(
+                        &plan,
+                        cursor,
+                        Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
+                        verify_yara_files,
+                    )?;
+                    query_time += started_query.elapsed();
+                    if query_profile.is_none() {
+                        query_profile = Some(result.query_profile.clone());
+                    }
+                    if prepared_query_profile.is_none() {
+                        prepared_query_profile = Some(result.prepared_query_profile.clone());
+                    }
+                    rows.extend(result.sha256.iter().cloned());
+                    if verify_yara_files {
+                        let mut page_external_ids = result.external_ids.unwrap_or_default();
+                        if page_external_ids.len() < result.sha256.len() {
+                            page_external_ids.resize(result.sha256.len(), None);
+                        }
+                        external_ids.extend(page_external_ids);
+                    }
+                    match result.next_cursor {
+                        Some(next) => cursor = next,
+                        None => break (result.total_candidates, result.tier_used),
+                    }
+                };
+                (
+                    plan,
+                    total,
+                    tier_used,
+                    rows,
+                    query_profile.unwrap_or_default(),
+                    prepared_query_profile.unwrap_or_default(),
+                    external_ids,
+                )
+            };
+
         let literal_plan = if verify_yara_files {
             fixed_literal_match_plan(&plan)
         } else {
             None
         };
         let mut yara_rules = None::<Arc<YaraRules>>;
-
-        let mut cursor = 0usize;
-        let mut rows = Vec::<String>::new();
         let mut verified_rows = Vec::<String>::new();
         let mut verified_checked = 0usize;
         let mut verified_matched = 0usize;
         let mut verified_skipped = 0usize;
-        let mut query_profile = None::<crate::candidate::CandidateQueryProfile>;
-        let mut prepared_query_profile = None::<crate::candidate::CandidatePreparedQueryProfile>;
-        let (total, tier_used) = loop {
-            let started_query = Instant::now();
-            let result = client.candidate_query_plan_with_options(
-                &plan,
-                cursor,
-                Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
-                verify_yara_files,
-            )?;
-            query_time += started_query.elapsed();
-            if query_profile.is_none() {
-                query_profile = Some(result.query_profile.clone());
+
+        if verify_yara_files {
+            if external_ids.len() < rows.len() {
+                external_ids.resize(rows.len(), None);
             }
-            if prepared_query_profile.is_none() {
-                prepared_query_profile = Some(result.prepared_query_profile.clone());
-            }
-            if !verify_yara_files {
-                rows.extend(result.sha256.iter().cloned());
-            } else {
-                let mut external_ids = result.external_ids.unwrap_or_default();
-                if external_ids.len() < result.sha256.len() {
-                    external_ids.resize(result.sha256.len(), None);
+            let mut unverified_rows = Vec::<String>::new();
+            let mut page_results = vec![None::<bool>; rows.len()];
+            let mut verify_jobs = Vec::<(usize, String, PathBuf)>::new();
+            for (index, (sha256, external_id)) in rows
+                .iter()
+                .cloned()
+                .zip(external_ids.into_iter())
+                .enumerate()
+            {
+                let Some(path_text) = external_id else {
+                    verified_skipped += 1;
+                    unverified_rows.push(sha256);
+                    continue;
+                };
+                let candidate_path = PathBuf::from(path_text);
+                if !candidate_path.is_file() {
+                    verified_skipped += 1;
+                    unverified_rows.push(sha256);
+                    continue;
                 }
-                let mut page_results = vec![None::<bool>; result.sha256.len()];
-                let mut verify_jobs = Vec::<(usize, String, PathBuf)>::new();
-                for (index, (sha256, external_id)) in result
-                    .sha256
-                    .iter()
-                    .cloned()
-                    .zip(external_ids.into_iter())
-                    .enumerate()
-                {
-                    let Some(path_text) = external_id else {
-                        verified_skipped += 1;
-                        rows.push(sha256);
-                        continue;
-                    };
-                    let candidate_path = PathBuf::from(path_text);
-                    if !candidate_path.is_file() {
-                        verified_skipped += 1;
-                        rows.push(sha256);
-                        continue;
+                verify_jobs.push((index, sha256, candidate_path));
+            }
+            verify_jobs.sort_by(|left, right| left.2.cmp(&right.2));
+            for (index, _sha256, candidate_path) in verify_jobs {
+                verified_checked += 1;
+                let started_verify = Instant::now();
+                let matched = if let Some(plan) = &literal_plan {
+                    match verify_fixed_literal_plan_on_file(&candidate_path, plan) {
+                        Ok(matched) => matched,
+                        Err(_) => {
+                            if yara_rules.is_none() {
+                                yara_rules =
+                                    Some(compile_yara_verifier_cached(Path::new(&args.rule))?);
+                            }
+                            let mut scanner =
+                                YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
+                            scanner
+                                .scan_file(&candidate_path)
+                                .map_err(|err| SspryError::from(err.to_string()))?
+                                .matching_rules()
+                                .len()
+                                > 0
+                        }
                     }
-                    verify_jobs.push((index, sha256, candidate_path));
-                }
-                verify_jobs.sort_by(|left, right| left.2.cmp(&right.2));
-                for (index, _sha256, candidate_path) in verify_jobs {
-                    verified_checked += 1;
-                    let started_verify = Instant::now();
-                    let matched = if let Some(plan) = &literal_plan {
-                        match verify_fixed_literal_plan_on_file(&candidate_path, plan) {
-                            Ok(matched) => matched,
-                            Err(_) => {
-                                if yara_rules.is_none() {
-                                    yara_rules =
-                                        Some(compile_yara_verifier_cached(Path::new(&args.rule))?);
-                                }
-                                let mut scanner = YaraScanner::new(
-                                    yara_rules.as_ref().expect("cached YARA rules"),
-                                );
-                                scanner
-                                    .scan_file(&candidate_path)
-                                    .map_err(|err| SspryError::from(err.to_string()))?
-                                    .matching_rules()
-                                    .len()
-                                    > 0
-                            }
-                        }
-                    } else {
-                        if yara_rules.is_none() {
-                            yara_rules = Some(compile_yara_verifier_cached(Path::new(&args.rule))?);
-                        }
-                        let mut scanner =
-                            YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
-                        scanner
-                            .scan_file(&candidate_path)
-                            .map_err(|err| SspryError::from(err.to_string()))?
-                            .matching_rules()
-                            .len()
-                            > 0
-                    };
-                    verify_time += started_verify.elapsed();
-                    page_results[index] = Some(matched);
-                }
-                for (index, sha256) in result.sha256.iter().cloned().enumerate() {
-                    match page_results.get(index).copied().flatten() {
-                        Some(true) => {
-                            verified_matched += 1;
-                            verified_rows.push(sha256);
-                        }
-                        Some(false) => {}
-                        None => {
-                            if !rows.iter().any(|value| value == &sha256) {
-                                rows.push(sha256);
-                            }
+                } else {
+                    if yara_rules.is_none() {
+                        yara_rules = Some(compile_yara_verifier_cached(Path::new(&args.rule))?);
+                    }
+                    let mut scanner =
+                        YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
+                    scanner
+                        .scan_file(&candidate_path)
+                        .map_err(|err| SspryError::from(err.to_string()))?
+                        .matching_rules()
+                        .len()
+                        > 0
+                };
+                verify_time += started_verify.elapsed();
+                page_results[index] = Some(matched);
+            }
+            for (index, sha256) in rows.iter().cloned().enumerate() {
+                match page_results.get(index).copied().flatten() {
+                    Some(true) => {
+                        verified_matched += 1;
+                        verified_rows.push(sha256);
+                    }
+                    Some(false) => {}
+                    None => {
+                        if !unverified_rows.iter().any(|value| value == &sha256) {
+                            unverified_rows.push(sha256);
                         }
                     }
                 }
             }
-            match result.next_cursor {
-                Some(next) => cursor = next,
-                None => break (result.total_candidates, result.tier_used),
-            }
-        };
+            verified_rows.extend(unverified_rows);
+        }
 
         println!("tier_used: {tier_used}");
         println!("candidates: {total}");
@@ -3277,7 +3592,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             println!("verified_checked: {verified_checked}");
             println!("verified_matched: {verified_matched}");
             println!("verified_skipped: {verified_skipped}");
-            verified_rows.extend(rows);
             for row in verified_rows {
                 println!("{row}");
             }
@@ -3286,12 +3600,10 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 println!("{row}");
             }
         }
-        if args.verbose {
+        if args.verbose && args.root.is_none() {
             server_rss_kb = server_memory_kb(&args.connection)?;
         }
         if args.verbose {
-            let query_profile = query_profile.unwrap_or_default();
-            let prepared_query_profile = prepared_query_profile.unwrap_or_default();
             let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
             let plan_ms = plan_time.as_secs_f64() * 1000.0;
             let query_ms = query_time.as_secs_f64() * 1000.0;
@@ -3421,6 +3733,12 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 eprintln!("verbose.search.server_current_rss_kb: {server_current_rss_kb}");
                 eprintln!("verbose.search.server_peak_rss_kb: {server_peak_rss_kb}");
             }
+            if let Some(tree_count) = tree_count {
+                eprintln!("verbose.search.tree_count: {tree_count}");
+            }
+            if let Some(tree_search_workers) = tree_search_workers {
+                eprintln!("verbose.search.tree_search_workers: {tree_search_workers}");
+            }
             if verify_yara_files {
                 eprintln!("verbose.search.verified_checked: {verified_checked}");
                 eprintln!("verbose.search.verified_matched: {verified_matched}");
@@ -3540,8 +3858,19 @@ struct DeleteArgs {
 struct SearchCommandArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
+    #[arg(
+        long = "root",
+        help = "Candidate forest root for in-process search. When set, search runs directly against tree_*/current stores instead of RPC servers."
+    )]
+    root: Option<String>,
     #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
     rule: String,
+    #[arg(
+        long = "tree-search-workers",
+        default_value_t = 0,
+        help = "Forest-level tree search workers for --root mode. 0 means auto up to the tree count."
+    )]
+    tree_search_workers: usize,
     #[arg(
         long = "max-anchors-per-pattern",
         default_value_t = 16,
@@ -4779,7 +5108,9 @@ rule remote_q {
         assert_eq!(
             cmd_search(&SearchCommandArgs {
                 connection: connection.clone(),
+                root: None,
                 rule: rule_path.display().to_string(),
+                tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
                 max_candidates: 8,
                 verify_yara_files: false,
@@ -4790,7 +5121,9 @@ rule remote_q {
         assert_eq!(
             cmd_search(&SearchCommandArgs {
                 connection: connection.clone(),
+                root: None,
                 rule: rule_path.display().to_string(),
+                tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
                 max_candidates: 8,
                 verify_yara_files: true,

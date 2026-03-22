@@ -48,10 +48,12 @@ Current state:
 - `run_forest_probe.py --reuse-existing-db` exists and is the right default for search tuning
 - preserved `25k` and `50k` DB roots are now part of the normal profiling workflow
 - per-rule prepared-query memory profiling is available in verbose search output
+- `search --root` plus `--tree-search-workers` now exists for in-process forest search and tree-level concurrency checks
 
 Work:
 - keep search tuning on reused DBs, not fresh rebuilds
 - keep emitting per-rule prepared-query memory fields during profiling
+- use direct forest search for correctness / threading experiments, but keep persistent server mode as the default for large repeated rule sweeps
 - update docs whenever the searchable/scaling-safe boundary changes
 
 Exit criteria:

@@ -131,6 +131,8 @@ Usage: sspry search [OPTIONS] --rule <RULE>
 Options:
       --addr <ADDR>
           Server address as host:port. [env: SSPRY_ADDR=] [default: 127.0.0.1:17653]
+      --root <ROOT>
+          Candidate forest root for in-process search. When set, search runs directly against tree_*/current stores instead of RPC servers.
       --perf-report <PERF_REPORT>
           Write JSON performance report to this path.
       --perf-stdout
@@ -139,6 +141,8 @@ Options:
           Connection/read timeout in seconds. [default: 30]
       --rule <RULE>
           Path to YARA rule file.
+      --tree-search-workers <TREE_SEARCH_WORKERS>
+          Forest-level tree search workers for --root mode. 0 means auto up to the tree count. [default: 0]
       --max-anchors-per-pattern <MAX_ANCHORS_PER_PATTERN>
           Keep at most this many anchors per pattern alternative. [default: 16]
       --max-candidates <MAX_CANDIDATES>
@@ -156,15 +160,22 @@ Examples:
 ```bash
 cargo run -- search --addr 127.0.0.1:17653 --rule ./rule.yar
 cargo run -- search --addr 127.0.0.1:17653 --rule ./rule.yar --verify
+cargo run -- search --root ./candidate_db --rule ./rule.yar --tree-search-workers 2
 ```
 
 Important behavior:
 
+- `--root` switches search to the in-process forest path and bypasses RPC entirely
+- `--tree-search-workers` only applies in `--root` mode
 - some rules are intentionally rejected for scalable indexed search:
   - high-fanout unions with no mandatory anchorable pattern
   - low-information `at pe.entry_point` style stub rules
   - short suffix/range rules where only tiny literals gate `in (filesize-N..filesize)` checks
 - `--verbose` includes per-rule runtime and prepared-query memory profiling fields
+- in `--root` mode, `--verbose` also reports:
+  - `tree_count`
+  - `tree_search_workers`
+  - client RSS fields for the search process itself
 
 ## `info`
 

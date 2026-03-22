@@ -2753,7 +2753,14 @@ fn derive_nocase_search_alternatives(
             end += step;
         }
     }
-    let Some((_weighted_score, _anchor_hint, _search_weight, _inverse_variants, best_len, best_start)) = best
+    let Some((
+        _weighted_score,
+        _anchor_hint,
+        _search_weight,
+        _inverse_variants,
+        best_len,
+        best_start,
+    )) = best
     else {
         return Err(SspryError::from(
             "nocase literal expands too broadly for the active gram sizes",
@@ -3086,8 +3093,8 @@ fn optimize_grams(
                 })
                 .unwrap_or(0);
             let hint = exact_gram_anchor_hint(*gram, gram_size);
-            let better =
-                (spread, hint, std::cmp::Reverse(*gram)) > (best_spread, best_hint, std::cmp::Reverse(best_gram));
+            let better = (spread, hint, std::cmp::Reverse(*gram))
+                > (best_spread, best_hint, std::cmp::Reverse(best_gram));
             if better {
                 best_idx = idx;
                 best_spread = spread;
@@ -3426,15 +3433,18 @@ const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS: usize = 4;
 
 fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
     pattern.alternatives.iter().any(|alt| !alt.is_empty())
+        || pattern.tier2_alternatives.iter().any(|alt| !alt.is_empty())
         || pattern
-            .tier2_alternatives
+            .anchor_literals
             .iter()
-            .any(|alt| !alt.is_empty())
-        || pattern.anchor_literals.iter().any(|literal| !literal.is_empty())
+            .any(|literal| !literal.is_empty())
 }
 
 fn pattern_has_anchor_literals(pattern: &PatternPlan) -> bool {
-    pattern.anchor_literals.iter().any(|literal| !literal.is_empty())
+    pattern
+        .anchor_literals
+        .iter()
+        .any(|literal| !literal.is_empty())
 }
 
 fn pattern_max_anchor_literal_len(pattern: &PatternPlan) -> usize {
@@ -3447,12 +3457,7 @@ fn pattern_max_anchor_literal_len(pattern: &PatternPlan) -> usize {
 }
 
 fn pattern_max_tier1_grams(pattern: &PatternPlan) -> usize {
-    pattern
-        .alternatives
-        .iter()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
+    pattern.alternatives.iter().map(Vec::len).max().unwrap_or(0)
 }
 
 fn pattern_max_tier2_grams(pattern: &PatternPlan) -> usize {
@@ -3530,11 +3535,7 @@ fn combinations_intersection_of_unions(
 
 fn mandatory_pattern_ids(node: &QueryNode) -> HashSet<String> {
     match node.kind.as_str() {
-        "pattern" => node
-            .pattern_id
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>(),
+        "pattern" => node.pattern_id.iter().cloned().collect::<HashSet<_>>(),
         "and" => node
             .children
             .iter()
@@ -3589,7 +3590,9 @@ fn mandatory_pattern_ids(node: &QueryNode) -> HashSet<String> {
 
 fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
     match node.kind.as_str() {
-        "or" => node.children.len() > 1 || node.children.iter().any(node_has_branching_pattern_union),
+        "or" => {
+            node.children.len() > 1 || node.children.iter().any(node_has_branching_pattern_union)
+        }
         "n_of" => {
             let threshold = node.threshold.unwrap_or(0);
             (threshold > 0 && threshold < node.children.len())
@@ -3600,7 +3603,11 @@ fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
 }
 
 fn node_contains_kind(node: &QueryNode, kind: &str) -> bool {
-    node.kind == kind || node.children.iter().any(|child| node_contains_kind(child, kind))
+    node.kind == kind
+        || node
+            .children
+            .iter()
+            .any(|child| node_contains_kind(child, kind))
 }
 
 fn total_pattern_anchor_fanout(patterns: &[PatternPlan]) -> usize {
@@ -3660,7 +3667,10 @@ fn reject_overbroad_pattern_union(root: &QueryNode, patterns: &[PatternPlan]) ->
     )))
 }
 
-fn reject_low_information_entrypoint_stub(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
+fn reject_low_information_entrypoint_stub(
+    root: &QueryNode,
+    patterns: &[PatternPlan],
+) -> Result<()> {
     if patterns.is_empty()
         || !node_contains_kind(root, "verifier_only_at")
         || patterns.len() > LOW_INFORMATION_EP_STUB_PATTERN_LIMIT
@@ -6841,7 +6851,10 @@ rule q {
         )
         .expect("nocase alternatives");
         assert!(alts.iter().all(|alt| {
-            let lowered = alt.iter().map(|byte| byte.to_ascii_lowercase()).collect::<Vec<_>>();
+            let lowered = alt
+                .iter()
+                .map(|byte| byte.to_ascii_lowercase())
+                .collect::<Vec<_>>();
             lowered.windows(4).any(|window| window == b".pas")
         }));
     }
@@ -6905,9 +6918,10 @@ rule low_information_entrypoint_stub {
             100,
         )
         .expect_err("low-information entrypoint stub should fail");
-        assert!(err
-            .to_string()
-            .contains("entry-point stub provides only low-information gram anchors"));
+        assert!(
+            err.to_string()
+                .contains("entry-point stub provides only low-information gram anchors")
+        );
 
         compile_query_plan_default(
             r#"
@@ -6944,9 +6958,10 @@ rule low_information_range_rule {
             100,
         )
         .expect_err("low-information range rule should fail");
-        assert!(err
-            .to_string()
-            .contains("short range/suffix anchors are too weak at scale"));
+        assert!(
+            err.to_string()
+                .contains("short range/suffix anchors are too weak at scale")
+        );
 
         compile_query_plan_default(
             r#"
@@ -6983,9 +6998,10 @@ rule low_information_single_pattern {
             100,
         )
         .expect_err("low-information single-pattern rule should fail");
-        assert!(err
-            .to_string()
-            .contains("single-pattern rule provides only tiny gram anchors"));
+        assert!(
+            err.to_string()
+                .contains("single-pattern rule provides only tiny gram anchors")
+        );
 
         compile_query_plan_default(
             r#"
@@ -7003,5 +7019,4 @@ rule stronger_single_pattern {
         )
         .expect("stronger single-pattern rule should compile");
     }
-
 }

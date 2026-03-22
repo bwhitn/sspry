@@ -19,6 +19,13 @@ At a high level:
 5. The store returns candidate digests.
 6. If `--verify` is enabled, the client reopens stored file paths and verifies matches locally with `yara-x`.
 
+`search` now has two execution modes:
+
+- RPC mode: query one running `serve` process via `--addr`
+- direct forest mode: query one forest root in-process via `--root`
+
+Direct forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
+
 ## Query Flow
 
 ![Query Flow](images/query-flow.svg)
@@ -33,6 +40,14 @@ The query path is:
 6. Use per-document Tier1 and Tier2 blooms to refine candidates.
 7. Rank and page candidates.
 8. Optionally verify file paths locally.
+
+In direct forest mode, the query path adds one layer above shard search:
+
+1. open all tree stores under the forest root
+2. validate that gram sizes, identity source, and summary caps match across trees
+3. build one compiled plan against the shared forest policy
+4. fan out the query across trees with up to `tree_search_workers`
+5. merge candidate hashes, query profiles, and optional external ids
 
 ## Storage Layout
 
@@ -168,6 +183,8 @@ The planner also now has explicit fail-fast boundaries for structurally bad larg
 - short range/suffix rules where the only searchable literals are tiny near-EOF anchors
 
 Those are not treated as searchable/good rules because the engine would otherwise be forced into near-full scans or recall-risky heuristics.
+
+The planner also treats Tier2-only searchable patterns as anchorable for these structural checks. That keeps tier2-anchorable rules from being rejected just because they do not contribute Tier1 grams.
 
 ## Verification Model
 

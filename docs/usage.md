@@ -108,8 +108,14 @@ If a provided value does not match the server identity format, `delete` returns 
 Options:
 
 - `--addr <host:port>`
+- `--root <path>`
+  - in-process forest search root
+  - opens `tree_*/current` directly instead of using RPC
 - `--timeout <seconds>`
 - `--rule <path>`
+- `--tree-search-workers <n>`
+  - forest-level tree concurrency for `--root`
+  - `0` means auto up to the tree count
 - `--max-anchors-per-pattern <n>`
 - `--max-candidates <n>` default `15000`; `0` means unlimited
 - `--verify`
@@ -118,6 +124,10 @@ Behavior:
 
 - default search is unverified
 - `--verify` reopens candidate file paths and runs local YARA verification
+- `--addr` and `--root` are the two search transports:
+  - `--addr` uses a persistent RPC server
+  - `--root` opens the forest locally in-process
+- `--tree-search-workers` only affects `--root`
 - verified search requires stored file paths to still exist on disk
 - indexed search currently supports:
   - literal string anchors with:
@@ -179,6 +189,15 @@ Behavior:
   - `prepared_mask_cache_bytes`
   - `prepared_any_lane_variant_sets`
   - `prepared_compacted_any_lane_grams`
+  - `client_current_rss_kb`
+  - `client_peak_rss_kb`
+  - `tree_count`
+  - `tree_search_workers`
+
+Practical note:
+
+- for repeated rule-by-rule tuning on a preserved DB, `--addr` against a persistent server is usually faster than calling `search --root` once per rule
+- `search --root` is the right path for local forest correctness checks and tree-level threaded-search experiments
 
 ## info
 

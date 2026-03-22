@@ -148,6 +148,8 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
         'verbose.search.prepared_any_lane_variant_sets',
         'verbose.search.prepared_compacted_any_lane_grams',
         'verbose.search.prepared_max_pattern_bytes',
+        'verbose.search.client_current_rss_kb',
+        'verbose.search.client_peak_rss_kb',
         'verbose.search.server_current_rss_kb',
         'verbose.search.server_peak_rss_kb',
     ):
@@ -398,6 +400,36 @@ def run_search_one(sspry: Path, addr: str, rule: Path, timeout_s: int) -> tuple[
     return proc, (time.time() - started) * 1000.0
 
 
+def run_search_one_local_forest(
+    sspry: Path,
+    db_root: Path,
+    rule: Path,
+    timeout_s: int,
+    tree_search_workers: int,
+) -> tuple[subprocess.CompletedProcess, float]:
+    started = time.time()
+    proc = None
+    try:
+        proc = run(
+            [
+                str(sspry),
+                'search',
+                '--root',
+                str(db_root),
+                '--rule',
+                str(rule),
+                '--tree-search-workers',
+                str(tree_search_workers),
+                '--verbose',
+            ],
+            capture_output=True,
+            timeout=timeout_s + 30,
+        )
+    except subprocess.TimeoutExpired as e:
+        proc = subprocess.CompletedProcess(e.cmd, 124, e.stdout or '', (e.stderr or '') + '\nTIMEOUT')
+    return proc, (time.time() - started) * 1000.0
+
+
 def aggregate_rule_results(rule: Path, tree_results: list[dict], elapsed_ms_parallel: float) -> dict:
     out = {
         'rule': rule.name,
@@ -543,6 +575,7 @@ def main() -> int:
     parser.add_argument('--server-sample-interval-s', type=float, default=0.0)
     parser.add_argument('--per-rule-server-snapshots', action='store_true')
     parser.add_argument('--reuse-existing-db', action='store_true')
+    parser.add_argument('--search-mode', choices=('server', 'local-forest'), default='server')
     args = parser.parse_args()
 
     sspry = Path(args.sspry)
@@ -584,6 +617,7 @@ def main() -> int:
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'tree_search_workers': args.tree_search_workers,
+        'search_mode': args.search_mode,
         'drain_between_trees': args.drain_between_trees,
         'reused_existing_db': args.reuse_existing_db,
         'trees': [],
@@ -712,100 +746,126 @@ def main() -> int:
 
     search_servers = []
     try:
-        for idx, manifest in enumerate(manifests):
-            tree_name = f'tree_{idx:02d}'
-            tree_run_dir = trees_dir / tree_name
-            db_root = db_base / tree_name
-            addr = f'127.0.0.1:{args.base_port + idx}'
-            fp_args = []
-            if args.set_fp is not None:
-                fp_args.extend(['--set-fp', str(args.set_fp)])
-            if args.tier1_set_fp is not None:
-                fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
-            if args.tier2_set_fp is not None:
-                fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
-            server = subprocess.Popen(
-                [
-                    str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
-                    '--search-workers', str(args.search_workers),
-                    *fp_args,
-                    *(['--shards', str(args.shards)] if args.shards else []),
-                ],
-                stdout=(tree_run_dir / 'search.server.stdout').open('w'),
-                stderr=(tree_run_dir / 'search.server.stderr').open('w'),
-            )
-            wait_for_server(
-                sspry,
-                addr,
-                tree_run_dir / 'search.start.info.light.json',
-                attempts=args.search_server_start_attempts,
-            )
-            sampler = None
-            if args.server_sample_interval_s > 0:
-                sampler = start_server_sampler(
-                    tree_run_dir / 'search.server_samples.json',
+        searches_dir.mkdir(parents=True, exist_ok=True)
+        tree_count = len(manifests)
+        if args.search_mode == 'server':
+            for idx, manifest in enumerate(manifests):
+                tree_name = f'tree_{idx:02d}'
+                tree_run_dir = trees_dir / tree_name
+                db_root = db_base / tree_name
+                addr = f'127.0.0.1:{args.base_port + idx}'
+                fp_args = []
+                if args.set_fp is not None:
+                    fp_args.extend(['--set-fp', str(args.set_fp)])
+                if args.tier1_set_fp is not None:
+                    fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
+                if args.tier2_set_fp is not None:
+                    fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
+                server = subprocess.Popen(
+                    [
+                        str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
+                        '--search-workers', str(args.search_workers),
+                        *fp_args,
+                        *(['--shards', str(args.shards)] if args.shards else []),
+                    ],
+                    stdout=(tree_run_dir / 'search.server.stdout').open('w'),
+                    stderr=(tree_run_dir / 'search.server.stderr').open('w'),
+                )
+                wait_for_server(
                     sspry,
                     addr,
-                    server.pid,
-                    args.server_sample_interval_s,
+                    tree_run_dir / 'search.start.info.light.json',
+                    attempts=args.search_server_start_attempts,
                 )
-            search_servers.append((addr, server, tree_run_dir, sampler))
+                sampler = None
+                if args.server_sample_interval_s > 0:
+                    sampler = start_server_sampler(
+                        tree_run_dir / 'search.server_samples.json',
+                        sspry,
+                        addr,
+                        server.pid,
+                        args.server_sample_interval_s,
+                    )
+                search_servers.append((addr, server, tree_run_dir, sampler))
+            tree_count = len(search_servers)
 
-        searches_dir.mkdir(parents=True, exist_ok=True)
         search_summary = []
-        tree_search_workers = args.tree_search_workers or len(search_servers)
-        tree_search_workers = max(1, min(tree_search_workers, len(search_servers)))
-        tree_batches = max(1, math.ceil(len(search_servers) / tree_search_workers))
+        tree_search_workers = args.tree_search_workers or tree_count
+        tree_search_workers = max(1, min(tree_search_workers, tree_count))
+        tree_batches = max(1, math.ceil(tree_count / tree_search_workers))
         effective_search_timeout_s = args.search_timeout_s * tree_batches
         forest_summary['effective_tree_search_workers'] = tree_search_workers
         forest_summary['tree_search_batches'] = tree_batches
         forest_summary['effective_search_timeout_s'] = effective_search_timeout_s
         print(
-            f'search.start trees={len(search_servers)} tree_workers={tree_search_workers} '
-            f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s}',
+            f'search.start trees={tree_count} tree_workers={tree_search_workers} '
+            f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s} mode={args.search_mode}',
             flush=True,
         )
         for rule in sorted(rules_dir.glob('*.yar')):
             started = time.time()
-            per_tree = []
             print(
                 f'search.rule.start rule={rule.name} tree_workers={tree_search_workers} '
                 f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s}',
                 flush=True,
             )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=tree_search_workers) as pool:
-                future_map = {
-                    pool.submit(run_search_one, sspry, addr, rule, effective_search_timeout_s): (addr, tree_run_dir, server)
-                    for addr, server, tree_run_dir, _ in search_servers
-                }
-                for future in concurrent.futures.as_completed(future_map):
-                    addr, tree_run_dir, server = future_map[future]
-                    proc, elapsed_ms = future.result()
-                    tree_dir = searches_dir / rule.stem
-                    tree_dir.mkdir(parents=True, exist_ok=True)
-                    safe_addr = addr.replace(':', '_').replace('.', '_')
-                    (tree_dir / f'{safe_addr}.stdout').write_text(proc.stdout or '')
-                    (tree_dir / f'{safe_addr}.stderr').write_text(proc.stderr or '')
-                    if args.per_rule_server_snapshots:
-                        sample = capture_server_sample(sspry, addr, server.pid)
-                        (tree_dir / f'{safe_addr}.server.sample.json').write_text(
-                            json.dumps(sample, indent=2, sort_keys=True)
-                        )
-                    record = parse_search_result(rule, proc, elapsed_ms)
-                    record['addr'] = addr
-                    record['tree'] = tree_run_dir.name
-                    per_tree.append(record)
-            per_tree.sort(key=lambda item: item['tree'])
-            aggregated = aggregate_rule_results(rule, per_tree, (time.time() - started) * 1000.0)
-            aggregated['tree_workers'] = tree_search_workers
-            aggregated['tree_batches'] = tree_batches
-            aggregated['effective_timeout_s'] = effective_search_timeout_s
-            search_summary.append(aggregated)
-            print(
-                f"search.rule.done rule={rule.name} exit={aggregated['exit_code']} "
-                f"wall_ms={aggregated['elapsed_ms_wall_parallel']:.3f}",
-                flush=True,
-            )
+            tree_dir = searches_dir / rule.stem
+            tree_dir.mkdir(parents=True, exist_ok=True)
+            if args.search_mode == 'local-forest':
+                proc, elapsed_ms = run_search_one_local_forest(
+                    sspry,
+                    db_base,
+                    rule,
+                    effective_search_timeout_s,
+                    tree_search_workers,
+                )
+                (tree_dir / 'local_forest.stdout').write_text(proc.stdout or '')
+                (tree_dir / 'local_forest.stderr').write_text(proc.stderr or '')
+                record = parse_search_result(rule, proc, elapsed_ms)
+                record['search_mode'] = 'local-forest'
+                record['tree_workers'] = tree_search_workers
+                record['tree_batches'] = tree_batches
+                record['effective_timeout_s'] = effective_search_timeout_s
+                record['tree_count'] = tree_count
+                search_summary.append(record)
+                print(
+                    f"search.rule.done rule={rule.name} exit={record['exit_code']} "
+                    f"wall_ms={record['elapsed_ms_wall']:.3f}",
+                    flush=True,
+                )
+            else:
+                per_tree = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=tree_search_workers) as pool:
+                    future_map = {
+                        pool.submit(run_search_one, sspry, addr, rule, effective_search_timeout_s): (addr, tree_run_dir, server)
+                        for addr, server, tree_run_dir, _ in search_servers
+                    }
+                    for future in concurrent.futures.as_completed(future_map):
+                        addr, tree_run_dir, server = future_map[future]
+                        proc, elapsed_ms = future.result()
+                        safe_addr = addr.replace(':', '_').replace('.', '_')
+                        (tree_dir / f'{safe_addr}.stdout').write_text(proc.stdout or '')
+                        (tree_dir / f'{safe_addr}.stderr').write_text(proc.stderr or '')
+                        if args.per_rule_server_snapshots:
+                            sample = capture_server_sample(sspry, addr, server.pid)
+                            (tree_dir / f'{safe_addr}.server.sample.json').write_text(
+                                json.dumps(sample, indent=2, sort_keys=True)
+                            )
+                        record = parse_search_result(rule, proc, elapsed_ms)
+                        record['addr'] = addr
+                        record['tree'] = tree_run_dir.name
+                        per_tree.append(record)
+                per_tree.sort(key=lambda item: item['tree'])
+                aggregated = aggregate_rule_results(rule, per_tree, (time.time() - started) * 1000.0)
+                aggregated['tree_workers'] = tree_search_workers
+                aggregated['tree_batches'] = tree_batches
+                aggregated['effective_timeout_s'] = effective_search_timeout_s
+                search_summary.append(aggregated)
+                print(
+                    f"search.rule.done rule={rule.name} exit={aggregated['exit_code']} "
+                    f"wall_ms={aggregated['elapsed_ms_wall_parallel']:.3f}",
+                    flush=True,
+                )
         (run_dir / 'search_summary.json').write_text(json.dumps(search_summary, indent=2, sort_keys=True))
     finally:
         for addr, server, tree_run_dir, sampler in search_servers:

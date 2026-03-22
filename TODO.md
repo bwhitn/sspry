@@ -4,7 +4,7 @@ Current repo:
 - `/root/pertest/repos/yaya`
 
 Current pushed baseline:
-- `7a93eef` `Reject overbroad high-fanout search rules`
+- `21ec939` `Reject low-information entrypoint stub rules`
 
 ## Current State
 
@@ -38,6 +38,8 @@ Current pushed baseline:
 
 - search tuning should use preserved DB roots plus `--reuse-existing-db`
 - per-rule prepared-query profiling is available in verbose search output
+- direct in-process forest search is available through `sspry search --root ... --tree-search-workers ...`
+- for large repeated sweeps, persistent server mode is still the practical default because it avoids reopening the forest for every rule
 - the important rule metrics are now:
   - `docs_scanned`
   - `candidates`
