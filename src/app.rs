@@ -59,6 +59,8 @@ pub const DEFAULT_INCREMENTAL_SHARDS: usize = 32;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
+const REMOTE_INDEX_ROTATION_RETRY_LIMIT: usize = 2400;
+const REMOTE_INDEX_ROTATION_RETRY_SLEEP_MS: u64 = 50;
 
 struct ServeSignalFlags {
     shutdown: Arc<AtomicBool>,
@@ -1254,12 +1256,39 @@ fn rotate_remote_index_session(
     client.end_index_session()?;
     *progress_rpc_time += started_progress_rpc.elapsed();
     base_client.publish()?;
-    *client = base_client.connect_persistent()?;
     let started_progress_rpc = Instant::now();
-    client.begin_index_session()?;
-    client.update_index_session_progress(Some(total_files), *processed, *processed)?;
+    let mut retries = 0usize;
+    loop {
+        *client = base_client.connect_persistent()?;
+        let resume = (|| -> Result<()> {
+            client.begin_index_session()?;
+            client.update_index_session_progress(Some(total_files), *processed, *processed)?;
+            Ok(())
+        })();
+        match resume {
+            Ok(()) => break,
+            Err(err)
+                if is_retryable_remote_index_rotation_error(&err)
+                    && retries < REMOTE_INDEX_ROTATION_RETRY_LIMIT =>
+            {
+                retries = retries.saturating_add(1);
+                thread::sleep(Duration::from_millis(
+                    REMOTE_INDEX_ROTATION_RETRY_SLEEP_MS,
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
     *progress_rpc_time += started_progress_rpc.elapsed();
     Ok(())
+}
+
+fn is_retryable_remote_index_rotation_error(err: &SspryError) -> bool {
+    let text = err.to_string();
+    (text.contains("server is publishing") && text.contains("retry later"))
+        || (text.contains("another index session is already active")
+            && text.contains("retry later"))
+        || text.contains("no active index session; cannot update progress")
 }
 
 fn store_config_from_parts(
