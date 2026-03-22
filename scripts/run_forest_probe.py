@@ -600,6 +600,7 @@ def main() -> int:
     parser.add_argument('--tier1-set-fp', type=float)
     parser.add_argument('--tier2-set-fp', type=float)
     parser.add_argument('--search-workers', type=int, default=1)
+    parser.add_argument('--index-workers', type=int, default=0)
     parser.add_argument('--tree-search-workers', type=int, default=0)
     parser.add_argument('--search-timeout-s', type=int, default=240)
     parser.add_argument('--search-server-start-attempts', type=int, default=1200)
@@ -653,6 +654,7 @@ def main() -> int:
         'summary_cap_kib': args.summary_cap_kib,
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
+        'index_workers': args.index_workers,
         'tree_search_workers': args.tree_search_workers,
         'search_mode': args.search_mode,
         'drain_between_trees': args.drain_between_trees,
@@ -730,7 +732,9 @@ def main() -> int:
             proc = run(
                 [
                     str(sspry), '--perf-report', str(tree_run_dir / 'index.perf.json'),
-                    'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64', '--verbose',
+                    'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64',
+                    *(['--workers', str(args.index_workers)] if args.index_workers else []),
+                    '--verbose',
                 ],
                 stdout=(tree_run_dir / 'index.stdout').open('w'),
                 stderr=(tree_run_dir / 'index.stderr').open('w'),
