@@ -150,6 +150,11 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
         'verbose.search.prepared_max_pattern_bytes',
         'verbose.search.client_current_rss_kb',
         'verbose.search.client_peak_rss_kb',
+        'verbose.search.client_smaps_rss_kb',
+        'verbose.search.client_anonymous_kb',
+        'verbose.search.client_private_clean_kb',
+        'verbose.search.client_private_dirty_kb',
+        'verbose.search.client_shared_clean_kb',
         'verbose.search.server_current_rss_kb',
         'verbose.search.server_peak_rss_kb',
     ):

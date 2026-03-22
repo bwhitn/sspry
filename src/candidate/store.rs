@@ -1656,6 +1656,10 @@ impl CandidateStore {
         self.append_writers.retarget_root(root);
     }
 
+    pub fn clear_search_caches(&mut self) {
+        self.prepared_query_cache.clear();
+    }
+
     fn mark_write_activity(&mut self) {
         self.mutation_counter = self.mutation_counter.saturating_add(1);
         self.last_write_activity_monotonic = Some(Instant::now());

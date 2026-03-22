@@ -384,6 +384,54 @@ fn current_process_memory_kb() -> (usize, usize) {
     (current_rss_kb, peak_rss_kb)
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ProcessSmapsRollupKb {
+    rss_kb: u64,
+    anonymous_kb: u64,
+    private_clean_kb: u64,
+    private_dirty_kb: u64,
+    shared_clean_kb: u64,
+}
+
+fn current_process_smaps_rollup_kb() -> ProcessSmapsRollupKb {
+    let text = fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    let mut out = ProcessSmapsRollupKb::default();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("Rss:") {
+            out.rss_kb = value
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("Anonymous:") {
+            out.anonymous_kb = value
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("Private_Clean:") {
+            out.private_clean_kb = value
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("Private_Dirty:") {
+            out.private_dirty_kb = value
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("Shared_Clean:") {
+            out.shared_clean_kb = value
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    out
+}
+
 fn available_memory_bytes() -> Option<u64> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
@@ -1421,6 +1469,11 @@ struct BatchSearchRecord {
     verbose_search_verify_enabled: Option<bool>,
     verbose_search_client_current_rss_kb: Option<usize>,
     verbose_search_client_peak_rss_kb: Option<usize>,
+    verbose_search_client_smaps_rss_kb: Option<u64>,
+    verbose_search_client_anonymous_kb: Option<u64>,
+    verbose_search_client_private_clean_kb: Option<u64>,
+    verbose_search_client_private_dirty_kb: Option<u64>,
+    verbose_search_client_shared_clean_kb: Option<u64>,
     verbose_search_server_current_rss_kb: Option<u64>,
     verbose_search_server_peak_rss_kb: Option<u64>,
     verbose_search_tree_count: Option<usize>,
@@ -1668,6 +1721,14 @@ fn query_local_forest_all_candidates(
         external_ids,
         hashes: ordered,
     })
+}
+
+fn clear_local_forest_search_caches(tree_groups: &mut [TreeStoreGroup]) {
+    for group in tree_groups {
+        for store in &mut group.stores {
+            store.clear_search_caches();
+        }
+    }
 }
 
 fn verify_search_candidates(
@@ -3817,8 +3878,29 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             eprintln!("verbose.search.candidates: {total}");
             eprintln!("verbose.search.verify_enabled: {}", verify_yara_files);
             let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
+            let smaps_rollup = current_process_smaps_rollup_kb();
             eprintln!("verbose.search.client_current_rss_kb: {client_current_rss_kb}");
             eprintln!("verbose.search.client_peak_rss_kb: {client_peak_rss_kb}");
+            eprintln!(
+                "verbose.search.client_smaps_rss_kb: {}",
+                smaps_rollup.rss_kb
+            );
+            eprintln!(
+                "verbose.search.client_anonymous_kb: {}",
+                smaps_rollup.anonymous_kb
+            );
+            eprintln!(
+                "verbose.search.client_private_clean_kb: {}",
+                smaps_rollup.private_clean_kb
+            );
+            eprintln!(
+                "verbose.search.client_private_dirty_kb: {}",
+                smaps_rollup.private_dirty_kb
+            );
+            eprintln!(
+                "verbose.search.client_shared_clean_kb: {}",
+                smaps_rollup.shared_clean_kb
+            );
             if let Some((server_current_rss_kb, server_peak_rss_kb)) = server_rss_kb {
                 eprintln!("verbose.search.server_current_rss_kb: {server_current_rss_kb}");
                 eprintln!("verbose.search.server_peak_rss_kb: {server_peak_rss_kb}");
@@ -3931,8 +4013,10 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     args.verify_yara_files,
                 )?;
                 let verify_ms = started_verify.elapsed().as_secs_f64() * 1000.0;
+                clear_local_forest_search_caches(&mut tree_groups);
                 let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
                 let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
+                let smaps_rollup = current_process_smaps_rollup_kb();
                 Ok(BatchSearchRecord {
                     rule: rule_name.clone(),
                     rule_path: rule.display().to_string(),
@@ -4019,6 +4103,11 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_verify_enabled: Some(args.verify_yara_files),
                     verbose_search_client_current_rss_kb: Some(client_current_rss_kb),
                     verbose_search_client_peak_rss_kb: Some(client_peak_rss_kb),
+                    verbose_search_client_smaps_rss_kb: Some(smaps_rollup.rss_kb),
+                    verbose_search_client_anonymous_kb: Some(smaps_rollup.anonymous_kb),
+                    verbose_search_client_private_clean_kb: Some(smaps_rollup.private_clean_kb),
+                    verbose_search_client_private_dirty_kb: Some(smaps_rollup.private_dirty_kb),
+                    verbose_search_client_shared_clean_kb: Some(smaps_rollup.shared_clean_kb),
                     verbose_search_server_current_rss_kb: None,
                     verbose_search_server_peak_rss_kb: None,
                     verbose_search_tree_count: Some(tree_count),
@@ -4074,6 +4163,11 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_verify_enabled: Some(args.verify_yara_files),
                     verbose_search_client_current_rss_kb: None,
                     verbose_search_client_peak_rss_kb: None,
+                    verbose_search_client_smaps_rss_kb: None,
+                    verbose_search_client_anonymous_kb: None,
+                    verbose_search_client_private_clean_kb: None,
+                    verbose_search_client_private_dirty_kb: None,
+                    verbose_search_client_shared_clean_kb: None,
                     verbose_search_server_current_rss_kb: None,
                     verbose_search_server_peak_rss_kb: None,
                     verbose_search_tree_count: Some(tree_count),

@@ -44,6 +44,9 @@ Current pushed baseline:
 - current caveat:
   - `search-batch` still shows too much resident-memory growth on the preserved `50k` tree
   - it is good enough for smaller direct-forest checkpoints, but not yet the default broad tuning path
+- latest `50k` direct-forest result:
+  - clearing per-store prepared-query caches between rules cut anon materially
+  - the remaining memory problem is now mostly `Private_Clean` / file-backed residency, not retained query-anon growth
 - the important rule metrics are now:
   - `docs_scanned`
   - `candidates`

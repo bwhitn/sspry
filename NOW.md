@@ -51,6 +51,11 @@ Current state:
 - `search --root` plus `--tree-search-workers` now exists for in-process forest search and tree-level concurrency checks
 - `search-batch` now exists for long-lived in-process forest sweeps without per-rule reopen overhead
 - early `50k` batch checkpoints show the control-flow is correct, but resident memory still climbs too much for this to replace the persistent server path as the default tuning loop yet
+- clearing local prepared-query caches between batch rules materially reduced search-batch anon on the preserved `50k` slice
+  - `5`-rule slice:
+    - anon max: about `11.64 GiB -> 3.71 GiB`
+    - peak RSS: about `55.77 GiB -> 47.84 GiB`
+    - private clean stayed about flat at `44.13 GiB`
 
 Work:
 - keep search tuning on reused DBs, not fresh rebuilds
@@ -58,6 +63,7 @@ Work:
 - use `search-batch` for direct-forest repeated sweeps
 - keep one-shot `search --root` for correctness / threading spot checks
 - keep the persistent server path as the default large-slice tuning loop until `search-batch` resident memory is lower
+- treat the remaining `search-batch` memory problem as mostly file-backed residency driven by scan breadth, not retained anon cache growth
 - update docs whenever the searchable/scaling-safe boundary changes
 
 Exit criteria:
