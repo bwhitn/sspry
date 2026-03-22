@@ -3421,6 +3421,8 @@ const LOW_INFORMATION_RANGE_RULE_PATTERN_LIMIT: usize = 3;
 const LOW_INFORMATION_RANGE_RULE_MAX_TIER1_GRAMS: usize = 1;
 const LOW_INFORMATION_RANGE_RULE_MAX_TIER2_GRAMS: usize = 2;
 const LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN: usize = 4;
+const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS: usize = 0;
+const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS: usize = 2;
 
 fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
     pattern.alternatives.iter().any(|alt| !alt.is_empty())
@@ -3720,6 +3722,26 @@ fn reject_low_information_range_rule(root: &QueryNode, patterns: &[PatternPlan])
     }
     Err(SspryError::from(
         "Rule is overbroad for scalable search: short range/suffix anchors are too weak at scale. Add a longer mandatory literal or split the rule.",
+    ))
+}
+
+fn reject_low_information_single_pattern(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
+    if patterns.len() != 1 || node_has_branching_pattern_union(root) {
+        return Ok(());
+    }
+    let pattern = &patterns[0];
+    if pattern_has_anchor_literals(pattern) {
+        return Ok(());
+    }
+    let max_tier1 = pattern_max_tier1_grams(pattern);
+    let max_tier2 = pattern_max_tier2_grams(pattern);
+    if max_tier1 > LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS
+        || max_tier2 > LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS
+    {
+        return Ok(());
+    }
+    Err(SspryError::from(
+        "Rule is overbroad for scalable search: single-pattern rule provides only tiny gram anchors. Add a longer literal or combine it with a stronger mandatory condition.",
     ))
 }
 
@@ -4739,6 +4761,7 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     reject_overbroad_pattern_union(&root, &patterns)?;
     reject_low_information_entrypoint_stub(&root, &patterns)?;
     reject_low_information_range_rule(&root, &patterns)?;
+    reject_low_information_single_pattern(&root, &patterns)?;
     Ok(CompiledQueryPlan {
         patterns,
         root,
@@ -6941,6 +6964,44 @@ rule stronger_range_rule {
             100,
         )
         .expect("stronger range rule should compile");
+    }
+
+    #[test]
+    fn low_information_single_pattern_is_rejected() {
+        let err = compile_query_plan_default(
+            r#"
+rule low_information_single_pattern {
+  strings:
+    $a = { C6 ?? ?? ?? ?? 00 62 C6 ?? ?? ?? ?? 00 6F C6 ?? ?? ?? ?? 00 6F C6 ?? ?? ?? ?? 00 75 }
+  condition:
+    $a
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect_err("low-information single-pattern rule should fail");
+        assert!(err
+            .to_string()
+            .contains("single-pattern rule provides only tiny gram anchors"));
+
+        compile_query_plan_default(
+            r#"
+rule stronger_single_pattern {
+  strings:
+    $a = "LongerAnchorLiteral"
+  condition:
+    $a
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("stronger single-pattern rule should compile");
     }
 
 }
