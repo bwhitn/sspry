@@ -601,6 +601,7 @@ def main() -> int:
     parser.add_argument('--tier2-set-fp', type=float)
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--index-workers', type=int, default=0)
+    parser.add_argument('--index-mode', choices=('server', 'local-root'), default='server')
     parser.add_argument('--tree-search-workers', type=int, default=0)
     parser.add_argument('--search-timeout-s', type=int, default=240)
     parser.add_argument('--search-server-start-attempts', type=int, default=1200)
@@ -655,6 +656,7 @@ def main() -> int:
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'index_workers': args.index_workers,
+        'index_mode': args.index_mode,
         'tree_search_workers': args.tree_search_workers,
         'search_mode': args.search_mode,
         'drain_between_trees': args.drain_between_trees,
@@ -663,6 +665,8 @@ def main() -> int:
     }
 
     total_index_wall_s = 0.0
+    if args.index_mode == 'local-root' and args.search_mode != 'local-forest':
+        raise RuntimeError('index-mode=local-root currently requires search-mode=local-forest')
     for idx, manifest in enumerate(manifests):
         tree_name = f'tree_{idx:02d}'
         tree_run_dir = trees_dir / tree_name
@@ -705,6 +709,64 @@ def main() -> int:
             fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
         if args.tier2_set_fp is not None:
             fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
+        if args.index_mode == 'local-root':
+            current_root = db_root / 'current'
+            current_root.parent.mkdir(parents=True, exist_ok=True)
+            init_proc = run(
+                [
+                    str(sspry), 'init', '--root', str(current_root),
+                    '--candidate-shards', str(args.shards or 1),
+                    '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
+                    *fp_args,
+                ],
+                stdout=(tree_run_dir / 'init.stdout').open('w'),
+                stderr=(tree_run_dir / 'init.stderr').open('w'),
+            )
+            if init_proc.returncode != 0:
+                raise RuntimeError(f'init failed for {tree_name} with exit {init_proc.returncode}')
+            started = time.monotonic()
+            proc = run(
+                [
+                    str(sspry), '--perf-report', str(tree_run_dir / 'index.perf.json'),
+                    'index', '--root', str(current_root), '--path-list', str(manifest['path']),
+                    '--batch-size', '64',
+                    *(['--workers', str(args.index_workers)] if args.index_workers else []),
+                    '--verbose',
+                ],
+                stdout=(tree_run_dir / 'index.stdout').open('w'),
+                stderr=(tree_run_dir / 'index.stderr').open('w'),
+            )
+            elapsed_s = time.monotonic() - started
+            total_index_wall_s += elapsed_s
+            (tree_run_dir / 'index.exit_code.txt').write_text(str(proc.returncode))
+            (tree_run_dir / 'index.wall_seconds.txt').write_text(f'{elapsed_s:.6f}\n')
+            if proc.returncode != 0:
+                raise RuntimeError(f'index failed for {tree_name} with exit {proc.returncode}')
+            after_publish = write_snapshot(tree_run_dir / 'system.after_publish.json', system_snapshot())
+            (tree_run_dir / 'final.dir_stats.json').write_text(json.dumps(dir_stats(db_root), indent=2, sort_keys=True))
+            index_metrics = parse_index_metrics((tree_run_dir / 'index.stderr').read_text())
+            tree_record = {
+                'tree': tree_name,
+                'addr': '',
+                'manifest': str(manifest['path']),
+                'index_wall_seconds': elapsed_s,
+                'files': manifest['files'],
+                'manifest_bytes': manifest['bytes'],
+                'index_files_per_minute': ((manifest['files'] / elapsed_s) * 60.0) if elapsed_s > 0 else 0.0,
+                'index_metrics': index_metrics,
+                'post_publish_info': {},
+                'dir_stats': json.loads((tree_run_dir / 'final.dir_stats.json').read_text()),
+                'system_before_index': before_index,
+                'system_after_publish': after_publish,
+            }
+            forest_summary['trees'].append(tree_record)
+            print(
+                f"index.done tree={tree_name} files={tree_record['files']} bytes={tree_record['manifest_bytes']} "
+                f"wall_s={elapsed_s:.3f} files_per_min={tree_record['index_files_per_minute']:.3f} "
+                f"db_bytes={tree_record['dir_stats']['db_bytes']}",
+                flush=True,
+            )
+            continue
         server = subprocess.Popen(
             [
                 str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',

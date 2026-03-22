@@ -21,7 +21,6 @@ use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
     FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
 };
-#[cfg(test)]
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
@@ -1357,8 +1356,7 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
     )
 }
 
-#[cfg(test)]
-fn store_config_from_init_args(args: &InternalInitArgs) -> CandidateConfig {
+fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible init args");
     let (tier1_filter_target_fp, tier2_filter_target_fp) = resolve_filter_target_fps(
@@ -1379,7 +1377,6 @@ fn store_config_from_init_args(args: &InternalInitArgs) -> CandidateConfig {
     )
 }
 
-#[cfg(test)]
 fn ensure_store(config: CandidateConfig, force: bool) -> Result<CandidateStore> {
     let meta_path = config.root.join("meta.json");
     if force || !meta_path.exists() {
@@ -2294,8 +2291,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
     }
 }
 
-#[cfg(test)]
-fn cmd_internal_init(args: &InternalInitArgs) -> i32 {
+fn cmd_init(args: &InitArgs) -> i32 {
     match (|| -> Result<i32> {
         let root = Path::new(&args.root);
         let shard_count = args.candidate_shards.max(1);
@@ -2508,7 +2504,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                 gram_sizes,
                 chunk_size: args.chunk_size,
-                store_path: args.external_id_from_path,
+                store_path: config.store_path,
                 id_source,
             };
             let configured_budget_bytes = DEFAULT_MEMORY_BUDGET_BYTES;
@@ -3575,6 +3571,19 @@ fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
 }
 
 fn cmd_index(args: &IndexArgs) -> i32 {
+    if args.root.is_some() {
+        return cmd_internal_index_batch(&InternalIndexBatchArgs {
+            connection: args.connection.clone(),
+            paths: args.paths.clone(),
+            path_list: args.path_list,
+            root: args.root.clone(),
+            batch_size: args.batch_size,
+            workers: args.workers.unwrap_or(0),
+            chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
+            external_id_from_path: false,
+            verbose: args.verbose,
+        });
+    }
     let server_policy = match server_scan_policy(&args.connection) {
         Ok(server_policy) => server_policy,
         Err(err) => {
@@ -4274,6 +4283,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Serve(ServeArgs),
+    Init(InitArgs),
     Index(IndexArgs),
     Delete(DeleteArgs),
     Search(SearchCommandArgs),
@@ -4287,6 +4297,11 @@ enum Commands {
 struct IndexArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
+    #[arg(
+        long = "root",
+        help = "Candidate store root directory for direct local indexing. When set, indexing bypasses RPC and writes directly to this initialized root."
+    )]
+    root: Option<String>,
     #[arg(required = true, help = "File or directory paths.")]
     paths: Vec<String>,
     #[arg(
@@ -4540,9 +4555,8 @@ struct ServeArgs {
     gram_sizes: String,
 }
 
-#[cfg(test)]
 #[derive(Debug, clap::Args)]
-struct InternalInitArgs {
+struct InitArgs {
     #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate store root directory.")]
     root: String,
     #[arg(
@@ -4694,6 +4708,7 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
 
     let exit_code = match cli.command {
         Commands::Serve(args) => cmd_serve(&args),
+        Commands::Init(args) => cmd_init(&args),
         Commands::Index(args) => cmd_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
         Commands::Search(args) => cmd_search(&args),
@@ -4729,8 +4744,8 @@ mod tests {
         root: &Path,
         candidate_shards: usize,
         force: bool,
-    ) -> InternalInitArgs {
-        InternalInitArgs {
+    ) -> InitArgs {
+        InitArgs {
             root: root.display().to_string(),
             candidate_shards,
             force,
@@ -5288,7 +5303,7 @@ rule q {
         .expect("rule");
 
         let candidate_init_args = default_internal_init_args(&candidate_root, 1, true);
-        assert_eq!(cmd_internal_init(&candidate_init_args), 0);
+        assert_eq!(cmd_init(&candidate_init_args), 0);
 
         let ingest_one = InternalIndexArgs {
             connection: default_connection(),
@@ -5438,15 +5453,15 @@ rule q {
         .expect("rule");
 
         assert_eq!(
-            cmd_internal_init(&default_internal_init_args(&candidate_root, 2, true)),
+            cmd_init(&default_internal_init_args(&candidate_root, 2, true)),
             0
         );
         assert_eq!(
-            cmd_internal_init(&default_internal_init_args(&candidate_root, 2, false)),
+            cmd_init(&default_internal_init_args(&candidate_root, 2, false)),
             0
         );
         assert_eq!(
-            cmd_internal_init(&default_internal_init_args(&candidate_root, 1, false)),
+            cmd_init(&default_internal_init_args(&candidate_root, 1, false)),
             1
         );
 
@@ -5586,6 +5601,7 @@ rule remote_q {
         assert_eq!(
             cmd_index(&IndexArgs {
                 connection: connection.clone(),
+                root: None,
                 paths: vec![
                     sample_b.display().to_string(),
                     sample_c.display().to_string()
@@ -5805,6 +5821,7 @@ rule remote_q {
         assert_eq!(
             cmd_index(&IndexArgs {
                 connection: connection.clone(),
+                root: None,
                 paths: vec![sample.display().to_string()],
                 path_list: false,
                 batch_size: 1,
