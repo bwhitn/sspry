@@ -1770,10 +1770,7 @@ fn consume_verifier_only_for_of_at_loop(
     if chars.get(index) == Some(&'(') {
         index = consume_parenthesized_span(chars, index)?;
     } else {
-        while index < chars.len()
-            && !chars[index].is_whitespace()
-            && chars[index] != ':'
-        {
+        while index < chars.len() && !chars[index].is_whitespace() && chars[index] != ':' {
             index += 1;
         }
     }
@@ -1822,7 +1819,10 @@ fn expand_verifier_only_for_of_selector(
             }
             return Ok(matches);
         }
-        if known_pattern_names.iter().any(|pattern_id| pattern_id == trimmed) {
+        if known_pattern_names
+            .iter()
+            .any(|pattern_id| pattern_id == trimmed)
+        {
             return Ok(vec![trimmed.to_owned()]);
         }
         Err(SspryError::from(format!(
@@ -3755,11 +3755,7 @@ fn build_local_rule_fragment(
                     fullword_flags.push(*fullword);
                 }
             }
-            if !pattern_has_searchable_anchor(
-                &alternatives,
-                &tier2_alternatives,
-                &fixed_literals,
-            ) {
+            if !pattern_has_searchable_anchor(&alternatives, &tier2_alternatives, &fixed_literals) {
                 verifier_only_pattern_ids.insert(pattern_id);
                 continue;
             }
@@ -3860,11 +3856,7 @@ fn build_local_rule_fragment(
                 raw_pattern_id
             };
             let alt_count = alternatives.len();
-            if !pattern_has_searchable_anchor(
-                &alternatives,
-                &tier2_alternatives,
-                &fixed_literals,
-            ) {
+            if !pattern_has_searchable_anchor(&alternatives, &tier2_alternatives, &fixed_literals) {
                 verifier_only_pattern_ids.insert(pattern_id);
                 continue;
             }
@@ -3899,10 +3891,8 @@ fn build_local_rule_fragment(
         .collect::<Vec<_>>();
     known_pattern_names.sort();
     known_pattern_names.dedup();
-    let rewritten_condition = rewrite_verifier_only_for_of_at_loops(
-        &rule.condition_text,
-        &known_pattern_names,
-    )?;
+    let rewritten_condition =
+        rewrite_verifier_only_for_of_at_loops(&rule.condition_text, &known_pattern_names)?;
     let mut parser = ConditionParser::new_with_rules(
         &rewritten_condition,
         fragment

@@ -22,13 +22,15 @@ use crate::candidate::store::{
     CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
     CandidateInsertBatchProfile, CandidateStoreOpenProfile, PreparedQueryArtifacts,
     build_prepared_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
-    prepared_query_artifacts_memory_bytes, write_compacted_snapshot,
+    prepared_query_artifacts_memory_bytes, prepared_query_artifacts_profile,
+    write_compacted_snapshot,
 };
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
-    PatternPlan, QueryNode, candidate_shard_index, candidate_shard_root, metadata_field_is_boolean,
-    metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
-    read_candidate_shard_count, write_candidate_shard_count,
+    BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
+    CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode, candidate_shard_index,
+    candidate_shard_root, metadata_field_is_boolean, metadata_field_is_integer,
+    normalize_max_candidates, normalize_query_metadata_field, read_candidate_shard_count,
+    write_candidate_shard_count,
 };
 use crate::perf::{record_counter, scope};
 use crate::{Result, SspryError};
@@ -173,6 +175,8 @@ pub struct CandidateQueryResponse {
     pub tier_used: String,
     #[serde(default)]
     pub query_profile: CandidateQueryProfile,
+    #[serde(default)]
+    pub prepared_query_profile: CandidatePreparedQueryProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ids: Option<Vec<Option<String>>>,
 }
@@ -461,11 +465,20 @@ struct CachedCandidateQuery {
     ordered_hashes: Vec<String>,
     tier_used: String,
     query_profile: CandidateQueryProfile,
+    prepared_query_profile: CandidatePreparedQueryProfile,
 }
 
 fn cached_candidate_query_memory_bytes(query: &CachedCandidateQuery) -> u64 {
     (std::mem::size_of::<CachedCandidateQuery>() as u64)
         .saturating_add(query.tier_used.capacity() as u64)
+        .saturating_add(
+            query
+                .prepared_query_profile
+                .max_pattern_id
+                .as_ref()
+                .map(|value| value.capacity() as u64)
+                .unwrap_or(0),
+        )
         .saturating_add(
             (query.ordered_hashes.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<String>() as u64),
@@ -4228,6 +4241,7 @@ impl ServerState {
         plan: &CompiledQueryPlan,
     ) -> Result<CachedCandidateQuery> {
         let prepared = self.shared_prepared_query_artifacts(plan)?;
+        let prepared_query_profile = prepared_query_artifacts_profile(prepared.as_ref());
         let published = self.published_store_set()?;
         if self.candidate_shard_count() == 1 {
             let mut store = lock_candidate_store_blocking(&published.stores[0])?;
@@ -4239,6 +4253,7 @@ impl ServerState {
                 ordered_hashes,
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
                 query_profile,
+                prepared_query_profile,
             });
         }
 
@@ -4266,6 +4281,7 @@ impl ServerState {
                 ordered_hashes,
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
                 query_profile,
+                prepared_query_profile,
             });
         }
 
@@ -4325,6 +4341,7 @@ impl ServerState {
             ordered_hashes,
             tier_used: Self::merge_candidate_tier_used(&tier_used),
             query_profile,
+            prepared_query_profile,
         })
     }
 
@@ -4926,6 +4943,7 @@ impl ServerState {
             next_cursor,
             tier_used: cached.tier_used.clone(),
             query_profile: cached.query_profile.clone(),
+            prepared_query_profile: cached.prepared_query_profile.clone(),
             external_ids,
         })
     }

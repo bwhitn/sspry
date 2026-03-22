@@ -2789,6 +2789,37 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 !args.no_tier2_fallback,
                 args.max_candidates,
             )?;
+            let mut tier1_filter_keys = std::collections::HashSet::<(usize, usize)>::new();
+            let mut tier2_filter_keys = std::collections::HashSet::<(usize, usize)>::new();
+            let mut summary_cap_bytes = None::<usize>;
+            for store in &stores {
+                tier1_filter_keys.extend(store.tier1_superblock_filter_keys());
+                tier2_filter_keys.extend(store.tier2_doc_filter_keys());
+                let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
+                if let Some(existing) = summary_cap_bytes {
+                    if existing != shard_summary_cap {
+                        return Err(SspryError::from(
+                            "candidate stores use mixed tier2 superblock summary caps",
+                        ));
+                    }
+                } else {
+                    summary_cap_bytes = Some(shard_summary_cap);
+                }
+            }
+            let mut ordered_tier1_filter_keys = tier1_filter_keys.into_iter().collect::<Vec<_>>();
+            ordered_tier1_filter_keys.sort_unstable();
+            let mut ordered_tier2_filter_keys = tier2_filter_keys.into_iter().collect::<Vec<_>>();
+            ordered_tier2_filter_keys.sort_unstable();
+            let prepared_query_profile = crate::candidate::store::prepared_query_artifacts_profile(
+                crate::candidate::store::build_prepared_query_artifacts(
+                    &plan,
+                    &ordered_tier1_filter_keys,
+                    &ordered_tier2_filter_keys,
+                    summary_cap_bytes
+                        .unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
+                )?
+                .as_ref(),
+            );
             if stores.len() == 1 {
                 let result = stores[0].query_candidates(&plan, args.cursor, args.chunk_size)?;
                 rpc::CandidateQueryResponse {
@@ -2799,6 +2830,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     next_cursor: result.next_cursor,
                     tier_used: result.tier_used,
                     query_profile: result.query_profile,
+                    prepared_query_profile,
                     external_ids: None,
                 }
             } else {
@@ -2835,6 +2867,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     next_cursor: (end < total_candidates).then_some(end),
                     tier_used: merge_tier_used(tier_used),
                     query_profile,
+                    prepared_query_profile,
                     external_ids: None,
                 }
             }
@@ -3005,6 +3038,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut verified_matched = 0usize;
         let mut verified_skipped = 0usize;
         let mut query_profile = None::<crate::candidate::CandidateQueryProfile>;
+        let mut prepared_query_profile = None::<crate::candidate::CandidatePreparedQueryProfile>;
         let (total, tier_used) = loop {
             let started_query = Instant::now();
             let result = client.candidate_query_plan_with_options(
@@ -3016,6 +3050,9 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             query_time += started_query.elapsed();
             if query_profile.is_none() {
                 query_profile = Some(result.query_profile.clone());
+            }
+            if prepared_query_profile.is_none() {
+                prepared_query_profile = Some(result.prepared_query_profile.clone());
             }
             if !verify_yara_files {
                 rows.extend(result.sha256.iter().cloned());
@@ -3126,6 +3163,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         }
         if args.verbose {
             let query_profile = query_profile.unwrap_or_default();
+            let prepared_query_profile = prepared_query_profile.unwrap_or_default();
             let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
             let plan_ms = plan_time.as_secs_f64() * 1000.0;
             let query_ms = query_time.as_secs_f64() * 1000.0;
@@ -3166,6 +3204,81 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 "verbose.search.tier2_bloom_bytes: {}",
                 query_profile.tier2_bloom_bytes
             );
+            eprintln!(
+                "verbose.search.prepared_query_bytes: {}",
+                prepared_query_profile.prepared_query_bytes
+            );
+            eprintln!(
+                "verbose.search.prepared_pattern_plan_bytes: {}",
+                prepared_query_profile.prepared_pattern_plan_bytes
+            );
+            eprintln!(
+                "verbose.search.prepared_mask_cache_bytes: {}",
+                prepared_query_profile.prepared_mask_cache_bytes
+            );
+            eprintln!(
+                "verbose.search.prepared_pattern_count: {}",
+                prepared_query_profile.pattern_count
+            );
+            eprintln!(
+                "verbose.search.prepared_mask_cache_entries: {}",
+                prepared_query_profile.mask_cache_entries
+            );
+            eprintln!(
+                "verbose.search.prepared_fixed_literal_count: {}",
+                prepared_query_profile.fixed_literal_count
+            );
+            eprintln!(
+                "verbose.search.prepared_tier1_alternatives: {}",
+                prepared_query_profile.tier1_alternatives
+            );
+            eprintln!(
+                "verbose.search.prepared_tier2_alternatives: {}",
+                prepared_query_profile.tier2_alternatives
+            );
+            eprintln!(
+                "verbose.search.prepared_tier1_shift_variants: {}",
+                prepared_query_profile.tier1_shift_variants
+            );
+            eprintln!(
+                "verbose.search.prepared_tier2_shift_variants: {}",
+                prepared_query_profile.tier2_shift_variants
+            );
+            eprintln!(
+                "verbose.search.prepared_tier1_any_lane_alternatives: {}",
+                prepared_query_profile.tier1_any_lane_alternatives
+            );
+            eprintln!(
+                "verbose.search.prepared_tier2_any_lane_alternatives: {}",
+                prepared_query_profile.tier2_any_lane_alternatives
+            );
+            eprintln!(
+                "verbose.search.prepared_tier1_compacted_any_lane_alternatives: {}",
+                prepared_query_profile.tier1_compacted_any_lane_alternatives
+            );
+            eprintln!(
+                "verbose.search.prepared_tier2_compacted_any_lane_alternatives: {}",
+                prepared_query_profile.tier2_compacted_any_lane_alternatives
+            );
+            eprintln!(
+                "verbose.search.prepared_any_lane_variant_sets: {}",
+                prepared_query_profile.any_lane_variant_sets
+            );
+            eprintln!(
+                "verbose.search.prepared_compacted_any_lane_grams: {}",
+                prepared_query_profile.compacted_any_lane_grams
+            );
+            eprintln!(
+                "verbose.search.prepared_max_pattern_bytes: {}",
+                prepared_query_profile.max_pattern_bytes
+            );
+            eprintln!(
+                "verbose.search.prepared_impossible_query: {}",
+                prepared_query_profile.impossible_query
+            );
+            if let Some(max_pattern_id) = &prepared_query_profile.max_pattern_id {
+                eprintln!("verbose.search.prepared_max_pattern_id: {max_pattern_id}");
+            }
             eprintln!("verbose.search.max_candidates: {}", args.max_candidates);
             eprintln!(
                 "verbose.search.max_anchors_per_pattern: {}",

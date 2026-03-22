@@ -198,6 +198,29 @@ pub struct CandidateQueryResult {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CandidatePreparedQueryProfile {
+    pub impossible_query: bool,
+    pub prepared_query_bytes: u64,
+    pub prepared_pattern_plan_bytes: u64,
+    pub prepared_mask_cache_bytes: u64,
+    pub pattern_count: u64,
+    pub mask_cache_entries: u64,
+    pub fixed_literal_count: u64,
+    pub tier1_alternatives: u64,
+    pub tier2_alternatives: u64,
+    pub tier1_shift_variants: u64,
+    pub tier2_shift_variants: u64,
+    pub tier1_any_lane_alternatives: u64,
+    pub tier2_any_lane_alternatives: u64,
+    pub tier1_compacted_any_lane_alternatives: u64,
+    pub tier2_compacted_any_lane_alternatives: u64,
+    pub any_lane_variant_sets: u64,
+    pub compacted_any_lane_grams: u64,
+    pub max_pattern_bytes: u64,
+    pub max_pattern_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CandidateQueryProfile {
     pub docs_scanned: u64,
     pub superblocks_skipped: u64,
@@ -229,6 +252,41 @@ impl CandidateQueryProfile {
         self.tier2_bloom_bytes = self
             .tier2_bloom_bytes
             .saturating_add(other.tier2_bloom_bytes);
+    }
+}
+
+impl CandidatePreparedQueryProfile {
+    fn accumulate_shifted(&mut self, shifted: &ShiftedRequiredMasks, tier2: bool) {
+        let shift_count = shifted.shifts.len() as u64;
+        if tier2 {
+            self.tier2_shift_variants = self.tier2_shift_variants.saturating_add(shift_count);
+        } else {
+            self.tier1_shift_variants = self.tier1_shift_variants.saturating_add(shift_count);
+        }
+        if !shifted.any_lane_values.is_empty() {
+            if tier2 {
+                self.tier2_any_lane_alternatives =
+                    self.tier2_any_lane_alternatives.saturating_add(1);
+            } else {
+                self.tier1_any_lane_alternatives =
+                    self.tier1_any_lane_alternatives.saturating_add(1);
+            }
+            self.any_lane_variant_sets = self
+                .any_lane_variant_sets
+                .saturating_add(shifted.any_lane_values.len() as u64);
+        }
+        if !shifted.any_lane_grams.is_empty() {
+            if tier2 {
+                self.tier2_compacted_any_lane_alternatives =
+                    self.tier2_compacted_any_lane_alternatives.saturating_add(1);
+            } else {
+                self.tier1_compacted_any_lane_alternatives =
+                    self.tier1_compacted_any_lane_alternatives.saturating_add(1);
+            }
+            self.compacted_any_lane_grams = self
+                .compacted_any_lane_grams
+                .saturating_add(shifted.any_lane_grams.len() as u64);
+        }
     }
 }
 
@@ -5202,6 +5260,50 @@ pub(crate) fn prepared_query_artifacts_memory_bytes(artifacts: &PreparedQueryArt
     (std::mem::size_of::<PreparedQueryArtifacts>() as u64)
         .saturating_add(patterns_bytes)
         .saturating_add(mask_cache_bytes)
+}
+
+pub(crate) fn prepared_query_artifacts_profile(
+    artifacts: &PreparedQueryArtifacts,
+) -> CandidatePreparedQueryProfile {
+    let mut profile = CandidatePreparedQueryProfile {
+        impossible_query: artifacts.impossible_query,
+        prepared_query_bytes: prepared_query_artifacts_memory_bytes(artifacts),
+        ..CandidatePreparedQueryProfile::default()
+    };
+    for (pattern_id, pattern) in &artifacts.patterns {
+        profile.pattern_count = profile.pattern_count.saturating_add(1);
+        profile.fixed_literal_count = profile
+            .fixed_literal_count
+            .saturating_add(pattern.fixed_literals.len() as u64);
+        profile.tier1_alternatives = profile
+            .tier1_alternatives
+            .saturating_add(pattern.alternatives.len() as u64);
+        profile.tier2_alternatives = profile
+            .tier2_alternatives
+            .saturating_add(pattern.tier2_alternatives.len() as u64);
+
+        let pattern_bytes = prepared_pattern_plan_memory_bytes(pattern);
+        profile.prepared_pattern_plan_bytes = profile
+            .prepared_pattern_plan_bytes
+            .saturating_add(pattern_bytes);
+        if pattern_bytes > profile.max_pattern_bytes {
+            profile.max_pattern_bytes = pattern_bytes;
+            profile.max_pattern_id = Some(pattern_id.clone());
+        }
+    }
+    for masks in artifacts.mask_cache.values() {
+        profile.mask_cache_entries = profile.mask_cache_entries.saturating_add(1);
+        profile.prepared_mask_cache_bytes = profile
+            .prepared_mask_cache_bytes
+            .saturating_add(prepared_pattern_masks_memory_bytes(masks));
+        for shifted in &masks.tier1 {
+            profile.accumulate_shifted(shifted, false);
+        }
+        for shifted in &masks.tier2 {
+            profile.accumulate_shifted(shifted, true);
+        }
+    }
+    profile
 }
 
 fn lane_position_variants_for_pattern(
