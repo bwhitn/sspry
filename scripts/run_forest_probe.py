@@ -621,7 +621,7 @@ def main() -> int:
     parser.add_argument('--index-workers', type=int, default=0)
     parser.add_argument('--index-mode', choices=('server', 'local-root'), default='server')
     parser.add_argument('--tree-search-workers', type=int, default=0)
-    parser.add_argument('--search-timeout-s', type=int, default=120)
+    parser.add_argument('--search-timeout-s', type=int, default=100)
     parser.add_argument('--search-server-start-attempts', type=int, default=1200)
     parser.add_argument('--drain-between-trees', action='store_true')
     parser.add_argument('--drain-sync', action='store_true')

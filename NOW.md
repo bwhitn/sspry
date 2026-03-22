@@ -48,7 +48,7 @@ Current state:
 - `run_forest_probe.py --reuse-existing-db` exists and is the right default for search tuning
 - the probe defaults now target:
   - `10,000` files per tree
-  - `120s` per-tree search timeout before tree-batch scaling
+  - `100s` per-tree search timeout before tree-batch scaling
 - preserved `25k` and `50k` DB roots are now part of the normal profiling workflow
 - per-rule prepared-query memory profiling is available in verbose search output
 - `search --root` plus `--tree-search-workers` now exists for in-process forest search and tree-level concurrency checks
