@@ -3412,6 +3412,210 @@ fn contains_pattern_node(node: &QueryNode) -> bool {
     node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
 }
 
+const OVERBROAD_UNION_FANOUT_LIMIT: usize = 192;
+const MANDATORY_PATTERN_COMBINATION_LIMIT: usize = 4096;
+
+fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
+    pattern.alternatives.iter().any(|alt| !alt.is_empty())
+        || pattern
+            .tier2_alternatives
+            .iter()
+            .any(|alt| !alt.is_empty())
+        || pattern.anchor_literals.iter().any(|literal| !literal.is_empty())
+}
+
+fn choose_bounded(n: usize, k: usize, limit: usize) -> Option<usize> {
+    if k > n {
+        return Some(0);
+    }
+    let k = k.min(n.saturating_sub(k));
+    let mut value = 1usize;
+    for i in 0..k {
+        let numerator = n.saturating_sub(i);
+        let denominator = i.saturating_add(1);
+        value = value.checked_mul(numerator)?;
+        value /= denominator;
+        if value > limit {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+fn combinations_intersection_of_unions(
+    child_sets: &[HashSet<String>],
+    threshold: usize,
+) -> HashSet<String> {
+    fn visit(
+        child_sets: &[HashSet<String>],
+        threshold: usize,
+        start: usize,
+        current: &mut Vec<usize>,
+        intersection: &mut Option<HashSet<String>>,
+    ) {
+        if current.len() == threshold {
+            let union = current
+                .iter()
+                .flat_map(|idx| child_sets[*idx].iter().cloned())
+                .collect::<HashSet<_>>();
+            if let Some(existing) = intersection {
+                existing.retain(|pattern_id| union.contains(pattern_id));
+            } else {
+                *intersection = Some(union);
+            }
+            return;
+        }
+        let remaining = threshold.saturating_sub(current.len());
+        let max_start = child_sets.len().saturating_sub(remaining);
+        for idx in start..=max_start {
+            current.push(idx);
+            visit(child_sets, threshold, idx + 1, current, intersection);
+            current.pop();
+            if intersection.as_ref().is_some_and(HashSet::is_empty) {
+                return;
+            }
+        }
+    }
+
+    let mut intersection = None;
+    visit(
+        child_sets,
+        threshold,
+        0,
+        &mut Vec::with_capacity(threshold),
+        &mut intersection,
+    );
+    intersection.unwrap_or_default()
+}
+
+fn mandatory_pattern_ids(node: &QueryNode) -> HashSet<String> {
+    match node.kind.as_str() {
+        "pattern" => node
+            .pattern_id
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        "and" => node
+            .children
+            .iter()
+            .flat_map(mandatory_pattern_ids)
+            .collect::<HashSet<_>>(),
+        "or" => {
+            let mut children = node.children.iter();
+            let Some(first) = children.next() else {
+                return HashSet::new();
+            };
+            let mut mandatory = mandatory_pattern_ids(first);
+            for child in children {
+                mandatory.retain(|pattern_id| mandatory_pattern_ids(child).contains(pattern_id));
+                if mandatory.is_empty() {
+                    break;
+                }
+            }
+            mandatory
+        }
+        "n_of" => {
+            let threshold = node.threshold.unwrap_or(0);
+            if threshold == 0 || node.children.is_empty() || threshold > node.children.len() {
+                return HashSet::new();
+            }
+            if threshold == node.children.len() {
+                return node
+                    .children
+                    .iter()
+                    .flat_map(mandatory_pattern_ids)
+                    .collect::<HashSet<_>>();
+            }
+            let Some(combo_count) = choose_bounded(
+                node.children.len(),
+                threshold,
+                MANDATORY_PATTERN_COMBINATION_LIMIT,
+            ) else {
+                return HashSet::new();
+            };
+            if combo_count == 0 {
+                return HashSet::new();
+            }
+            let child_sets = node
+                .children
+                .iter()
+                .map(mandatory_pattern_ids)
+                .collect::<Vec<_>>();
+            combinations_intersection_of_unions(&child_sets, threshold)
+        }
+        _ => HashSet::new(),
+    }
+}
+
+fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
+    match node.kind.as_str() {
+        "or" => node.children.len() > 1 || node.children.iter().any(node_has_branching_pattern_union),
+        "n_of" => {
+            let threshold = node.threshold.unwrap_or(0);
+            (threshold > 0 && threshold < node.children.len())
+                || node.children.iter().any(node_has_branching_pattern_union)
+        }
+        _ => node.children.iter().any(node_has_branching_pattern_union),
+    }
+}
+
+fn total_pattern_anchor_fanout(patterns: &[PatternPlan]) -> usize {
+    patterns
+        .iter()
+        .map(|pattern| {
+            pattern
+                .anchor_literals
+                .iter()
+                .filter(|literal| !literal.is_empty())
+                .count()
+                .max(
+                    pattern
+                        .alternatives
+                        .iter()
+                        .filter(|alt| !alt.is_empty())
+                        .count()
+                        .max(
+                            pattern
+                                .tier2_alternatives
+                                .iter()
+                                .filter(|alt| !alt.is_empty())
+                                .count(),
+                        ),
+                )
+                .max(1)
+        })
+        .sum()
+}
+
+fn reject_overbroad_pattern_union(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
+    if patterns.is_empty() || !node_has_branching_pattern_union(root) {
+        return Ok(());
+    }
+    let pattern_map = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern))
+        .collect::<HashMap<_, _>>();
+    let mandatory_anchorable = mandatory_pattern_ids(root)
+        .into_iter()
+        .filter(|pattern_id| {
+            pattern_map
+                .get(pattern_id)
+                .copied()
+                .is_some_and(pattern_is_anchorable)
+        })
+        .count();
+    if mandatory_anchorable > 0 {
+        return Ok(());
+    }
+    let fanout = total_pattern_anchor_fanout(patterns);
+    if fanout < OVERBROAD_UNION_FANOUT_LIMIT {
+        return Ok(());
+    }
+    Err(SspryError::from(format!(
+        "Rule is overbroad for scalable search: no mandatory anchorable pattern and union fanout {fanout} exceeds {OVERBROAD_UNION_FANOUT_LIMIT}. Add a stable mandatory anchor or split the rule."
+    )))
+}
+
 pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteralMatchPlan> {
     if contains_identity_node(&plan.root) {
         return None;
@@ -4425,6 +4629,7 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             fixed_literal_fullword,
         });
     }
+    reject_overbroad_pattern_union(&root, &patterns)?;
     Ok(CompiledQueryPlan {
         patterns,
         root,
@@ -6507,5 +6712,47 @@ rule q {
             let lowered = alt.iter().map(|byte| byte.to_ascii_lowercase()).collect::<Vec<_>>();
             lowered.windows(4).any(|window| window == b".pas")
         }));
+    }
+
+    #[test]
+    fn overbroad_high_fanout_union_requires_mandatory_anchor() {
+        let err = compile_query_plan_default(
+            r#"
+rule overbroad_iron_tiger_style {
+  strings:
+    $a = "Game Over Good Luck By Wind" nocase wide ascii
+    $b = "ReleiceName" nocase wide ascii
+    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
+    $d = "Winds Update" nocase wide ascii
+  condition:
+    uint16(0) == 0x5a4d and any of them
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect_err("overbroad union should fail");
+        assert!(err.to_string().contains("overbroad for scalable search"));
+
+        compile_query_plan_default(
+            r#"
+rule narrow_all_of {
+  strings:
+    $a = "Game Over Good Luck By Wind" nocase wide ascii
+    $b = "ReleiceName" nocase wide ascii
+    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
+    $d = "Winds Update" nocase wide ascii
+  condition:
+    uint16(0) == 0x5a4d and all of them
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("all-of rule should stay searchable");
     }
 }
