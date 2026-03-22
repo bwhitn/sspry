@@ -25,6 +25,8 @@ pub struct PatternPlan {
     #[serde(default)]
     pub tier2_alternatives: Vec<Vec<u64>>,
     #[serde(default)]
+    pub anchor_literals: Vec<Vec<u8>>,
+    #[serde(default)]
     pub fixed_literals: Vec<Vec<u8>>,
     #[serde(default)]
     pub fixed_literal_wide: Vec<bool>,
@@ -62,6 +64,13 @@ fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
             )
         })
         .sum::<u64>();
+    let anchor_literals_bytes = pattern
+        .anchor_literals
+        .iter()
+        .map(|literal| {
+            (std::mem::size_of::<Vec<u8>>() as u64).saturating_add(literal.capacity() as u64)
+        })
+        .sum::<u64>();
     let fixed_literals_bytes = pattern
         .fixed_literals
         .iter()
@@ -81,6 +90,11 @@ fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
                 .saturating_mul(std::mem::size_of::<Vec<u64>>() as u64),
         )
         .saturating_add(tier2_alternatives_bytes)
+        .saturating_add(
+            (pattern.anchor_literals.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u8>>() as u64),
+        )
+        .saturating_add(anchor_literals_bytes)
         .saturating_add(
             (pattern.fixed_literals.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<Vec<u8>>() as u64),
@@ -241,6 +255,7 @@ struct ParsedRuleBlock {
 struct RulePlanFragment {
     pattern_alternatives: BTreeMap<String, Vec<Vec<u64>>>,
     pattern_tier2_alternatives: BTreeMap<String, Vec<Vec<u64>>>,
+    pattern_anchor_literals: BTreeMap<String, Vec<Vec<u8>>>,
     pattern_fixed_literals: BTreeMap<String, Vec<Vec<u8>>>,
     pattern_fixed_literal_wide: BTreeMap<String, Vec<bool>>,
     pattern_fixed_literal_fullword: BTreeMap<String, Vec<bool>>,
@@ -2634,6 +2649,47 @@ fn expand_ascii_nocase_variants(bytes: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+fn anchor_hint_for_byte(byte: u8) -> u128 {
+    match byte {
+        0 => 0,
+        b'\\' | b'/' | b'.' | b'_' | b'-' | b':' | b'@' => 24,
+        b'0'..=b'9' => 18,
+        b'A'..=b'Z' | b'a'..=b'z' => 4,
+        b' ' | b'\t' | b'\r' | b'\n' => 2,
+        _ if byte.is_ascii_punctuation() => 16,
+        _ if byte.is_ascii() => 8,
+        _ => 12,
+    }
+}
+
+fn bytes_anchor_hint(bytes: &[u8], gram_sizes: GramSizes) -> u128 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let stable_hint = bytes
+        .iter()
+        .map(|byte| anchor_hint_for_byte(*byte))
+        .sum::<u128>();
+    let distinct_bytes = bytes.iter().copied().collect::<HashSet<_>>().len() as u128;
+    let unique_tier1 = grams_tier1_from_bytes(bytes, gram_sizes.tier1)
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len() as u128;
+    let unique_tier2 = grams_tier2_from_bytes(bytes, gram_sizes.tier2)
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len() as u128;
+    stable_hint
+        .saturating_mul(32)
+        .saturating_add(distinct_bytes.saturating_mul(8))
+        .saturating_add(unique_tier1.saturating_mul(24))
+        .saturating_add(unique_tier2.saturating_mul(8))
+}
+
+fn exact_gram_anchor_hint(gram: u64, gram_size: usize) -> u128 {
+    bytes_anchor_hint(&gram.to_le_bytes()[..gram_size], GramSizes::default())
+}
+
 fn derive_nocase_search_alternatives(
     literal: &[u8],
     wide: bool,
@@ -2661,7 +2717,7 @@ fn derive_nocase_search_alternatives(
         return Ok(vec![literal.to_vec()]);
     }
     let step = if wide { 2 } else { 1 };
-    let mut best: Option<(u128, u128, usize, usize, usize)> = None;
+    let mut best: Option<(u128, u128, u128, usize, usize, usize)> = None;
     for start in (0..=literal.len() - min_search_len).step_by(step) {
         let mut end = start + min_search_len;
         while end <= literal.len() {
@@ -2676,16 +2732,19 @@ fn derive_nocase_search_alternatives(
                 let tier1_grams = gram_count_for_len(slice.len(), gram_sizes.tier1);
                 let tier2_grams = gram_count_for_len(slice.len(), gram_sizes.tier2);
                 let search_weight = (tier1_grams as u128) * 8 + tier2_grams as u128;
+                let anchor_hint = bytes_anchor_hint(slice, gram_sizes);
                 let weighted_score = search_weight
                     .saturating_mul(search_weight)
                     .saturating_mul(search_weight)
+                    .saturating_mul(anchor_hint.saturating_add(1))
                     / variant_count.max(1) as u128;
                 let score = (
                     weighted_score,
+                    anchor_hint,
                     search_weight,
                     usize::MAX - variant_count,
                     slice.len(),
-                    usize::MAX - start,
+                    start,
                 );
                 if best.map(|current| score > current).unwrap_or(true) {
                     best = Some(score);
@@ -2694,14 +2753,12 @@ fn derive_nocase_search_alternatives(
             end += step;
         }
     }
-    let Some((_weighted_score, _search_weight, _inverse_variants, best_len, best_start_inverse)) =
-        best
+    let Some((_weighted_score, _anchor_hint, _search_weight, _inverse_variants, best_len, best_start)) = best
     else {
         return Err(SspryError::from(
             "nocase literal expands too broadly for the active gram sizes",
         ));
     };
-    let best_start = usize::MAX - best_start_inverse;
     let window = &literal[best_start..best_start + best_len];
     Ok(expand_ascii_nocase_variants(window))
 }
@@ -2978,7 +3035,11 @@ fn optimize_grams(
     let has_positions = !fixed_literal.is_empty() && fixed_literal.len() >= gram_size;
     if !has_positions {
         let mut ranked = grams.to_vec();
-        ranked.sort_unstable();
+        ranked.sort_by(|left, right| {
+            exact_gram_anchor_hint(*right, gram_size)
+                .cmp(&exact_gram_anchor_hint(*left, gram_size))
+                .then_with(|| left.cmp(right))
+        });
         ranked.truncate(max_anchors_per_alt);
         return ranked;
     }
@@ -2997,6 +3058,7 @@ fn optimize_grams(
     while selected.len() < max_anchors_per_alt && !remaining.is_empty() {
         let mut best_idx = 0usize;
         let mut best_spread = 0usize;
+        let mut best_hint = 0u128;
         let mut best_gram = u64::MAX;
         for (idx, gram) in remaining.iter().enumerate() {
             let spread = positions_by_gram
@@ -3023,10 +3085,13 @@ fn optimize_grams(
                     }
                 })
                 .unwrap_or(0);
-            let better = (usize::MAX - spread, *gram) < (usize::MAX - best_spread, best_gram);
+            let hint = exact_gram_anchor_hint(*gram, gram_size);
+            let better =
+                (spread, hint, std::cmp::Reverse(*gram)) > (best_spread, best_hint, std::cmp::Reverse(best_gram));
             if better {
                 best_idx = idx;
                 best_spread = spread;
+                best_hint = hint;
                 best_gram = *gram;
             }
         }
@@ -3126,6 +3191,7 @@ fn dedupe_or_nodes(node: &mut QueryNode) {
 fn dedupe_pattern_alternatives(
     alternatives: Vec<Vec<u64>>,
     tier2_alternatives: Vec<Vec<u64>>,
+    anchor_literals: Vec<Vec<u8>>,
     fixed_literals: Vec<Vec<u8>>,
     fixed_literal_wide: Vec<bool>,
     fixed_literal_fullword: Vec<bool>,
@@ -3133,30 +3199,35 @@ fn dedupe_pattern_alternatives(
     Vec<Vec<u64>>,
     Vec<Vec<u64>>,
     Vec<Vec<u8>>,
+    Vec<Vec<u8>>,
     Vec<bool>,
     Vec<bool>,
 ) {
-    let mut seen = HashSet::<(Vec<u64>, Vec<u64>, Vec<u8>, bool, bool)>::new();
+    let mut seen = HashSet::<(Vec<u64>, Vec<u64>, Vec<u8>, Vec<u8>, bool, bool)>::new();
     let mut kept_tier1 = Vec::new();
     let mut kept_tier2 = Vec::new();
+    let mut kept_anchor_literals = Vec::new();
     let mut kept_literals = Vec::new();
     let mut kept_wide = Vec::new();
     let mut kept_fullword = Vec::new();
     let max_len = alternatives
         .len()
         .max(tier2_alternatives.len())
+        .max(anchor_literals.len())
         .max(fixed_literals.len())
         .max(fixed_literal_wide.len())
         .max(fixed_literal_fullword.len());
     for index in 0..max_len {
         let tier1 = alternatives.get(index).cloned().unwrap_or_default();
         let tier2 = tier2_alternatives.get(index).cloned().unwrap_or_default();
+        let anchor_literal = anchor_literals.get(index).cloned().unwrap_or_default();
         let literal = fixed_literals.get(index).cloned().unwrap_or_default();
         let wide = fixed_literal_wide.get(index).copied().unwrap_or(false);
         let fullword = fixed_literal_fullword.get(index).copied().unwrap_or(false);
         if !seen.insert((
             tier1.clone(),
             tier2.clone(),
+            anchor_literal.clone(),
             literal.clone(),
             wide,
             fullword,
@@ -3165,6 +3236,7 @@ fn dedupe_pattern_alternatives(
         }
         kept_tier1.push(tier1);
         kept_tier2.push(tier2);
+        kept_anchor_literals.push(anchor_literal);
         kept_literals.push(literal);
         kept_wide.push(wide);
         kept_fullword.push(fullword);
@@ -3172,6 +3244,7 @@ fn dedupe_pattern_alternatives(
     (
         kept_tier1,
         kept_tier2,
+        kept_anchor_literals,
         kept_literals,
         kept_wide,
         kept_fullword,
@@ -3255,6 +3328,7 @@ fn inject_numeric_read_anchor_patterns(
     node: &mut QueryNode,
     pattern_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
     pattern_tier2_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
+    pattern_anchor_literals: &mut BTreeMap<String, Vec<Vec<u8>>>,
     pattern_fixed_literals: &mut BTreeMap<String, Vec<Vec<u8>>>,
     pattern_fixed_literal_wide: &mut BTreeMap<String, Vec<bool>>,
     pattern_fixed_literal_fullword: &mut BTreeMap<String, Vec<bool>>,
@@ -3266,6 +3340,7 @@ fn inject_numeric_read_anchor_patterns(
             child,
             pattern_alternatives,
             pattern_tier2_alternatives,
+            pattern_anchor_literals,
             pattern_fixed_literals,
             pattern_fixed_literal_wide,
             pattern_fixed_literal_fullword,
@@ -3296,6 +3371,7 @@ fn inject_numeric_read_anchor_patterns(
         synthetic_pattern_id.clone(),
         vec![grams_tier2_from_bytes(&anchor_bytes, gram_sizes.tier2)],
     );
+    pattern_anchor_literals.insert(synthetic_pattern_id.clone(), vec![anchor_bytes.clone()]);
     pattern_fixed_literals.insert(synthetic_pattern_id.clone(), vec![anchor_bytes]);
     pattern_fixed_literal_wide.insert(synthetic_pattern_id.clone(), vec![false]);
     pattern_fixed_literal_fullword.insert(synthetic_pattern_id.clone(), vec![false]);
@@ -3534,6 +3610,17 @@ fn merge_rule_fragment(into: &mut RulePlanFragment, other: &RulePlanFragment) ->
             )));
         }
     }
+    for (key, value) in &other.pattern_anchor_literals {
+        if let Some(existing) = into
+            .pattern_anchor_literals
+            .insert(key.clone(), value.clone())
+            && existing != *value
+        {
+            return Err(SspryError::from(format!(
+                "Conflicting anchor literals for {key}"
+            )));
+        }
+    }
     for (key, value) in &other.pattern_fixed_literals {
         if let Some(existing) = into
             .pattern_fixed_literals
@@ -3680,6 +3767,7 @@ fn rename_fragment_for_rule_dependency(fragment: &mut RulePlanFragment, rule_nam
         }
         *map = next;
     };
+    remap_bytes(&mut fragment.pattern_anchor_literals);
     remap_bytes(&mut fragment.pattern_fixed_literals);
 
     let remap_bools = |map: &mut BTreeMap<String, Vec<bool>>| {
@@ -3727,6 +3815,7 @@ fn build_local_rule_fragment(
             };
             let mut alternatives = Vec::new();
             let mut tier2_alternatives = Vec::new();
+            let mut anchor_literals = Vec::new();
             let mut fixed_literals = Vec::new();
             let mut wide_flags = Vec::new();
             let mut fullword_flags = Vec::new();
@@ -3746,6 +3835,7 @@ fn build_local_rule_fragment(
                 for search_alt in search_variants {
                     alternatives.push(grams_tier1_from_bytes(&search_alt, gram_sizes.tier1));
                     tier2_alternatives.push(grams_tier2_from_bytes(&search_alt, gram_sizes.tier2));
+                    anchor_literals.push(search_alt.clone());
                     fixed_literals.push(if def.exact_literals && !effective_nocase {
                         alt.clone()
                     } else {
@@ -3765,6 +3855,9 @@ fn build_local_rule_fragment(
             fragment
                 .pattern_tier2_alternatives
                 .insert(pattern_id.clone(), tier2_alternatives);
+            fragment
+                .pattern_anchor_literals
+                .insert(pattern_id.clone(), anchor_literals);
             fragment
                 .pattern_fixed_literals
                 .insert(pattern_id.clone(), fixed_literals);
@@ -3800,6 +3893,7 @@ fn build_local_rule_fragment(
                 } else {
                     vec![Vec::new(); def.alternatives.len()]
                 };
+                let anchor_literals = def.alternatives.clone();
                 if !pattern_has_searchable_anchor(
                     &alternatives,
                     &tier2_alternatives,
@@ -3814,6 +3908,9 @@ fn build_local_rule_fragment(
                 fragment
                     .pattern_tier2_alternatives
                     .insert(pattern_id.clone(), tier2_alternatives);
+                fragment
+                    .pattern_anchor_literals
+                    .insert(pattern_id.clone(), anchor_literals);
                 fragment
                     .pattern_fixed_literals
                     .insert(pattern_id.clone(), fixed_literals);
@@ -3866,6 +3963,9 @@ fn build_local_rule_fragment(
             fragment
                 .pattern_tier2_alternatives
                 .insert(pattern_id.clone(), tier2_alternatives);
+            fragment
+                .pattern_anchor_literals
+                .insert(pattern_id.clone(), fixed_literals.clone());
             fragment
                 .pattern_fixed_literals
                 .insert(pattern_id.clone(), fixed_literals);
@@ -3991,6 +4091,7 @@ fn finalize_rule_fragment(
         &mut root,
         &mut fragment.pattern_alternatives,
         &mut fragment.pattern_tier2_alternatives,
+        &mut fragment.pattern_anchor_literals,
         &mut fragment.pattern_fixed_literals,
         &mut fragment.pattern_fixed_literal_wide,
         &mut fragment.pattern_fixed_literal_fullword,
@@ -4020,6 +4121,10 @@ fn finalize_rule_fragment(
             .pattern_tier2_alternatives
             .remove(&pattern_id)
             .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let anchor_literals = fragment
+            .pattern_anchor_literals
+            .remove(&pattern_id)
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
         let fixed_literals = fragment
             .pattern_fixed_literals
             .remove(&pattern_id)
@@ -4035,12 +4140,14 @@ fn finalize_rule_fragment(
         let (
             alternatives,
             tier2_alternatives,
+            anchor_literals,
             fixed_literals,
             fixed_literal_wide,
             fixed_literal_fullword,
         ) = dedupe_pattern_alternatives(
             alternatives,
             tier2_alternatives,
+            anchor_literals,
             fixed_literals,
             fixed_literal_wide,
             fixed_literal_fullword,
@@ -4053,17 +4160,17 @@ fn finalize_rule_fragment(
         let optimized = alternatives
             .iter()
             .zip(tier2_alternatives.iter())
-            .zip(fixed_literals.iter())
-            .map(|((alt, tier2_alt), fixed_literal)| {
+            .zip(anchor_literals.iter())
+            .map(|((alt, tier2_alt), anchor_literal)| {
                 if allow_tier2_fallback
                     && !force_tier1_only
                     && alt.is_empty()
                     && !tier2_alt.is_empty()
-                    && fixed_literal.is_empty()
+                    && anchor_literal.is_empty()
                 {
                     Vec::new()
                 } else {
-                    optimize_grams(alt, fixed_literal, gram_sizes.tier1, budget)
+                    optimize_grams(alt, anchor_literal, gram_sizes.tier1, budget)
                 }
             })
             .collect::<Vec<_>>();
@@ -4071,6 +4178,7 @@ fn finalize_rule_fragment(
             pattern_id,
             alternatives: optimized,
             tier2_alternatives,
+            anchor_literals,
             fixed_literals,
             fixed_literal_wide,
             fixed_literal_fullword,
@@ -4089,6 +4197,10 @@ fn finalize_rule_fragment(
                 pattern.tier2_alternatives.clone(),
             )
         })
+        .collect();
+    fragment.pattern_anchor_literals = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.anchor_literals.clone()))
         .collect();
     fragment.pattern_fixed_literals = patterns
         .iter()
@@ -4125,6 +4237,10 @@ fn finalize_rule_fragment(
                 pattern.tier2_alternatives.clone(),
             )
         })
+        .collect();
+    fragment.pattern_anchor_literals = patterns
+        .iter()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern.anchor_literals.clone()))
         .collect();
     fragment.pattern_fixed_literals = patterns
         .iter()
@@ -4279,6 +4395,11 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             .get(&pattern_id)
             .cloned()
             .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let anchor_literals = fragment
+            .pattern_anchor_literals
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
         let fixed_literals = fragment
             .pattern_fixed_literals
             .get(&pattern_id)
@@ -4298,6 +4419,7 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
             pattern_id,
             alternatives,
             tier2_alternatives,
+            anchor_literals,
             fixed_literals,
             fixed_literal_wide,
             fixed_literal_fullword,
@@ -5675,7 +5797,7 @@ rule nocase_anchor {
             },
         )
         .expect("balanced nocase");
-        assert_eq!(balanced_nocase.len(), 4);
+        assert_eq!(balanced_nocase.len(), 8);
 
         let short_nocase = compile_query_plan_default(
             r#"
@@ -6220,6 +6342,7 @@ rule q {
                 pattern_id: "$bad".to_owned(),
                 alternatives: vec![vec![1_u64]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -6243,6 +6366,7 @@ rule q {
                 pattern_id: "$bad".to_owned(),
                 alternatives: vec![vec![1_u64], vec![2_u64]],
                 tier2_alternatives: vec![Vec::new(), Vec::new()],
+                anchor_literals: vec![vec![0x41], vec![0x42]],
                 fixed_literals: vec![vec![0x41]],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -6347,17 +6471,41 @@ rule q {
         assert_eq!(root.children[0].pattern_id.as_deref(), Some("$a"));
         assert_eq!(root.children[1].pattern_id.as_deref(), Some("$b"));
 
-        let (alts, alts5, literals, wide, fullword) = dedupe_pattern_alternatives(
+        let (alts, alts5, anchors, literals, wide, fullword) = dedupe_pattern_alternatives(
             vec![vec![1_u64, 2], vec![1_u64, 2], vec![3_u64]],
             vec![vec![7_u64], vec![7_u64], vec![8_u64]],
+            vec![b"XY".to_vec(), b"XY".to_vec(), b"ZZ".to_vec()],
             vec![b"AB".to_vec(), b"AB".to_vec(), b"CD".to_vec()],
             vec![false, false, true],
             vec![false, false, true],
         );
         assert_eq!(alts, vec![vec![1_u64, 2], vec![3_u64]]);
         assert_eq!(alts5, vec![vec![7_u64], vec![8_u64]]);
+        assert_eq!(anchors, vec![b"XY".to_vec(), b"ZZ".to_vec()]);
         assert_eq!(literals, vec![b"AB".to_vec(), b"CD".to_vec()]);
         assert_eq!(wide, vec![false, true]);
         assert_eq!(fullword, vec![false, true]);
+    }
+
+    #[test]
+    fn optimize_grams_prefers_more_selective_bytes_without_literal_positions() {
+        let gram_letters = pack_exact_gram(b"ASPX");
+        let gram_suffix = pack_exact_gram(b".pas");
+        let optimized = optimize_grams(&[gram_letters, gram_suffix], &[], 4, 1);
+        assert_eq!(optimized, vec![gram_suffix]);
+    }
+
+    #[test]
+    fn nocase_window_selection_prefers_fixed_byte_heavy_suffixes() {
+        let alts = derive_nocase_search_alternatives(
+            br"\UnitFrmManagerKeyLog.pas",
+            false,
+            GramSizes::default(),
+        )
+        .expect("nocase alternatives");
+        assert!(alts.iter().all(|alt| {
+            let lowered = alt.iter().map(|byte| byte.to_ascii_lowercase()).collect::<Vec<_>>();
+            lowered.windows(4).any(|window| window == b".pas")
+        }));
     }
 }

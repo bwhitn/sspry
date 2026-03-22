@@ -12,6 +12,7 @@ struct PatternSummary {
     tier1_grams_per_alt: Vec<usize>,
     tier1_gram_hex_per_alt: Vec<Vec<String>>,
     tier2_grams_per_alt: Vec<usize>,
+    anchor_literals_hex: Vec<String>,
     fixed_literals_hex: Vec<String>,
     fixed_literal_wide: Vec<bool>,
     fixed_literal_fullword: Vec<bool>,
@@ -63,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect(),
                 tier2_grams_per_alt: pattern.tier2_alternatives.iter().map(Vec::len).collect(),
+                anchor_literals_hex: pattern.anchor_literals.iter().map(hex::encode).collect(),
                 fixed_literals_hex: pattern.fixed_literals.iter().map(hex::encode).collect(),
                 fixed_literal_wide: pattern.fixed_literal_wide.clone(),
                 fixed_literal_fullword: pattern.fixed_literal_fullword.clone(),

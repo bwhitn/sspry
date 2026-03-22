@@ -5568,6 +5568,7 @@ fn compiled_query_plan_to_wire(plan: &CompiledQueryPlan) -> Value {
                 "id": pattern.pattern_id,
                 "alternatives": pattern.alternatives,
                 "tier2_alternatives": pattern.tier2_alternatives,
+                "anchor_literals": pattern.anchor_literals,
                 "fixed_literals": pattern.fixed_literals,
                 "fixed_literal_wide": pattern.fixed_literal_wide,
                 "fixed_literal_fullword": pattern.fixed_literal_fullword,
@@ -5615,6 +5616,11 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_else(|| vec![Value::Array(Vec::new()); alternatives_raw.len()]);
+        let anchor_literals_raw = object
+            .get("anchor_literals")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| fixed_literals_raw.clone());
         let fixed_literal_wide_raw = object
             .get("fixed_literal_wide")
             .and_then(Value::as_array)
@@ -5628,6 +5634,7 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         let alt_count = alternatives_raw.len();
         let mut alternatives = Vec::with_capacity(alt_count);
         let mut tier2_alternatives = Vec::with_capacity(alt_count);
+        let mut anchor_literals = Vec::with_capacity(alt_count);
         let mut fixed_literals = Vec::with_capacity(alt_count);
         let mut fixed_literal_wide = Vec::with_capacity(alt_count);
         let mut fixed_literal_fullword = Vec::with_capacity(alt_count);
@@ -5661,6 +5668,29 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         }
         while tier2_alternatives.len() < alternatives.len() {
             tier2_alternatives.push(Vec::new());
+        }
+        for literal in anchor_literals_raw.into_iter().take(alt_count) {
+            let bytes = literal
+                .as_array()
+                .ok_or_else(|| {
+                    SspryError::from("pattern anchor_literals entries must be byte lists")
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .ok_or_else(|| SspryError::from("pattern anchor literal byte out of range"))
+                        .and_then(|byte| {
+                            u8::try_from(byte).map_err(|_| {
+                                SspryError::from("pattern anchor literal byte out of range")
+                            })
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            anchor_literals.push(bytes);
+        }
+        while anchor_literals.len() < alternatives.len() {
+            anchor_literals.push(Vec::new());
         }
         for literal in fixed_literals_raw.into_iter().take(alt_count) {
             let bytes = literal
@@ -5705,6 +5735,7 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
             pattern_id,
             alternatives,
             tier2_alternatives,
+            anchor_literals,
             fixed_literals,
             fixed_literal_wide,
             fixed_literal_fullword,
@@ -6449,6 +6480,7 @@ mod tests {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -7130,6 +7162,7 @@ mod tests {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -7251,6 +7284,7 @@ mod tests {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -7858,6 +7892,7 @@ mod tests {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![0x01020304]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -8181,6 +8216,7 @@ mod tests {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -9263,6 +9299,7 @@ rule q {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -9542,6 +9579,7 @@ rule q {
                         pattern_id: "$a".to_owned(),
                         alternatives: vec![vec![gram]],
                         tier2_alternatives: vec![Vec::new()],
+                        anchor_literals: vec![Vec::new()],
                         fixed_literals: vec![Vec::new()],
                         fixed_literal_wide: vec![false],
                         fixed_literal_fullword: vec![false],
@@ -9649,6 +9687,7 @@ rule q {
                 pattern_id: "$a".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],

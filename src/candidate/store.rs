@@ -5204,6 +5204,13 @@ fn prepared_pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
             )
         })
         .sum::<u64>();
+    let anchor_literals_bytes = pattern
+        .anchor_literals
+        .iter()
+        .map(|literal| {
+            (std::mem::size_of::<Vec<u8>>() as u64).saturating_add(literal.capacity() as u64)
+        })
+        .sum::<u64>();
     let fixed_literals_bytes = pattern
         .fixed_literals
         .iter()
@@ -5223,6 +5230,11 @@ fn prepared_pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
                 .saturating_mul(std::mem::size_of::<Vec<u64>>() as u64),
         )
         .saturating_add(tier2_alternatives_bytes)
+        .saturating_add(
+            (pattern.anchor_literals.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<u8>>() as u64),
+        )
+        .saturating_add(anchor_literals_bytes)
         .saturating_add(
             (pattern.fixed_literals.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<Vec<u8>>() as u64),
@@ -5569,17 +5581,17 @@ fn build_pattern_mask_cache(
     for pattern in patterns {
         let mut tier1_masks = Vec::with_capacity(pattern.alternatives.len());
         for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
-            let fixed_literal = pattern
-                .fixed_literals
+            let anchor_literal = pattern
+                .anchor_literals
                 .get(alt_index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut shifted_tier1 = ShiftedRequiredMasks::default();
-            if fixed_literal.is_empty()
-                || fixed_literal.len() < tier1_gram_size
+            if anchor_literal.is_empty()
+                || anchor_literal.len() < tier1_gram_size
                 || exact_pattern_has_ambiguous_positions(
                     alternative,
-                    fixed_literal,
+                    anchor_literal,
                     tier1_gram_size,
                 )
             {
@@ -5592,7 +5604,7 @@ fn build_pattern_mask_cache(
             } else {
                 let lane_variants = lane_position_variants_for_pattern(
                     alternative,
-                    fixed_literal,
+                    anchor_literal,
                     tier1_gram_size,
                     DEFAULT_BLOOM_POSITION_LANES,
                 );
@@ -5623,17 +5635,17 @@ fn build_pattern_mask_cache(
 
         let mut tier2_masks = Vec::with_capacity(pattern.tier2_alternatives.len());
         for (alt_index, alternative) in pattern.tier2_alternatives.iter().enumerate() {
-            let fixed_literal = pattern
-                .fixed_literals
+            let anchor_literal = pattern
+                .anchor_literals
                 .get(alt_index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut shifted_tier2 = ShiftedRequiredMasks::default();
-            if fixed_literal.is_empty()
-                || fixed_literal.len() < tier2_gram_size
+            if anchor_literal.is_empty()
+                || anchor_literal.len() < tier2_gram_size
                 || exact_pattern_has_ambiguous_positions(
                     alternative,
-                    fixed_literal,
+                    anchor_literal,
                     tier2_gram_size,
                 )
             {
@@ -5646,7 +5658,7 @@ fn build_pattern_mask_cache(
             } else {
                 let lane_variants = lane_position_variants_for_pattern(
                     alternative,
-                    fixed_literal,
+                    anchor_literal,
                     tier2_gram_size,
                     DEFAULT_BLOOM_POSITION_LANES,
                 );
@@ -6685,6 +6697,7 @@ mod tests {
             pattern_id: "$a".to_owned(),
             alternatives: vec![grams.clone()],
             tier2_alternatives: vec![Vec::new()],
+            anchor_literals: vec![Vec::new()],
             fixed_literals: vec![Vec::new()],
             fixed_literal_wide: vec![false],
             fixed_literal_fullword: vec![false],
@@ -6749,6 +6762,7 @@ mod tests {
             pattern_id: "$a".to_owned(),
             alternatives: vec![vec![gram]],
             tier2_alternatives: vec![Vec::new()],
+            anchor_literals: vec![b"abcdzzzzabcd".to_vec()],
             fixed_literals: vec![b"abcdzzzzabcd".to_vec()],
             fixed_literal_wide: vec![false],
             fixed_literal_fullword: vec![false],
@@ -6773,6 +6787,7 @@ mod tests {
             pattern_id: "$a".to_owned(),
             alternatives: vec![Vec::new()],
             tier2_alternatives: vec![vec![pack_exact_gram(b"To:")]],
+            anchor_literals: vec![b"To:".to_vec()],
             fixed_literals: vec![b"To:".to_vec()],
             fixed_literal_wide: vec![false],
             fixed_literal_fullword: vec![false],
@@ -6848,6 +6863,7 @@ mod tests {
             pattern_id: "$a".to_owned(),
             alternatives: vec![Vec::new()],
             tier2_alternatives: vec![vec![pack_exact_gram(b"To:")]],
+            anchor_literals: vec![b"To:".to_vec()],
             fixed_literals: vec![b"To:".to_vec()],
             fixed_literal_wide: vec![false],
             fixed_literal_fullword: vec![false],
@@ -8365,6 +8381,7 @@ rule q {
                     pattern_id: "tier1".to_owned(),
                     alternatives: vec![vec![1]],
                     tier2_alternatives: vec![Vec::new()],
+                    anchor_literals: vec![Vec::new()],
                     fixed_literals: vec![Vec::new()],
                     fixed_literal_wide: vec![false],
                     fixed_literal_fullword: vec![false],
@@ -8373,6 +8390,7 @@ rule q {
                     pattern_id: "tier2".to_owned(),
                     alternatives: vec![vec![2]],
                     tier2_alternatives: vec![Vec::new()],
+                    anchor_literals: vec![Vec::new()],
                     fixed_literals: vec![Vec::new()],
                     fixed_literal_wide: vec![false],
                     fixed_literal_fullword: vec![false],
@@ -8427,6 +8445,7 @@ rule q {
                 pattern_id: "empty".to_owned(),
                 alternatives: vec![Vec::new()],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -8435,6 +8454,7 @@ rule q {
                 pattern_id: "tier1".to_owned(),
                 alternatives: vec![vec![1]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -8443,6 +8463,7 @@ rule q {
                 pattern_id: "tier2".to_owned(),
                 alternatives: vec![vec![1, 2]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -8451,6 +8472,7 @@ rule q {
                 pattern_id: "missing".to_owned(),
                 alternatives: vec![vec![99]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
                 fixed_literals: vec![Vec::new()],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -8964,6 +8986,7 @@ rule q {
                     pack_exact_gram(&[1, 2, 3]),
                     pack_exact_gram(&[2, 3, 4]),
                 ]],
+                anchor_literals: vec![vec![1, 2, 3, 4]],
                 fixed_literals: vec![vec![1, 2, 3, 4]],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
@@ -9042,6 +9065,7 @@ rule q {
                 pattern_id: "tier1".to_owned(),
                 alternatives: vec![vec![gram]],
                 tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![vec![1, 2, 3, 4]],
                 fixed_literals: vec![vec![1, 2, 3, 4]],
                 fixed_literal_wide: vec![false],
                 fixed_literal_fullword: vec![false],
