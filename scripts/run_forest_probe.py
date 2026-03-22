@@ -23,6 +23,14 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, text=True, **kwargs)
 
 
+def timeout_text(value):
+    if value is None:
+        return ''
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return value
+
+
 def wait_for_server(sspry: Path, addr: str, out_path: Path, attempts: int = 300) -> None:
     for _ in range(attempts):
         proc = run([str(sspry), 'info', '--addr', addr, '--light'], capture_output=True)
@@ -431,7 +439,12 @@ def run_search_one_local_forest(
             timeout=timeout_s + 30,
         )
     except subprocess.TimeoutExpired as e:
-        proc = subprocess.CompletedProcess(e.cmd, 124, e.stdout or '', (e.stderr or '') + '\nTIMEOUT')
+        proc = subprocess.CompletedProcess(
+            e.cmd,
+            124,
+            timeout_text(e.stdout),
+            timeout_text(e.stderr) + '\nTIMEOUT',
+        )
     return proc, (time.time() - started) * 1000.0
 
 
@@ -463,7 +476,12 @@ def run_search_batch_local_forest(
             timeout=timeout_s + 60,
         )
     except subprocess.TimeoutExpired as e:
-        proc = subprocess.CompletedProcess(e.cmd, 124, e.stdout or '', (e.stderr or '') + '\nTIMEOUT')
+        proc = subprocess.CompletedProcess(
+            e.cmd,
+            124,
+            timeout_text(e.stdout),
+            timeout_text(e.stderr) + '\nTIMEOUT',
+        )
     return proc, (time.time() - started) * 1000.0
 
 
