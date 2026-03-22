@@ -4248,7 +4248,16 @@ impl ServerState {
             let (mut hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
             hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            let ordered_hashes = hits.into_iter().map(|(sha256, _)| sha256).collect();
+            let ordered_hashes = hits
+                .into_iter()
+                .map(|(sha256, _)| sha256)
+                .collect::<Vec<_>>();
+            if ordered_hashes.len() > plan.max_candidates {
+                return Err(crate::candidate::store::candidate_limit_exceeded_error(
+                    ordered_hashes.len(),
+                    plan.max_candidates,
+                ));
+            }
             return Ok(CachedCandidateQuery {
                 ordered_hashes,
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
@@ -4276,7 +4285,16 @@ impl ServerState {
                 query_profile.merge_from(&local_profile);
             }
             hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            let ordered_hashes = hits.into_iter().map(|(sha256, _)| sha256).collect();
+            let ordered_hashes = hits
+                .into_iter()
+                .map(|(sha256, _)| sha256)
+                .collect::<Vec<_>>();
+            if ordered_hashes.len() > plan.max_candidates {
+                return Err(crate::candidate::store::candidate_limit_exceeded_error(
+                    ordered_hashes.len(),
+                    plan.max_candidates,
+                ));
+            }
             return Ok(CachedCandidateQuery {
                 ordered_hashes,
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
@@ -4336,7 +4354,16 @@ impl ServerState {
             query_profile.merge_from(&local_profile);
         }
         hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        let ordered_hashes = hits.into_iter().map(|(sha256, _)| sha256).collect();
+        let ordered_hashes = hits
+            .into_iter()
+            .map(|(sha256, _)| sha256)
+            .collect::<Vec<_>>();
+        if ordered_hashes.len() > plan.max_candidates {
+            return Err(crate::candidate::store::candidate_limit_exceeded_error(
+                ordered_hashes.len(),
+                plan.max_candidates,
+            ));
+        }
         Ok(CachedCandidateQuery {
             ordered_hashes,
             tier_used: Self::merge_candidate_tier_used(&tier_used),
@@ -6543,6 +6570,49 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(100),
             "expected query to wait for shard lock, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_query_errors_when_matches_exceed_max_candidates() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let rule = tmp.path().join("overflow_rule.yar");
+        fs::write(
+            &rule,
+            r#"
+rule overflow_rule {
+    strings:
+        $a = "ABCD"
+    condition:
+        $a
+}
+"#,
+        )
+        .expect("write rule");
+        let doc_a = candidate_document_wire_from_bytes(&tmp.path().join("a.bin"), b"xxABCDyy");
+        let doc_b = candidate_document_wire_from_bytes(&tmp.path().join("b.bin"), b"ABCDzzzz");
+        state
+            .handle_candidate_insert_batch(&[doc_a, doc_b])
+            .expect("insert docs");
+        state.handle_publish().expect("publish");
+
+        let plan = compile_query_plan_from_file_default(&rule, 8, false, true, 1).expect("plan");
+        let err = state
+            .handle_candidate_query(
+                CandidateQueryRequest {
+                    plan: Value::Null,
+                    cursor: 0,
+                    chunk_size: Some(8),
+                    include_external_ids: false,
+                },
+                &plan,
+            )
+            .expect_err("overflow must fail");
+        assert!(
+            err.to_string()
+                .contains("Candidate query exceeded max_candidates (2 > 1)"),
+            "unexpected error: {err}"
         );
     }
 

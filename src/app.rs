@@ -1271,9 +1271,7 @@ fn rotate_remote_index_session(
                     && retries < REMOTE_INDEX_ROTATION_RETRY_LIMIT =>
             {
                 retries = retries.saturating_add(1);
-                thread::sleep(Duration::from_millis(
-                    REMOTE_INDEX_ROTATION_RETRY_SLEEP_MS,
-                ));
+                thread::sleep(Duration::from_millis(REMOTE_INDEX_ROTATION_RETRY_SLEEP_MS));
             }
             Err(err) => return Err(err),
         }
@@ -1726,9 +1724,12 @@ fn query_local_forest_all_candidates(
             external_id_map.entry(sha256).or_insert(external_id);
         }
     }
-    let mut ordered = hashes.into_iter().collect::<Vec<_>>();
+    let ordered = hashes.into_iter().collect::<Vec<_>>();
     if ordered.len() > plan.max_candidates {
-        ordered.truncate(plan.max_candidates);
+        return Err(crate::candidate::store::candidate_limit_exceeded_error(
+            ordered.len(),
+            plan.max_candidates,
+        ));
     }
     let external_ids = if include_external_ids {
         Some(
@@ -3487,9 +3488,12 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                         }
                     }
                 }
-                let mut ordered = hashes.into_iter().collect::<Vec<_>>();
+                let ordered = hashes.into_iter().collect::<Vec<_>>();
                 if ordered.len() > plan.max_candidates {
-                    ordered.truncate(plan.max_candidates);
+                    return Err(crate::candidate::store::candidate_limit_exceeded_error(
+                        ordered.len(),
+                        plan.max_candidates,
+                    ));
                 }
                 let total_candidates = ordered.len();
                 let start = args.cursor.min(total_candidates);
@@ -4740,11 +4744,7 @@ mod tests {
         }
     }
 
-    fn default_internal_init_args(
-        root: &Path,
-        candidate_shards: usize,
-        force: bool,
-    ) -> InitArgs {
+    fn default_internal_init_args(root: &Path, candidate_shards: usize, force: bool) -> InitArgs {
         InitArgs {
             root: root.display().to_string(),
             candidate_shards,
@@ -5518,7 +5518,7 @@ rule q {
                 no_tier2_fallback: false,
                 max_candidates: 2,
             }),
-            0
+            1
         );
         assert_eq!(
             cmd_internal_query(&InternalQueryArgs {

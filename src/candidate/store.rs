@@ -1359,14 +1359,10 @@ impl TierFlags {
 
 fn paginate_query_hits(
     matched_hits: &mut Vec<(String, u32)>,
-    max_candidates: usize,
     cursor: usize,
     chunk_size: usize,
 ) -> (Vec<String>, Vec<u32>, usize, usize, usize, Option<usize>) {
     matched_hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    if matched_hits.len() > max_candidates {
-        matched_hits.truncate(max_candidates);
-    }
 
     let total = matched_hits.len();
     let start = cursor.min(total);
@@ -1383,6 +1379,15 @@ fn paginate_query_hits(
     let next_cursor = if end < total { Some(end) } else { None };
 
     (page, page_scores, total, start, end, next_cursor)
+}
+
+pub(crate) fn candidate_limit_exceeded_error(
+    total_candidates: usize,
+    max_candidates: usize,
+) -> SspryError {
+    SspryError::from(format!(
+        "Candidate query exceeded max_candidates ({total_candidates} > {max_candidates}); narrow the rule or raise --max-candidates."
+    ))
 }
 
 fn tier2_superblock_memory_budget_bytes(
@@ -3139,8 +3144,6 @@ impl CandidateStore {
             } else {
                 self.scan_query_hits(plan, prepared)?
             };
-        let (page, page_scores, total, start, end, next_cursor) =
-            paginate_query_hits(&mut matched_hits, plan.max_candidates, cursor, chunk_size);
         total_scope.add_items(query_profile.docs_scanned);
         record_counter(
             "candidate.query_candidates_docs_scanned_total",
@@ -3187,6 +3190,14 @@ impl CandidateStore {
             matched_hits.len() as u64,
             query_profile.superblocks_skipped,
         );
+        if matched_hits.len() > plan.max_candidates {
+            return Err(candidate_limit_exceeded_error(
+                matched_hits.len(),
+                plan.max_candidates,
+            ));
+        }
+        let (page, page_scores, total, start, end, next_cursor) =
+            paginate_query_hits(&mut matched_hits, cursor, chunk_size);
 
         Ok(CandidateQueryResult {
             sha256: page,
@@ -8421,13 +8432,13 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 2,
+            max_candidates: 3,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
 
         let result = store.query_candidates(&plan, 0, 1).expect("query");
-        assert_eq!(result.total_candidates, 2);
+        assert_eq!(result.total_candidates, 3);
         assert_eq!(result.returned_count, 1);
         assert_eq!(result.next_cursor, Some(1));
         assert_eq!(result.tier_used, "tier1");
@@ -8801,6 +8812,116 @@ rule q {
         )
         .expect("not filesize");
         assert!(!outcome.matched);
+    }
+
+    #[test]
+    fn query_candidates_errors_when_match_count_exceeds_max_candidates() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("candidate_db");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root,
+                filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+
+        let filter_bytes = 8;
+        let bloom_one = lane_bloom_bytes(filter_bytes, 2, &[1]);
+        let bloom_two = lane_bloom_bytes(filter_bytes, 2, &[2]);
+        let bloom_one_two = lane_bloom_bytes(filter_bytes, 2, &[1, 2]);
+
+        insert_primary(
+            &mut store,
+            [0x11; 32],
+            8,
+            None,
+            Some(2),
+            filter_bytes,
+            &bloom_one,
+            None,
+        )
+        .expect("insert doc one");
+        insert_primary(
+            &mut store,
+            [0x22; 32],
+            8,
+            None,
+            Some(2),
+            filter_bytes,
+            &bloom_two,
+            None,
+        )
+        .expect("insert doc two");
+        insert_primary(
+            &mut store,
+            [0x33; 32],
+            8,
+            None,
+            Some(2),
+            filter_bytes,
+            &bloom_one_two,
+            None,
+        )
+        .expect("insert doc three");
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![
+                PatternPlan {
+                    pattern_id: "tier1".to_owned(),
+                    alternatives: vec![vec![1]],
+                    tier2_alternatives: vec![Vec::new()],
+                    anchor_literals: vec![Vec::new()],
+                    fixed_literals: vec![Vec::new()],
+                    fixed_literal_wide: vec![false],
+                    fixed_literal_fullword: vec![false],
+                },
+                PatternPlan {
+                    pattern_id: "tier2".to_owned(),
+                    alternatives: vec![vec![2]],
+                    tier2_alternatives: vec![Vec::new()],
+                    anchor_literals: vec![Vec::new()],
+                    fixed_literals: vec![Vec::new()],
+                    fixed_literal_wide: vec![false],
+                    fixed_literal_fullword: vec![false],
+                },
+            ],
+            root: QueryNode {
+                kind: "or".to_owned(),
+                pattern_id: None,
+                threshold: None,
+                children: vec![
+                    QueryNode {
+                        kind: "pattern".to_owned(),
+                        pattern_id: Some("tier1".to_owned()),
+                        threshold: None,
+                        children: Vec::new(),
+                    },
+                    QueryNode {
+                        kind: "pattern".to_owned(),
+                        pattern_id: Some("tier2".to_owned()),
+                        threshold: None,
+                        children: Vec::new(),
+                    },
+                ],
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 2,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+
+        let err = store
+            .query_candidates(&plan, 0, 1)
+            .expect_err("overflow must fail");
+        assert!(
+            err.to_string()
+                .contains("Candidate query exceeded max_candidates (3 > 2)"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
