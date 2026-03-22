@@ -3412,7 +3412,7 @@ fn contains_pattern_node(node: &QueryNode) -> bool {
     node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
 }
 
-const OVERBROAD_UNION_FANOUT_LIMIT: usize = 192;
+const OVERBROAD_UNION_FANOUT_LIMIT: usize = 160;
 const MANDATORY_PATTERN_COMBINATION_LIMIT: usize = 4096;
 const LOW_INFORMATION_EP_STUB_PATTERN_LIMIT: usize = 2;
 const LOW_INFORMATION_EP_STUB_MAX_TIER1_GRAMS: usize = 2;
