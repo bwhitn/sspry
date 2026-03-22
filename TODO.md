@@ -535,6 +535,7 @@ Current ingest-slope hypothesis after the balanced-forest work:
 Current local shard-fanout probe:
 - harness change:
   - `scripts/run_forest_probe.py` now accepts `--shards` and forwards it to both index and search servers
+  - default tree size is now `10,000` files with a `120s` per-tree search timeout
 - layout change:
   - the `incremental` serve layout now defaults to `32` candidate shards instead of `64`
   - the standard layout remains `256`
