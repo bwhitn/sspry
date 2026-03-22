@@ -968,10 +968,31 @@ fn batch_row_to_wire(row: IndexBatchRow) -> CandidateDocumentWire {
 }
 
 const REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES: usize = DEFAULT_MAX_REQUEST_BYTES - 1024;
+const REMOTE_INDEX_SESSION_MAX_DOCUMENTS: usize = 2048;
+const REMOTE_INDEX_SESSION_MIN_INPUT_BYTES: u64 = 1 << 30;
+const REMOTE_INDEX_SESSION_MAX_INPUT_BYTES: u64 = 4 << 30;
 
 struct RemotePendingBatch {
     rows: Vec<Vec<u8>>,
     payload_size: usize,
+}
+
+fn remote_index_session_document_limit(effective_budget_bytes: u64, batch_size: usize) -> usize {
+    if effective_budget_bytes == 0 {
+        return REMOTE_INDEX_SESSION_MAX_DOCUMENTS.max(batch_size);
+    }
+    let derived = usize::try_from(effective_budget_bytes / (640 * 1024) / 4).unwrap_or(usize::MAX);
+    derived.clamp(batch_size.max(1), REMOTE_INDEX_SESSION_MAX_DOCUMENTS)
+}
+
+fn remote_index_session_input_bytes_limit(effective_budget_bytes: u64) -> u64 {
+    if effective_budget_bytes == 0 {
+        return REMOTE_INDEX_SESSION_MAX_INPUT_BYTES;
+    }
+    (effective_budget_bytes / 4).clamp(
+        REMOTE_INDEX_SESSION_MIN_INPUT_BYTES,
+        REMOTE_INDEX_SESSION_MAX_INPUT_BYTES,
+    )
 }
 
 fn empty_remote_batch_payload_size() -> Result<usize> {
@@ -1155,6 +1176,42 @@ fn flush_remote_pending_rows(
         last_progress_at,
         false,
     );
+    Ok(())
+}
+
+fn rotate_remote_index_session(
+    base_client: &SspryClient,
+    client: &mut PersistentSspryClient,
+    pending: &mut RemotePendingBatch,
+    processed: &mut usize,
+    submit_time: &mut Duration,
+    show_progress: bool,
+    total_files: usize,
+    last_progress_reported: &mut usize,
+    last_progress_at: &mut Instant,
+    empty_payload_size: usize,
+    progress_rpc_time: &mut Duration,
+) -> Result<()> {
+    flush_remote_pending_rows(
+        client,
+        pending,
+        processed,
+        submit_time,
+        show_progress,
+        total_files,
+        last_progress_reported,
+        last_progress_at,
+        empty_payload_size,
+    )?;
+    let started_progress_rpc = Instant::now();
+    client.end_index_session()?;
+    *progress_rpc_time += started_progress_rpc.elapsed();
+    base_client.publish()?;
+    *client = base_client.connect_persistent()?;
+    let started_progress_rpc = Instant::now();
+    client.begin_index_session()?;
+    client.update_index_session_progress(Some(total_files), *processed, *processed)?;
+    *progress_rpc_time += started_progress_rpc.elapsed();
     Ok(())
 }
 
@@ -1921,7 +1978,11 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             &input_roots,
             args.root.as_deref().map(Path::new),
         );
-        let workers = resolved_workers.workers;
+        let workers = if args.root.is_none() && args.workers == 0 {
+            1
+        } else {
+            resolved_workers.workers
+        };
         if let Some(root) = &args.root {
             let mut stores = open_stores(Path::new(root))?;
             let config = stores
@@ -2085,17 +2146,27 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let configured_budget_bytes = server_policy.memory_budget_bytes;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
             let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
+            let remote_session_document_limit =
+                remote_index_session_document_limit(effective_budget_bytes, batch_size);
+            let remote_session_input_bytes_limit =
+                remote_index_session_input_bytes_limit(effective_budget_bytes);
             let empty_payload_size = empty_remote_batch_payload_size()?;
             let mut pending = RemotePendingBatch {
                 rows: Vec::new(),
                 payload_size: empty_payload_size,
             };
+            let mut session_submitted_documents = 0usize;
+            let mut session_submitted_input_bytes = 0u64;
+            let mut session_publish_rotations = 0usize;
             let remote_result = (|| -> Result<()> {
                 if workers <= 1 {
                     stream_selected_input_files(&input_roots, args.path_list, |file_path| {
                         let started_scan = Instant::now();
                         let scanned = scan_index_batch_row(&file_path, policy)?;
                         scan_time += started_scan.elapsed();
+                        session_submitted_documents = session_submitted_documents.saturating_add(1);
+                        session_submitted_input_bytes =
+                            session_submitted_input_bytes.saturating_add(scanned.file_size);
                         let started_encode = Instant::now();
                         let row = batch_row_to_wire(scanned);
                         encode_time += started_encode.elapsed();
@@ -2112,6 +2183,26 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             &mut last_progress_at,
                             empty_payload_size,
                         )?;
+                        if session_submitted_documents >= remote_session_document_limit
+                            || session_submitted_input_bytes >= remote_session_input_bytes_limit
+                        {
+                            rotate_remote_index_session(
+                                &base_client,
+                                &mut client,
+                                &mut pending,
+                                &mut processed,
+                                &mut submit_time,
+                                show_progress,
+                                total_files,
+                                &mut last_progress_reported,
+                                &mut last_progress_at,
+                                empty_payload_size,
+                                &mut progress_rpc_time,
+                            )?;
+                            session_submitted_documents = 0;
+                            session_submitted_input_bytes = 0;
+                            session_publish_rotations = session_publish_rotations.saturating_add(1);
+                        }
                         Ok(())
                     })?;
                 } else {
@@ -2170,6 +2261,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             let scanned = scanned?;
                             received = received.saturating_add(1);
                             scan_time += scanned.scan_elapsed;
+                            session_submitted_documents =
+                                session_submitted_documents.saturating_add(1);
+                            session_submitted_input_bytes =
+                                session_submitted_input_bytes.saturating_add(scanned.row.file_size);
                             let started_encode = Instant::now();
                             let row = batch_row_to_wire(scanned.row);
                             encode_time += started_encode.elapsed();
@@ -2186,6 +2281,27 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 &mut last_progress_at,
                                 empty_payload_size,
                             )?;
+                            if session_submitted_documents >= remote_session_document_limit
+                                || session_submitted_input_bytes >= remote_session_input_bytes_limit
+                            {
+                                rotate_remote_index_session(
+                                    &base_client,
+                                    &mut client,
+                                    &mut pending,
+                                    &mut processed,
+                                    &mut submit_time,
+                                    show_progress,
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    empty_payload_size,
+                                    &mut progress_rpc_time,
+                                )?;
+                                session_submitted_documents = 0;
+                                session_submitted_input_bytes = 0;
+                                session_publish_rotations =
+                                    session_publish_rotations.saturating_add(1);
+                            }
                         }
                         if received != total_files {
                             return Err(SspryError::from(format!(
@@ -2217,6 +2333,18 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
                 eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
                 eprintln!("verbose.index.queue_capacity: {queue_capacity}");
+                eprintln!(
+                    "verbose.index.remote_session_document_limit: {}",
+                    remote_session_document_limit
+                );
+                eprintln!(
+                    "verbose.index.remote_session_input_bytes_limit: {}",
+                    remote_session_input_bytes_limit
+                );
+                eprintln!(
+                    "verbose.index.remote_session_publish_rotations: {}",
+                    session_publish_rotations
+                );
                 eprintln!("verbose.index.worker_auto: {}", resolved_workers.auto);
                 eprintln!(
                     "verbose.index.input_storage_class: {}",
