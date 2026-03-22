@@ -3421,8 +3421,8 @@ const LOW_INFORMATION_RANGE_RULE_PATTERN_LIMIT: usize = 3;
 const LOW_INFORMATION_RANGE_RULE_MAX_TIER1_GRAMS: usize = 1;
 const LOW_INFORMATION_RANGE_RULE_MAX_TIER2_GRAMS: usize = 2;
 const LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN: usize = 4;
-const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS: usize = 0;
-const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS: usize = 2;
+const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS: usize = 1;
+const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS: usize = 4;
 
 fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
     pattern.alternatives.iter().any(|alt| !alt.is_empty())
