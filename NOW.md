@@ -2,77 +2,64 @@
 
 This file is the short-horizon worklist.
 
-It reflects the current state after the `100k` balanced forest ingest/search experiment.
+It reflects the current state after the `25k` and `50k` scaling passes on the curated searchable rule set.
 
 ## Immediate Priorities
 
-### 1. Keep the many-tree ingest direction, but only for ingest
+### 1. Keep search and index practical on a `16 GiB` target
 
 Current state:
-- `4 x 25k` byte-balanced trees with explicit writeback drain kept `100k` ingest in a tight `844-875 files/min` band
-- this is materially better evidence than the earlier collapsing single-tree and naive forest runs
-- the drain phase is doing real work; it reliably clears dirty/writeback backlog before the next tree
+- remote index session segmentation plus forced publish boundaries cut the early `25k` index memory spike from about `13.26 GiB` anon to about `1.38 GiB` at first publish
+- search-side retained memory is materially better after prepared-plan cache caps and mask dedup
+- the remaining memory problem is not generic RSS inflation; it is rule-shape-specific active query cost plus large file-backed residency on large corpora
 
 Work:
-- treat `older trees immutable` as the leading storage direction
-- keep one active mutable tree and roll to a new tree at the measured writeback knee
-- preserve the writeback-aware forest harness as the evaluation path for larger ingest runs
+- keep the segmented single-worker-safe remote index path as the safe default
+- keep using `smaps_rollup` plus live `info --light` to separate anonymous from file-backed memory
+- reject structurally unsafe search rules instead of trying to force them through the scaling-safe set
 
 Exit criteria:
-- the many-tree ingest shape is the default scaling experiment for `100k+`
-- tree rollover and drain behavior are documented as the current ingest strategy
+- the default remote ingest path stays under the practical `16 GiB` budget envelope
+- large-corpus search does not need ad hoc cache flushing or one-off tuning to stay stable
 
-### 2. Fix large-corpus search on the many-tree shape
+### 2. Reduce `docs_scanned` on the remaining broad-but-allowed search families
 
 Current state:
-- the accepted whole-tree gate now rejects some trees before any per-doc bloom I/O
-- supported `200`-file forest smoke:
-  - `01`: `docs_scanned = 0`, `tier1_bloom_bytes = 0`
-  - `10`: `docs_scanned = 0`, `tier1_bloom_bytes = 0`
-  - `11`: `docs_scanned = 9`, `tier1_bloom_bytes = 14.35 MiB`
-  - `12`: `docs_scanned = 4`, `tier1_bloom_bytes = 6.99 MiB`
-  - `08`: `docs_scanned = 24`, `tier1_bloom_bytes = 24.45 MiB`
-  - `09`: `docs_scanned = 26`, `tier1_bloom_bytes = 21.77 MiB`
-- the `100k` forest is still not good enough:
-  - `08`: `396.535 s`
-  - `09`: `316.611 s`
-  - `10`: `88.383 s`
-  - `11`: `264.048 s`
-  - `12`: `181.229 s`
-- large-corpus queries still scan too much inside trees and still move about `53 GiB` of tier1 bloom data per search
+- high-fanout union rules with no mandatory anchorable pattern are now rejected up front
+- low-information `at pe.entry_point` stub rules are now rejected up front
+- the next remaining bad family is rules that are still structurally searchable but scan too much of the corpus
+- current evidence says candidate pruning improved first; the next meaningful win has to happen earlier in the scan path
 
 Work:
-- keep the whole-tree gate and push the next selectivity layer inside each tree
-- focus on:
-  - within-tree prefilters that actually reject work after a tree passes the tree gate
-  - reopened-search locality
-  - tier1 bloom I/O reduction
-- keep forest fanout measurements as the main search benchmark for this architecture
+- rank remaining heavy rules by `docs_scanned`, not just `query_ms`
+- separate:
+  - common-anchor / common-gram rules
+  - genuinely salvageable rules with stronger mandatory structure
+- keep removing rules from the scaling-safe set when there is no recall-safe path to narrow the first scan
 
 Exit criteria:
-- supported forest searches at `100k` stop behaving like near-full scans inside accepted trees
-- heavy rules no longer sit in the multi-minute range
+- the remaining scaling-safe set no longer contains near-full-corpus scan rules at `50k`
+- `docs_scanned` is the primary metric that improves, not just candidate count
 
-### 3. Continue reducing the write-path slope
+### 3. Preserve fast iteration on large corpora
 
 Current state:
-- `append_sidecars` is still the dominant ingest hot bucket
-- exact-capacity payload assembly is a real improvement and should remain the baseline
+- `run_forest_probe.py --reuse-existing-db` exists and is the right default for search tuning
+- preserved `25k` and `50k` DB roots are now part of the normal profiling workflow
+- per-rule prepared-query memory profiling is available in verbose search output
 
 Work:
-- keep attacking `append_sidecars`
-- keep `append_doc_records_us` and `tier2_update_us` secondary targets
-- prefer changes that improve sustained large-corpus throughput, not short synthetic wins
+- keep search tuning on reused DBs, not fresh rebuilds
+- keep emitting per-rule prepared-query memory fields during profiling
+- update docs whenever the searchable/scaling-safe boundary changes
 
 Exit criteria:
-- the next `100k+` ingest run improves sustained files/min materially from the current forest baseline
-- writeback pressure is lower or easier to drain between trees
+- planner/runtime tuning loops do not require re-indexing just to measure search changes
+- rule-family profiling and rebucketing are documented and repeatable
 
 ## Order
 
 Work these in this order:
-1. keep the many-tree ingest direction
-2. fix large-corpus search on top of it
-3. continue reducing the write-path slope
-
-Only after these are stable do we return to broader cleanup or new feature work.
+1. keep memory practical on the `16 GiB` target
+2. reduce `docs_scanned` on the remaining broad search families
+3. preserve fast reuse-based profiling

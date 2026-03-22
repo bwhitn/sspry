@@ -163,6 +163,21 @@ Behavior:
   - if the current gram sizes are larger than the literal width, the rule still needs another string/hex anchor
   - numeric equality only supports literal constants, not expressions such as `uint32(0) == filesize`
   - without `--verify`, candidate results may still include extra false positives
+- indexed search now also fails fast on some rule shapes that are structurally unsafe for scalable search:
+  - high-fanout unions with no mandatory anchorable pattern
+  - low-information `at pe.entry_point` style stub rules that only contribute tiny generic gram anchors
+- these fail-fast cases are intentional:
+  - they preserve recall
+  - they prevent large-corpus near-full scans from being treated as “good” searchable rules
+  - the fix for the rule is usually to add a stronger mandatory anchor or split the rule into narrower pieces
+- `--verbose` search output includes per-rule runtime and prepared-query profiling fields such as:
+  - `query_ms`
+  - `docs_scanned`
+  - `candidates`
+  - `prepared_query_bytes`
+  - `prepared_mask_cache_bytes`
+  - `prepared_any_lane_variant_sets`
+  - `prepared_compacted_any_lane_grams`
 
 ## info
 
@@ -230,6 +245,7 @@ This bypasses the database and scans one file directly.
 - Treat `--gram-sizes` as a format choice, not a casual runtime knob.
 - Use `--set-fp` to control the disk-size vs candidate-quality tradeoff.
 - Use `--search-workers` to control server search parallelism.
+- For repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change.
 - Expect delete to be immediate logically but reclaimed physically later by shard-local compaction.
 - `SIGINT` and `SIGTERM` trigger graceful drain and shutdown.
 - `SIGUSR1` prints a live `info` snapshot to `stderr`.

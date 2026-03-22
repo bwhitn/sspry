@@ -1,223 +1,88 @@
 # Performance TODO
 
-Current baseline:
-- Repo: `/root/pertest/repos/yaya`
-- Current pushed runtime baseline: `71ce8ed` `Reuse work stores on first workspace publish`
-- Repo-local git auto maintenance is disabled during benchmark work:
-  - `gc.auto = 0`
-  - `maintenance.auto = false`
+Current repo:
+- `/root/pertest/repos/yaya`
+
+Current pushed baseline:
+- `7a93eef` `Reject overbroad high-fanout search rules`
 
 ## Current State
-- Bloom-only cutover is now the default live path:
-  - public `candidate_df` replanning transport is removed
-  - live exact-gram persistence is removed from ingest/import/delete
-  - compatibility-only gram wire fields are removed from the app/RPC surface
-  - the CLI no longer prints the retired `legacy_query:` exact-gram expression on search
-  - query-plan wire decode no longer accepts the retired pre-`ast` payload shape
-  - workspace startup now rejects the retired single `work/` root instead of auto-migrating it
-  - candidate stats no longer emit the retired `gram_sizes` and `filter_bucket_counts` aliases
-  - live duplicate/import timing metrics are renamed from `classify_*` to `resolve_doc_state_*`
-  - the dead `ENABLE_PRESSURE_PUBLISH = false` gate is removed; live backpressure/pressure telemetry remains
-  - bloom sizing no longer carries the dead `filter_size_divisor` parameter or its hardcoded `= 1` constants
-  - the old test-only `scan_file_features_bloom_only()` convenience wrapper is removed; tests use the explicit gram-size scanner entrypoint now
-  - the old default/tier2-size query-plan convenience wrappers are removed; tests use local helpers over `*_with_gram_sizes`
-  - candidate insert wire now carries `bloom_item_estimate` / `tier2_bloom_item_estimate` and no longer carries redundant explicit bloom-hash counts
-  - unused cargo dependencies `rustc-hash` and `hashbrown` are removed
-  - the rpc transport integration test no longer duplicates local default-size bloom/query helper wrappers
-- `features.rs` status:
-  - default ingest is on the bloom-only scanner path
-  - production `DocumentFeatures` no longer exposes the retired gram-era fields
-  - the `entropy_*`, `bucket_*`, and exact-gram selection helpers are now test-only in `features.rs`
-  - production still keeps the HLL `estimate_*grams*` helpers because app-side bloom sizing depends on them
-  - dead public reexports for exact-gram helper utilities were removed from `candidate/mod.rs`
-- `26k` bloom-only verification after the compatibility-wire cleanup:
-  - artifact:
-    - `/root/pertest/results/sspry_verify_26000_bloomcut_20260318_r2`
-  - `index_wall_ms = 563,508`
-  - `files_per_minute_wall = 2768.37`
-  - `current_rss_kb = 243,800`
-  - `peak_rss_kb = 354,084`
-  - `db_bytes = 18,539,136,064`
-  - `store_us = 28,269,116`
-  - `store_classify_df_lookup_us = 0`
-  - `store_append_sidecars_us = 26,714,030`
-  - `store_tier2_update_us = 1,363,948`
-- Read from that `26k` verification:
-  - the bloom-only cleanup held under a real release ingest
-  - the default path no longer performs any DF/classify lookup work
-  - ingest/store time is now overwhelmingly bloom-side append work
-- verification coverage now includes one full CLI roundtrip test:
-  - `serve --store-path`
-  - `index` over a temp dataset
-  - wait for auto-publish
-  - `search --verify`
-  - `delete` the matching file path
-  - assert the published search path immediately stops returning that verified match
-  - note:
-    - delete applies directly to the published store and the active work store
-    - it does not wait for a second publish cycle
 
-- Full-corpus run `r6` on `4cbcd5a` was rejected and stopped at `30,981 / 260,278` docs (`11.90%`).
-- Grouped DF segment lookups regressed into very large exact local scans:
-  - `store_classify_df_lookup_segment_rows_examined = 13,216,478,954`
-  - `store_classify_df_lookup_segment_visits = 51,626`
-  - `store_classify_df_lookup_segment_point_lookups = 0`
-  - `store_classify_df_lookup_us = 159,136,764` at only `30,981` docs
-- Memory interpretation for this regression:
-  - `VmRSS = 4,786,084 KB`
-  - `RssAnon = 1,597,620 KB`
-  - `RssFile = 3,188,464 KB`
-- Action: revert `4cbcd5a` and continue full-corpus testing from the safer fence-index baseline.
+### Search-scale boundary
 
+- the curated scaling-safe alias is maintained at:
+  - `/root/pertest/results/good_rules_current_scaling`
+- rules now fail fast instead of being treated as scaling-safe when they are structurally bad for large-corpus search
+- the current explicit fail-fast classes are:
+  - high-fanout unions with no mandatory anchorable pattern
+  - low-information `at pe.entry_point` style stub rules
 
-Latest large-run stall check:
-- `120k` artifact root:
-  - `/root/pertest/results/sspry_stallcheck_120000_20260317_r2`
-- dataset:
-  - files: `120,000`
-  - bytes: `341,905,356,438`
-  - GiB: `318.424113503657`
-- result:
-  - completed successfully
-  - `index_wall_ms = 8,712,406`
-  - `files_per_minute_wall = 826.41`
-  - `avg_sampled_current_rss_kb = 7,233,236.88`
-  - `max_sampled_current_rss_kb = 11,170,672`
-  - `max_sampled_peak_rss_kb = 11,311,044`
-  - `final_db_bytes = 110,684,438,124`
+### Search-memory state
 
-Important read from the `120k` run:
-- the full-corpus stall does not reproduce at `120k`
-- but ingest slows down steadily as the corpus grows
-- the cleanest steady-state slowdown is `Q2 -> Q3`, not `Q1`
-- `Q2 -> Q3` per-doc store growth:
-  - `store_us/doc`: `65.4 ms -> 73.8 ms`
-  - `classify_us/doc`: `11.0 ms -> 15.3 ms`
-  - `classify_df_lookup_us/doc`: `9.8 ms -> 14.1 ms`
-  - `compact_df_counts_us/doc`: `23.2 ms -> 29.1 ms`
-  - `append_sidecars_us/doc`: `29.3 ms -> 27.8 ms`
-- interpretation:
-  - `classify_df_lookup` is the clearest monotonic scaler
-  - `compact_df_counts` is the secondary steady-state grower
-  - `append_sidecars` is still large, but it does not show the same clean steady-state worsening
+- prepared-plan cache growth is bounded
+- duplicate prepared-mask storage is removed
+- heavy any-lane materialization is compacted under budget
+- live `info` now reports mmap residency more accurately
+- the remaining search problem is mostly scan breadth on the surviving broad families, not the earlier retained-anon ratchet
 
-Current large-ingest baseline on `master`:
-- `26k` artifact root:
-  - `/root/pertest/results/sspry_ingest_26000_20260316_doublebuf_reuse_r3`
-- `50k` artifact root:
-  - `/root/pertest/results/sspry_ingest_50000_20260316_doublebuf_reuse_r1`
+### Index-memory state
 
-Pressure-publish/backpressure validation on local `master`:
-- valid `26k` pressure run:
-  - `/root/pertest/results/sspry_ingest_26000_20260317_pressure_r6`
-- tuned `50k` pressure validation:
-  - `/root/pertest/results/sspry_ingest_50000_20260317_pressure_r3`
-- current read:
-  - the tuned policy now does the right thing operationally:
-    - first pressure publish during active indexing is cheap and reuses work stores
-    - later active-session publish thresholds shrink to smaller chunks
-    - seal backlog blocks another pressure publish and converts into stronger ingest backpressure
-    - current tuned active-session republish thresholds are:
-      - `2048` docs
-      - `4 GiB` estimated input bytes
-  - validated large-run memory:
-    - `26k`: `peak_rss_kb = 9,971,436`
-    - `50k`: validated through `97.886%` with `peak_rss_kb = 9,851,628`
-  - validated `26k` timing:
-    - `total_ms = 725,760.387`
-    - `submit_ms = 335,424.167`
-    - `publish_runs_total = 2`
-  - validated `50k` behavior:
-    - `97.886%` sample:
-      - `submitted_documents = 48,943`
-      - `publish_runs_total = 2`
-      - `last_publish_imported_docs = 9,228`
-      - `index_backpressure_events_total = 687`
-      - `index_backpressure_sleep_ms_total = 54,350`
-      - `current_rss_kb = 9,184,488`
-    - the earlier `13 GiB` second-publish spike did not recur after the tighter republish thresholds
-  - operational follow-up:
-    - verbose remote index RSS reporting now uses the lightweight status endpoint instead of full stats
-    - the earlier `Resource temporarily unavailable (os error 11)` tail failure should be rechecked later on a full completed `50k`/larger run, but it is no longer blocking this pressure-policy tuning pass
+- segmented remote index sessions with forced publish boundaries are the safe default path
+- early `25k` validation showed:
+  - old unsplit baseline max anon: about `13.26 GiB`
+  - segmented single-worker-safe path at first publish: about `1.38 GiB`
+- this is enough proof to treat the old early index-memory ratchet as fixed in direction
 
-`26k` current system:
-- dataset:
-  - files: `26,000`
-  - bytes: `65,094,641,220`
-  - GiB: `60.624108854681`
-- index wall:
-  - `743,419 ms`
-- first publish:
-  - `publish_wait_ms = 61`
-  - `last_publish_duration_ms = 137`
-  - `last_publish_reused_work_stores = true`
-- memory:
-  - `current_rss_kb = 4,068,564`
-  - `peak_rss_kb = 4,228,352`
+### Profiling workflow
 
-`50k` current system:
-- dataset:
-  - files: `50,000`
-  - bytes: `143,010,953,447`
-  - GiB: `133.189329362474`
-- index wall:
-  - `2,148,392 ms`
-- first publish:
-  - `publish_wait_ms = 181`
-  - `last_publish_duration_ms = 876`
-  - `last_publish_reused_work_stores = true`
-- memory:
-  - `current_rss_kb = 6,223,800`
-  - `peak_rss_kb = 6,413,300`
+- search tuning should use preserved DB roots plus `--reuse-existing-db`
+- per-rule prepared-query profiling is available in verbose search output
+- the important rule metrics are now:
+  - `docs_scanned`
+  - `candidates`
+  - `query_ms`
+  - `prepared_query_bytes`
+  - `prepared_mask_cache_bytes`
+  - `prepared_any_lane_variant_sets`
+  - `prepared_compacted_any_lane_grams`
 
-Current large-run insert/store priority order:
-- source:
-  - `/root/pertest/results/sspry_stallcheck_120000_20260317_r2/final.info.light.json`
-- `store_append_sidecars_us = 2,552,260,490`
-- `store_classify_us = 2,356,714,720`
-- `store_classify_df_lookup_us = 2,208,038,954`
-- `store_compact_df_counts_us = 2,140,133,620`
-- `store_apply_df_counts_us = 135,508,102`
-- `store_tier2_update_us = 8,460,711`
+## Immediate Work
 
-Interpretation:
-- first visible publish is no longer the main problem
-- the current system is bottlenecked by server insert/store work again
-- inside insert/store, the immediate optimization priorities are now:
-  1. `classify_df_lookup`
-  2. `compact_df_counts`
-  3. `append_sidecars`
-  4. `apply_df_counts`
-- adaptive publish is currently backing off for ingest pressure on this workload, which is expected:
-  - `adaptive_publish.mode = backoff`
-  - `adaptive_publish.reason = submit_pressure_high`
-- with the tuned pressure policy, active-session publish/import can now stay under the practical memory envelope on `26k` and `50k`
-- for memory budgeting on a `16 GiB` deployment target, treat anon pressure as the primary limit:
-  - monitor `RssAnon` / `Pss_Anon` and system `Active(anon) + Inactive(anon)` alongside `VmRSS`
-  - file-backed mmap growth still matters for IO/locality, but `VmRSS` alone is too pessimistic for the server budget
+### 1. Reduce `docs_scanned` on the remaining broad rules
 
-Operational notes:
-- the first-publish double-buffer reuse fix removed the pathological first-publish memory spike
-- search still only sees the published store set
-- remote indexing now retries narrow publish pauses, and publish waits for active sessions instead of poisoning them
+Current read:
+- after removing the obvious non-scaling-safe rules, the next family is mostly packer/version rules and similar low-information signatures
+- these are often structurally broad even when they are no longer union-heavy
+- candidate pruning improved first; the next real win must reduce the first scan itself
 
-Current profiling additions on local `master`:
-- insert-side sidecar telemetry now also exposes:
-  - `store_append_bloom_payload_assemble_us`
-  - `store_append_metadata_payload_us`
-  - `store_append_doc_row_build_us`
-- per-session insert-batch submetrics are now reset correctly on new index sessions
+Do next:
+- rank remaining heavy rules by `docs_scanned`
+- split them into:
+  - rejectable structural cases
+  - salvageable cases with a stronger mandatory anchor path
+- prefer fail-fast rejection when there is no recall-safe way to narrow first-scan breadth
 
-Current sidecar read from the telemetry pass (`26k` profile):
-- artifact:
-  - `/root/pertest/results/sspry_ingest_26000_20260317_sidecar_profile_r1/final.info.light.json`
-- `store_append_sidecars_us = 34,781,302`
-- `store_append_sidecar_payloads_us = 33,455,741`
-- `store_append_bloom_payload_assemble_us = 7,616,550`
-- `store_append_bloom_payload_us = 17,760,087`
-- `store_append_tier2_bloom_payload_us = 13,797,903`
-- `store_append_doc_row_build_us = 6,542,741`
-- `store_append_doc_records_us = 352,594`
+### 2. Keep the scaling-safe set curated
+
+Current read:
+- the set should reflect what is actually safe to run at `25k` and `50k`
+- “supported syntax” and “scaling-safe search rule” are not the same thing
+
+Do next:
+- keep auditing the canonical rule set after every planner boundary change
+- keep writing explicit rebucket artifacts for removed rules
+- keep the alias updated so later scale tests use the right set automatically
+
+### 3. Finish the `50k` search-only validation loop on reused DBs
+
+Do next:
+- run search-only passes against the preserved `50k` DB
+- compare before/after on:
+  - `docs_scanned`
+  - `candidates`
+  - `query_ms`
+  - per-rule prepared-query memory
+- do not rebuild the DB just to test planner/runtime changes
 - `store_append_metadata_payload_us = 143,540`
 
 Interpretation:

@@ -27,7 +27,7 @@ The query path is:
 
 1. Parse restricted YARA into fixed literals / boolean structure.
 2. Extract Tier1 and Tier2 grams from the rule using the DB-wide gram sizes.
-3. Build an anchor plan with branch ordering and per-pattern anchor reduction.
+3. Build an anchor plan with branch ordering, per-pattern anchor reduction, and preserved selected anchor literals.
 4. Query shards in parallel.
 5. Use Tier2 superblock summaries to skip groups of files.
 6. Use per-document Tier1 and Tier2 blooms to refine candidates.
@@ -155,9 +155,18 @@ Current search improvements include:
 - dynamic shard scheduling across server search workers
 - bounded server-side query-result cache
 - prepared-query artifact cache inside the store
+- per-rule prepared-query memory profiling
+- preserved selected anchor literals for prepared masks so chosen anchors do not silently degrade into broad any-lane masks
 - candidate scoring before verification/pagination
 
 These are intended to be recall-safe planner/runtime improvements.
+
+The planner also now has explicit fail-fast boundaries for structurally bad large-corpus rules:
+
+- high-fanout unions with no mandatory anchorable pattern
+- low-information `verifier_only_at` / entry-point stub rules
+
+Those are not treated as searchable/good rules because the engine would otherwise be forced into near-full scans or recall-risky heuristics.
 
 ## Verification Model
 
@@ -182,8 +191,8 @@ These are the main implementation gaps worth keeping in view:
 
 - compaction is shard-local and working, but it is not yet a full multi-generation MVCC design
 - long-lived store cleanup and sweep behavior need another pass
-- short common literals are still the hardest precision case because the engine is gram-based and mostly non-positional
-- some advanced search-planner ideas are still not implemented, including stronger rescue for very common literals
+- short common literals and tiny wildcard-heavy hex stubs are still the hardest precision cases because the engine is gram-based and mostly non-positional
+- some advanced search-planner ideas are still not implemented, especially stronger first-scan selectivity for broad-but-valid rules
 - shutdown drains existing requests, rejects new mutations during drain, and is available both by signal and explicit RPC/CLI command
 
 ## Why The Design Looks Like This

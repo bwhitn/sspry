@@ -3414,6 +3414,9 @@ fn contains_pattern_node(node: &QueryNode) -> bool {
 
 const OVERBROAD_UNION_FANOUT_LIMIT: usize = 192;
 const MANDATORY_PATTERN_COMBINATION_LIMIT: usize = 4096;
+const LOW_INFORMATION_EP_STUB_PATTERN_LIMIT: usize = 2;
+const LOW_INFORMATION_EP_STUB_MAX_TIER1_GRAMS: usize = 2;
+const LOW_INFORMATION_EP_STUB_MAX_TIER2_GRAMS: usize = 3;
 
 fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
     pattern.alternatives.iter().any(|alt| !alt.is_empty())
@@ -3422,6 +3425,28 @@ fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
             .iter()
             .any(|alt| !alt.is_empty())
         || pattern.anchor_literals.iter().any(|literal| !literal.is_empty())
+}
+
+fn pattern_has_anchor_literals(pattern: &PatternPlan) -> bool {
+    pattern.anchor_literals.iter().any(|literal| !literal.is_empty())
+}
+
+fn pattern_max_tier1_grams(pattern: &PatternPlan) -> usize {
+    pattern
+        .alternatives
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+}
+
+fn pattern_max_tier2_grams(pattern: &PatternPlan) -> usize {
+    pattern
+        .tier2_alternatives
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
 }
 
 fn choose_bounded(n: usize, k: usize, limit: usize) -> Option<usize> {
@@ -3559,6 +3584,10 @@ fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
     }
 }
 
+fn node_contains_kind(node: &QueryNode, kind: &str) -> bool {
+    node.kind == kind || node.children.iter().any(|child| node_contains_kind(child, kind))
+}
+
 fn total_pattern_anchor_fanout(patterns: &[PatternPlan]) -> usize {
     patterns
         .iter()
@@ -3614,6 +3643,36 @@ fn reject_overbroad_pattern_union(root: &QueryNode, patterns: &[PatternPlan]) ->
     Err(SspryError::from(format!(
         "Rule is overbroad for scalable search: no mandatory anchorable pattern and union fanout {fanout} exceeds {OVERBROAD_UNION_FANOUT_LIMIT}. Add a stable mandatory anchor or split the rule."
     )))
+}
+
+fn reject_low_information_entrypoint_stub(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
+    if patterns.is_empty()
+        || !node_contains_kind(root, "verifier_only_at")
+        || patterns.len() > LOW_INFORMATION_EP_STUB_PATTERN_LIMIT
+    {
+        return Ok(());
+    }
+    if patterns.iter().any(pattern_has_anchor_literals) {
+        return Ok(());
+    }
+    let max_tier1 = patterns
+        .iter()
+        .map(pattern_max_tier1_grams)
+        .max()
+        .unwrap_or(0);
+    let max_tier2 = patterns
+        .iter()
+        .map(pattern_max_tier2_grams)
+        .max()
+        .unwrap_or(0);
+    if max_tier1 > LOW_INFORMATION_EP_STUB_MAX_TIER1_GRAMS
+        || max_tier2 > LOW_INFORMATION_EP_STUB_MAX_TIER2_GRAMS
+    {
+        return Ok(());
+    }
+    Err(SspryError::from(
+        "Rule is overbroad for scalable search: entry-point stub provides only low-information gram anchors. Add a longer mandatory literal or split the rule.",
+    ))
 }
 
 pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteralMatchPlan> {
@@ -4630,6 +4689,7 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
         });
     }
     reject_overbroad_pattern_union(&root, &patterns)?;
+    reject_low_information_entrypoint_stub(&root, &patterns)?;
     Ok(CompiledQueryPlan {
         patterns,
         root,
@@ -6754,5 +6814,43 @@ rule narrow_all_of {
             100,
         )
         .expect("all-of rule should stay searchable");
+    }
+
+    #[test]
+    fn low_information_entrypoint_stub_is_rejected() {
+        let err = compile_query_plan_default(
+            r#"
+rule low_information_entrypoint_stub {
+  strings:
+    $a0 = { 50 BE [4] 8D BE [4] 57 83 CD }
+  condition:
+    $a0 at pe.entry_point
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect_err("low-information entrypoint stub should fail");
+        assert!(err
+            .to_string()
+            .contains("entry-point stub provides only low-information gram anchors"));
+
+        compile_query_plan_default(
+            r#"
+rule stronger_entrypoint_anchor {
+  strings:
+    $a0 = { 50 BE [4] 8D BE [4] 57 83 CD 11 22 33 44 55 66 77 88 99 AA BB CC }
+  condition:
+    $a0 at pe.entry_point
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("stronger entrypoint anchor should compile");
     }
 }

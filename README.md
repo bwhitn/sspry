@@ -14,6 +14,11 @@ A mutable file search database with fast candidate retrieval and optional YARA v
 - optional local YARA verification over stored file paths
 - shard-local background compaction with deferred physical reclaim
 
+The current search planner is intentionally conservative about recall:
+
+- if a rule has a safe searchable anchor, `sspry` uses it and verifies the rest later
+- if a rule is structurally too broad to search safely at scale, `sspry` now returns an explicit planner error instead of pretending it is scaling-safe
+
 The current public CLI is intentionally small:
 
 - `serve`
@@ -56,3 +61,6 @@ If `cargo-llvm-cov` is installed:
 - The workspace layout is `current/`, `work_a/`, `work_b/`, and `retired/`.
 - The default ingest/search path is bloom-only; the retired exact-gram / DF path has been removed from the normal runtime.
 - Search can return candidate digests directly or optionally verify matches locally with `yara-x` when stored paths are available.
+- Search now rejects two important non-scaling-safe rule shapes:
+  - high-fanout unions with no mandatory anchorable pattern
+  - low-information `at pe.entry_point` style stub rules that only contribute tiny generic gram anchors

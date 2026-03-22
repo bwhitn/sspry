@@ -33,6 +33,7 @@ Options:
 - The default server address is `127.0.0.1:17653`.
 - `--perf-report` writes a JSON performance report to a file.
 - `--perf-stdout` prints a JSON performance report to stdout on exit.
+- `search` can now fail fast on structurally overbroad rule shapes instead of treating them as scaling-safe.
 
 ## `serve`
 
@@ -156,6 +157,13 @@ Examples:
 cargo run -- search --addr 127.0.0.1:17653 --rule ./rule.yar
 cargo run -- search --addr 127.0.0.1:17653 --rule ./rule.yar --verify
 ```
+
+Important behavior:
+
+- some rules are intentionally rejected for scalable indexed search:
+  - high-fanout unions with no mandatory anchorable pattern
+  - low-information `at pe.entry_point` style stub rules
+- `--verbose` includes per-rule runtime and prepared-query memory profiling fields
 
 ## `info`
 
