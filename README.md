@@ -34,6 +34,12 @@ The current public CLI is intentionally small:
 - RPC search against a running `serve` process via `--addr`
 - in-process forest search via `--root`, which opens `tree_*/current` stores directly and can search trees concurrently with `--tree-search-workers`
 
+`search-batch` is the long-lived in-process forest runner for repeated rule sweeps:
+
+- it opens the forest once
+- runs many rules against that same live forest
+- writes JSON results for benchmarking/profiling
+
 ## Quick Links
 
 - [Quickstart](docs/quickstart.md)
@@ -67,7 +73,9 @@ If `cargo-llvm-cov` is installed:
 - The default ingest/search path is bloom-only; the retired exact-gram / DF path has been removed from the normal runtime.
 - Search can return candidate digests directly or optionally verify matches locally with `yara-x` when stored paths are available.
 - `search --root <forest_root>` is the direct forest path for tree-level threaded search experiments and one-off local queries.
-- For large repeated tuning sweeps, the persistent server path is still usually faster than invoking `search --root` once per rule, because the direct local path reopens the forest each time.
+- For large repeated tuning sweeps, use `search-batch` or a persistent server path.
+- A bare `search --root` per rule is intentionally still a one-shot path and will reopen the forest each time.
+- Current caveat: on the preserved `50k` tree, `search-batch` is functionally correct but still too resident-memory-heavy to replace the persistent server path as the default tuning loop.
 - Search now rejects two important non-scaling-safe rule shapes:
   - high-fanout unions with no mandatory anchorable pattern
   - low-information `at pe.entry_point` style stub rules that only contribute tiny generic gram anchors

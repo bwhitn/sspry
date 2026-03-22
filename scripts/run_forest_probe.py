@@ -430,6 +430,38 @@ def run_search_one_local_forest(
     return proc, (time.time() - started) * 1000.0
 
 
+def run_search_batch_local_forest(
+    sspry: Path,
+    db_root: Path,
+    rules_dir: Path,
+    json_out: Path,
+    timeout_s: int,
+    tree_search_workers: int,
+) -> tuple[subprocess.CompletedProcess, float]:
+    started = time.time()
+    proc = None
+    try:
+        proc = run(
+            [
+                str(sspry),
+                'search-batch',
+                '--root',
+                str(db_root),
+                '--rules-dir',
+                str(rules_dir),
+                '--json-out',
+                str(json_out),
+                '--tree-search-workers',
+                str(tree_search_workers),
+            ],
+            capture_output=True,
+            timeout=timeout_s + 60,
+        )
+    except subprocess.TimeoutExpired as e:
+        proc = subprocess.CompletedProcess(e.cmd, 124, e.stdout or '', (e.stderr or '') + '\nTIMEOUT')
+    return proc, (time.time() - started) * 1000.0
+
+
 def aggregate_rule_results(rule: Path, tree_results: list[dict], elapsed_ms_parallel: float) -> dict:
     out = {
         'rule': rule.name,
@@ -802,38 +834,34 @@ def main() -> int:
             f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s} mode={args.search_mode}',
             flush=True,
         )
-        for rule in sorted(rules_dir.glob('*.yar')):
-            started = time.time()
-            print(
-                f'search.rule.start rule={rule.name} tree_workers={tree_search_workers} '
-                f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s}',
-                flush=True,
+        rule_files = sorted(rules_dir.glob('*.yar'))
+        if args.search_mode == 'local-forest':
+            batch_json = run_dir / 'search_summary.json'
+            proc, elapsed_ms = run_search_batch_local_forest(
+                sspry,
+                db_base,
+                rules_dir,
+                batch_json,
+                effective_search_timeout_s * max(1, len(rule_files)),
+                tree_search_workers,
             )
-            tree_dir = searches_dir / rule.stem
-            tree_dir.mkdir(parents=True, exist_ok=True)
-            if args.search_mode == 'local-forest':
-                proc, elapsed_ms = run_search_one_local_forest(
-                    sspry,
-                    db_base,
-                    rule,
-                    effective_search_timeout_s,
-                    tree_search_workers,
+            (run_dir / 'search_batch.stdout').write_text(proc.stdout or '')
+            (run_dir / 'search_batch.stderr').write_text(proc.stderr or '')
+            if proc.returncode != 0:
+                raise SystemExit(
+                    f'local-forest batch search failed exit={proc.returncode} elapsed_ms={elapsed_ms:.3f}'
                 )
-                (tree_dir / 'local_forest.stdout').write_text(proc.stdout or '')
-                (tree_dir / 'local_forest.stderr').write_text(proc.stderr or '')
-                record = parse_search_result(rule, proc, elapsed_ms)
-                record['search_mode'] = 'local-forest'
-                record['tree_workers'] = tree_search_workers
-                record['tree_batches'] = tree_batches
-                record['effective_timeout_s'] = effective_search_timeout_s
-                record['tree_count'] = tree_count
-                search_summary.append(record)
+            search_summary = json.loads(batch_json.read_text())
+        else:
+            for rule in rule_files:
+                started = time.time()
                 print(
-                    f"search.rule.done rule={rule.name} exit={record['exit_code']} "
-                    f"wall_ms={record['elapsed_ms_wall']:.3f}",
+                    f'search.rule.start rule={rule.name} tree_workers={tree_search_workers} '
+                    f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s}',
                     flush=True,
                 )
-            else:
+                tree_dir = searches_dir / rule.stem
+                tree_dir.mkdir(parents=True, exist_ok=True)
                 per_tree = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=tree_search_workers) as pool:
                     future_map = {

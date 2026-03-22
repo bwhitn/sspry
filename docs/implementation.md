@@ -26,6 +26,12 @@ At a high level:
 
 Direct forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
 
+`search-batch` is the long-lived variant of direct forest mode:
+
+- open the forest once
+- iterate many rules against the same live tree set
+- emit per-rule JSON records for profiling
+
 ## Query Flow
 
 ![Query Flow](images/query-flow.svg)
@@ -48,6 +54,8 @@ In direct forest mode, the query path adds one layer above shard search:
 3. build one compiled plan against the shared forest policy
 4. fan out the query across trees with up to `tree_search_workers`
 5. merge candidate hashes, query profiles, and optional external ids
+
+In `search-batch`, that forest-open/validation work is done once for the whole sweep instead of once per rule.
 
 ## Storage Layout
 

@@ -39,7 +39,11 @@ Current pushed baseline:
 - search tuning should use preserved DB roots plus `--reuse-existing-db`
 - per-rule prepared-query profiling is available in verbose search output
 - direct in-process forest search is available through `sspry search --root ... --tree-search-workers ...`
-- for large repeated sweeps, persistent server mode is still the practical default because it avoids reopening the forest for every rule
+- long-lived direct-forest sweeps are now available through `sspry search-batch`
+- persistent server mode is still useful for comparison, but direct-forest benchmarking no longer requires per-rule reopen cost
+- current caveat:
+  - `search-batch` still shows too much resident-memory growth on the preserved `50k` tree
+  - it is good enough for smaller direct-forest checkpoints, but not yet the default broad tuning path
 - the important rule metrics are now:
   - `docs_scanned`
   - `candidates`

@@ -199,6 +199,37 @@ Practical note:
 - for repeated rule-by-rule tuning on a preserved DB, `--addr` against a persistent server is usually faster than calling `search --root` once per rule
 - `search --root` is the right path for local forest correctness checks and tree-level threaded-search experiments
 
+## search-batch
+
+```bash
+./target/release/sspry search-batch [options]
+```
+
+Options:
+
+- `--root <path>`
+  - required forest root
+- `--rules-dir <path>`
+  - directory of `.yar` files in sorted filename order
+- `--rule-manifest <path>`
+  - newline-delimited rule path list
+- `--json-out <path>`
+  - required output JSON path
+- `--tree-search-workers <n>`
+  - forest-level tree concurrency
+- `--max-anchors-per-pattern <n>`
+- `--max-candidates <n>`
+- `--verify`
+
+Behavior:
+
+- opens the forest once and reuses it across the whole rule sweep
+- intended for repeated benchmark/profiling passes on preserved DBs
+- this is the direct-forest alternative to the persistent RPC server path when you want tree-level threaded search without per-rule reopen overhead
+- current practical caveat:
+  - on the preserved `50k` tree, this path still keeps too much resident state to be the default broad tuning loop
+  - use it for direct-forest experiments and smaller slices while that memory shape is being improved
+
 ## info
 
 ```bash

@@ -49,11 +49,15 @@ Current state:
 - preserved `25k` and `50k` DB roots are now part of the normal profiling workflow
 - per-rule prepared-query memory profiling is available in verbose search output
 - `search --root` plus `--tree-search-workers` now exists for in-process forest search and tree-level concurrency checks
+- `search-batch` now exists for long-lived in-process forest sweeps without per-rule reopen overhead
+- early `50k` batch checkpoints show the control-flow is correct, but resident memory still climbs too much for this to replace the persistent server path as the default tuning loop yet
 
 Work:
 - keep search tuning on reused DBs, not fresh rebuilds
 - keep emitting per-rule prepared-query memory fields during profiling
-- use direct forest search for correctness / threading experiments, but keep persistent server mode as the default for large repeated rule sweeps
+- use `search-batch` for direct-forest repeated sweeps
+- keep one-shot `search --root` for correctness / threading spot checks
+- keep the persistent server path as the default large-slice tuning loop until `search-batch` resident memory is lower
 - update docs whenever the searchable/scaling-safe boundary changes
 
 Exit criteria:

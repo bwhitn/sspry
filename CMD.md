@@ -177,6 +177,48 @@ Important behavior:
   - `tree_search_workers`
   - client RSS fields for the search process itself
 
+## `search-batch`
+
+```text
+Usage: sspry search-batch --root <ROOT> --json-out <JSON_OUT> [OPTIONS]
+
+Options:
+      --root <ROOT>
+          Candidate forest root for in-process batch search.
+      --rules-dir <RULES_DIR>
+          Directory containing .yar files to search in sorted filename order.
+      --rule-manifest <RULE_MANIFEST>
+          Newline-delimited manifest of rule file paths.
+      --json-out <JSON_OUT>
+          Write batch JSON results to this path.
+      --tree-search-workers <TREE_SEARCH_WORKERS>
+          Forest-level tree search workers. 0 means auto up to the tree count. [default: 0]
+      --max-anchors-per-pattern <MAX_ANCHORS_PER_PATTERN>
+          Keep at most this many anchors per pattern alternative. [default: 16]
+      --max-candidates <MAX_CANDIDATES>
+          Cap on returned candidate set size per rule; 0 means unlimited. [default: 15000]
+      --verify
+          Enable local YARA verification over candidate file paths.
+  -h, --help
+          Print help
+```
+
+Example:
+
+```bash
+cargo run -- search-batch \
+  --root ./candidate_db \
+  --rules-dir ./rules \
+  --json-out ./search_summary.json \
+  --tree-search-workers 2
+```
+
+Important behavior:
+
+- `search-batch` is the long-lived local forest runner for repeated benchmark sweeps
+- it keeps the forest open across all rules in the batch
+- it is the correct direct-forest path when one-shot `search --root` reopen cost would distort timings
+
 ## `info`
 
 ```text

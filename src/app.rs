@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use crossbeam_channel::bounded;
 use md5::Md5;
+use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 #[cfg(unix)]
@@ -1371,6 +1372,68 @@ struct LocalForestQueryAggregate {
     external_ids: Option<Vec<Option<String>>>,
 }
 
+#[derive(Debug, Serialize)]
+struct BatchSearchRecord {
+    rule: String,
+    rule_path: String,
+    exit_code: i32,
+    elapsed_ms_wall: f64,
+    error: Option<String>,
+    candidates: Option<usize>,
+    tier_used: Option<String>,
+    verified_checked: Option<usize>,
+    verified_matched: Option<usize>,
+    verified_skipped: Option<usize>,
+    verbose_search_total_ms: Option<f64>,
+    verbose_search_plan_ms: Option<f64>,
+    verbose_search_query_ms: Option<f64>,
+    verbose_search_verify_ms: Option<f64>,
+    verbose_search_docs_scanned: Option<u64>,
+    verbose_search_superblocks_skipped: Option<u64>,
+    verbose_search_metadata_loads: Option<u64>,
+    verbose_search_metadata_bytes: Option<u64>,
+    verbose_search_tier1_bloom_loads: Option<u64>,
+    verbose_search_tier1_bloom_bytes: Option<u64>,
+    verbose_search_tier2_bloom_loads: Option<u64>,
+    verbose_search_tier2_bloom_bytes: Option<u64>,
+    verbose_search_prepared_query_bytes: Option<u64>,
+    verbose_search_prepared_pattern_plan_bytes: Option<u64>,
+    verbose_search_prepared_mask_cache_bytes: Option<u64>,
+    verbose_search_prepared_pattern_count: Option<u64>,
+    verbose_search_prepared_mask_cache_entries: Option<u64>,
+    verbose_search_prepared_fixed_literal_count: Option<u64>,
+    verbose_search_prepared_tier1_alternatives: Option<u64>,
+    verbose_search_prepared_tier2_alternatives: Option<u64>,
+    verbose_search_prepared_tier1_shift_variants: Option<u64>,
+    verbose_search_prepared_tier2_shift_variants: Option<u64>,
+    verbose_search_prepared_tier1_any_lane_alternatives: Option<u64>,
+    verbose_search_prepared_tier2_any_lane_alternatives: Option<u64>,
+    verbose_search_prepared_tier1_compacted_any_lane_alternatives: Option<u64>,
+    verbose_search_prepared_tier2_compacted_any_lane_alternatives: Option<u64>,
+    verbose_search_prepared_any_lane_variant_sets: Option<u64>,
+    verbose_search_prepared_compacted_any_lane_grams: Option<u64>,
+    verbose_search_prepared_max_pattern_bytes: Option<u64>,
+    verbose_search_prepared_max_pattern_id: Option<String>,
+    verbose_search_prepared_impossible_query: Option<bool>,
+    verbose_search_max_candidates: Option<usize>,
+    verbose_search_max_anchors_per_pattern: Option<usize>,
+    verbose_search_candidates: Option<usize>,
+    verbose_search_verify_enabled: Option<bool>,
+    verbose_search_client_current_rss_kb: Option<usize>,
+    verbose_search_client_peak_rss_kb: Option<usize>,
+    verbose_search_server_current_rss_kb: Option<u64>,
+    verbose_search_server_peak_rss_kb: Option<u64>,
+    verbose_search_tree_count: Option<usize>,
+    verbose_search_tree_search_workers: Option<usize>,
+}
+
+struct SearchVerificationResult {
+    rows: Vec<String>,
+    verified_checked: usize,
+    verified_matched: usize,
+    verified_skipped: usize,
+}
+
 fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
     let direct_current = root.join("current");
     if direct_current.is_dir() {
@@ -1604,6 +1667,109 @@ fn query_local_forest_all_candidates(
         query_profile,
         external_ids,
         hashes: ordered,
+    })
+}
+
+fn verify_search_candidates(
+    rule_path: &Path,
+    plan: &crate::candidate::CompiledQueryPlan,
+    rows: Vec<String>,
+    mut external_ids: Vec<Option<String>>,
+    verify_yara_files: bool,
+) -> Result<SearchVerificationResult> {
+    if !verify_yara_files {
+        return Ok(SearchVerificationResult {
+            rows,
+            verified_checked: 0,
+            verified_matched: 0,
+            verified_skipped: 0,
+        });
+    }
+    if external_ids.len() < rows.len() {
+        external_ids.resize(rows.len(), None);
+    }
+    let literal_plan = fixed_literal_match_plan(plan);
+    let mut yara_rules = None::<Arc<YaraRules>>;
+    let mut verified_rows = Vec::<String>::new();
+    let mut verified_checked = 0usize;
+    let mut verified_matched = 0usize;
+    let mut verified_skipped = 0usize;
+    let mut unverified_rows = Vec::<String>::new();
+    let mut page_results = vec![None::<bool>; rows.len()];
+    let mut verify_jobs = Vec::<(usize, String, PathBuf)>::new();
+    for (index, (sha256, external_id)) in rows
+        .iter()
+        .cloned()
+        .zip(external_ids.into_iter())
+        .enumerate()
+    {
+        let Some(path_text) = external_id else {
+            verified_skipped += 1;
+            unverified_rows.push(sha256);
+            continue;
+        };
+        let candidate_path = PathBuf::from(path_text);
+        if !candidate_path.is_file() {
+            verified_skipped += 1;
+            unverified_rows.push(sha256);
+            continue;
+        }
+        verify_jobs.push((index, sha256, candidate_path));
+    }
+    verify_jobs.sort_by(|left, right| left.2.cmp(&right.2));
+    for (index, _sha256, candidate_path) in verify_jobs {
+        verified_checked += 1;
+        let matched = if let Some(plan) = &literal_plan {
+            match verify_fixed_literal_plan_on_file(&candidate_path, plan) {
+                Ok(matched) => matched,
+                Err(_) => {
+                    if yara_rules.is_none() {
+                        yara_rules = Some(compile_yara_verifier_cached(rule_path)?);
+                    }
+                    let mut scanner =
+                        YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
+                    scanner
+                        .scan_file(&candidate_path)
+                        .map_err(|err| SspryError::from(err.to_string()))?
+                        .matching_rules()
+                        .len()
+                        > 0
+                }
+            }
+        } else {
+            if yara_rules.is_none() {
+                yara_rules = Some(compile_yara_verifier_cached(rule_path)?);
+            }
+            let mut scanner = YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
+            scanner
+                .scan_file(&candidate_path)
+                .map_err(|err| SspryError::from(err.to_string()))?
+                .matching_rules()
+                .len()
+                > 0
+        };
+        page_results[index] = Some(matched);
+    }
+    for (index, sha256) in rows.iter().cloned().enumerate() {
+        match page_results.get(index).copied().flatten() {
+            Some(true) => {
+                verified_matched += 1;
+                verified_rows.push(sha256);
+            }
+            Some(false) => {}
+            None => {
+                if !unverified_rows.iter().any(|value| value == &sha256) {
+                    unverified_rows.push(sha256);
+                }
+            }
+        }
+    }
+    verified_rows.extend(unverified_rows);
+    Ok(SearchVerificationResult {
+        rows: verified_rows,
+        verified_checked,
+        verified_matched,
+        verified_skipped,
     })
 }
 
@@ -3396,7 +3562,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut tree_search_workers = None::<usize>;
 
         let started_plan = Instant::now();
-        let (plan, total, tier_used, rows, query_profile, prepared_query_profile, mut external_ids) =
+        let (plan, total, tier_used, rows, query_profile, prepared_query_profile, external_ids) =
             if let Some(root) = &args.root {
                 let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
                 tree_count = Some(tree_groups.len());
@@ -3494,97 +3660,21 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 )
             };
 
-        let literal_plan = if verify_yara_files {
-            fixed_literal_match_plan(&plan)
-        } else {
-            None
-        };
-        let mut yara_rules = None::<Arc<YaraRules>>;
-        let mut verified_rows = Vec::<String>::new();
-        let mut verified_checked = 0usize;
-        let mut verified_matched = 0usize;
-        let mut verified_skipped = 0usize;
-
-        if verify_yara_files {
-            if external_ids.len() < rows.len() {
-                external_ids.resize(rows.len(), None);
-            }
-            let mut unverified_rows = Vec::<String>::new();
-            let mut page_results = vec![None::<bool>; rows.len()];
-            let mut verify_jobs = Vec::<(usize, String, PathBuf)>::new();
-            for (index, (sha256, external_id)) in rows
-                .iter()
-                .cloned()
-                .zip(external_ids.into_iter())
-                .enumerate()
-            {
-                let Some(path_text) = external_id else {
-                    verified_skipped += 1;
-                    unverified_rows.push(sha256);
-                    continue;
-                };
-                let candidate_path = PathBuf::from(path_text);
-                if !candidate_path.is_file() {
-                    verified_skipped += 1;
-                    unverified_rows.push(sha256);
-                    continue;
-                }
-                verify_jobs.push((index, sha256, candidate_path));
-            }
-            verify_jobs.sort_by(|left, right| left.2.cmp(&right.2));
-            for (index, _sha256, candidate_path) in verify_jobs {
-                verified_checked += 1;
-                let started_verify = Instant::now();
-                let matched = if let Some(plan) = &literal_plan {
-                    match verify_fixed_literal_plan_on_file(&candidate_path, plan) {
-                        Ok(matched) => matched,
-                        Err(_) => {
-                            if yara_rules.is_none() {
-                                yara_rules =
-                                    Some(compile_yara_verifier_cached(Path::new(&args.rule))?);
-                            }
-                            let mut scanner =
-                                YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
-                            scanner
-                                .scan_file(&candidate_path)
-                                .map_err(|err| SspryError::from(err.to_string()))?
-                                .matching_rules()
-                                .len()
-                                > 0
-                        }
-                    }
-                } else {
-                    if yara_rules.is_none() {
-                        yara_rules = Some(compile_yara_verifier_cached(Path::new(&args.rule))?);
-                    }
-                    let mut scanner =
-                        YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
-                    scanner
-                        .scan_file(&candidate_path)
-                        .map_err(|err| SspryError::from(err.to_string()))?
-                        .matching_rules()
-                        .len()
-                        > 0
-                };
-                verify_time += started_verify.elapsed();
-                page_results[index] = Some(matched);
-            }
-            for (index, sha256) in rows.iter().cloned().enumerate() {
-                match page_results.get(index).copied().flatten() {
-                    Some(true) => {
-                        verified_matched += 1;
-                        verified_rows.push(sha256);
-                    }
-                    Some(false) => {}
-                    None => {
-                        if !unverified_rows.iter().any(|value| value == &sha256) {
-                            unverified_rows.push(sha256);
-                        }
-                    }
-                }
-            }
-            verified_rows.extend(unverified_rows);
-        }
+        let started_verify = Instant::now();
+        let verification = verify_search_candidates(
+            Path::new(&args.rule),
+            &plan,
+            rows,
+            external_ids,
+            verify_yara_files,
+        )?;
+        verify_time += started_verify.elapsed();
+        let SearchVerificationResult {
+            rows,
+            verified_checked,
+            verified_matched,
+            verified_skipped,
+        } = verification;
 
         println!("tier_used: {tier_used}");
         println!("candidates: {total}");
@@ -3592,7 +3682,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             println!("verified_checked: {verified_checked}");
             println!("verified_matched: {verified_matched}");
             println!("verified_skipped: {verified_skipped}");
-            for row in verified_rows {
+            for row in rows {
                 println!("{row}");
             }
         } else {
@@ -3755,6 +3845,259 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
     }
 }
 
+fn collect_rules_from_args(
+    rules_dir: &Option<String>,
+    rule_manifest: &Option<String>,
+) -> Result<Vec<PathBuf>> {
+    let mut rules = if let Some(dir) = rules_dir {
+        let mut values = fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("yar"))
+            .collect::<Vec<_>>();
+        values.sort();
+        values
+    } else if let Some(manifest) = rule_manifest {
+        fs::read_to_string(manifest)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if rules.is_empty() {
+        return Err(SspryError::from(
+            "search-batch requires at least one rule from --rules-dir or --rule-manifest",
+        ));
+    }
+    rules.sort();
+    Ok(rules)
+}
+
+fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let root = Path::new(&args.root);
+        let rules = collect_rules_from_args(&args.rules_dir, &args.rule_manifest)?;
+        let mut tree_groups = open_forest_tree_groups(root)?;
+        let tree_count = tree_groups.len();
+        let (gram_sizes, active_identity_source, summary_cap_bytes) =
+            validate_forest_search_policy(&tree_groups)?;
+        let tree_search_workers = args.tree_search_workers.max(1).min(tree_count.max(1));
+        eprintln!(
+            "search.batch.start rules={} trees={} tree_workers={}",
+            rules.len(),
+            tree_count,
+            tree_search_workers
+        );
+        let mut out = Vec::<BatchSearchRecord>::with_capacity(rules.len());
+        for rule in rules {
+            let started_total = Instant::now();
+            let rule_name = rule
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            eprintln!("search.batch.rule.start rule={rule_name}");
+            let record = match (|| -> Result<BatchSearchRecord> {
+                let started_plan = Instant::now();
+                let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+                    &rule,
+                    gram_sizes,
+                    active_identity_source.as_deref(),
+                    args.max_anchors_per_pattern,
+                    false,
+                    true,
+                    args.max_candidates,
+                )?;
+                let prepared_query_profile =
+                    forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
+                let plan_ms = started_plan.elapsed().as_secs_f64() * 1000.0;
+                let started_query = Instant::now();
+                let local = query_local_forest_all_candidates(
+                    &mut tree_groups,
+                    &plan,
+                    args.verify_yara_files,
+                    tree_search_workers,
+                )?;
+                let query_ms = started_query.elapsed().as_secs_f64() * 1000.0;
+                let started_verify = Instant::now();
+                let verification = verify_search_candidates(
+                    &rule,
+                    &plan,
+                    local.hashes,
+                    local.external_ids.unwrap_or_default(),
+                    args.verify_yara_files,
+                )?;
+                let verify_ms = started_verify.elapsed().as_secs_f64() * 1000.0;
+                let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
+                let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
+                Ok(BatchSearchRecord {
+                    rule: rule_name.clone(),
+                    rule_path: rule.display().to_string(),
+                    exit_code: 0,
+                    elapsed_ms_wall: total_ms,
+                    error: None,
+                    candidates: Some(local.total_candidates),
+                    tier_used: Some(local.tier_used),
+                    verified_checked: Some(verification.verified_checked),
+                    verified_matched: Some(verification.verified_matched),
+                    verified_skipped: Some(verification.verified_skipped),
+                    verbose_search_total_ms: Some(total_ms),
+                    verbose_search_plan_ms: Some(plan_ms),
+                    verbose_search_query_ms: Some(query_ms),
+                    verbose_search_verify_ms: Some(verify_ms),
+                    verbose_search_docs_scanned: Some(local.query_profile.docs_scanned),
+                    verbose_search_superblocks_skipped: Some(
+                        local.query_profile.superblocks_skipped,
+                    ),
+                    verbose_search_metadata_loads: Some(local.query_profile.metadata_loads),
+                    verbose_search_metadata_bytes: Some(local.query_profile.metadata_bytes),
+                    verbose_search_tier1_bloom_loads: Some(local.query_profile.tier1_bloom_loads),
+                    verbose_search_tier1_bloom_bytes: Some(local.query_profile.tier1_bloom_bytes),
+                    verbose_search_tier2_bloom_loads: Some(local.query_profile.tier2_bloom_loads),
+                    verbose_search_tier2_bloom_bytes: Some(local.query_profile.tier2_bloom_bytes),
+                    verbose_search_prepared_query_bytes: Some(
+                        prepared_query_profile.prepared_query_bytes,
+                    ),
+                    verbose_search_prepared_pattern_plan_bytes: Some(
+                        prepared_query_profile.prepared_pattern_plan_bytes,
+                    ),
+                    verbose_search_prepared_mask_cache_bytes: Some(
+                        prepared_query_profile.prepared_mask_cache_bytes,
+                    ),
+                    verbose_search_prepared_pattern_count: Some(
+                        prepared_query_profile.pattern_count,
+                    ),
+                    verbose_search_prepared_mask_cache_entries: Some(
+                        prepared_query_profile.mask_cache_entries,
+                    ),
+                    verbose_search_prepared_fixed_literal_count: Some(
+                        prepared_query_profile.fixed_literal_count,
+                    ),
+                    verbose_search_prepared_tier1_alternatives: Some(
+                        prepared_query_profile.tier1_alternatives,
+                    ),
+                    verbose_search_prepared_tier2_alternatives: Some(
+                        prepared_query_profile.tier2_alternatives,
+                    ),
+                    verbose_search_prepared_tier1_shift_variants: Some(
+                        prepared_query_profile.tier1_shift_variants,
+                    ),
+                    verbose_search_prepared_tier2_shift_variants: Some(
+                        prepared_query_profile.tier2_shift_variants,
+                    ),
+                    verbose_search_prepared_tier1_any_lane_alternatives: Some(
+                        prepared_query_profile.tier1_any_lane_alternatives,
+                    ),
+                    verbose_search_prepared_tier2_any_lane_alternatives: Some(
+                        prepared_query_profile.tier2_any_lane_alternatives,
+                    ),
+                    verbose_search_prepared_tier1_compacted_any_lane_alternatives: Some(
+                        prepared_query_profile.tier1_compacted_any_lane_alternatives,
+                    ),
+                    verbose_search_prepared_tier2_compacted_any_lane_alternatives: Some(
+                        prepared_query_profile.tier2_compacted_any_lane_alternatives,
+                    ),
+                    verbose_search_prepared_any_lane_variant_sets: Some(
+                        prepared_query_profile.any_lane_variant_sets,
+                    ),
+                    verbose_search_prepared_compacted_any_lane_grams: Some(
+                        prepared_query_profile.compacted_any_lane_grams,
+                    ),
+                    verbose_search_prepared_max_pattern_bytes: Some(
+                        prepared_query_profile.max_pattern_bytes,
+                    ),
+                    verbose_search_prepared_max_pattern_id: prepared_query_profile.max_pattern_id,
+                    verbose_search_prepared_impossible_query: Some(
+                        prepared_query_profile.impossible_query,
+                    ),
+                    verbose_search_max_candidates: Some(args.max_candidates),
+                    verbose_search_max_anchors_per_pattern: Some(args.max_anchors_per_pattern),
+                    verbose_search_candidates: Some(local.total_candidates),
+                    verbose_search_verify_enabled: Some(args.verify_yara_files),
+                    verbose_search_client_current_rss_kb: Some(client_current_rss_kb),
+                    verbose_search_client_peak_rss_kb: Some(client_peak_rss_kb),
+                    verbose_search_server_current_rss_kb: None,
+                    verbose_search_server_peak_rss_kb: None,
+                    verbose_search_tree_count: Some(tree_count),
+                    verbose_search_tree_search_workers: Some(tree_search_workers),
+                })
+            })() {
+                Ok(record) => record,
+                Err(err) => BatchSearchRecord {
+                    rule: rule_name.clone(),
+                    rule_path: rule.display().to_string(),
+                    exit_code: 1,
+                    elapsed_ms_wall: started_total.elapsed().as_secs_f64() * 1000.0,
+                    error: Some(err.to_string()),
+                    candidates: None,
+                    tier_used: None,
+                    verified_checked: None,
+                    verified_matched: None,
+                    verified_skipped: None,
+                    verbose_search_total_ms: None,
+                    verbose_search_plan_ms: None,
+                    verbose_search_query_ms: None,
+                    verbose_search_verify_ms: None,
+                    verbose_search_docs_scanned: None,
+                    verbose_search_superblocks_skipped: None,
+                    verbose_search_metadata_loads: None,
+                    verbose_search_metadata_bytes: None,
+                    verbose_search_tier1_bloom_loads: None,
+                    verbose_search_tier1_bloom_bytes: None,
+                    verbose_search_tier2_bloom_loads: None,
+                    verbose_search_tier2_bloom_bytes: None,
+                    verbose_search_prepared_query_bytes: None,
+                    verbose_search_prepared_pattern_plan_bytes: None,
+                    verbose_search_prepared_mask_cache_bytes: None,
+                    verbose_search_prepared_pattern_count: None,
+                    verbose_search_prepared_mask_cache_entries: None,
+                    verbose_search_prepared_fixed_literal_count: None,
+                    verbose_search_prepared_tier1_alternatives: None,
+                    verbose_search_prepared_tier2_alternatives: None,
+                    verbose_search_prepared_tier1_shift_variants: None,
+                    verbose_search_prepared_tier2_shift_variants: None,
+                    verbose_search_prepared_tier1_any_lane_alternatives: None,
+                    verbose_search_prepared_tier2_any_lane_alternatives: None,
+                    verbose_search_prepared_tier1_compacted_any_lane_alternatives: None,
+                    verbose_search_prepared_tier2_compacted_any_lane_alternatives: None,
+                    verbose_search_prepared_any_lane_variant_sets: None,
+                    verbose_search_prepared_compacted_any_lane_grams: None,
+                    verbose_search_prepared_max_pattern_bytes: None,
+                    verbose_search_prepared_max_pattern_id: None,
+                    verbose_search_prepared_impossible_query: None,
+                    verbose_search_max_candidates: Some(args.max_candidates),
+                    verbose_search_max_anchors_per_pattern: Some(args.max_anchors_per_pattern),
+                    verbose_search_candidates: None,
+                    verbose_search_verify_enabled: Some(args.verify_yara_files),
+                    verbose_search_client_current_rss_kb: None,
+                    verbose_search_client_peak_rss_kb: None,
+                    verbose_search_server_current_rss_kb: None,
+                    verbose_search_server_peak_rss_kb: None,
+                    verbose_search_tree_count: Some(tree_count),
+                    verbose_search_tree_search_workers: Some(tree_search_workers),
+                },
+            };
+            eprintln!(
+                "search.batch.rule.done rule={} exit={} wall_ms={:.3}",
+                record.rule, record.exit_code, record.elapsed_ms_wall
+            );
+            out.push(record);
+        }
+        fs::write(&args.json_out, serde_json::to_string_pretty(&out)?)?;
+        eprintln!("search.batch.done rules={}", out.len());
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn cmd_info(args: &InfoCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let stats = if args.light {
@@ -3811,6 +4154,7 @@ enum Commands {
     Index(IndexArgs),
     Delete(DeleteArgs),
     Search(SearchCommandArgs),
+    SearchBatch(SearchBatchArgs),
     Info(InfoCommandArgs),
     Shutdown(ShutdownArgs),
     Yara(YaraArgs),
@@ -3892,6 +4236,58 @@ struct SearchCommandArgs {
     verify_yara_files: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SearchBatchArgs {
+    #[arg(
+        long = "root",
+        required = true,
+        help = "Candidate forest root for in-process batch search."
+    )]
+    root: String,
+    #[arg(
+        long = "rules-dir",
+        conflicts_with = "rule_manifest",
+        help = "Directory containing .yar files to search in sorted filename order."
+    )]
+    rules_dir: Option<String>,
+    #[arg(
+        long = "rule-manifest",
+        conflicts_with = "rules_dir",
+        help = "Newline-delimited manifest of rule file paths."
+    )]
+    rule_manifest: Option<String>,
+    #[arg(
+        long = "json-out",
+        required = true,
+        help = "Write batch JSON results to this path."
+    )]
+    json_out: String,
+    #[arg(
+        long = "tree-search-workers",
+        default_value_t = 0,
+        help = "Forest-level tree search workers. 0 means auto up to the tree count."
+    )]
+    tree_search_workers: usize,
+    #[arg(
+        long = "max-anchors-per-pattern",
+        default_value_t = 16,
+        help = "Keep at most this many anchors per pattern alternative."
+    )]
+    max_anchors_per_pattern: usize,
+    #[arg(
+        long = "max-candidates",
+        default_value_t = 15000,
+        help = "Cap on returned candidate set size per rule; 0 means unlimited."
+    )]
+    max_candidates: usize,
+    #[arg(
+        long = "verify",
+        action = ArgAction::SetTrue,
+        help = "Enable local YARA verification over candidate file paths."
+    )]
+    verify_yara_files: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -4178,6 +4574,7 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
         Commands::Index(args) => cmd_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
         Commands::Search(args) => cmd_search(&args),
+        Commands::SearchBatch(args) => cmd_search_batch(&args),
         Commands::Info(args) => cmd_info(&args),
         Commands::Shutdown(args) => cmd_shutdown(&args),
         Commands::Yara(args) => cmd_yara(&args),
