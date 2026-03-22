@@ -166,6 +166,7 @@ Behavior:
 - indexed search now also fails fast on some rule shapes that are structurally unsafe for scalable search:
   - high-fanout unions with no mandatory anchorable pattern
   - low-information `at pe.entry_point` style stub rules that only contribute tiny generic gram anchors
+  - short suffix/range rules where only tiny literals gate `in (filesize-N..filesize)` checks
 - these fail-fast cases are intentional:
   - they preserve recall
   - they prevent large-corpus near-full scans from being treated as “good” searchable rules

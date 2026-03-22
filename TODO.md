@@ -16,6 +16,7 @@ Current pushed baseline:
 - the current explicit fail-fast classes are:
   - high-fanout unions with no mandatory anchorable pattern
   - low-information `at pe.entry_point` style stub rules
+  - short suffix/range rules where only tiny literals gate `in (filesize-N..filesize)` checks
 
 ### Search-memory state
 

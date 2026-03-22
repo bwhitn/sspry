@@ -165,6 +165,7 @@ The planner also now has explicit fail-fast boundaries for structurally bad larg
 
 - high-fanout unions with no mandatory anchorable pattern
 - low-information `verifier_only_at` / entry-point stub rules
+- short range/suffix rules where the only searchable literals are tiny near-EOF anchors
 
 Those are not treated as searchable/good rules because the engine would otherwise be forced into near-full scans or recall-risky heuristics.
 

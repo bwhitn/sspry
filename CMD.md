@@ -163,6 +163,7 @@ Important behavior:
 - some rules are intentionally rejected for scalable indexed search:
   - high-fanout unions with no mandatory anchorable pattern
   - low-information `at pe.entry_point` style stub rules
+  - short suffix/range rules where only tiny literals gate `in (filesize-N..filesize)` checks
 - `--verbose` includes per-rule runtime and prepared-query memory profiling fields
 
 ## `info`

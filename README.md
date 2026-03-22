@@ -64,3 +64,4 @@ If `cargo-llvm-cov` is installed:
 - Search now rejects two important non-scaling-safe rule shapes:
   - high-fanout unions with no mandatory anchorable pattern
   - low-information `at pe.entry_point` style stub rules that only contribute tiny generic gram anchors
+  - short suffix/range rules where only tiny literals gate `in (filesize-N..filesize)` checks

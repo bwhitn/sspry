@@ -27,6 +27,7 @@ Exit criteria:
 Current state:
 - high-fanout union rules with no mandatory anchorable pattern are now rejected up front
 - low-information `at pe.entry_point` stub rules are now rejected up front
+- short suffix/range rules with only tiny near-EOF literals are now rejected up front
 - the next remaining bad family is rules that are still structurally searchable but scan too much of the corpus
 - current evidence says candidate pruning improved first; the next meaningful win has to happen earlier in the scan path
 

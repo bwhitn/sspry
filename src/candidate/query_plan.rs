@@ -3417,6 +3417,10 @@ const MANDATORY_PATTERN_COMBINATION_LIMIT: usize = 4096;
 const LOW_INFORMATION_EP_STUB_PATTERN_LIMIT: usize = 2;
 const LOW_INFORMATION_EP_STUB_MAX_TIER1_GRAMS: usize = 2;
 const LOW_INFORMATION_EP_STUB_MAX_TIER2_GRAMS: usize = 3;
+const LOW_INFORMATION_RANGE_RULE_PATTERN_LIMIT: usize = 3;
+const LOW_INFORMATION_RANGE_RULE_MAX_TIER1_GRAMS: usize = 1;
+const LOW_INFORMATION_RANGE_RULE_MAX_TIER2_GRAMS: usize = 2;
+const LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN: usize = 4;
 
 fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
     pattern.alternatives.iter().any(|alt| !alt.is_empty())
@@ -3429,6 +3433,15 @@ fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
 
 fn pattern_has_anchor_literals(pattern: &PatternPlan) -> bool {
     pattern.anchor_literals.iter().any(|literal| !literal.is_empty())
+}
+
+fn pattern_max_anchor_literal_len(pattern: &PatternPlan) -> usize {
+    pattern
+        .anchor_literals
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
 }
 
 fn pattern_max_tier1_grams(pattern: &PatternPlan) -> usize {
@@ -3672,6 +3685,41 @@ fn reject_low_information_entrypoint_stub(root: &QueryNode, patterns: &[PatternP
     }
     Err(SspryError::from(
         "Rule is overbroad for scalable search: entry-point stub provides only low-information gram anchors. Add a longer mandatory literal or split the rule.",
+    ))
+}
+
+fn reject_low_information_range_rule(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
+    if patterns.is_empty()
+        || !node_contains_kind(root, "verifier_only_in_range")
+        || patterns.len() > LOW_INFORMATION_RANGE_RULE_PATTERN_LIMIT
+        || patterns.len() < 2
+        || !node_contains_kind(root, "verifier_only_at")
+    {
+        return Ok(());
+    }
+    let max_anchor_len = patterns
+        .iter()
+        .map(pattern_max_anchor_literal_len)
+        .max()
+        .unwrap_or(0);
+    let max_tier1 = patterns
+        .iter()
+        .map(pattern_max_tier1_grams)
+        .max()
+        .unwrap_or(0);
+    let max_tier2 = patterns
+        .iter()
+        .map(pattern_max_tier2_grams)
+        .max()
+        .unwrap_or(0);
+    if max_anchor_len > LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN
+        || max_tier1 > LOW_INFORMATION_RANGE_RULE_MAX_TIER1_GRAMS
+        || max_tier2 > LOW_INFORMATION_RANGE_RULE_MAX_TIER2_GRAMS
+    {
+        return Ok(());
+    }
+    Err(SspryError::from(
+        "Rule is overbroad for scalable search: short range/suffix anchors are too weak at scale. Add a longer mandatory literal or split the rule.",
     ))
 }
 
@@ -4690,6 +4738,7 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     }
     reject_overbroad_pattern_union(&root, &patterns)?;
     reject_low_information_entrypoint_stub(&root, &patterns)?;
+    reject_low_information_range_rule(&root, &patterns)?;
     Ok(CompiledQueryPlan {
         patterns,
         root,
@@ -6853,4 +6902,45 @@ rule stronger_entrypoint_anchor {
         )
         .expect("stronger entrypoint anchor should compile");
     }
+
+    #[test]
+    fn low_information_range_rule_is_rejected() {
+        let err = compile_query_plan_default(
+            r#"
+rule low_information_range_rule {
+  strings:
+    $hdr = { 50 4B 03 04 }
+    $ext = ".js" nocase
+  condition:
+    $hdr at 0 and $ext in (filesize-100..filesize)
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect_err("low-information range rule should fail");
+        assert!(err
+            .to_string()
+            .contains("short range/suffix anchors are too weak at scale"));
+
+        compile_query_plan_default(
+            r#"
+rule stronger_range_rule {
+  strings:
+    $hdr = { 50 4B 03 04 }
+    $ext = ".download-javascript-payload.js" nocase
+  condition:
+    $hdr at 0 and $ext in (filesize-100..filesize)
+}
+"#,
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("stronger range rule should compile");
+    }
+
 }
