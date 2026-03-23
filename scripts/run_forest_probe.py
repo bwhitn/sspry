@@ -625,6 +625,7 @@ def main() -> int:
     parser.add_argument('--disable-pattern-superblocks', action='store_true')
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--index-workers', type=int, default=0)
+    parser.add_argument('--collect-perf', action='store_true')
     parser.add_argument('--index-mode', choices=('server', 'local-root'), default='server')
     parser.add_argument('--tree-search-workers', type=int, default=0)
     parser.add_argument('--search-timeout-s', type=int, default=100)
@@ -751,14 +752,17 @@ def main() -> int:
             if init_proc.returncode != 0:
                 raise RuntimeError(f'init failed for {tree_name} with exit {init_proc.returncode}')
             started = time.monotonic()
+            index_cmd = [
+                str(sspry),
+                'index', '--root', str(current_root), '--path-list', str(manifest['path']),
+                '--batch-size', '64',
+                *(['--workers', str(args.index_workers)] if args.index_workers else []),
+                '--verbose',
+            ]
+            if args.collect_perf:
+                index_cmd[1:1] = ['--perf-report', str(tree_run_dir / 'index.perf.json')]
             proc = run(
-                [
-                    str(sspry), '--perf-report', str(tree_run_dir / 'index.perf.json'),
-                    'index', '--root', str(current_root), '--path-list', str(manifest['path']),
-                    '--batch-size', '64',
-                    *(['--workers', str(args.index_workers)] if args.index_workers else []),
-                    '--verbose',
-                ],
+                index_cmd,
                 stdout=(tree_run_dir / 'index.stdout').open('w'),
                 stderr=(tree_run_dir / 'index.stderr').open('w'),
             )
@@ -818,13 +822,16 @@ def main() -> int:
                     args.server_sample_interval_s,
                 )
             started = time.monotonic()
+            index_cmd = [
+                str(sspry),
+                'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64',
+                *(['--workers', str(args.index_workers)] if args.index_workers else []),
+                '--verbose',
+            ]
+            if args.collect_perf:
+                index_cmd[1:1] = ['--perf-report', str(tree_run_dir / 'index.perf.json')]
             proc = run(
-                [
-                    str(sspry), '--perf-report', str(tree_run_dir / 'index.perf.json'),
-                    'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64',
-                    *(['--workers', str(args.index_workers)] if args.index_workers else []),
-                    '--verbose',
-                ],
+                index_cmd,
                 stdout=(tree_run_dir / 'index.stdout').open('w'),
                 stderr=(tree_run_dir / 'index.stderr').open('w'),
             )

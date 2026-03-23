@@ -2588,6 +2588,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     let started_scan = Instant::now();
                     pending.push(scan_index_batch_row(&file_path, policy)?);
                     scan_time += started_scan.elapsed();
+                    maybe_report_index_progress(
+                        show_progress,
+                        processed.saturating_add(pending.len()),
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        false,
+                    );
                     if pending.len() >= batch_size {
                         flush_local_pending_rows(
                             &mut stores,
@@ -2658,6 +2666,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         received = received.saturating_add(1);
                         scan_time += scanned.scan_elapsed;
                         pending.push(scanned.row);
+                        maybe_report_index_progress(
+                            show_progress,
+                            processed.saturating_add(pending.len()),
+                            total_files,
+                            &mut last_progress_reported,
+                            &mut last_progress_at,
+                            false,
+                        );
                         if pending.len() >= batch_size {
                             flush_local_pending_rows(
                                 &mut stores,
@@ -2721,11 +2737,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 id_source: server_policy.id_source,
             };
             let base_client = rpc_client(&args.connection);
-            let mut client = base_client.connect_persistent()?;
-            client.begin_index_session()?;
-            let started_progress_rpc = Instant::now();
-            client.update_index_session_progress(Some(total_files), 0, 0)?;
-            progress_rpc_time += started_progress_rpc.elapsed();
             let configured_budget_bytes = server_policy.memory_budget_bytes;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
             let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
@@ -2741,115 +2752,25 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let mut session_submitted_documents = 0usize;
             let mut session_submitted_input_bytes = 0u64;
             let mut session_publish_rotations = 0usize;
+            base_client.begin_index_client()?;
             let remote_result = (|| -> Result<()> {
-                if workers <= 1 {
-                    stream_selected_input_files(&input_roots, args.path_list, |file_path| {
-                        let started_scan = Instant::now();
-                        let scanned = scan_index_batch_row(&file_path, policy)?;
-                        scan_time += started_scan.elapsed();
-                        session_submitted_documents = session_submitted_documents.saturating_add(1);
-                        session_submitted_input_bytes =
-                            session_submitted_input_bytes.saturating_add(scanned.file_size);
-                        let started_encode = Instant::now();
-                        let row = batch_row_to_wire(scanned);
-                        encode_time += started_encode.elapsed();
-                        client_buffer_time += push_remote_batch_row(
-                            &mut client,
-                            &mut pending,
-                            row,
-                            batch_size,
-                            &mut processed,
-                            &mut submit_time,
-                            show_progress,
-                            total_files,
-                            &mut last_progress_reported,
-                            &mut last_progress_at,
-                            empty_payload_size,
-                        )?;
-                        if session_submitted_documents >= remote_session_document_limit
-                            || session_submitted_input_bytes >= remote_session_input_bytes_limit
-                        {
-                            rotate_remote_index_session(
-                                &base_client,
-                                &mut client,
-                                &mut pending,
-                                &mut processed,
-                                &mut submit_time,
-                                show_progress,
-                                total_files,
-                                &mut last_progress_reported,
-                                &mut last_progress_at,
-                                empty_payload_size,
-                                &mut progress_rpc_time,
-                            )?;
-                            session_submitted_documents = 0;
-                            session_submitted_input_bytes = 0;
-                            session_publish_rotations = session_publish_rotations.saturating_add(1);
-                        }
-                        Ok(())
-                    })?;
-                } else {
-                    let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
-                    let (result_tx, result_rx) =
-                        bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
-                    let worker_count = workers;
-                    thread::scope(|scope| {
-                        for _ in 0..worker_count {
-                            let job_rx = job_rx.clone();
-                            let result_tx = result_tx.clone();
-                            scope.spawn(move || {
-                                for file_path in job_rx.iter() {
-                                    let started_scan = Instant::now();
-                                    let result =
-                                        scan_index_batch_row(&file_path, policy).map(|row| {
-                                            ScannedIndexBatchRow {
-                                                row,
-                                                scan_elapsed: started_scan.elapsed(),
-                                            }
-                                        });
-                                    let _ = result_tx.send(result);
-                                }
-                            });
-                        }
-                        let producer_tx = job_tx.clone();
-                        let producer_result_tx = result_tx.clone();
-                        let producer_roots = input_roots.clone();
-                        let producer_path_list = args.path_list;
-                        scope.spawn(move || {
-                            let produce = stream_selected_input_files(
-                                &producer_roots,
-                                producer_path_list,
-                                |file_path| {
-                                    producer_tx.send(file_path).map_err(|_| {
-                                    SspryError::from(
-                                        "candidate ingest file producer terminated unexpectedly",
-                                    )
-                                })?;
-                                    Ok(())
-                                },
-                            );
-                            if let Err(err) = produce {
-                                let _ = producer_result_tx.send(Err(err));
-                            }
-                            drop(producer_tx);
-                        });
-
-                        drop(job_tx);
-                        drop(result_tx);
-
-                        let mut received = 0usize;
-                        while let Ok(scanned) = result_rx.recv() {
-                            let started_wait = Instant::now();
-                            result_wait_time += started_wait.elapsed();
-                            let scanned = scanned?;
-                            received = received.saturating_add(1);
-                            scan_time += scanned.scan_elapsed;
+                let mut client = base_client.connect_persistent()?;
+                client.begin_index_session()?;
+                let started_progress_rpc = Instant::now();
+                client.update_index_session_progress(Some(total_files), 0, 0)?;
+                progress_rpc_time += started_progress_rpc.elapsed();
+                let body_result = (|| -> Result<()> {
+                    if workers <= 1 {
+                        stream_selected_input_files(&input_roots, args.path_list, |file_path| {
+                            let started_scan = Instant::now();
+                            let scanned = scan_index_batch_row(&file_path, policy)?;
+                            scan_time += started_scan.elapsed();
                             session_submitted_documents =
                                 session_submitted_documents.saturating_add(1);
                             session_submitted_input_bytes =
-                                session_submitted_input_bytes.saturating_add(scanned.row.file_size);
+                                session_submitted_input_bytes.saturating_add(scanned.file_size);
                             let started_encode = Instant::now();
-                            let row = batch_row_to_wire(scanned.row);
+                            let row = batch_row_to_wire(scanned);
                             encode_time += started_encode.elapsed();
                             client_buffer_time += push_remote_batch_row(
                                 &mut client,
@@ -2864,6 +2785,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 &mut last_progress_at,
                                 empty_payload_size,
                             )?;
+                            maybe_report_index_progress(
+                                show_progress,
+                                processed.saturating_add(pending.rows.len()),
+                                total_files,
+                                &mut last_progress_reported,
+                                &mut last_progress_at,
+                                false,
+                            );
                             if session_submitted_documents >= remote_session_document_limit
                                 || session_submitted_input_bytes >= remote_session_input_bytes_limit
                             {
@@ -2885,32 +2814,145 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 session_publish_rotations =
                                     session_publish_rotations.saturating_add(1);
                             }
-                        }
-                        if received != total_files {
-                            return Err(SspryError::from(format!(
-                                "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
-                            )));
-                        }
-                        Ok::<(), SspryError>(())
-                    })?;
-                }
+                            Ok(())
+                        })?;
+                    } else {
+                        let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                        let (result_tx, result_rx) =
+                            bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
+                        let worker_count = workers;
+                        thread::scope(|scope| {
+                            for _ in 0..worker_count {
+                                let job_rx = job_rx.clone();
+                                let result_tx = result_tx.clone();
+                                scope.spawn(move || {
+                                    for file_path in job_rx.iter() {
+                                        let started_scan = Instant::now();
+                                        let result =
+                                            scan_index_batch_row(&file_path, policy).map(|row| {
+                                                ScannedIndexBatchRow {
+                                                    row,
+                                                    scan_elapsed: started_scan.elapsed(),
+                                                }
+                                            });
+                                        let _ = result_tx.send(result);
+                                    }
+                                });
+                            }
+                            let producer_tx = job_tx.clone();
+                            let producer_result_tx = result_tx.clone();
+                            let producer_roots = input_roots.clone();
+                            let producer_path_list = args.path_list;
+                            scope.spawn(move || {
+                                let produce = stream_selected_input_files(
+                                    &producer_roots,
+                                    producer_path_list,
+                                    |file_path| {
+                                        producer_tx.send(file_path).map_err(|_| {
+                                            SspryError::from(
+                                                "candidate ingest file producer terminated unexpectedly",
+                                            )
+                                        })?;
+                                        Ok(())
+                                    },
+                                );
+                                if let Err(err) = produce {
+                                    let _ = producer_result_tx.send(Err(err));
+                                }
+                                drop(producer_tx);
+                            });
 
-                flush_remote_pending_rows(
-                    &mut client,
-                    &mut pending,
-                    &mut processed,
-                    &mut submit_time,
-                    show_progress,
-                    total_files,
-                    &mut last_progress_reported,
-                    &mut last_progress_at,
-                    empty_payload_size,
-                )?;
+                            drop(job_tx);
+                            drop(result_tx);
+
+                            let mut received = 0usize;
+                            while let Ok(scanned) = result_rx.recv() {
+                                let started_wait = Instant::now();
+                                result_wait_time += started_wait.elapsed();
+                                let scanned = scanned?;
+                                received = received.saturating_add(1);
+                                scan_time += scanned.scan_elapsed;
+                                session_submitted_documents =
+                                    session_submitted_documents.saturating_add(1);
+                                session_submitted_input_bytes = session_submitted_input_bytes
+                                    .saturating_add(scanned.row.file_size);
+                                let started_encode = Instant::now();
+                                let row = batch_row_to_wire(scanned.row);
+                                encode_time += started_encode.elapsed();
+                                client_buffer_time += push_remote_batch_row(
+                                    &mut client,
+                                    &mut pending,
+                                    row,
+                                    batch_size,
+                                    &mut processed,
+                                    &mut submit_time,
+                                    show_progress,
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    empty_payload_size,
+                                )?;
+                                maybe_report_index_progress(
+                                    show_progress,
+                                    processed.saturating_add(pending.rows.len()),
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    false,
+                                );
+                                if session_submitted_documents >= remote_session_document_limit
+                                    || session_submitted_input_bytes
+                                        >= remote_session_input_bytes_limit
+                                {
+                                    rotate_remote_index_session(
+                                        &base_client,
+                                        &mut client,
+                                        &mut pending,
+                                        &mut processed,
+                                        &mut submit_time,
+                                        show_progress,
+                                        total_files,
+                                        &mut last_progress_reported,
+                                        &mut last_progress_at,
+                                        empty_payload_size,
+                                        &mut progress_rpc_time,
+                                    )?;
+                                    session_submitted_documents = 0;
+                                    session_submitted_input_bytes = 0;
+                                    session_publish_rotations =
+                                        session_publish_rotations.saturating_add(1);
+                                }
+                            }
+                            if received != total_files {
+                                return Err(SspryError::from(format!(
+                                    "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
+                                )));
+                            }
+                            Ok::<(), SspryError>(())
+                        })?;
+                    }
+
+                    flush_remote_pending_rows(
+                        &mut client,
+                        &mut pending,
+                        &mut processed,
+                        &mut submit_time,
+                        show_progress,
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        empty_payload_size,
+                    )?;
+                    Ok(())
+                })();
+                let end_session_result = client.end_index_session();
+                body_result?;
+                end_session_result?;
                 Ok(())
             })();
-            let end_session_result = client.end_index_session();
+            let end_client_result = base_client.end_index_client();
             remote_result?;
-            end_session_result?;
+            end_client_result?;
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");

@@ -57,6 +57,8 @@ const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
 const ACTION_INDEX_SESSION_END: u8 = 11;
 const ACTION_INDEX_SESSION_PROGRESS: u8 = 12;
 const ACTION_CANDIDATE_STATUS: u8 = 13;
+const ACTION_INDEX_CLIENT_BEGIN: u8 = 14;
+const ACTION_INDEX_CLIENT_END: u8 = 15;
 const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 
@@ -376,6 +378,7 @@ struct ServerState {
     mutations_paused: AtomicBool,
     publish_in_progress: AtomicBool,
     active_mutations: AtomicUsize,
+    active_index_clients: AtomicUsize,
     active_index_sessions: AtomicUsize,
     work_dirty: AtomicBool,
     work_active_estimated_documents: AtomicU64,
@@ -983,6 +986,12 @@ impl SspryClient {
         Ok(response.message)
     }
 
+    pub fn begin_index_client(&self) -> Result<String> {
+        let response: CandidateIndexSessionResponse =
+            self.request_typed_json(ACTION_INDEX_CLIENT_BEGIN, &json!({}))?;
+        Ok(response.message)
+    }
+
     pub fn update_index_session_progress(
         &self,
         total_documents: Option<usize>,
@@ -1003,6 +1012,12 @@ impl SspryClient {
     pub fn end_index_session(&self) -> Result<String> {
         let response: CandidateIndexSessionResponse =
             self.request_typed_json(ACTION_INDEX_SESSION_END, &json!({}))?;
+        Ok(response.message)
+    }
+
+    pub fn end_index_client(&self) -> Result<String> {
+        let response: CandidateIndexSessionResponse =
+            self.request_typed_json(ACTION_INDEX_CLIENT_END, &json!({}))?;
         Ok(response.message)
     }
 
@@ -1761,6 +1776,7 @@ impl ServerState {
             mutations_paused: AtomicBool::new(false),
             publish_in_progress: AtomicBool::new(false),
             active_mutations: AtomicUsize::new(0),
+            active_index_clients: AtomicUsize::new(0),
             active_index_sessions: AtomicUsize::new(0),
             work_dirty: AtomicBool::new(false),
             work_active_estimated_documents: AtomicU64::new(startup_work_documents),
@@ -2021,11 +2037,12 @@ impl ServerState {
         let estimated_input_bytes = self
             .work_active_estimated_input_bytes
             .load(Ordering::Acquire);
+        let active_index_clients = self.active_index_clients.load(Ordering::Acquire);
         let active_index_sessions = self.active_index_sessions.load(Ordering::Acquire);
         let publish_runs_total = self.publish_runs_total.load(Ordering::Acquire);
         let mut document_threshold = self.work_buffer_document_threshold();
         let mut input_bytes_threshold = self.work_buffer_input_bytes_threshold();
-        if active_index_sessions > 0 && publish_runs_total > 0 {
+        if (active_index_clients > 0 || active_index_sessions > 0) && publish_runs_total > 0 {
             document_threshold =
                 document_threshold.min(WORK_BUFFER_REPUBLISH_MAX_DOCUMENT_THRESHOLD);
             input_bytes_threshold = input_bytes_threshold.min(
@@ -2386,6 +2403,28 @@ impl ServerState {
         }
     }
 
+    fn handle_begin_index_client(&self) -> Result<CandidateIndexSessionResponse> {
+        if self.publish_requested.load(Ordering::Acquire)
+            || self.publish_in_progress.load(Ordering::Acquire)
+            || self.mutations_paused.load(Ordering::Acquire)
+        {
+            return Err(SspryError::from(
+                "server is publishing; index client unavailable; retry later",
+            ));
+        }
+        match self
+            .active_index_clients
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Ok(CandidateIndexSessionResponse {
+                message: "index client started".to_owned(),
+            }),
+            Err(_) => Err(SspryError::from(
+                "another index client is already active; retry later",
+            )),
+        }
+    }
+
     fn handle_update_index_session_progress(
         &self,
         request: &CandidateIndexSessionProgressRequest,
@@ -2539,6 +2578,18 @@ impl ServerState {
         let _ = self.update_adaptive_publish_from_index_session();
         Ok(CandidateIndexSessionResponse {
             message: "index session finished".to_owned(),
+        })
+    }
+
+    fn handle_end_index_client(&self) -> Result<CandidateIndexSessionResponse> {
+        let previous = self.active_index_clients.swap(0, Ordering::SeqCst);
+        if previous == 0 {
+            return Ok(CandidateIndexSessionResponse {
+                message: "no active index client".to_owned(),
+            });
+        }
+        Ok(CandidateIndexSessionResponse {
+            message: "index client finished".to_owned(),
         })
     }
 
@@ -2696,6 +2747,7 @@ impl ServerState {
         let publish_requested = self.publish_requested.load(Ordering::Acquire);
         let publish_in_progress = self.publish_in_progress.load(Ordering::Acquire);
         let mutations_paused = self.mutations_paused.load(Ordering::Acquire);
+        let active_index_clients = self.active_index_clients.load(Ordering::Acquire);
         let active_index_sessions = self.active_index_sessions.load(Ordering::Acquire);
         let active_mutations = self.active_mutations.load(Ordering::Acquire);
         let last_mutation = self.last_work_mutation_unix_ms.load(Ordering::Acquire);
@@ -2717,6 +2769,7 @@ impl ServerState {
         );
         let idle_eligible = self.config.workspace_mode
             && work_dirty
+            && active_index_clients == 0
             && active_index_sessions == 0
             && active_mutations == 0
             && !publish_requested
@@ -2737,6 +2790,8 @@ impl ServerState {
             "publish_in_progress"
         } else if mutations_paused {
             "mutations_paused"
+        } else if active_index_clients > 0 {
+            "active_index_clients"
         } else if active_index_sessions > 0 {
             "active_index_sessions"
         } else if active_mutations > 0 {
@@ -2780,6 +2835,7 @@ impl ServerState {
 
     fn run_retired_root_prune_cycle(&self) -> Result<()> {
         if self.publish_in_progress.load(Ordering::Acquire)
+            || self.active_index_clients.load(Ordering::Acquire) > 0
             || self.active_index_sessions.load(Ordering::Acquire) > 0
             || self.active_mutations.load(Ordering::Acquire) > 0
         {
@@ -2938,6 +2994,10 @@ impl ServerState {
             json!(self.publish_in_progress.load(Ordering::Acquire)),
         );
         stats.insert(
+            "active_index_clients".to_owned(),
+            json!(self.active_index_clients.load(Ordering::Acquire)),
+        );
+        stats.insert(
             "active_index_sessions".to_owned(),
             json!(self.active_index_sessions.load(Ordering::Acquire)),
         );
@@ -3022,6 +3082,10 @@ impl ServerState {
         };
         let index_server_insert_batch_profile = self.index_server_insert_batch_profile_json();
         let mut index_session = Map::new();
+        index_session.insert(
+            "client_active".to_owned(),
+            json!(self.active_index_clients.load(Ordering::Acquire) > 0),
+        );
         index_session.insert(
             "active".to_owned(),
             json!(self.active_index_sessions.load(Ordering::Acquire) > 0),
@@ -3556,6 +3620,10 @@ impl ServerState {
             json!(self.publish_in_progress.load(Ordering::Acquire)),
         );
         stats.insert(
+            "active_index_clients".to_owned(),
+            json!(self.active_index_clients.load(Ordering::Acquire)),
+        );
+        stats.insert(
             "active_index_sessions".to_owned(),
             json!(self.active_index_sessions.load(Ordering::Acquire)),
         );
@@ -3644,6 +3712,7 @@ impl ServerState {
             "index_session".to_owned(),
             json!({
                 "active": self.active_index_sessions.load(Ordering::Acquire) > 0,
+                "client_active": self.active_index_clients.load(Ordering::Acquire) > 0,
                 "total_documents": index_total_documents,
                 "submitted_documents": index_submitted_documents,
                 "processed_documents": index_processed_documents,
@@ -4368,6 +4437,8 @@ impl ServerState {
                 ACTION_CANDIDATE_INSERT
                     | ACTION_CANDIDATE_INSERT_BATCH
                     | ACTION_CANDIDATE_DELETE
+                    | ACTION_INDEX_CLIENT_BEGIN
+                    | ACTION_INDEX_CLIENT_END
                     | ACTION_INDEX_SESSION_BEGIN
                     | ACTION_INDEX_SESSION_PROGRESS
                     | ACTION_PUBLISH
@@ -4379,6 +4450,8 @@ impl ServerState {
         }
         match action {
             ACTION_PING => json_bytes(&json!({ "message": "pong" })),
+            ACTION_INDEX_CLIENT_BEGIN => json_bytes(&self.handle_begin_index_client()?),
+            ACTION_INDEX_CLIENT_END => json_bytes(&self.handle_end_index_client()?),
             ACTION_INDEX_SESSION_BEGIN => json_bytes(&self.handle_begin_index_session()?),
             ACTION_INDEX_SESSION_END => json_bytes(&self.handle_end_index_session()?),
             ACTION_INDEX_SESSION_PROGRESS => {
