@@ -1351,25 +1351,21 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.retired_generation_count)
         .sum::<usize>();
-    let tier2_superblock_summary_bytes = stats_rows
-        .iter()
-        .map(|item| item.tier2_superblock_summary_bytes)
-        .sum::<u64>();
     let tier1_superblock_summary_bytes = stats_rows
         .iter()
         .map(|item| item.tier1_superblock_summary_bytes)
         .sum::<u64>();
-    let tier2_pattern_superblock_summary_bytes = stats_rows
+    let tier2_superblock_summary_bytes = stats_rows
         .iter()
-        .map(|item| item.tier2_pattern_superblock_summary_bytes)
+        .map(|item| item.tier2_superblock_summary_bytes)
         .sum::<u64>();
     let tier1_superblock_positions_bytes = stats_rows
         .iter()
         .map(|item| item.tier1_superblock_positions_bytes)
         .sum::<u64>();
-    let tier2_pattern_superblock_positions_bytes = stats_rows
+    let tier2_superblock_positions_bytes = stats_rows
         .iter()
-        .map(|item| item.tier2_pattern_superblock_positions_bytes)
+        .map(|item| item.tier2_superblock_positions_bytes)
         .sum::<u64>();
     let tree_tier1_gate_bytes = stats_rows
         .iter()
@@ -1457,24 +1453,20 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert("store_path".to_owned(), json!(stats.store_path));
     out.insert("deleted_doc_count".to_owned(), json!(deleted_doc_count));
     out.insert(
-        "tier2_superblock_summary_bytes".to_owned(),
-        json!(tier2_superblock_summary_bytes),
-    );
-    out.insert(
         "tier1_superblock_summary_bytes".to_owned(),
         json!(tier1_superblock_summary_bytes),
     );
     out.insert(
-        "tier2_pattern_superblock_summary_bytes".to_owned(),
-        json!(tier2_pattern_superblock_summary_bytes),
+        "tier2_superblock_summary_bytes".to_owned(),
+        json!(tier2_superblock_summary_bytes),
     );
     out.insert(
         "tier1_superblock_positions_bytes".to_owned(),
         json!(tier1_superblock_positions_bytes),
     );
     out.insert(
-        "tier2_pattern_superblock_positions_bytes".to_owned(),
-        json!(tier2_pattern_superblock_positions_bytes),
+        "tier2_superblock_positions_bytes".to_owned(),
+        json!(tier2_superblock_positions_bytes),
     );
     out.insert(
         "tree_tier1_gate_bytes".to_owned(),
@@ -1563,13 +1555,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
             .map(Value::from)
             .unwrap_or(Value::Null),
     );
-    out.insert(
-        "filter_target_fp".to_owned(),
-        stats
-            .filter_target_fp
-            .map(Value::from)
-            .unwrap_or(Value::Null),
-    );
     out.insert("tier2_gram_size".to_owned(), json!(stats.tier2_gram_size));
     out.insert("tier1_gram_size".to_owned(), json!(stats.tier1_gram_size));
     out.insert("query_count".to_owned(), json!(stats.query_count));
@@ -1592,12 +1577,12 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert("tier2_superblock_adaptive".to_owned(), json!(false));
     out.insert("tier2_superblock_adapt_interval_scans".to_owned(), json!(0));
     out.insert(
-        "tier2_superblock_count".to_owned(),
-        json!(stats.tier2_superblock_count),
+        "tier1_superblock_count".to_owned(),
+        json!(stats.tier1_superblock_count),
     );
     out.insert(
-        "tier2_superblock_docs".to_owned(),
-        json!(stats.tier2_superblock_docs),
+        "tier1_superblock_docs".to_owned(),
+        json!(stats.tier1_superblock_docs),
     );
     out.insert(
         "tier2_superblocks_skipped_total".to_owned(),
@@ -2270,7 +2255,7 @@ impl ServerState {
             match store_lock.try_lock() {
                 Ok(store) => {
                     store.remove_tree_gate_snapshots()?;
-                    store.persist_tier2_superblocks_snapshot()?;
+                    store.persist_superblock_snapshots()?;
                     Ok((1, 0))
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -7888,10 +7873,7 @@ rule overflow_rule {
             stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
             Some(0.35)
         );
-        assert_eq!(
-            stats.get("filter_target_fp").and_then(Value::as_f64),
-            Some(0.35)
-        );
+        assert_eq!(stats.get("filter_target_fp"), None);
     }
 
     #[test]

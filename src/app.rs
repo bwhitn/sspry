@@ -1376,8 +1376,9 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
 }
 
 fn ensure_store(config: CandidateConfig, force: bool) -> Result<CandidateStore> {
-    let meta_path = config.root.join("meta.json");
-    if force || !meta_path.exists() {
+    let local_meta_path = config.root.join("store_meta.json");
+    let legacy_meta_path = config.root.join("meta.json");
+    if force || (!local_meta_path.exists() && !legacy_meta_path.exists()) {
         return CandidateStore::init(config, force);
     }
     CandidateStore::open(config.root)
@@ -2379,13 +2380,15 @@ fn cmd_init(args: &InitArgs) -> i32 {
                 )));
             }
 
-            let meta_path = root.join("meta.json");
-            let first_meta = root.join("shard_000").join("meta.json");
-            if shard_count == 1 && meta_path.exists() {
+            let local_meta_path = root.join("store_meta.json");
+            let legacy_meta_path = root.join("meta.json");
+            let first_local_meta = root.join("shard_000").join("store_meta.json");
+            let first_legacy_meta = root.join("shard_000").join("meta.json");
+            if shard_count == 1 && (local_meta_path.exists() || legacy_meta_path.exists()) {
                 println!("Candidate store already initialized at {}", args.root);
                 return Ok(0);
             }
-            if shard_count > 1 && first_meta.exists() {
+            if shard_count > 1 && (first_local_meta.exists() || first_legacy_meta.exists()) {
                 println!(
                     "Candidate store already initialized at {} with {} shard(s)",
                     args.root, shard_count
@@ -2683,6 +2686,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 &mut last_progress_reported,
                 &mut last_progress_at,
             )?;
+            for store in &mut stores {
+                let _ = store.persist_meta_if_dirty()?;
+                store.persist_superblock_snapshots()?;
+            }
 
             if args.verbose {
                 eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
@@ -2975,6 +2982,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 for (key, label) in [
                     ("disk_usage_bytes", "verbose.index.server_disk_usage_bytes"),
                     (
+                        "tier1_superblock_summary_bytes",
+                        "verbose.index.server_tier1_superblock_summary_bytes",
+                    ),
+                    (
                         "tier2_superblock_summary_bytes",
                         "verbose.index.server_tier2_superblock_summary_bytes",
                     ),
@@ -2983,8 +2994,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         "verbose.index.server_tier2_superblock_budget_bytes",
                     ),
                     (
-                        "tier2_superblock_docs",
-                        "verbose.index.server_tier2_superblock_docs_per_block",
+                        "tier1_superblock_docs",
+                        "verbose.index.server_tier1_superblock_docs_per_block",
                     ),
                 ] {
                     if let Some(value) = stats_scope.get(key).and_then(|value| value.as_u64()) {

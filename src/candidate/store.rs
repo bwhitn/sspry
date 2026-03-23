@@ -316,7 +316,6 @@ pub struct CandidateStats {
     pub store_path: bool,
     pub tier1_filter_target_fp: Option<f64>,
     pub tier2_filter_target_fp: Option<f64>,
-    pub filter_target_fp: Option<f64>,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
     pub compaction_idle_cooldown_s: f64,
@@ -329,13 +328,12 @@ pub struct CandidateStats {
     pub tier2_docs_matched_total: u64,
     pub tier2_superblocks_skipped_total: u64,
     pub tier2_match_ratio: f64,
-    pub tier2_superblock_count: usize,
-    pub tier2_superblock_docs: usize,
-    pub tier2_superblock_summary_bytes: u64,
+    pub tier1_superblock_count: usize,
+    pub tier1_superblock_docs: usize,
     pub tier1_superblock_summary_bytes: u64,
-    pub tier2_pattern_superblock_summary_bytes: u64,
+    pub tier2_superblock_summary_bytes: u64,
     pub tier1_superblock_positions_bytes: u64,
-    pub tier2_pattern_superblock_positions_bytes: u64,
+    pub tier2_superblock_positions_bytes: u64,
     pub tree_tier1_gate_bytes: u64,
     pub tree_tier2_gate_bytes: u64,
     pub superblock_summary_bytes_total: u64,
@@ -359,7 +357,28 @@ pub struct CandidateStats {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-struct StoreMeta {
+struct ForestMeta {
+    version: u32,
+    id_source: String,
+    store_path: bool,
+    tier2_gram_size: usize,
+    tier1_gram_size: usize,
+    tier2_superblock_summary_cap_bytes: usize,
+    tier1_filter_target_fp: Option<f64>,
+    tier2_filter_target_fp: Option<f64>,
+    compaction_idle_cooldown_s: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct StoreLocalMeta {
+    version: u32,
+    next_doc_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct LegacyStoreMeta {
     version: u32,
     next_doc_id: u64,
     id_source: String,
@@ -389,7 +408,32 @@ impl Default for ShardCompactionManifest {
     }
 }
 
-impl Default for StoreMeta {
+impl Default for ForestMeta {
+    fn default() -> Self {
+        Self {
+            version: STORE_VERSION,
+            id_source: "sha256".to_owned(),
+            store_path: false,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+            tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+            tier1_filter_target_fp: Some(0.35),
+            tier2_filter_target_fp: Some(0.35),
+            compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
+        }
+    }
+}
+
+impl Default for StoreLocalMeta {
+    fn default() -> Self {
+        Self {
+            version: STORE_VERSION,
+            next_doc_id: 1,
+        }
+    }
+}
+
+impl Default for LegacyStoreMeta {
     fn default() -> Self {
         Self {
             version: STORE_VERSION,
@@ -407,13 +451,38 @@ impl Default for StoreMeta {
     }
 }
 
-impl StoreMeta {
+impl ForestMeta {
     fn resolved_tier1_filter_target_fp(&self) -> Option<f64> {
-        self.tier1_filter_target_fp.or(self.filter_target_fp)
+        self.tier1_filter_target_fp
     }
 
     fn resolved_tier2_filter_target_fp(&self) -> Option<f64> {
-        self.tier2_filter_target_fp.or(self.filter_target_fp)
+        self.tier2_filter_target_fp
+    }
+}
+
+impl From<&LegacyStoreMeta> for ForestMeta {
+    fn from(value: &LegacyStoreMeta) -> Self {
+        Self {
+            version: value.version,
+            id_source: value.id_source.clone(),
+            store_path: value.store_path,
+            tier2_gram_size: value.tier2_gram_size,
+            tier1_gram_size: value.tier1_gram_size,
+            tier2_superblock_summary_cap_bytes: value.tier2_superblock_summary_cap_bytes,
+            tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
+            tier2_filter_target_fp: value.tier2_filter_target_fp.or(value.filter_target_fp),
+            compaction_idle_cooldown_s: value.compaction_idle_cooldown_s,
+        }
+    }
+}
+
+impl From<&LegacyStoreMeta> for StoreLocalMeta {
+    fn from(value: &LegacyStoreMeta) -> Self {
+        Self {
+            version: value.version,
+            next_doc_id: value.next_doc_id,
+        }
     }
 }
 
@@ -912,7 +981,7 @@ impl TreeBloomGateIndex {
 #[derive(Clone, Debug)]
 pub(crate) struct CandidateCompactionSnapshot {
     root: PathBuf,
-    meta: StoreMeta,
+    meta: ForestMeta,
     mutation_counter: u64,
     current_generation: u64,
     live_docs: Vec<CompactionDocRef>,
@@ -1213,7 +1282,8 @@ fn update_tree_gate_for_doc_bytes_batch<'a>(
 #[derive(Debug)]
 pub struct CandidateStore {
     root: PathBuf,
-    meta: StoreMeta,
+    meta: ForestMeta,
+    local_meta: StoreLocalMeta,
     docs: Vec<CandidateDoc>,
     doc_rows: Vec<DocMetaRow>,
     tier2_doc_rows: Vec<Tier2DocMetaRow>,
@@ -1435,12 +1505,88 @@ fn scaled_docs_per_block_for_budget(
     current_docs_per_block.saturating_mul(usize::try_from(scale).unwrap_or(usize::MAX))
 }
 
+fn load_forest_meta(root: &Path) -> Result<ForestMeta> {
+    let policy_root = forest_policy_root(root);
+    let policy_path = forest_meta_path(&policy_root);
+    if policy_path.exists() {
+        let meta: ForestMeta = serde_json::from_slice(&fs::read(&policy_path)?).map_err(|_| {
+            SspryError::from(format!(
+                "Invalid candidate metadata at {}",
+                policy_path.display()
+            ))
+        })?;
+        if meta.version != STORE_VERSION {
+            return Err(SspryError::from(format!(
+                "Unsupported candidate store version: {}",
+                meta.version
+            )));
+        }
+        return Ok(meta);
+    }
+
+    let legacy_path = forest_meta_path(root);
+    let legacy: LegacyStoreMeta =
+        serde_json::from_slice(&fs::read(&legacy_path)?).map_err(|_| {
+            SspryError::from(format!(
+                "Invalid candidate metadata at {}",
+                legacy_path.display()
+            ))
+        })?;
+    if legacy.version != STORE_VERSION {
+        return Err(SspryError::from(format!(
+            "Unsupported candidate store version: {}",
+            legacy.version
+        )));
+    }
+    Ok(ForestMeta::from(&legacy))
+}
+
+fn load_store_local_meta(root: &Path) -> Result<StoreLocalMeta> {
+    let local_path = store_local_meta_path(root);
+    if local_path.exists() {
+        let meta: StoreLocalMeta =
+            serde_json::from_slice(&fs::read(&local_path)?).map_err(|_| {
+                SspryError::from(format!(
+                    "Invalid candidate local metadata at {}",
+                    local_path.display()
+                ))
+            })?;
+        if meta.version != STORE_VERSION {
+            return Err(SspryError::from(format!(
+                "Unsupported candidate store version: {}",
+                meta.version
+            )));
+        }
+        return Ok(meta);
+    }
+
+    let legacy_path = forest_meta_path(root);
+    let legacy: LegacyStoreMeta =
+        serde_json::from_slice(&fs::read(&legacy_path)?).map_err(|_| {
+            SspryError::from(format!(
+                "Invalid candidate metadata at {}",
+                legacy_path.display()
+            ))
+        })?;
+    if legacy.version != STORE_VERSION {
+        return Err(SspryError::from(format!(
+            "Unsupported candidate store version: {}",
+            legacy.version
+        )));
+    }
+    Ok(StoreLocalMeta::from(&legacy))
+}
+
 impl CandidateStore {
     pub fn init(config: CandidateConfig, force: bool) -> Result<Self> {
         validate_config(&config)?;
         fs::create_dir_all(&config.root)?;
         let compaction_manifest_path = shard_compaction_manifest_path(&config.root);
-        let meta_path = meta_path(&config.root);
+        let policy_root = forest_policy_root(&config.root);
+        fs::create_dir_all(&policy_root)?;
+        let meta_path = forest_meta_path(&policy_root);
+        let local_meta_path = store_local_meta_path(&config.root);
+        let legacy_meta_path = forest_meta_path(&config.root);
         let sha_path = sha_by_docid_path(&config.root);
         let doc_meta_path = doc_meta_path(&config.root);
         let tier2_doc_meta_path = tier2_doc_meta_path(&config.root);
@@ -1449,7 +1595,8 @@ impl CandidateStore {
         let tier2_blooms_path = tier2_blooms_path(&config.root);
         let external_ids_path = external_ids_path(&config.root);
         if !force
-            && (meta_path.exists()
+            && (local_meta_path.exists()
+                || legacy_meta_path.exists()
                 || sha_path.exists()
                 || doc_meta_path.exists()
                 || tier2_doc_meta_path.exists()
@@ -1476,6 +1623,10 @@ impl CandidateStore {
             }
             let _ = fs::remove_file(&compaction_manifest_path);
             let _ = fs::remove_file(&meta_path);
+            let _ = fs::remove_file(&local_meta_path);
+            if legacy_meta_path != meta_path {
+                let _ = fs::remove_file(&legacy_meta_path);
+            }
             let _ = fs::remove_file(&sha_path);
             let _ = fs::remove_file(&doc_meta_path);
             let _ = fs::remove_file(&tier2_doc_meta_path);
@@ -1483,17 +1634,18 @@ impl CandidateStore {
             let _ = fs::remove_file(&blooms_path);
             let _ = fs::remove_file(&tier2_blooms_path);
             let _ = fs::remove_file(&external_ids_path);
+            let _ = fs::remove_file(&tier1_superblocks_path(&config.root));
             let _ = fs::remove_file(&tier2_superblocks_path(&config.root));
-            let _ = fs::remove_file(&tier2_pattern_superblocks_path(&config.root));
+            let _ = fs::remove_file(&legacy_primary_superblocks_path(&config.root));
+            let _ = fs::remove_file(&legacy_tier2_superblocks_path(&config.root));
             let _ = fs::remove_file(&tree_tier1_gates_path(&config.root));
             let _ = fs::remove_file(&tree_tier2_gates_path(&config.root));
         }
 
         let mut store = Self {
             root: config.root.clone(),
-            meta: StoreMeta {
+            meta: ForestMeta {
                 version: STORE_VERSION,
-                next_doc_id: 1,
                 id_source: config.id_source.clone(),
                 store_path: config.store_path,
                 tier2_gram_size: config.tier2_gram_size,
@@ -1503,9 +1655,9 @@ impl CandidateStore {
                     .max(1),
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
-                filter_target_fp: None,
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
             },
+            local_meta: StoreLocalMeta::default(),
             docs: Vec::new(),
             doc_rows: Vec::new(),
             tier2_doc_rows: Vec::new(),
@@ -1551,21 +1703,13 @@ impl CandidateStore {
             .try_into()
             .unwrap_or(u64::MAX);
         let meta_started = Instant::now();
-        let meta: StoreMeta =
-            serde_json::from_slice(&fs::read(meta_path(&root))?).map_err(|_| {
-                SspryError::from(format!("Invalid candidate metadata at {}", root.display()))
-            })?;
+        let meta = load_forest_meta(&root)?;
+        let local_meta = load_store_local_meta(&root)?;
         let meta_ms = meta_started
             .elapsed()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        if meta.version != STORE_VERSION {
-            return Err(SspryError::from(format!(
-                "Unsupported candidate store version: {}",
-                meta.version
-            )));
-        }
         let load_state_started = Instant::now();
         let (docs, doc_rows, tier2_doc_rows) = load_candidate_store_state(&root)?;
         let load_state_ms = load_state_started
@@ -1577,6 +1721,7 @@ impl CandidateStore {
         let mut store = Self {
             root: root.clone(),
             meta,
+            local_meta,
             docs,
             doc_rows,
             tier2_doc_rows,
@@ -1608,8 +1753,8 @@ impl CandidateStore {
             .try_into()
             .unwrap_or(u64::MAX);
         let normalized_next_doc_id = store.docs.len() as u64 + 1;
-        if store.meta.next_doc_id != normalized_next_doc_id {
-            store.meta.next_doc_id = normalized_next_doc_id;
+        if store.local_meta.next_doc_id != normalized_next_doc_id {
+            store.local_meta.next_doc_id = normalized_next_doc_id;
             store.meta_persist_dirty = true;
         }
         let rebuild_profile = store.rebuild_indexes_profiled()?;
@@ -1663,11 +1808,7 @@ impl CandidateStore {
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
             tier1_filter_target_fp,
             tier2_filter_target_fp,
-            filter_target_fp: if tier1_filter_target_fp == tier2_filter_target_fp {
-                tier1_filter_target_fp
-            } else {
-                None
-            },
+            filter_target_fp: None,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
         }
     }
@@ -2090,8 +2231,8 @@ impl CandidateStore {
             )?;
             self.maybe_rebalance_tier2_superblocks()?;
         } else {
-            doc_id = self.meta.next_doc_id;
-            self.meta.next_doc_id += 1;
+            doc_id = self.local_meta.next_doc_id;
+            self.local_meta.next_doc_id += 1;
             let doc = CandidateDoc {
                 doc_id,
                 sha256: sha256_hex.clone(),
@@ -2343,8 +2484,8 @@ impl CandidateStore {
             insert_profile.resolve_doc_state_us = insert_profile
                 .resolve_doc_state_us
                 .saturating_add(elapsed_us(resolve_doc_state_started));
-            let doc_id = self.meta.next_doc_id;
-            self.meta.next_doc_id += 1;
+            let doc_id = self.local_meta.next_doc_id;
+            self.local_meta.next_doc_id += 1;
             let doc = CandidateDoc {
                 doc_id,
                 sha256: sha256_hex.clone(),
@@ -2753,8 +2894,8 @@ impl CandidateStore {
                 }
             }
 
-            let doc_id = self.meta.next_doc_id;
-            self.meta.next_doc_id += 1;
+            let doc_id = self.local_meta.next_doc_id;
+            self.local_meta.next_doc_id += 1;
             pending_inserts.push(PendingImportedInsert {
                 doc_id,
                 sha256_hex,
@@ -3616,13 +3757,6 @@ impl CandidateStore {
             store_path: self.meta.store_path,
             tier1_filter_target_fp: self.meta.resolved_tier1_filter_target_fp(),
             tier2_filter_target_fp: self.meta.resolved_tier2_filter_target_fp(),
-            filter_target_fp: if self.meta.resolved_tier1_filter_target_fp()
-                == self.meta.resolved_tier2_filter_target_fp()
-            {
-                self.meta.resolved_tier1_filter_target_fp()
-            } else {
-                None
-            },
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
@@ -3635,14 +3769,12 @@ impl CandidateStore {
             tier2_docs_matched_total: self.tier2_telemetry.tier2_docs_matched_total,
             tier2_superblocks_skipped_total: self.tier2_telemetry.tier2_superblocks_skipped_total,
             tier2_match_ratio,
-            tier2_superblock_count: self.tier2_superblocks.total_block_count(),
-            tier2_superblock_docs: self.tier2_superblocks.docs_per_block,
-            tier2_superblock_summary_bytes: tier1_superblock_summary_bytes
-                .saturating_add(tier2_pattern_superblock_summary_bytes),
+            tier1_superblock_count: self.tier2_superblocks.total_block_count(),
+            tier1_superblock_docs: self.tier2_superblocks.docs_per_block,
             tier1_superblock_summary_bytes,
-            tier2_pattern_superblock_summary_bytes,
+            tier2_superblock_summary_bytes: tier2_pattern_superblock_summary_bytes,
             tier1_superblock_positions_bytes,
-            tier2_pattern_superblock_positions_bytes,
+            tier2_superblock_positions_bytes: tier2_pattern_superblock_positions_bytes,
             tree_tier1_gate_bytes: self.tree_tier1_gates.memory_bytes(),
             tree_tier2_gate_bytes: self.tree_tier2_gates.memory_bytes(),
             superblock_summary_bytes_total: tier1_superblock_summary_bytes
@@ -3838,7 +3970,10 @@ impl CandidateStore {
 
     fn persist_meta(&mut self) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        write_json(meta_path(&self.root), &self.meta)?;
+        let policy_root = forest_policy_root(&self.root);
+        fs::create_dir_all(&policy_root)?;
+        write_json(forest_meta_path(&policy_root), &self.meta)?;
+        write_json(store_local_meta_path(&self.root), &self.local_meta)?;
         self.meta_persist_dirty = false;
         Ok(())
     }
@@ -4387,20 +4522,38 @@ impl CandidateStore {
         self.tree_tier2_gates = TreeBloomGateIndex::default();
         let maybe_snapshot = self
             .load_superblocks_snapshot(
+                &tier1_superblocks_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
+            .ok()
+            .flatten()
+            .or_else(|| {
+                self.load_superblocks_snapshot(
+                    &legacy_primary_superblocks_path(&self.root),
+                    self.docs.len(),
+                    expected_active_doc_count,
+                )
+                .ok()
+                .flatten()
+            });
+        let maybe_pattern_snapshot = self
+            .load_superblocks_snapshot(
                 &tier2_superblocks_path(&self.root),
                 self.docs.len(),
                 expected_active_doc_count,
             )
             .ok()
-            .flatten();
-        let maybe_pattern_snapshot = self
-            .load_superblocks_snapshot(
-                &tier2_pattern_superblocks_path(&self.root),
-                self.docs.len(),
-                expected_active_doc_count,
-            )
-            .ok()
-            .flatten();
+            .flatten()
+            .or_else(|| {
+                self.load_superblocks_snapshot(
+                    &legacy_tier2_superblocks_path(&self.root),
+                    self.docs.len(),
+                    expected_active_doc_count,
+                )
+                .ok()
+                .flatten()
+            });
         let load_tier2_superblocks_ms = load_tier2_started
             .elapsed()
             .as_millis()
@@ -4442,14 +4595,14 @@ impl CandidateStore {
         })
     }
 
-    pub(crate) fn persist_tier2_superblocks_snapshot(&self) -> Result<()> {
+    pub(crate) fn persist_superblock_snapshots(&self) -> Result<()> {
         self.persist_superblocks_snapshot(
             &self.tier2_superblocks,
-            &tier2_superblocks_path(&self.root),
+            &tier1_superblocks_path(&self.root),
         )?;
         self.persist_superblocks_snapshot(
             &self.tier2_pattern_superblocks,
-            &tier2_pattern_superblocks_path(&self.root),
+            &tier2_superblocks_path(&self.root),
         )
     }
 
@@ -4736,14 +4889,51 @@ pub(crate) fn write_compacted_snapshot(
         append_blob(tier2_doc_meta_path(compacted_root), &tier2_row.encode())?;
     }
 
-    let mut meta = snapshot.meta.clone();
-    meta.next_doc_id = snapshot.live_docs.len() as u64 + 1;
-    write_json(meta_path(compacted_root), &meta)?;
+    write_json(
+        forest_meta_path(&forest_policy_root(compacted_root)),
+        &snapshot.meta,
+    )?;
+    write_json(
+        store_local_meta_path(compacted_root),
+        &StoreLocalMeta {
+            version: STORE_VERSION,
+            next_doc_id: snapshot.live_docs.len() as u64 + 1,
+        },
+    )?;
     Ok(())
 }
 
-fn meta_path(root: &Path) -> PathBuf {
+fn forest_policy_root(root: &Path) -> PathBuf {
+    if root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name == "current")
+        && root
+            .parent()
+            .and_then(|value| value.file_name())
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("tree_"))
+    {
+        return root
+            .parent()
+            .and_then(|value| value.parent())
+            .unwrap_or(root)
+            .to_path_buf();
+    }
+    root.to_path_buf()
+}
+
+fn forest_meta_path(root: &Path) -> PathBuf {
     root.join("meta.json")
+}
+
+#[cfg(test)]
+fn meta_path(root: &Path) -> PathBuf {
+    forest_meta_path(root)
+}
+
+fn store_local_meta_path(root: &Path) -> PathBuf {
+    root.join("store_meta.json")
 }
 
 fn sha_by_docid_path(root: &Path) -> PathBuf {
@@ -4774,11 +4964,19 @@ fn external_ids_path(root: &Path) -> PathBuf {
     root.join("external_ids.dat")
 }
 
+fn tier1_superblocks_path(root: &Path) -> PathBuf {
+    root.join("tier1_superblocks.bin")
+}
+
+fn legacy_primary_superblocks_path(root: &Path) -> PathBuf {
+    root.join("tier2_superblocks.bin")
+}
+
 fn tier2_superblocks_path(root: &Path) -> PathBuf {
     root.join("tier2_superblocks.bin")
 }
 
-fn tier2_pattern_superblocks_path(root: &Path) -> PathBuf {
+fn legacy_tier2_superblocks_path(root: &Path) -> PathBuf {
     root.join("tier2_pattern_superblocks.bin")
 }
 
@@ -7741,7 +7939,8 @@ rule q {
         let bloom_hashes =
             store.resolve_bloom_hashes_for_document(512 * 1024, Some(100_000), Some(7));
         assert_eq!(bloom_hashes, 16);
-        assert_eq!(store.stats().filter_target_fp, Some(0.25));
+        assert_eq!(store.stats().tier1_filter_target_fp, Some(0.25));
+        assert_eq!(store.stats().tier2_filter_target_fp, Some(0.25));
     }
 
     #[test]
@@ -7897,9 +8096,9 @@ rule q {
                 .contains("Invalid candidate metadata")
         );
 
-        let bad_version = StoreMeta {
+        let bad_version = LegacyStoreMeta {
             version: STORE_VERSION + 1,
-            ..StoreMeta::default()
+            ..LegacyStoreMeta::default()
         };
         fs::write(
             meta_path(&open_root),
@@ -7915,7 +8114,7 @@ rule q {
 
         fs::write(
             meta_path(&open_root),
-            serde_json::to_vec_pretty(&StoreMeta::default()).expect("meta json"),
+            serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("meta json"),
         )
         .expect("write good meta");
         let opened = CandidateStore::open(&open_root).expect("open without docs");
@@ -8098,7 +8297,7 @@ rule q {
         fs::write(doc_meta_path(&invalid_bloom_root), row.encode()).expect("write bad row");
         fs::write(
             meta_path(&invalid_bloom_root),
-            serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad bloom meta"),
+            serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
         assert!(
@@ -8136,7 +8335,7 @@ rule q {
         fs::write(external_ids_path(&invalid_utf8_root), [0xFF, 0xFE]).expect("write bad utf8");
         fs::write(
             meta_path(&invalid_utf8_root),
-            serde_json::to_vec_pretty(&StoreMeta::default()).expect("bad utf8 meta"),
+            serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad utf8 meta"),
         )
         .expect("write bad utf8 meta");
         assert!(
@@ -9552,7 +9751,7 @@ rule q {
             .expect("insert");
         let expected_summary_bytes = store.tier2_superblocks.summary_memory_bytes;
         store
-            .persist_tier2_superblocks_snapshot()
+            .persist_superblock_snapshots()
             .expect("persist snapshot");
 
         let (reopened, profile) = CandidateStore::open_profiled(&root).expect("reopen");
@@ -9621,7 +9820,7 @@ rule q {
             )
             .expect("insert first");
         store
-            .persist_tier2_superblocks_snapshot()
+            .persist_superblock_snapshots()
             .expect("persist snapshot");
 
         let (sha_two, grams_two, _, _, bloom_two) =
