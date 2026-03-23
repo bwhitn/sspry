@@ -222,6 +222,11 @@ pub struct CandidatePreparedQueryProfile {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CandidateQueryProfile {
+    pub tree_gate_trees_considered: u64,
+    pub tree_gate_passed: u64,
+    pub tree_gate_tier1_pruned: u64,
+    pub tree_gate_tier2_pruned: u64,
+    pub tree_gate_special_docs_bypass: u64,
     pub docs_scanned: u64,
     pub superblocks_skipped: u64,
     pub metadata_loads: u64,
@@ -234,6 +239,19 @@ pub struct CandidateQueryProfile {
 
 impl CandidateQueryProfile {
     pub(crate) fn merge_from(&mut self, other: &Self) {
+        self.tree_gate_trees_considered = self
+            .tree_gate_trees_considered
+            .saturating_add(other.tree_gate_trees_considered);
+        self.tree_gate_passed = self.tree_gate_passed.saturating_add(other.tree_gate_passed);
+        self.tree_gate_tier1_pruned = self
+            .tree_gate_tier1_pruned
+            .saturating_add(other.tree_gate_tier1_pruned);
+        self.tree_gate_tier2_pruned = self
+            .tree_gate_tier2_pruned
+            .saturating_add(other.tree_gate_tier2_pruned);
+        self.tree_gate_special_docs_bypass = self
+            .tree_gate_special_docs_bypass
+            .saturating_add(other.tree_gate_special_docs_bypass);
         self.docs_scanned = self.docs_scanned.saturating_add(other.docs_scanned);
         self.superblocks_skipped = self
             .superblocks_skipped
@@ -3101,6 +3119,15 @@ impl CandidateStore {
         )
     }
 
+    pub fn query_tree_gate_profile(
+        &mut self,
+        plan: &CompiledQueryPlan,
+    ) -> Result<CandidateQueryProfile> {
+        let prepared = self.prepare_query_artifacts(plan)?;
+        let (_, _, query_profile) = self.tree_gate_profile(plan, &prepared)?;
+        Ok(query_profile)
+    }
+
     pub(crate) fn query_candidates_with_prepared(
         &mut self,
         plan: &CompiledQueryPlan,
@@ -3152,6 +3179,26 @@ impl CandidateStore {
         record_counter(
             "candidate.query_candidates_matches_total",
             matched_hits.len() as u64,
+        );
+        record_counter(
+            "candidate.query_candidates_tree_gate_trees_considered_total",
+            query_profile.tree_gate_trees_considered,
+        );
+        record_counter(
+            "candidate.query_candidates_tree_gate_passed_total",
+            query_profile.tree_gate_passed,
+        );
+        record_counter(
+            "candidate.query_candidates_tree_gate_tier1_pruned_total",
+            query_profile.tree_gate_tier1_pruned,
+        );
+        record_counter(
+            "candidate.query_candidates_tree_gate_tier2_pruned_total",
+            query_profile.tree_gate_tier2_pruned,
+        );
+        record_counter(
+            "candidate.query_candidates_tree_gate_special_docs_bypass_total",
+            query_profile.tree_gate_special_docs_bypass,
         );
         record_counter(
             "candidate.query_candidates_superblocks_skipped_total",
@@ -3211,32 +3258,64 @@ impl CandidateStore {
         })
     }
 
+    fn tree_gate_profile(
+        &self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+    ) -> Result<(bool, bool, CandidateQueryProfile)> {
+        let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
+        let mut query_profile = CandidateQueryProfile::default();
+        query_profile.tree_gate_trees_considered = 1;
+        let tier2_superblocks = if self.tier2_pattern_superblocks.masks_by_bucket.is_empty() {
+            None
+        } else {
+            Some(&self.tier2_pattern_superblocks)
+        };
+        let tier1_tree_match = tree_maybe_matches_node(
+            &plan.root,
+            &prepared.mask_cache,
+            &self.tree_tier1_gates,
+            &self.tier2_superblocks,
+            &self.tree_tier2_gates,
+            tier2_superblocks,
+            false,
+        )?;
+        let normal_tree_match = if allow_block_skip && tier1_tree_match {
+            tree_maybe_matches_node(
+                &plan.root,
+                &prepared.mask_cache,
+                &self.tree_tier1_gates,
+                &self.tier2_superblocks,
+                &self.tree_tier2_gates,
+                tier2_superblocks,
+                true,
+            )?
+        } else {
+            tier1_tree_match
+        };
+        let has_special_docs = self.has_live_special_docs();
+        if normal_tree_match {
+            query_profile.tree_gate_passed = 1;
+        } else if has_special_docs {
+            query_profile.tree_gate_special_docs_bypass = 1;
+        } else if !tier1_tree_match {
+            query_profile.tree_gate_tier1_pruned = 1;
+        } else {
+            query_profile.tree_gate_tier2_pruned = 1;
+        }
+        Ok((normal_tree_match, has_special_docs, query_profile))
+    }
+
     fn scan_query_hits(
         &self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
-        let normal_tree_match = tree_maybe_matches_node(
-            &plan.root,
-            &prepared.mask_cache,
-            &self.tree_tier1_gates,
-            &self.tier2_superblocks,
-            &self.tree_tier2_gates,
-            if self.tier2_pattern_superblocks.masks_by_bucket.is_empty() {
-                None
-            } else {
-                Some(&self.tier2_pattern_superblocks)
-            },
-            allow_block_skip,
-        )?;
-        let has_special_docs = self.has_live_special_docs();
+        let (normal_tree_match, has_special_docs, mut query_profile) =
+            self.tree_gate_profile(plan, prepared)?;
         if !normal_tree_match && !has_special_docs {
-            return Ok((
-                Vec::new(),
-                TierFlags::default(),
-                CandidateQueryProfile::default(),
-            ));
+            return Ok((Vec::new(), TierFlags::default(), query_profile));
         }
         let block_refs = self.tier2_superblocks.block_refs();
         let block_count = block_refs.len();
@@ -3247,7 +3326,6 @@ impl CandidateStore {
             .as_secs();
         let mut matched_hits = Vec::<(String, u32)>::new();
         let mut used_tiers = TierFlags::default();
-        let mut query_profile = CandidateQueryProfile::default();
 
         if normal_tree_match && block_count > 0 {
             let worker_count = query_scan_worker_count(block_count);
