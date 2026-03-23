@@ -50,6 +50,7 @@ pub struct CandidateConfig {
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
     pub tier2_superblock_summary_cap_bytes: usize,
+    pub enable_tier2_superblocks: bool,
     pub tier1_filter_target_fp: Option<f64>,
     pub tier2_filter_target_fp: Option<f64>,
     pub filter_target_fp: Option<f64>,
@@ -65,6 +66,7 @@ impl Default for CandidateConfig {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+            enable_tier2_superblocks: true,
             tier1_filter_target_fp: None,
             tier2_filter_target_fp: None,
             filter_target_fp: Some(0.35),
@@ -364,6 +366,7 @@ struct ForestMeta {
     tier2_gram_size: usize,
     tier1_gram_size: usize,
     tier2_superblock_summary_cap_bytes: usize,
+    enable_tier2_superblocks: bool,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     compaction_idle_cooldown_s: f64,
@@ -386,6 +389,7 @@ struct LegacyStoreMeta {
     tier2_gram_size: usize,
     tier1_gram_size: usize,
     tier2_superblock_summary_cap_bytes: usize,
+    enable_tier2_superblocks: bool,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     filter_target_fp: Option<f64>,
@@ -417,6 +421,7 @@ impl Default for ForestMeta {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+            enable_tier2_superblocks: true,
             tier1_filter_target_fp: Some(0.35),
             tier2_filter_target_fp: Some(0.35),
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
@@ -443,6 +448,7 @@ impl Default for LegacyStoreMeta {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
+            enable_tier2_superblocks: true,
             tier1_filter_target_fp: None,
             tier2_filter_target_fp: None,
             filter_target_fp: Some(0.35),
@@ -470,6 +476,7 @@ impl From<&LegacyStoreMeta> for ForestMeta {
             tier2_gram_size: value.tier2_gram_size,
             tier1_gram_size: value.tier1_gram_size,
             tier2_superblock_summary_cap_bytes: value.tier2_superblock_summary_cap_bytes,
+            enable_tier2_superblocks: value.enable_tier2_superblocks,
             tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
             tier2_filter_target_fp: value.tier2_filter_target_fp.or(value.filter_target_fp),
             compaction_idle_cooldown_s: value.compaction_idle_cooldown_s,
@@ -1653,6 +1660,7 @@ impl CandidateStore {
                 tier2_superblock_summary_cap_bytes: config
                     .tier2_superblock_summary_cap_bytes
                     .max(1),
+                enable_tier2_superblocks: config.enable_tier2_superblocks,
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
@@ -1805,6 +1813,7 @@ impl CandidateStore {
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
+            enable_tier2_superblocks: self.meta.enable_tier2_superblocks,
             tier1_filter_target_fp,
             tier2_filter_target_fp,
             filter_target_fp: None,
@@ -4308,6 +4317,9 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
+        if !self.meta.enable_tier2_superblocks {
+            return Ok(());
+        }
         if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
@@ -4331,6 +4343,9 @@ impl CandidateStore {
         &mut self,
         updates: &[(usize, usize, usize, &[u8])],
     ) -> Result<()> {
+        if !self.meta.enable_tier2_superblocks {
+            return Ok(());
+        }
         update_superblocks_for_doc_bytes_batch(
             &mut self.tier2_superblocks,
             self.meta.tier2_superblock_summary_cap_bytes,
@@ -4356,6 +4371,9 @@ impl CandidateStore {
     }
 
     fn update_tier2_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+        if !self.meta.enable_tier2_superblocks {
+            return Ok(());
+        }
         if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
@@ -4420,17 +4438,20 @@ impl CandidateStore {
     }
 
     fn rebuild_superblocks_with_docs_per_block(&mut self, docs_per_block: usize) -> Result<()> {
+        let docs_per_block = docs_per_block.max(1);
         self.tier1_superblocks = Tier2SuperblockIndex {
-            docs_per_block: docs_per_block.max(1),
+            docs_per_block,
             ..Tier2SuperblockIndex::default()
         };
         self.tier2_superblocks = Tier2SuperblockIndex {
-            docs_per_block: docs_per_block.max(1),
+            docs_per_block,
             ..Tier2SuperblockIndex::default()
         };
         for pos in 0..self.docs.len() {
             self.update_tier1_superblocks_for_doc_inner(pos)?;
-            self.update_tier2_superblocks_for_doc_inner(pos)?;
+            if self.meta.enable_tier2_superblocks {
+                self.update_tier2_superblocks_for_doc_inner(pos)?;
+            }
         }
         Ok(())
     }
@@ -4528,22 +4549,26 @@ impl CandidateStore {
             .ok()
             .flatten()
         };
-        let maybe_pattern_snapshot = if using_new_snapshot_layout {
-            self.load_superblocks_snapshot(
-                &tier2_superblocks_path(&self.root),
-                self.docs.len(),
-                expected_active_doc_count,
-            )
-            .ok()
-            .flatten()
+        let maybe_pattern_snapshot = if self.meta.enable_tier2_superblocks {
+            if using_new_snapshot_layout {
+                self.load_superblocks_snapshot(
+                    &tier2_superblocks_path(&self.root),
+                    self.docs.len(),
+                    expected_active_doc_count,
+                )
+                .ok()
+                .flatten()
+            } else {
+                self.load_superblocks_snapshot(
+                    &legacy_tier2_superblocks_path(&self.root),
+                    self.docs.len(),
+                    expected_active_doc_count,
+                )
+                .ok()
+                .flatten()
+            }
         } else {
-            self.load_superblocks_snapshot(
-                &legacy_tier2_superblocks_path(&self.root),
-                self.docs.len(),
-                expected_active_doc_count,
-            )
-            .ok()
-            .flatten()
+            None
         };
         let load_superblock_snapshots_ms = load_superblock_snapshots_started
             .elapsed()
@@ -4551,11 +4576,30 @@ impl CandidateStore {
             .try_into()
             .unwrap_or(u64::MAX);
         let (loaded_superblocks_from_snapshot, rebuild_superblocks_ms) =
-            if let (Some(snapshot), Some(pattern_snapshot)) =
-                (maybe_snapshot, maybe_pattern_snapshot)
-            {
+            if self.meta.enable_tier2_superblocks {
+                if let (Some(snapshot), Some(pattern_snapshot)) =
+                    (maybe_snapshot, maybe_pattern_snapshot)
+                {
+                    self.tier1_superblocks = snapshot;
+                    self.tier2_superblocks = pattern_snapshot;
+                    (true, 0)
+                } else {
+                    let rebuild_superblocks_started = Instant::now();
+                    self.rebuild_superblocks()?;
+                    let rebuild_superblocks_ms = rebuild_superblocks_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    (false, rebuild_superblocks_ms)
+                }
+            } else if let Some(snapshot) = maybe_snapshot {
+                let docs_per_block = snapshot.docs_per_block.max(1);
                 self.tier1_superblocks = snapshot;
-                self.tier2_superblocks = pattern_snapshot;
+                self.tier2_superblocks = Tier2SuperblockIndex {
+                    docs_per_block,
+                    ..Tier2SuperblockIndex::default()
+                };
                 (true, 0)
             } else {
                 let rebuild_superblocks_started = Instant::now();
@@ -4585,10 +4629,16 @@ impl CandidateStore {
             &self.tier1_superblocks,
             &tier1_superblocks_path(&self.root),
         )?;
-        self.persist_superblocks_snapshot(
-            &self.tier2_superblocks,
-            &tier2_superblocks_path(&self.root),
-        )
+        if self.meta.enable_tier2_superblocks {
+            self.persist_superblocks_snapshot(
+                &self.tier2_superblocks,
+                &tier2_superblocks_path(&self.root),
+            )?;
+        } else {
+            let _ = fs::remove_file(tier2_superblocks_path(&self.root));
+            let _ = fs::remove_file(legacy_tier2_superblocks_path(&self.root));
+        }
+        Ok(())
     }
 
     fn persist_superblocks_snapshot(

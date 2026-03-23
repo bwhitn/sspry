@@ -1297,6 +1297,7 @@ fn store_config_from_parts(
     tier2_gram_size: usize,
     tier1_gram_size: usize,
     tier2_superblock_summary_cap_kib: usize,
+    enable_tier2_superblocks: bool,
     compaction_idle_cooldown_s: f64,
 ) -> CandidateConfig {
     CandidateConfig {
@@ -1308,6 +1309,7 @@ fn store_config_from_parts(
         tier2_superblock_summary_cap_bytes: tier2_superblock_summary_cap_kib
             .max(1)
             .saturating_mul(1024),
+        enable_tier2_superblocks,
         tier1_filter_target_fp: Some(tier1_filter_target_fp),
         tier2_filter_target_fp: Some(tier2_filter_target_fp),
         filter_target_fp: if (tier1_filter_target_fp - tier2_filter_target_fp).abs() < f64::EPSILON
@@ -1350,6 +1352,7 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier2_superblock_summary_cap_kib,
+        !args.disable_pattern_superblocks,
         CandidateConfig::default().compaction_idle_cooldown_s,
     )
 }
@@ -1371,6 +1374,7 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier2_superblock_summary_cap_kib,
+        !args.disable_pattern_superblocks,
         args.compaction_idle_cooldown_s,
     )
 }
@@ -4647,6 +4651,12 @@ struct ServeArgs {
     )]
     tier2_superblock_summary_cap_kib: usize,
     #[arg(
+        long = "disable-pattern-superblocks",
+        action = ArgAction::SetTrue,
+        help = "Disable the tier2/pattern superblock summary layer for this DB."
+    )]
+    disable_pattern_superblocks: bool,
+    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
@@ -4745,6 +4755,12 @@ struct InitArgs {
         help = "Cap per-superblock summary bytes in KiB."
     )]
     tier2_superblock_summary_cap_kib: usize,
+    #[arg(
+        long = "disable-pattern-superblocks",
+        action = ArgAction::SetTrue,
+        help = "Disable the tier2/pattern superblock summary layer for this DB."
+    )]
+    disable_pattern_superblocks: bool,
 }
 
 #[cfg(test)]
@@ -4896,6 +4912,7 @@ mod tests {
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
+            disable_pattern_superblocks: false,
         }
     }
 
@@ -4997,6 +5014,7 @@ mod tests {
             id_source: CandidateIdSource::Sha256,
             store_path: false,
             gram_sizes: "3,4".to_owned(),
+            disable_pattern_superblocks: false,
         }
     }
 
@@ -5109,6 +5127,7 @@ mod tests {
             3,
             4,
             8,
+            true,
             33.5,
         );
         assert_eq!(fixed.root, PathBuf::from("root"));
@@ -5117,6 +5136,7 @@ mod tests {
         assert_eq!(fixed.tier2_gram_size, 3);
         assert_eq!(fixed.tier1_gram_size, 4);
         assert_eq!(fixed.tier2_superblock_summary_cap_bytes, 8 * 1024);
+        assert!(fixed.enable_tier2_superblocks);
         assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
         assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
         assert_eq!(fixed.filter_target_fp, None);
@@ -5131,6 +5151,7 @@ mod tests {
             5,
             4,
             16,
+            false,
             9.25,
         );
         assert_eq!(variable.root, PathBuf::from("root"));
@@ -5142,6 +5163,7 @@ mod tests {
         assert_eq!(variable.tier2_gram_size, 5);
         assert_eq!(variable.tier1_gram_size, 4);
         assert_eq!(variable.tier2_superblock_summary_cap_bytes, 16 * 1024);
+        assert!(!variable.enable_tier2_superblocks);
         assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
         let wire = batch_row_to_wire(IndexBatchRow {

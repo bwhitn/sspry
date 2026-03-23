@@ -622,6 +622,7 @@ def main() -> int:
     parser.add_argument('--set-fp', type=float)
     parser.add_argument('--tier1-set-fp', type=float)
     parser.add_argument('--tier2-set-fp', type=float)
+    parser.add_argument('--disable-pattern-superblocks', action='store_true')
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--index-workers', type=int, default=0)
     parser.add_argument('--index-mode', choices=('server', 'local-root'), default='server')
@@ -676,6 +677,7 @@ def main() -> int:
         'balance_bytes': args.balance_bytes,
         'tree_count': len(manifests),
         'summary_cap_kib': args.summary_cap_kib,
+        'disable_pattern_superblocks': args.disable_pattern_superblocks,
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'index_workers': args.index_workers,
@@ -740,6 +742,7 @@ def main() -> int:
                     str(sspry), 'init', '--root', str(current_root),
                     '--candidate-shards', str(args.shards or 1),
                     '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
+                    *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                     *fp_args,
                 ],
                 stdout=(tree_run_dir / 'init.stdout').open('w'),
@@ -795,6 +798,7 @@ def main() -> int:
                 str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',
                 '--memory-budget-gb', str(args.memory_budget_gb),
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
+                *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                 '--search-workers', str(args.search_workers),
                 *fp_args,
                 *(['--shards', str(args.shards)] if args.shards else []),
@@ -890,6 +894,7 @@ def main() -> int:
                 server = subprocess.Popen(
                     [
                         str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
+                        *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                         '--search-workers', str(args.search_workers),
                         *fp_args,
                         *(['--shards', str(args.shards)] if args.shards else []),
