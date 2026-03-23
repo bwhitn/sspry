@@ -59,8 +59,10 @@ const ACTION_INDEX_SESSION_PROGRESS: u8 = 12;
 const ACTION_CANDIDATE_STATUS: u8 = 13;
 const ACTION_INDEX_CLIENT_BEGIN: u8 = 14;
 const ACTION_INDEX_CLIENT_END: u8 = 15;
+const ACTION_INDEX_CLIENT_HEARTBEAT: u8 = 16;
 const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
+const INDEX_CLIENT_LEASE_MULTIPLIER: u64 = 3;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
@@ -233,6 +235,24 @@ struct CandidateIndexSessionResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct CandidateIndexClientBeginRequest {
+    heartbeat_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CandidateIndexClientBeginResponse {
+    message: String,
+    client_id: u64,
+    heartbeat_interval_ms: u64,
+    lease_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CandidateIndexClientHeartbeatRequest {
+    client_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CandidateIndexSessionProgressRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     total_documents: Option<u64>,
@@ -253,6 +273,12 @@ type ParsedCandidateInsertDocument = (
     Vec<u8>,
     Option<String>,
 );
+
+#[derive(Clone, Debug)]
+struct IndexClientLease {
+    lease_timeout_ms: u64,
+    last_heartbeat_unix_ms: u64,
+}
 
 #[derive(Debug)]
 struct StoreSet {
@@ -379,6 +405,9 @@ struct ServerState {
     publish_in_progress: AtomicBool,
     active_mutations: AtomicUsize,
     active_index_clients: AtomicUsize,
+    next_index_client_id: AtomicU64,
+    index_client_leases: Mutex<HashMap<u64, IndexClientLease>>,
+    publish_after_index_clients: AtomicBool,
     active_index_sessions: AtomicUsize,
     work_dirty: AtomicBool,
     work_active_estimated_documents: AtomicU64,
@@ -986,10 +1015,22 @@ impl SspryClient {
         Ok(response.message)
     }
 
-    pub fn begin_index_client(&self) -> Result<String> {
-        let response: CandidateIndexSessionResponse =
-            self.request_typed_json(ACTION_INDEX_CLIENT_BEGIN, &json!({}))?;
-        Ok(response.message)
+    pub fn begin_index_client(&self, heartbeat_interval_ms: u64) -> Result<(u64, u64)> {
+        let response: CandidateIndexClientBeginResponse = self.request_typed_json(
+            ACTION_INDEX_CLIENT_BEGIN,
+            &CandidateIndexClientBeginRequest {
+                heartbeat_interval_ms,
+            },
+        )?;
+        Ok((response.client_id, response.lease_timeout_ms))
+    }
+
+    pub fn heartbeat_index_client(&self, client_id: u64) -> Result<()> {
+        let _: CandidateIndexSessionResponse = self.request_typed_json(
+            ACTION_INDEX_CLIENT_HEARTBEAT,
+            &CandidateIndexClientHeartbeatRequest { client_id },
+        )?;
+        Ok(())
     }
 
     pub fn update_index_session_progress(
@@ -1015,9 +1056,11 @@ impl SspryClient {
         Ok(response.message)
     }
 
-    pub fn end_index_client(&self) -> Result<String> {
-        let response: CandidateIndexSessionResponse =
-            self.request_typed_json(ACTION_INDEX_CLIENT_END, &json!({}))?;
+    pub fn end_index_client(&self, client_id: u64) -> Result<String> {
+        let response: CandidateIndexSessionResponse = self.request_typed_json(
+            ACTION_INDEX_CLIENT_END,
+            &CandidateIndexClientHeartbeatRequest { client_id },
+        )?;
         Ok(response.message)
     }
 
@@ -1777,6 +1820,9 @@ impl ServerState {
             publish_in_progress: AtomicBool::new(false),
             active_mutations: AtomicUsize::new(0),
             active_index_clients: AtomicUsize::new(0),
+            next_index_client_id: AtomicU64::new(1),
+            index_client_leases: Mutex::new(HashMap::new()),
+            publish_after_index_clients: AtomicBool::new(false),
             active_index_sessions: AtomicUsize::new(0),
             work_dirty: AtomicBool::new(false),
             work_active_estimated_documents: AtomicU64::new(startup_work_documents),
@@ -1877,6 +1923,41 @@ impl ServerState {
 
     fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    fn prune_expired_index_clients(&self, now_unix_ms: u64) -> Result<usize> {
+        let mut leases = self
+            .index_client_leases
+            .lock()
+            .map_err(|_| SspryError::from("Index client lease lock poisoned."))?;
+        let before = leases.len();
+        leases.retain(|_, lease| {
+            now_unix_ms.saturating_sub(lease.last_heartbeat_unix_ms) <= lease.lease_timeout_ms
+        });
+        let after = leases.len();
+        self.active_index_clients.store(after, Ordering::SeqCst);
+        if before > 0 && after == 0 {
+            self.publish_after_index_clients
+                .store(true, Ordering::SeqCst);
+        }
+        Ok(after)
+    }
+
+    fn maybe_force_publish_after_index_clients(&self) -> Result<()> {
+        if !self.publish_after_index_clients.load(Ordering::Acquire)
+            || !self.config.workspace_mode
+            || !self.work_dirty.load(Ordering::Acquire)
+            || self.publish_requested.load(Ordering::Acquire)
+            || self.publish_in_progress.load(Ordering::Acquire)
+            || self.mutations_paused.load(Ordering::Acquire)
+            || self.active_mutations.load(Ordering::Acquire) > 0
+            || self.active_index_sessions.load(Ordering::Acquire) > 0
+            || self.active_index_clients.load(Ordering::Acquire) > 0
+        {
+            return Ok(());
+        }
+        let _ = self.handle_publish()?;
+        Ok(())
     }
 
     fn published_store_set(&self) -> Result<Arc<StoreSet>> {
@@ -2403,7 +2484,10 @@ impl ServerState {
         }
     }
 
-    fn handle_begin_index_client(&self) -> Result<CandidateIndexSessionResponse> {
+    fn handle_begin_index_client(
+        &self,
+        request: &CandidateIndexClientBeginRequest,
+    ) -> Result<CandidateIndexClientBeginResponse> {
         if self.publish_requested.load(Ordering::Acquire)
             || self.publish_in_progress.load(Ordering::Acquire)
             || self.mutations_paused.load(Ordering::Acquire)
@@ -2412,17 +2496,51 @@ impl ServerState {
                 "server is publishing; index client unavailable; retry later",
             ));
         }
-        match self
-            .active_index_clients
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => Ok(CandidateIndexSessionResponse {
-                message: "index client started".to_owned(),
-            }),
-            Err(_) => Err(SspryError::from(
-                "another index client is already active; retry later",
-            )),
-        }
+        let heartbeat_interval_ms = request.heartbeat_interval_ms.max(1);
+        let lease_timeout_ms = heartbeat_interval_ms.saturating_mul(INDEX_CLIENT_LEASE_MULTIPLIER);
+        let now = current_unix_ms();
+        self.prune_expired_index_clients(now)?;
+        let client_id = self.next_index_client_id.fetch_add(1, Ordering::SeqCst);
+        let mut leases = self
+            .index_client_leases
+            .lock()
+            .map_err(|_| SspryError::from("Index client lease lock poisoned."))?;
+        leases.insert(
+            client_id,
+            IndexClientLease {
+                lease_timeout_ms,
+                last_heartbeat_unix_ms: now,
+            },
+        );
+        self.active_index_clients
+            .store(leases.len(), Ordering::SeqCst);
+        self.publish_after_index_clients
+            .store(false, Ordering::SeqCst);
+        Ok(CandidateIndexClientBeginResponse {
+            message: "index client started".to_owned(),
+            client_id,
+            heartbeat_interval_ms,
+            lease_timeout_ms,
+        })
+    }
+
+    fn handle_heartbeat_index_client(
+        &self,
+        request: &CandidateIndexClientHeartbeatRequest,
+    ) -> Result<CandidateIndexSessionResponse> {
+        let now = current_unix_ms();
+        self.prune_expired_index_clients(now)?;
+        let mut leases = self
+            .index_client_leases
+            .lock()
+            .map_err(|_| SspryError::from("Index client lease lock poisoned."))?;
+        let lease = leases
+            .get_mut(&request.client_id)
+            .ok_or_else(|| SspryError::from("no active index client; heartbeat rejected"))?;
+        lease.last_heartbeat_unix_ms = now;
+        Ok(CandidateIndexSessionResponse {
+            message: "index client heartbeat updated".to_owned(),
+        })
     }
 
     fn handle_update_index_session_progress(
@@ -2581,13 +2699,30 @@ impl ServerState {
         })
     }
 
-    fn handle_end_index_client(&self) -> Result<CandidateIndexSessionResponse> {
-        let previous = self.active_index_clients.swap(0, Ordering::SeqCst);
-        if previous == 0 {
+    fn handle_end_index_client(
+        &self,
+        request: &CandidateIndexClientHeartbeatRequest,
+    ) -> Result<CandidateIndexSessionResponse> {
+        let now = current_unix_ms();
+        self.prune_expired_index_clients(now)?;
+        let mut leases = self
+            .index_client_leases
+            .lock()
+            .map_err(|_| SspryError::from("Index client lease lock poisoned."))?;
+        let removed = leases.remove(&request.client_id);
+        let remaining = leases.len();
+        self.active_index_clients.store(remaining, Ordering::SeqCst);
+        if removed.is_none() {
             return Ok(CandidateIndexSessionResponse {
                 message: "no active index client".to_owned(),
             });
         }
+        if remaining == 0 {
+            self.publish_after_index_clients
+                .store(true, Ordering::SeqCst);
+        }
+        drop(leases);
+        let _ = self.maybe_force_publish_after_index_clients();
         Ok(CandidateIndexSessionResponse {
             message: "index client finished".to_owned(),
         })
@@ -2743,13 +2878,16 @@ impl ServerState {
     }
 
     fn publish_readiness(&self, now_unix_ms: u64) -> PublishReadiness {
+        let active_index_clients = self
+            .prune_expired_index_clients(now_unix_ms)
+            .unwrap_or_else(|_| self.active_index_clients.load(Ordering::Acquire));
         let work_dirty = self.work_dirty.load(Ordering::Acquire);
         let publish_requested = self.publish_requested.load(Ordering::Acquire);
         let publish_in_progress = self.publish_in_progress.load(Ordering::Acquire);
         let mutations_paused = self.mutations_paused.load(Ordering::Acquire);
-        let active_index_clients = self.active_index_clients.load(Ordering::Acquire);
         let active_index_sessions = self.active_index_sessions.load(Ordering::Acquire);
         let active_mutations = self.active_mutations.load(Ordering::Acquire);
+        let publish_after_index_clients = self.publish_after_index_clients.load(Ordering::Acquire);
         let last_mutation = self.last_work_mutation_unix_ms.load(Ordering::Acquire);
         let idle_elapsed_ms = if last_mutation == 0 {
             0
@@ -2767,6 +2905,15 @@ impl ServerState {
                 .unwrap_or(u64::MAX),
             adaptive.tier2_pending_shards,
         );
+        let forced_eligible = self.config.workspace_mode
+            && work_dirty
+            && publish_after_index_clients
+            && active_index_clients == 0
+            && active_index_sessions == 0
+            && active_mutations == 0
+            && !publish_requested
+            && !publish_in_progress
+            && !mutations_paused;
         let idle_eligible = self.config.workspace_mode
             && work_dirty
             && active_index_clients == 0
@@ -2777,9 +2924,11 @@ impl ServerState {
             && !mutations_paused
             && last_mutation != 0
             && idle_elapsed_ms >= idle_threshold_ms;
-        let eligible = idle_eligible;
+        let eligible = forced_eligible || idle_eligible;
         let blocked_reason = if !self.config.workspace_mode {
             "workspace_disabled"
+        } else if forced_eligible {
+            "ready_after_index_clients"
         } else if idle_eligible {
             "ready"
         } else if !work_dirty {
@@ -2806,7 +2955,13 @@ impl ServerState {
         PublishReadiness {
             eligible,
             blocked_reason,
-            trigger_mode: if idle_eligible { "idle" } else { "blocked" },
+            trigger_mode: if forced_eligible {
+                "index_clients"
+            } else if idle_eligible {
+                "idle"
+            } else {
+                "blocked"
+            },
             trigger_reason: adaptive.reason,
             idle_elapsed_ms,
             idle_threshold_ms,
@@ -4439,6 +4594,7 @@ impl ServerState {
                     | ACTION_CANDIDATE_DELETE
                     | ACTION_INDEX_CLIENT_BEGIN
                     | ACTION_INDEX_CLIENT_END
+                    | ACTION_INDEX_CLIENT_HEARTBEAT
                     | ACTION_INDEX_SESSION_BEGIN
                     | ACTION_INDEX_SESSION_PROGRESS
                     | ACTION_PUBLISH
@@ -4450,8 +4606,18 @@ impl ServerState {
         }
         match action {
             ACTION_PING => json_bytes(&json!({ "message": "pong" })),
-            ACTION_INDEX_CLIENT_BEGIN => json_bytes(&self.handle_begin_index_client()?),
-            ACTION_INDEX_CLIENT_END => json_bytes(&self.handle_end_index_client()?),
+            ACTION_INDEX_CLIENT_BEGIN => {
+                let request: CandidateIndexClientBeginRequest = json_from_bytes(payload)?;
+                json_bytes(&self.handle_begin_index_client(&request)?)
+            }
+            ACTION_INDEX_CLIENT_END => {
+                let request: CandidateIndexClientHeartbeatRequest = json_from_bytes(payload)?;
+                json_bytes(&self.handle_end_index_client(&request)?)
+            }
+            ACTION_INDEX_CLIENT_HEARTBEAT => {
+                let request: CandidateIndexClientHeartbeatRequest = json_from_bytes(payload)?;
+                json_bytes(&self.handle_heartbeat_index_client(&request)?)
+            }
             ACTION_INDEX_SESSION_BEGIN => json_bytes(&self.handle_begin_index_session()?),
             ACTION_INDEX_SESSION_END => json_bytes(&self.handle_end_index_session()?),
             ACTION_INDEX_SESSION_PROGRESS => {
@@ -5406,6 +5572,8 @@ impl ServerState {
                 Ordering::SeqCst,
             );
             self.publish_runs_total.fetch_add(1, Ordering::SeqCst);
+            self.publish_after_index_clients
+                .store(false, Ordering::SeqCst);
             let _ = self.update_adaptive_publish_from_publish(publish_completed_unix_ms);
             self.invalidate_search_caches();
             Ok(CandidatePublishResponse {

@@ -60,6 +60,7 @@ const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
 const REMOTE_INDEX_ROTATION_RETRY_LIMIT: usize = 2400;
 const REMOTE_INDEX_ROTATION_RETRY_SLEEP_MS: u64 = 50;
+const INDEX_CLIENT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
 struct ServeSignalFlags {
     shutdown: Arc<AtomicBool>,
@@ -2752,7 +2753,29 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let mut session_submitted_documents = 0usize;
             let mut session_submitted_input_bytes = 0u64;
             let mut session_publish_rotations = 0usize;
-            base_client.begin_index_client()?;
+            let (index_client_id, _) =
+                base_client.begin_index_client(INDEX_CLIENT_HEARTBEAT_INTERVAL_MS)?;
+            let heartbeat_stop = Arc::new(AtomicBool::new(false));
+            let heartbeat_error = Arc::new(Mutex::new(None::<String>));
+            let heartbeat_client = rpc_client(&args.connection);
+            let heartbeat_stop_flag = heartbeat_stop.clone();
+            let heartbeat_error_slot = heartbeat_error.clone();
+            let heartbeat_handle = thread::spawn(move || {
+                while !heartbeat_stop_flag.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(INDEX_CLIENT_HEARTBEAT_INTERVAL_MS));
+                    if heartbeat_stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Err(err) = heartbeat_client.heartbeat_index_client(index_client_id) {
+                        if let Ok(mut slot) = heartbeat_error_slot.lock() {
+                            if slot.is_none() {
+                                *slot = Some(err.to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+            });
             let remote_result = (|| -> Result<()> {
                 let mut client = base_client.connect_persistent()?;
                 client.begin_index_session()?;
@@ -2950,8 +2973,17 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 end_session_result?;
                 Ok(())
             })();
-            let end_client_result = base_client.end_index_client();
+            heartbeat_stop.store(true, Ordering::SeqCst);
+            let _ = heartbeat_handle.join();
+            let heartbeat_result = heartbeat_error
+                .lock()
+                .map_err(|_| SspryError::from("Index heartbeat error slot poisoned."))?
+                .clone()
+                .map(|message| Err(SspryError::from(message)))
+                .unwrap_or(Ok(()));
+            let end_client_result = base_client.end_index_client(index_client_id);
             remote_result?;
+            heartbeat_result?;
             end_client_result?;
             if args.verbose {
                 server_rss_kb = server_memory_kb(&args.connection)?;
