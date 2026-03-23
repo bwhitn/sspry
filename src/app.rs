@@ -2741,10 +2741,16 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             let configured_budget_bytes = server_policy.memory_budget_bytes;
             let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
             let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
-            let remote_session_document_limit =
-                remote_index_session_document_limit(effective_budget_bytes, batch_size);
-            let remote_session_input_bytes_limit =
-                remote_index_session_input_bytes_limit(effective_budget_bytes);
+            let remote_session_document_limit = if args.rotate_remote_sessions {
+                remote_index_session_document_limit(effective_budget_bytes, batch_size)
+            } else {
+                usize::MAX
+            };
+            let remote_session_input_bytes_limit = if args.rotate_remote_sessions {
+                remote_index_session_input_bytes_limit(effective_budget_bytes)
+            } else {
+                u64::MAX
+            };
             let empty_payload_size = empty_remote_batch_payload_size()?;
             let mut pending = RemotePendingBatch {
                 rows: Vec::new(),
@@ -2816,8 +2822,10 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 &mut last_progress_at,
                                 false,
                             );
-                            if session_submitted_documents >= remote_session_document_limit
-                                || session_submitted_input_bytes >= remote_session_input_bytes_limit
+                            if args.rotate_remote_sessions
+                                && (session_submitted_documents >= remote_session_document_limit
+                                    || session_submitted_input_bytes
+                                        >= remote_session_input_bytes_limit)
                             {
                                 rotate_remote_index_session(
                                     &base_client,
@@ -2923,9 +2931,11 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                     &mut last_progress_at,
                                     false,
                                 );
-                                if session_submitted_documents >= remote_session_document_limit
-                                    || session_submitted_input_bytes
-                                        >= remote_session_input_bytes_limit
+                                if args.rotate_remote_sessions
+                                    && (session_submitted_documents
+                                        >= remote_session_document_limit
+                                        || session_submitted_input_bytes
+                                            >= remote_session_input_bytes_limit)
                                 {
                                     rotate_remote_index_session(
                                         &base_client,
@@ -2991,13 +3001,22 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
                 eprintln!("verbose.index.queue_capacity: {queue_capacity}");
                 eprintln!(
-                    "verbose.index.remote_session_document_limit: {}",
-                    remote_session_document_limit
+                    "verbose.index.rotate_remote_sessions: {}",
+                    args.rotate_remote_sessions
                 );
-                eprintln!(
-                    "verbose.index.remote_session_input_bytes_limit: {}",
-                    remote_session_input_bytes_limit
-                );
+                if args.rotate_remote_sessions {
+                    eprintln!(
+                        "verbose.index.remote_session_document_limit: {}",
+                        remote_session_document_limit
+                    );
+                    eprintln!(
+                        "verbose.index.remote_session_input_bytes_limit: {}",
+                        remote_session_input_bytes_limit
+                    );
+                } else {
+                    eprintln!("verbose.index.remote_session_document_limit: disabled");
+                    eprintln!("verbose.index.remote_session_input_bytes_limit: disabled");
+                }
                 eprintln!(
                     "verbose.index.remote_session_publish_rotations: {}",
                     session_publish_rotations
@@ -3739,6 +3758,7 @@ fn cmd_index(args: &IndexArgs) -> i32 {
             chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
             external_id_from_path: false,
             verbose: args.verbose,
+            rotate_remote_sessions: false,
         });
     }
     let server_policy = match server_scan_policy(&args.connection) {
@@ -3758,6 +3778,7 @@ fn cmd_index(args: &IndexArgs) -> i32 {
         chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
         external_id_from_path: server_policy.store_path,
         verbose: args.verbose,
+        rotate_remote_sessions: false,
     })
 }
 
@@ -4881,6 +4902,12 @@ struct InternalIndexBatchArgs {
     external_id_from_path: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
+    #[arg(
+        long = "rotate-remote-sessions",
+        action = ArgAction::SetTrue,
+        help = "Allow remote indexing to end the current server session and publish mid-job when session limits are hit."
+    )]
+    rotate_remote_sessions: bool,
 }
 
 #[cfg(test)]
@@ -5561,6 +5588,7 @@ rule q {
             chunk_size: 1024,
             external_id_from_path: true,
             verbose: false,
+            rotate_remote_sessions: false,
         };
         assert_eq!(cmd_internal_index_batch(&ingest_batch), 0);
 
@@ -5716,6 +5744,7 @@ rule q {
                 chunk_size: 1024,
                 external_id_from_path: true,
                 verbose: false,
+                rotate_remote_sessions: false,
             }),
             0
         );
@@ -5730,6 +5759,7 @@ rule q {
                 chunk_size: 1024,
                 external_id_from_path: false,
                 verbose: false,
+                rotate_remote_sessions: false,
             }),
             1
         );
