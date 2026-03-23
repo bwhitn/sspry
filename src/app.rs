@@ -2990,7 +2990,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         "verbose.index.server_tier2_superblock_summary_bytes",
                     ),
                     (
-                        "tier2_superblock_memory_budget_bytes",
+                        "superblock_memory_budget_bytes",
                         "verbose.index.server_tier2_superblock_budget_bytes",
                     ),
                     (
@@ -3148,8 +3148,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                             "verbose.index.server_last_publish_init_work_ms",
                         ),
                         (
-                            "last_publish_persist_tier2_superblocks_ms",
-                            "verbose.index.server_last_publish_persist_tier2_superblocks_ms",
+                            "last_publish_persist_superblocks_ms",
+                            "verbose.index.server_last_publish_persist_superblocks_ms",
                         ),
                         (
                             "last_publish_tier2_snapshot_persist_failures",

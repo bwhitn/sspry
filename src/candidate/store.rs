@@ -154,18 +154,18 @@ pub struct CandidateStoreOpenProfile {
     pub sidecars_ms: u64,
     pub rebuild_indexes_ms: u64,
     pub rebuild_sha_index_ms: u64,
-    pub load_tier2_superblocks_ms: u64,
-    pub rebuild_tier2_superblocks_ms: u64,
-    pub loaded_tier2_superblocks_from_snapshot: bool,
+    pub load_superblock_snapshots_ms: u64,
+    pub rebuild_superblocks_ms: u64,
+    pub loaded_superblocks_from_snapshot: bool,
     pub total_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CandidateStoreRebuildProfile {
     sha_index_ms: u64,
-    load_tier2_superblocks_ms: u64,
-    tier2_superblocks_ms: u64,
-    loaded_tier2_superblocks_from_snapshot: bool,
+    load_superblock_snapshots_ms: u64,
+    rebuild_superblocks_ms: u64,
+    loaded_superblocks_from_snapshot: bool,
     total_ms: u64,
 }
 
@@ -326,7 +326,7 @@ pub struct CandidateStats {
     pub query_count: u64,
     pub tier2_scanned_docs_total: u64,
     pub tier2_docs_matched_total: u64,
-    pub tier2_superblocks_skipped_total: u64,
+    pub superblocks_skipped_total: u64,
     pub tier2_match_ratio: f64,
     pub tier1_superblock_count: usize,
     pub tier1_superblock_docs: usize,
@@ -340,7 +340,7 @@ pub struct CandidateStats {
     pub superblock_positions_bytes_total: u64,
     pub mapped_superblock_snapshot_bytes_total: u64,
     pub mapped_tier1_superblock_snapshot_bytes: u64,
-    pub mapped_tier2_pattern_superblock_snapshot_bytes: u64,
+    pub mapped_tier2_superblock_snapshot_bytes: u64,
     pub docs_vector_bytes: u64,
     pub doc_rows_bytes: u64,
     pub tier2_doc_rows_bytes: u64,
@@ -352,7 +352,7 @@ pub struct CandidateStats {
     pub mapped_tier2_bloom_bytes: u64,
     pub mapped_metadata_bytes: u64,
     pub mapped_external_id_bytes: u64,
-    pub tier2_superblock_memory_budget_bytes: u64,
+    pub superblock_memory_budget_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -505,9 +505,9 @@ fn candidate_doc_memory_bytes(doc: &CandidateDoc) -> u64 {
 
 const DOC_META_ROW_BYTES: usize = 56;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
-const DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
+const DEFAULT_SUPERBLOCK_MEMORY_BUDGET_DIVISOR: u64 = 4;
 const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
-const MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
+const MIN_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_DELETED: u8 = 0x02;
 const DOC_FLAG_SPECIAL_POPULATION: u8 = 0x04;
 
@@ -600,7 +600,7 @@ struct Tier2Telemetry {
     query_count: u64,
     tier2_scanned_docs_total: u64,
     tier2_docs_matched_total: u64,
-    tier2_superblocks_skipped_total: u64,
+    superblocks_skipped_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1014,7 +1014,7 @@ pub(crate) struct PreparedQueryArtifacts {
     impossible_query: bool,
 }
 
-fn tier2_superblock_summary_bytes(filter_bytes: usize, _summary_cap_bytes: usize) -> usize {
+fn superblock_summary_bytes(filter_bytes: usize, _summary_cap_bytes: usize) -> usize {
     align_filter_bytes(filter_bytes.max(1))
 }
 
@@ -1029,7 +1029,7 @@ fn ensure_superblock_capacity_for(
     summary_cap_bytes: usize,
 ) {
     let needed_blocks = block_idx + 1;
-    let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes);
+    let summary_bytes = superblock_summary_bytes(bucket_key.0, summary_cap_bytes);
     index
         .summary_bytes_by_bucket
         .insert(bucket_key, summary_bytes);
@@ -1141,7 +1141,7 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
         );
         let filter_key = (*filter_bytes, *bloom_hashes);
         let bucket_key = tier2_superblock_bucket_key(*filter_bytes, *bloom_hashes);
-        let summary_bytes = tier2_superblock_summary_bytes(bucket_key.0, summary_cap_bytes).max(1);
+        let summary_bytes = superblock_summary_bytes(bucket_key.0, summary_cap_bytes).max(1);
         let folded = aggregated
             .entry((block_idx, filter_key))
             .or_insert_with(|| vec![0u8; summary_bytes]);
@@ -1297,14 +1297,14 @@ pub struct CandidateStore {
     last_write_activity_monotonic: Option<Instant>,
     tree_tier1_gates: TreeBloomGateIndex,
     tree_tier2_gates: TreeBloomGateIndex,
+    tier1_superblocks: Tier2SuperblockIndex,
     tier2_superblocks: Tier2SuperblockIndex,
-    tier2_pattern_superblocks: Tier2SuperblockIndex,
     tier2_telemetry: Tier2Telemetry,
     prepared_query_cache: BoundedCache<String, Arc<PreparedQueryArtifacts>>,
     memory_budget_bytes: u64,
     total_shards: usize,
-    tier2_superblock_memory_budget_divisor: u64,
-    tier2_superblock_memory_budget_bytes: u64,
+    superblock_memory_budget_divisor: u64,
+    superblock_memory_budget_bytes: u64,
     meta_persist_dirty: bool,
     last_insert_batch_profile: CandidateInsertBatchProfile,
     last_import_batch_profile: CandidateImportBatchProfile,
@@ -1478,7 +1478,7 @@ pub(crate) fn candidate_limit_exceeded_error(
     ))
 }
 
-fn tier2_superblock_memory_budget_bytes(
+fn superblock_memory_budget_bytes(
     memory_budget_bytes: u64,
     total_shards: usize,
     budget_divisor: u64,
@@ -1488,7 +1488,7 @@ fn tier2_superblock_memory_budget_bytes(
     }
     let aggregate_budget = memory_budget_bytes / budget_divisor.max(1);
     let per_shard_budget = aggregate_budget / total_shards as u64;
-    per_shard_budget.max(MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES)
+    per_shard_budget.max(MIN_SUPERBLOCK_MEMORY_BUDGET_BYTES)
 }
 
 fn scaled_docs_per_block_for_budget(
@@ -1671,14 +1671,14 @@ impl CandidateStore {
             last_write_activity_monotonic: None,
             tree_tier1_gates: TreeBloomGateIndex::default(),
             tree_tier2_gates: TreeBloomGateIndex::default(),
+            tier1_superblocks: Tier2SuperblockIndex::default(),
             tier2_superblocks: Tier2SuperblockIndex::default(),
-            tier2_pattern_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
             total_shards: 1,
-            tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
-            tier2_superblock_memory_budget_bytes: 0,
+            superblock_memory_budget_divisor: DEFAULT_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
+            superblock_memory_budget_bytes: 0,
             meta_persist_dirty: false,
             last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
@@ -1735,14 +1735,14 @@ impl CandidateStore {
             last_write_activity_monotonic: None,
             tree_tier1_gates: TreeBloomGateIndex::default(),
             tree_tier2_gates: TreeBloomGateIndex::default(),
+            tier1_superblocks: Tier2SuperblockIndex::default(),
             tier2_superblocks: Tier2SuperblockIndex::default(),
-            tier2_pattern_superblocks: Tier2SuperblockIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
             total_shards: 1,
-            tier2_superblock_memory_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
-            tier2_superblock_memory_budget_bytes: 0,
+            superblock_memory_budget_divisor: DEFAULT_SUPERBLOCK_MEMORY_BUDGET_DIVISOR,
+            superblock_memory_budget_bytes: 0,
             meta_persist_dirty: false,
             last_insert_batch_profile: CandidateInsertBatchProfile::default(),
             last_import_batch_profile: CandidateImportBatchProfile::default(),
@@ -1766,10 +1766,9 @@ impl CandidateStore {
             sidecars_ms,
             rebuild_indexes_ms: rebuild_profile.total_ms,
             rebuild_sha_index_ms: rebuild_profile.sha_index_ms,
-            load_tier2_superblocks_ms: rebuild_profile.load_tier2_superblocks_ms,
-            rebuild_tier2_superblocks_ms: rebuild_profile.tier2_superblocks_ms,
-            loaded_tier2_superblocks_from_snapshot: rebuild_profile
-                .loaded_tier2_superblocks_from_snapshot,
+            load_superblock_snapshots_ms: rebuild_profile.load_superblock_snapshots_ms,
+            rebuild_superblocks_ms: rebuild_profile.rebuild_superblocks_ms,
+            loaded_superblocks_from_snapshot: rebuild_profile.loaded_superblocks_from_snapshot,
             total_ms: started_total
                 .elapsed()
                 .as_millis()
@@ -1783,17 +1782,17 @@ impl CandidateStore {
         &mut self,
         memory_budget_bytes: u64,
         total_shards: usize,
-        tier2_superblock_memory_budget_divisor: u64,
+        superblock_memory_budget_divisor: u64,
     ) -> Result<()> {
         self.memory_budget_bytes = memory_budget_bytes;
         self.total_shards = total_shards.max(1);
-        self.tier2_superblock_memory_budget_divisor = tier2_superblock_memory_budget_divisor.max(1);
-        self.tier2_superblock_memory_budget_bytes = tier2_superblock_memory_budget_bytes(
+        self.superblock_memory_budget_divisor = superblock_memory_budget_divisor.max(1);
+        self.superblock_memory_budget_bytes = superblock_memory_budget_bytes(
             memory_budget_bytes,
             self.total_shards,
-            self.tier2_superblock_memory_budget_divisor,
+            self.superblock_memory_budget_divisor,
         );
-        self.maybe_rebalance_tier2_superblocks()
+        self.maybe_rebalance_superblocks()
     }
 
     pub fn config(&self) -> CandidateConfig {
@@ -1966,7 +1965,7 @@ impl CandidateStore {
         if let Err(err) = reopened.apply_runtime_limits(
             self.memory_budget_bytes,
             self.total_shards,
-            self.tier2_superblock_memory_budget_divisor,
+            self.superblock_memory_budget_divisor,
         ) {
             let _ = fs::remove_dir_all(&root);
             let _ = fs::rename(&retired_root, &root);
@@ -2224,12 +2223,9 @@ impl CandidateStore {
             }
             self.update_tree_tier1_gates_for_doc_bytes_inner(existing_pos, bloom_filter)?;
             self.update_tree_tier2_gates_for_doc_bytes_inner(existing_pos, tier2_bloom_filter)?;
-            self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
-            self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
-                existing_pos,
-                tier2_bloom_filter,
-            )?;
-            self.maybe_rebalance_tier2_superblocks()?;
+            self.update_tier1_superblocks_for_doc_bytes_inner(existing_pos, bloom_filter)?;
+            self.update_tier2_superblocks_for_doc_bytes_inner(existing_pos, tier2_bloom_filter)?;
+            self.maybe_rebalance_superblocks()?;
         } else {
             doc_id = self.local_meta.next_doc_id;
             self.local_meta.next_doc_id += 1;
@@ -2278,9 +2274,9 @@ impl CandidateStore {
             }
             self.update_tree_tier1_gates_for_doc_bytes_inner(new_pos, bloom_filter)?;
             self.update_tree_tier2_gates_for_doc_bytes_inner(new_pos, tier2_bloom_filter)?;
-            self.update_tier2_superblocks_for_doc_bytes_inner(new_pos, bloom_filter)?;
-            self.update_tier2_pattern_superblocks_for_doc_bytes_inner(new_pos, tier2_bloom_filter)?;
-            self.maybe_rebalance_tier2_superblocks()?;
+            self.update_tier1_superblocks_for_doc_bytes_inner(new_pos, bloom_filter)?;
+            self.update_tier2_superblocks_for_doc_bytes_inner(new_pos, tier2_bloom_filter)?;
+            self.maybe_rebalance_superblocks()?;
             status = "inserted".to_owned();
         }
 
@@ -2683,8 +2679,8 @@ impl CandidateStore {
             let tier2_update_started = Instant::now();
             self.update_tree_tier1_gates_for_doc_bytes_batch(&tier2_updates)?;
             self.update_tree_tier2_gates_for_doc_bytes_batch(&tier2_pattern_updates)?;
-            self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
-            self.update_tier2_pattern_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
+            self.update_tier1_superblocks_for_doc_bytes_batch(&tier2_updates)?;
+            self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
             insert_profile.tier2_update_us = insert_profile
                 .tier2_update_us
                 .saturating_add(elapsed_us(tier2_update_started));
@@ -2692,7 +2688,7 @@ impl CandidateStore {
                 self.mark_meta_dirty();
             }
             let rebalance_tier2_started = Instant::now();
-            self.maybe_rebalance_tier2_superblocks()?;
+            self.maybe_rebalance_superblocks()?;
             insert_profile.rebalance_tier2_us = insert_profile
                 .rebalance_tier2_us
                 .saturating_add(elapsed_us(rebalance_tier2_started));
@@ -2729,7 +2725,7 @@ impl CandidateStore {
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
             self.rebuild_tree_gates()?;
-            self.rebuild_tier2_superblocks()?;
+            self.rebuild_superblocks()?;
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
             return Ok(result);
@@ -2874,11 +2870,11 @@ impl CandidateStore {
                     if snapshot.special_population {
                         self.remember_special_doc_position(existing_pos);
                     }
-                    self.update_tier2_superblocks_for_doc_bytes_inner(
+                    self.update_tier1_superblocks_for_doc_bytes_inner(
                         existing_pos,
                         &document.bloom_filter,
                     )?;
-                    self.update_tier2_pattern_superblocks_for_doc_bytes_inner(
+                    self.update_tier2_superblocks_for_doc_bytes_inner(
                         existing_pos,
                         &document.tier2_bloom_filter,
                     )?;
@@ -3118,8 +3114,8 @@ impl CandidateStore {
             let tier2_update_started = Instant::now();
             self.update_tree_tier1_gates_for_doc_bytes_batch(&tier2_updates)?;
             self.update_tree_tier2_gates_for_doc_bytes_batch(&tier2_pattern_updates)?;
-            self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_updates)?;
-            self.update_tier2_pattern_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
+            self.update_tier1_superblocks_for_doc_bytes_batch(&tier2_updates)?;
+            self.update_tier2_superblocks_for_doc_bytes_batch(&tier2_pattern_updates)?;
             import_profile.tier2_update_ms = tier2_update_started
                 .elapsed()
                 .as_millis()
@@ -3132,7 +3128,7 @@ impl CandidateStore {
                 self.mark_meta_dirty();
             }
             let rebalance_tier2_started = Instant::now();
-            self.maybe_rebalance_tier2_superblocks()?;
+            self.maybe_rebalance_superblocks()?;
             import_profile.rebalance_tier2_ms = rebalance_tier2_started
                 .elapsed()
                 .as_millis()
@@ -3407,16 +3403,16 @@ impl CandidateStore {
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
         let mut query_profile = CandidateQueryProfile::default();
         query_profile.tree_gate_trees_considered = 1;
-        let tier2_superblocks = if self.tier2_pattern_superblocks.masks_by_bucket.is_empty() {
+        let tier2_superblocks = if self.tier2_superblocks.masks_by_bucket.is_empty() {
             None
         } else {
-            Some(&self.tier2_pattern_superblocks)
+            Some(&self.tier2_superblocks)
         };
         let tier1_tree_match = tree_maybe_matches_node(
             &plan.root,
             &prepared.mask_cache,
             &self.tree_tier1_gates,
-            &self.tier2_superblocks,
+            &self.tier1_superblocks,
             &self.tree_tier2_gates,
             tier2_superblocks,
             false,
@@ -3426,7 +3422,7 @@ impl CandidateStore {
                 &plan.root,
                 &prepared.mask_cache,
                 &self.tree_tier1_gates,
-                &self.tier2_superblocks,
+                &self.tier1_superblocks,
                 &self.tree_tier2_gates,
                 tier2_superblocks,
                 true,
@@ -3458,7 +3454,7 @@ impl CandidateStore {
         if !normal_tree_match && !has_special_docs {
             return Ok((Vec::new(), TierFlags::default(), query_profile));
         }
-        let block_refs = self.tier2_superblocks.block_refs();
+        let block_refs = self.tier1_superblocks.block_refs();
         let block_count = block_refs.len();
         let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
         let query_now_unix = SystemTime::now()
@@ -3615,11 +3611,11 @@ impl CandidateStore {
                     local_block_idx,
                     &plan.root,
                     &prepared.mask_cache,
-                    &self.tier2_superblocks,
-                    if self.tier2_pattern_superblocks.masks_by_bucket.is_empty() {
+                    &self.tier1_superblocks,
+                    if self.tier2_superblocks.masks_by_bucket.is_empty() {
                         None
                     } else {
-                        Some(&self.tier2_pattern_superblocks)
+                        Some(&self.tier2_superblocks)
                     },
                     true,
                 )?
@@ -3629,7 +3625,7 @@ impl CandidateStore {
                 continue;
             }
             let positions = self
-                .tier2_superblocks
+                .tier1_superblocks
                 .positions_by_bucket
                 .get(&bucket_key)
                 .and_then(|blocks| blocks.get(local_block_idx))
@@ -3741,15 +3737,12 @@ impl CandidateStore {
             mapped_metadata_bytes,
             mapped_external_id_bytes,
         ) = self.sidecars.mapped_bytes();
-        let tier1_superblock_summary_bytes = self.tier2_superblocks.summary_memory_bytes;
-        let tier2_pattern_superblock_summary_bytes =
-            self.tier2_pattern_superblocks.summary_memory_bytes;
-        let tier1_superblock_positions_bytes = self.tier2_superblocks.positions_memory_bytes();
-        let tier2_pattern_superblock_positions_bytes =
-            self.tier2_pattern_superblocks.positions_memory_bytes();
-        let mapped_tier1_superblock_snapshot_bytes = self.tier2_superblocks.snapshot_mapped_bytes();
-        let mapped_tier2_pattern_superblock_snapshot_bytes =
-            self.tier2_pattern_superblocks.snapshot_mapped_bytes();
+        let tier1_superblock_summary_bytes = self.tier1_superblocks.summary_memory_bytes;
+        let tier2_superblock_summary_bytes = self.tier2_superblocks.summary_memory_bytes;
+        let tier1_superblock_positions_bytes = self.tier1_superblocks.positions_memory_bytes();
+        let tier2_superblock_positions_bytes = self.tier2_superblocks.positions_memory_bytes();
+        let mapped_tier1_superblock_snapshot_bytes = self.tier1_superblocks.snapshot_mapped_bytes();
+        let mapped_tier2_superblock_snapshot_bytes = self.tier2_superblocks.snapshot_mapped_bytes();
         CandidateStats {
             doc_count,
             deleted_doc_count,
@@ -3767,24 +3760,24 @@ impl CandidateStore {
             query_count: self.tier2_telemetry.query_count,
             tier2_scanned_docs_total: self.tier2_telemetry.tier2_scanned_docs_total,
             tier2_docs_matched_total: self.tier2_telemetry.tier2_docs_matched_total,
-            tier2_superblocks_skipped_total: self.tier2_telemetry.tier2_superblocks_skipped_total,
+            superblocks_skipped_total: self.tier2_telemetry.superblocks_skipped_total,
             tier2_match_ratio,
-            tier1_superblock_count: self.tier2_superblocks.total_block_count(),
-            tier1_superblock_docs: self.tier2_superblocks.docs_per_block,
+            tier1_superblock_count: self.tier1_superblocks.total_block_count(),
+            tier1_superblock_docs: self.tier1_superblocks.docs_per_block,
             tier1_superblock_summary_bytes,
-            tier2_superblock_summary_bytes: tier2_pattern_superblock_summary_bytes,
+            tier2_superblock_summary_bytes,
             tier1_superblock_positions_bytes,
-            tier2_superblock_positions_bytes: tier2_pattern_superblock_positions_bytes,
+            tier2_superblock_positions_bytes: tier2_superblock_positions_bytes,
             tree_tier1_gate_bytes: self.tree_tier1_gates.memory_bytes(),
             tree_tier2_gate_bytes: self.tree_tier2_gates.memory_bytes(),
             superblock_summary_bytes_total: tier1_superblock_summary_bytes
-                .saturating_add(tier2_pattern_superblock_summary_bytes),
+                .saturating_add(tier2_superblock_summary_bytes),
             superblock_positions_bytes_total: tier1_superblock_positions_bytes
-                .saturating_add(tier2_pattern_superblock_positions_bytes),
+                .saturating_add(tier2_superblock_positions_bytes),
             mapped_superblock_snapshot_bytes_total: mapped_tier1_superblock_snapshot_bytes
-                .saturating_add(mapped_tier2_pattern_superblock_snapshot_bytes),
+                .saturating_add(mapped_tier2_superblock_snapshot_bytes),
             mapped_tier1_superblock_snapshot_bytes,
-            mapped_tier2_pattern_superblock_snapshot_bytes,
+            mapped_tier2_superblock_snapshot_bytes,
             docs_vector_bytes: self.docs_vector_memory_bytes(),
             doc_rows_bytes: (self.doc_rows.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<DocMetaRow>() as u64),
@@ -3799,7 +3792,7 @@ impl CandidateStore {
             mapped_tier2_bloom_bytes,
             mapped_metadata_bytes,
             mapped_external_id_bytes,
-            tier2_superblock_memory_budget_bytes: self.tier2_superblock_memory_budget_bytes,
+            superblock_memory_budget_bytes: self.superblock_memory_budget_bytes,
         }
     }
 
@@ -3815,7 +3808,7 @@ impl CandidateStore {
 
     pub(crate) fn tier1_superblock_filter_keys(&self) -> Vec<(usize, usize)> {
         let mut keys = self
-            .tier2_superblocks
+            .tier1_superblocks
             .bucket_for_key
             .keys()
             .copied()
@@ -4216,8 +4209,8 @@ impl CandidateStore {
         )
     }
 
-    fn tier2_superblock_summary_bytes(&self, filter_bytes: usize) -> usize {
-        tier2_superblock_summary_bytes(filter_bytes, self.meta.tier2_superblock_summary_cap_bytes)
+    fn superblock_summary_bytes(&self, filter_bytes: usize) -> usize {
+        superblock_summary_bytes(filter_bytes, self.meta.tier2_superblock_summary_cap_bytes)
     }
 
     fn update_tree_tier1_gates_for_doc_bytes_inner(
@@ -4277,7 +4270,7 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn update_tier2_superblocks_for_doc_bytes_inner(
+    fn update_tier1_superblocks_for_doc_bytes_inner(
         &mut self,
         pos: usize,
         bloom_bytes: &[u8],
@@ -4287,6 +4280,42 @@ impl CandidateStore {
         }
         let filter_bytes = self.docs[pos].filter_bytes;
         let bloom_hashes = self.docs[pos].bloom_hashes;
+        update_superblocks_for_doc_bytes_inner(
+            &mut self.tier1_superblocks,
+            self.meta.tier2_superblock_summary_cap_bytes,
+            pos,
+            filter_bytes,
+            bloom_hashes,
+            bloom_bytes,
+        );
+        Ok(())
+    }
+
+    fn update_tier1_superblocks_for_doc_bytes_batch(
+        &mut self,
+        updates: &[(usize, usize, usize, &[u8])],
+    ) -> Result<()> {
+        update_superblocks_for_doc_bytes_batch(
+            &mut self.tier1_superblocks,
+            self.meta.tier2_superblock_summary_cap_bytes,
+            updates,
+        );
+        Ok(())
+    }
+
+    fn update_tier2_superblocks_for_doc_bytes_inner(
+        &mut self,
+        pos: usize,
+        bloom_bytes: &[u8],
+    ) -> Result<()> {
+        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
+            return Ok(());
+        }
+        let filter_bytes = self.docs[pos].tier2_filter_bytes;
+        let bloom_hashes = self.docs[pos].tier2_bloom_hashes;
+        if filter_bytes == 0 || bloom_hashes == 0 || bloom_bytes.is_empty() {
+            return Ok(());
+        }
         update_superblocks_for_doc_bytes_inner(
             &mut self.tier2_superblocks,
             self.meta.tier2_superblock_summary_cap_bytes,
@@ -4310,43 +4339,7 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn update_tier2_pattern_superblocks_for_doc_bytes_inner(
-        &mut self,
-        pos: usize,
-        bloom_bytes: &[u8],
-    ) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
-            return Ok(());
-        }
-        let filter_bytes = self.docs[pos].tier2_filter_bytes;
-        let bloom_hashes = self.docs[pos].tier2_bloom_hashes;
-        if filter_bytes == 0 || bloom_hashes == 0 || bloom_bytes.is_empty() {
-            return Ok(());
-        }
-        update_superblocks_for_doc_bytes_inner(
-            &mut self.tier2_pattern_superblocks,
-            self.meta.tier2_superblock_summary_cap_bytes,
-            pos,
-            filter_bytes,
-            bloom_hashes,
-            bloom_bytes,
-        );
-        Ok(())
-    }
-
-    fn update_tier2_pattern_superblocks_for_doc_bytes_batch(
-        &mut self,
-        updates: &[(usize, usize, usize, &[u8])],
-    ) -> Result<()> {
-        update_superblocks_for_doc_bytes_batch(
-            &mut self.tier2_pattern_superblocks,
-            self.meta.tier2_superblock_summary_cap_bytes,
-            updates,
-        );
-        Ok(())
-    }
-
-    fn update_tier2_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+    fn update_tier1_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
         if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
@@ -4359,10 +4352,10 @@ impl CandidateStore {
             doc_id,
         )?;
         let owned_bloom_bytes = bloom_bytes.into_owned();
-        self.update_tier2_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
+        self.update_tier1_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
     }
 
-    fn update_tier2_pattern_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
+    fn update_tier2_superblocks_for_doc_inner(&mut self, pos: usize) -> Result<()> {
         if pos >= self.docs.len() || self.docs[pos].deleted {
             return Ok(());
         }
@@ -4378,7 +4371,7 @@ impl CandidateStore {
             doc_id,
         )?;
         let owned_bloom_bytes = bloom_bytes.into_owned();
-        self.update_tier2_pattern_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
+        self.update_tier2_superblocks_for_doc_bytes_inner(pos, &owned_bloom_bytes)
     }
 
     fn update_tree_tier1_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
@@ -4426,58 +4419,55 @@ impl CandidateStore {
         Ok(())
     }
 
-    fn rebuild_tier2_superblocks_with_docs_per_block(
-        &mut self,
-        docs_per_block: usize,
-    ) -> Result<()> {
+    fn rebuild_superblocks_with_docs_per_block(&mut self, docs_per_block: usize) -> Result<()> {
+        self.tier1_superblocks = Tier2SuperblockIndex {
+            docs_per_block: docs_per_block.max(1),
+            ..Tier2SuperblockIndex::default()
+        };
         self.tier2_superblocks = Tier2SuperblockIndex {
             docs_per_block: docs_per_block.max(1),
             ..Tier2SuperblockIndex::default()
         };
-        self.tier2_pattern_superblocks = Tier2SuperblockIndex {
-            docs_per_block: docs_per_block.max(1),
-            ..Tier2SuperblockIndex::default()
-        };
         for pos in 0..self.docs.len() {
+            self.update_tier1_superblocks_for_doc_inner(pos)?;
             self.update_tier2_superblocks_for_doc_inner(pos)?;
-            self.update_tier2_pattern_superblocks_for_doc_inner(pos)?;
         }
         Ok(())
     }
 
-    fn maybe_rebalance_tier2_superblocks(&mut self) -> Result<()> {
-        let budget_bytes = self.tier2_superblock_memory_budget_bytes;
+    fn maybe_rebalance_superblocks(&mut self) -> Result<()> {
+        let budget_bytes = self.superblock_memory_budget_bytes;
         let current_bytes = self
-            .tier2_superblocks
+            .tier1_superblocks
             .summary_memory_bytes
-            .saturating_add(self.tier2_pattern_superblocks.summary_memory_bytes);
+            .saturating_add(self.tier2_superblocks.summary_memory_bytes);
         if budget_bytes == 0 || current_bytes <= budget_bytes {
             return Ok(());
         }
         let target_docs_per_block = scaled_docs_per_block_for_budget(
-            self.tier2_superblocks.docs_per_block,
+            self.tier1_superblocks.docs_per_block,
             current_bytes,
             budget_bytes,
         );
-        if target_docs_per_block <= self.tier2_superblocks.docs_per_block {
+        if target_docs_per_block <= self.tier1_superblocks.docs_per_block {
             return Ok(());
         }
+        self.tier1_superblocks =
+            coarsen_superblocks(&self.tier1_superblocks, target_docs_per_block);
         self.tier2_superblocks =
             coarsen_superblocks(&self.tier2_superblocks, target_docs_per_block);
-        self.tier2_pattern_superblocks =
-            coarsen_superblocks(&self.tier2_pattern_superblocks, target_docs_per_block);
         Ok(())
     }
 
-    fn rebuild_tier2_superblocks(&mut self) -> Result<()> {
-        self.rebuild_tier2_superblocks_with_docs_per_block(self.tier2_superblocks.docs_per_block)
+    fn rebuild_superblocks(&mut self) -> Result<()> {
+        self.rebuild_superblocks_with_docs_per_block(self.tier1_superblocks.docs_per_block)
     }
 
     fn record_query_metrics(
         &mut self,
         tier2_scanned_docs: u64,
         tier2_docs_matched: u64,
-        tier2_superblocks_skipped: u64,
+        superblocks_skipped: u64,
     ) {
         self.tier2_telemetry.query_count = self.tier2_telemetry.query_count.saturating_add(1);
         self.tier2_telemetry.tier2_scanned_docs_total = self
@@ -4488,10 +4478,10 @@ impl CandidateStore {
             .tier2_telemetry
             .tier2_docs_matched_total
             .saturating_add(tier2_docs_matched);
-        self.tier2_telemetry.tier2_superblocks_skipped_total = self
+        self.tier2_telemetry.superblocks_skipped_total = self
             .tier2_telemetry
-            .tier2_superblocks_skipped_total
-            .saturating_add(tier2_superblocks_skipped);
+            .superblocks_skipped_total
+            .saturating_add(superblocks_skipped);
     }
 
     fn rebuild_indexes_profiled(&mut self) -> Result<CandidateStoreRebuildProfile> {
@@ -4516,77 +4506,72 @@ impl CandidateStore {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let load_tier2_started = Instant::now();
+        let load_superblock_snapshots_started = Instant::now();
         let expected_active_doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
         self.tree_tier1_gates = TreeBloomGateIndex::default();
         self.tree_tier2_gates = TreeBloomGateIndex::default();
-        let maybe_snapshot = self
-            .load_superblocks_snapshot(
+        let using_new_snapshot_layout = tier1_superblocks_path(&self.root).exists();
+        let maybe_snapshot = if using_new_snapshot_layout {
+            self.load_superblocks_snapshot(
                 &tier1_superblocks_path(&self.root),
                 self.docs.len(),
                 expected_active_doc_count,
             )
             .ok()
             .flatten()
-            .or_else(|| {
-                self.load_superblocks_snapshot(
-                    &legacy_primary_superblocks_path(&self.root),
-                    self.docs.len(),
-                    expected_active_doc_count,
-                )
-                .ok()
-                .flatten()
-            });
-        let maybe_pattern_snapshot = self
-            .load_superblocks_snapshot(
+        } else {
+            self.load_superblocks_snapshot(
+                &legacy_primary_superblocks_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
+            .ok()
+            .flatten()
+        };
+        let maybe_pattern_snapshot = if using_new_snapshot_layout {
+            self.load_superblocks_snapshot(
                 &tier2_superblocks_path(&self.root),
                 self.docs.len(),
                 expected_active_doc_count,
             )
             .ok()
             .flatten()
-            .or_else(|| {
-                self.load_superblocks_snapshot(
-                    &legacy_tier2_superblocks_path(&self.root),
-                    self.docs.len(),
-                    expected_active_doc_count,
-                )
-                .ok()
-                .flatten()
-            });
-        let load_tier2_superblocks_ms = load_tier2_started
+        } else {
+            self.load_superblocks_snapshot(
+                &legacy_tier2_superblocks_path(&self.root),
+                self.docs.len(),
+                expected_active_doc_count,
+            )
+            .ok()
+            .flatten()
+        };
+        let load_superblock_snapshots_ms = load_superblock_snapshots_started
             .elapsed()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let (loaded_tier2_superblocks_from_snapshot, tier2_superblocks_ms) =
+        let (loaded_superblocks_from_snapshot, rebuild_superblocks_ms) =
             if let (Some(snapshot), Some(pattern_snapshot)) =
                 (maybe_snapshot, maybe_pattern_snapshot)
             {
-                let tier2_started = Instant::now();
-                self.tier2_superblocks = snapshot;
-                self.tier2_pattern_superblocks = pattern_snapshot;
-                let tier2_superblocks_ms = tier2_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                (true, tier2_superblocks_ms)
+                self.tier1_superblocks = snapshot;
+                self.tier2_superblocks = pattern_snapshot;
+                (true, 0)
             } else {
-                let tier2_started = Instant::now();
-                self.rebuild_tier2_superblocks()?;
-                let tier2_superblocks_ms = tier2_started
+                let rebuild_superblocks_started = Instant::now();
+                self.rebuild_superblocks()?;
+                let rebuild_superblocks_ms = rebuild_superblocks_started
                     .elapsed()
                     .as_millis()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                (false, tier2_superblocks_ms)
+                (false, rebuild_superblocks_ms)
             };
         Ok(CandidateStoreRebuildProfile {
             sha_index_ms,
-            load_tier2_superblocks_ms,
-            tier2_superblocks_ms,
-            loaded_tier2_superblocks_from_snapshot,
+            load_superblock_snapshots_ms,
+            rebuild_superblocks_ms,
+            loaded_superblocks_from_snapshot,
             total_ms: started_total
                 .elapsed()
                 .as_millis()
@@ -4597,11 +4582,11 @@ impl CandidateStore {
 
     pub(crate) fn persist_superblock_snapshots(&self) -> Result<()> {
         self.persist_superblocks_snapshot(
-            &self.tier2_superblocks,
+            &self.tier1_superblocks,
             &tier1_superblocks_path(&self.root),
         )?;
         self.persist_superblocks_snapshot(
-            &self.tier2_pattern_superblocks,
+            &self.tier2_superblocks,
             &tier2_superblocks_path(&self.root),
         )
     }
@@ -4629,7 +4614,7 @@ impl CandidateStore {
                 .summary_bytes_by_bucket
                 .get(&(*filter_bucket, *bloom_hashes))
                 .copied()
-                .unwrap_or_else(|| self.tier2_superblock_summary_bytes(*filter_bucket));
+                .unwrap_or_else(|| self.superblock_summary_bytes(*filter_bucket));
             append_u64(&mut payload, summary_bytes as u64);
             append_u64(&mut payload, blocks.len() as u64);
             let position_blocks = index
@@ -4696,7 +4681,7 @@ impl CandidateStore {
             let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
             let bloom_hashes = read_u64(&bytes, &mut cursor)? as usize;
             let summary_bytes = read_u64(&bytes, &mut cursor)? as usize;
-            let expected_summary_bytes = self.tier2_superblock_summary_bytes(filter_bucket);
+            let expected_summary_bytes = self.superblock_summary_bytes(filter_bucket);
             if summary_bytes != expected_summary_bytes {
                 return Ok(None);
             }
@@ -9508,7 +9493,7 @@ rule q {
     }
 
     #[test]
-    fn tier2_superblocks_use_exact_filter_bytes() {
+    fn tier1_superblocks_use_exact_filter_bytes() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let mut store = CandidateStore::init(
@@ -9560,19 +9545,19 @@ rule q {
         let key = (filter_bytes, bloom_hashes);
         let bucket_key = (align_filter_bytes(filter_bytes), bloom_hashes);
         assert_eq!(
-            store.tier2_superblocks.bucket_for_key.get(&key).copied(),
+            store.tier1_superblocks.bucket_for_key.get(&key).copied(),
             Some(bucket_key)
         );
         assert_eq!(
             store
-                .tier2_superblocks
+                .tier1_superblocks
                 .summary_bytes_by_bucket
                 .get(&bucket_key)
                 .copied(),
             Some(align_filter_bytes(filter_bytes))
         );
         let blocks = store
-            .tier2_superblocks
+            .tier1_superblocks
             .masks_by_bucket
             .get(&bucket_key)
             .expect("superblock masks");
@@ -9581,7 +9566,7 @@ rule q {
     }
 
     #[test]
-    fn tier2_superblocks_ignore_summary_cap_for_exact_unions() {
+    fn tier1_superblocks_ignore_summary_cap_for_exact_unions() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let cap_bytes = 8 * 1024;
@@ -9634,7 +9619,7 @@ rule q {
 
         let bucket_key = tier2_superblock_bucket_key(filter_bytes, bloom_hashes);
         let blocks = store
-            .tier2_superblocks
+            .tier1_superblocks
             .masks_by_bucket
             .get(&bucket_key)
             .expect("superblock masks");
@@ -9644,15 +9629,15 @@ rule q {
     }
 
     #[test]
-    fn tier2_superblock_memory_budget_respects_memory_budget_and_divisor() {
+    fn superblock_memory_budget_respects_memory_budget_and_divisor() {
         assert_eq!(
-            tier2_superblock_memory_budget_bytes(16 * 1024 * 1024 * 1024, 256, 4),
+            superblock_memory_budget_bytes(16 * 1024 * 1024 * 1024, 256, 4),
             16 * 1024 * 1024
         );
-        assert_eq!(tier2_superblock_memory_budget_bytes(0, 256, 4), 0);
+        assert_eq!(superblock_memory_budget_bytes(0, 256, 4), 0);
         assert_eq!(
-            tier2_superblock_memory_budget_bytes(512 * 1024 * 1024, 256, 4),
-            MIN_TIER2_SUPERBLOCK_MEMORY_BUDGET_BYTES
+            superblock_memory_budget_bytes(512 * 1024 * 1024, 256, 4),
+            MIN_SUPERBLOCK_MEMORY_BUDGET_BYTES
         );
     }
 
@@ -9677,7 +9662,7 @@ rule q {
     }
 
     #[test]
-    fn apply_runtime_limits_updates_tier2_budget_stats() {
+    fn apply_runtime_limits_updates_superblock_budget_stats() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let mut store = CandidateStore::init(
@@ -9694,12 +9679,12 @@ rule q {
             .expect("apply runtime limits");
 
         let stats = store.stats();
-        assert_eq!(stats.tier2_superblock_memory_budget_bytes, 16 * 1024 * 1024);
+        assert_eq!(stats.superblock_memory_budget_bytes, 16 * 1024 * 1024);
         assert_eq!(stats.tier2_superblock_summary_bytes, 0);
     }
 
     #[test]
-    fn tier2_superblocks_snapshot_roundtrips_on_open() {
+    fn superblock_snapshots_roundtrip_on_open() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let mut store = CandidateStore::init(
@@ -9749,22 +9734,22 @@ rule q {
                 None,
             )
             .expect("insert");
-        let expected_summary_bytes = store.tier2_superblocks.summary_memory_bytes;
+        let expected_summary_bytes = store.tier1_superblocks.summary_memory_bytes;
         store
             .persist_superblock_snapshots()
             .expect("persist snapshot");
 
         let (reopened, profile) = CandidateStore::open_profiled(&root).expect("reopen");
-        assert!(profile.loaded_tier2_superblocks_from_snapshot);
-        assert_eq!(profile.rebuild_tier2_superblocks_ms, 0);
+        assert!(profile.loaded_superblocks_from_snapshot);
+        assert_eq!(profile.rebuild_superblocks_ms, 0);
         assert_eq!(
-            reopened.tier2_superblocks.summary_memory_bytes,
+            reopened.tier1_superblocks.summary_memory_bytes,
             expected_summary_bytes
         );
     }
 
     #[test]
-    fn stale_tier2_superblocks_snapshot_falls_back_to_rebuild() {
+    fn stale_superblock_snapshot_falls_back_to_rebuild() {
         fn make_doc(
             store: &CandidateStore,
             file_size: u64,
@@ -9842,7 +9827,7 @@ rule q {
             .expect("insert second");
 
         let (reopened, profile) = CandidateStore::open_profiled(&root).expect("reopen");
-        assert!(!profile.loaded_tier2_superblocks_from_snapshot);
-        assert!(reopened.tier2_superblocks.summary_memory_bytes > 0);
+        assert!(!profile.loaded_superblocks_from_snapshot);
+        assert!(reopened.tier1_superblocks.summary_memory_bytes > 0);
     }
 }

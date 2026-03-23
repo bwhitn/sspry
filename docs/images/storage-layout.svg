@@ -9,18 +9,18 @@
   <text x="68" y="232" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">shard_255</text>
   <rect x="290" y="80" width="260" height="300" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
   <text x="350" y="118" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Per-shard metadata</text>
-  <text x="320" y="156" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">meta.json</text>
+  <text x="320" y="156" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">store_meta.json</text>
   <text x="320" y="182" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">doc_meta.bin</text>
   <text x="320" y="208" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">sha256_by_docid.dat</text>
   <text x="320" y="234" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">tier2_doc_meta.bin</text>
-  <text x="320" y="260" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">tier2_superblocks.bin</text>
+  <text x="320" y="260" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">tier1_superblocks.bin</text>
   <rect x="620" y="80" width="280" height="300" rx="12" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
   <text x="700" y="118" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#7f1d1d">Per-shard blobs</text>
   <text x="650" y="156" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">blooms.bin</text>
   <text x="650" y="182" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">tier2_blooms.bin</text>
   <text x="650" y="208" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">doc_metadata.bin</text>
   <text x="650" y="234" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">external_ids.dat</text>
-  <text x="650" y="260" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">deleted state / sidecars</text>
+  <text x="650" y="260" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">tier2_superblocks.bin</text>
   <path d="M220 230 H290" stroke="#334155" stroke-width="3" fill="none"/>
   <polygon points="290,230 278,224 278,236" fill="#334155"/>
   <path d="M550 230 H620" stroke="#334155" stroke-width="3" fill="none"/>

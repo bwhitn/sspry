@@ -437,7 +437,7 @@ struct ServerState {
     last_publish_promote_work_imported_docs: AtomicU64,
     last_publish_promote_work_imported_shards: AtomicU64,
     last_publish_init_work_ms: AtomicU64,
-    last_publish_persist_tier2_superblocks_ms: AtomicU64,
+    last_publish_persist_superblocks_ms: AtomicU64,
     last_publish_tier2_snapshot_persist_failures: AtomicU64,
     last_publish_persisted_snapshot_shards: AtomicU64,
     last_publish_reused_work_stores: AtomicBool,
@@ -516,9 +516,9 @@ struct StoreRootStartupProfile {
     store_open_sidecars_ms: u64,
     store_open_rebuild_indexes_ms: u64,
     store_open_rebuild_sha_index_ms: u64,
-    store_open_load_tier2_superblocks_ms: u64,
-    store_open_loaded_tier2_superblocks_from_snapshot_shards: u64,
-    store_open_rebuild_tier2_superblocks_ms: u64,
+    store_open_load_superblock_snapshots_ms: u64,
+    store_open_loaded_superblocks_from_snapshot_shards: u64,
+    store_open_rebuild_superblocks_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1391,9 +1391,9 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.mapped_external_id_bytes)
         .sum::<u64>();
-    let tier2_superblock_memory_budget_bytes = stats_rows
+    let superblock_memory_budget_bytes = stats_rows
         .iter()
-        .map(|item| item.tier2_superblock_memory_budget_bytes)
+        .map(|item| item.superblock_memory_budget_bytes)
         .sum::<u64>();
     let superblock_summary_bytes_total = stats_rows
         .iter()
@@ -1411,9 +1411,9 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.mapped_tier1_superblock_snapshot_bytes)
         .sum::<u64>();
-    let mapped_tier2_pattern_superblock_snapshot_bytes = stats_rows
+    let mapped_tier2_superblock_snapshot_bytes = stats_rows
         .iter()
-        .map(|item| item.mapped_tier2_pattern_superblock_snapshot_bytes)
+        .map(|item| item.mapped_tier2_superblock_snapshot_bytes)
         .sum::<u64>();
     let docs_vector_bytes = stats_rows
         .iter()
@@ -1490,8 +1490,8 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(mapped_external_id_bytes),
     );
     out.insert(
-        "tier2_superblock_memory_budget_bytes".to_owned(),
-        json!(tier2_superblock_memory_budget_bytes),
+        "superblock_memory_budget_bytes".to_owned(),
+        json!(superblock_memory_budget_bytes),
     );
     out.insert(
         "superblock_summary_bytes_total".to_owned(),
@@ -1510,8 +1510,8 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(mapped_tier1_superblock_snapshot_bytes),
     );
     out.insert(
-        "mapped_tier2_pattern_superblock_snapshot_bytes".to_owned(),
-        json!(mapped_tier2_pattern_superblock_snapshot_bytes),
+        "mapped_tier2_superblock_snapshot_bytes".to_owned(),
+        json!(mapped_tier2_superblock_snapshot_bytes),
     );
     out.insert("docs_vector_bytes".to_owned(), json!(docs_vector_bytes));
     out.insert("doc_rows_bytes".to_owned(), json!(doc_rows_bytes));
@@ -1585,8 +1585,8 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(stats.tier1_superblock_docs),
     );
     out.insert(
-        "tier2_superblocks_skipped_total".to_owned(),
-        json!(stats.tier2_superblocks_skipped_total),
+        "superblocks_skipped_total".to_owned(),
+        json!(stats.superblocks_skipped_total),
     );
     out.insert("version".to_owned(), json!(1));
     out
@@ -1831,7 +1831,7 @@ impl ServerState {
             last_publish_promote_work_imported_docs: AtomicU64::new(0),
             last_publish_promote_work_imported_shards: AtomicU64::new(0),
             last_publish_init_work_ms: AtomicU64::new(0),
-            last_publish_persist_tier2_superblocks_ms: AtomicU64::new(0),
+            last_publish_persist_superblocks_ms: AtomicU64::new(0),
             last_publish_tier2_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_persisted_snapshot_shards: AtomicU64::new(0),
             last_publish_reused_work_stores: AtomicBool::new(false),
@@ -3113,9 +3113,9 @@ impl ServerState {
                 "store_open_sidecars_ms": profile.store_open_sidecars_ms,
                 "store_open_rebuild_indexes_ms": profile.store_open_rebuild_indexes_ms,
                 "store_open_rebuild_sha_index_ms": profile.store_open_rebuild_sha_index_ms,
-                "store_open_load_tier2_superblocks_ms": profile.store_open_load_tier2_superblocks_ms,
-                "store_open_loaded_tier2_superblocks_from_snapshot_shards": profile.store_open_loaded_tier2_superblocks_from_snapshot_shards,
-                "store_open_rebuild_tier2_superblocks_ms": profile.store_open_rebuild_tier2_superblocks_ms,
+                "store_open_load_superblock_snapshots_ms": profile.store_open_load_superblock_snapshots_ms,
+                "store_open_loaded_superblocks_from_snapshot_shards": profile.store_open_loaded_superblocks_from_snapshot_shards,
+                "store_open_rebuild_superblocks_ms": profile.store_open_rebuild_superblocks_ms,
             })
         };
         stats.insert(
@@ -3464,9 +3464,9 @@ impl ServerState {
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
             );
             publish.insert(
-                "last_publish_persist_tier2_superblocks_ms".to_owned(),
+                "last_publish_persist_superblocks_ms".to_owned(),
                 json!(
-                    self.last_publish_persist_tier2_superblocks_ms
+                    self.last_publish_persist_superblocks_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -3895,9 +3895,9 @@ impl ServerState {
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
             );
             publish.insert(
-                "last_publish_persist_tier2_superblocks_ms".to_owned(),
+                "last_publish_persist_superblocks_ms".to_owned(),
                 json!(
-                    self.last_publish_persist_tier2_superblocks_ms
+                    self.last_publish_persist_superblocks_ms
                         .load(Ordering::Acquire)
                 ),
             );
@@ -4991,7 +4991,7 @@ impl ServerState {
                 .store(0, Ordering::SeqCst);
             self.last_publish_promote_work_imported_shards
                 .store(0, Ordering::SeqCst);
-            self.last_publish_persist_tier2_superblocks_ms
+            self.last_publish_persist_superblocks_ms
                 .store(0, Ordering::SeqCst);
             self.last_publish_tier2_snapshot_persist_failures
                 .store(0, Ordering::SeqCst);
@@ -5265,7 +5265,7 @@ impl ServerState {
                     .enumerate()
                     .filter_map(|(shard_idx, changed)| changed.then_some(shard_idx)),
             )?;
-            self.last_publish_persist_tier2_superblocks_ms.store(
+            self.last_publish_persist_superblocks_ms.store(
                 persist_tier2_started
                     .elapsed()
                     .as_millis()
@@ -6025,17 +6025,17 @@ fn apply_store_open_profile(
     aggregate.store_open_rebuild_sha_index_ms = aggregate
         .store_open_rebuild_sha_index_ms
         .saturating_add(profile.rebuild_sha_index_ms);
-    aggregate.store_open_load_tier2_superblocks_ms = aggregate
-        .store_open_load_tier2_superblocks_ms
-        .saturating_add(profile.load_tier2_superblocks_ms);
-    if profile.loaded_tier2_superblocks_from_snapshot {
-        aggregate.store_open_loaded_tier2_superblocks_from_snapshot_shards = aggregate
-            .store_open_loaded_tier2_superblocks_from_snapshot_shards
+    aggregate.store_open_load_superblock_snapshots_ms = aggregate
+        .store_open_load_superblock_snapshots_ms
+        .saturating_add(profile.load_superblock_snapshots_ms);
+    if profile.loaded_superblocks_from_snapshot {
+        aggregate.store_open_loaded_superblocks_from_snapshot_shards = aggregate
+            .store_open_loaded_superblocks_from_snapshot_shards
             .saturating_add(1);
     }
-    aggregate.store_open_rebuild_tier2_superblocks_ms = aggregate
-        .store_open_rebuild_tier2_superblocks_ms
-        .saturating_add(profile.rebuild_tier2_superblocks_ms);
+    aggregate.store_open_rebuild_superblocks_ms = aggregate
+        .store_open_rebuild_superblocks_ms
+        .saturating_add(profile.rebuild_superblocks_ms);
 }
 
 fn ensure_candidate_store_profiled(
