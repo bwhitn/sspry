@@ -23,9 +23,10 @@ use crate::candidate::query_plan::{
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-    GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
-    choose_filter_bytes_for_file_size, compile_query_plan_from_file_with_gram_sizes,
+    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER1_SUPERBLOCK_DOCS,
+    DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, GramSizes, HLL_DEFAULT_PRECISION,
+    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
+    compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata,
@@ -51,6 +52,7 @@ pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
 pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
+pub const DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK: usize = DEFAULT_TIER1_SUPERBLOCK_DOCS;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB: usize =
     DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES / 1024;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
@@ -1297,6 +1299,7 @@ fn store_config_from_parts(
     tier2_filter_target_fp: f64,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
+    tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_kib: usize,
     enable_tier2_superblocks: bool,
     compaction_idle_cooldown_s: f64,
@@ -1307,6 +1310,7 @@ fn store_config_from_parts(
         store_path,
         tier2_gram_size,
         tier1_gram_size,
+        tier1_superblock_docs: tier1_superblock_docs.max(1),
         tier2_superblock_summary_cap_bytes: tier2_superblock_summary_cap_kib
             .max(1)
             .saturating_mul(1024),
@@ -1352,6 +1356,7 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
+        args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
         !args.disable_pattern_superblocks,
         CandidateConfig::default().compaction_idle_cooldown_s,
@@ -1374,6 +1379,7 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
+        args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
         !args.disable_pattern_superblocks,
         args.compaction_idle_cooldown_s,
@@ -4740,6 +4746,12 @@ struct ServeArgs {
     )]
     tier2_superblock_budget_divisor: u64,
     #[arg(
+        long = "tier1-superblock-docs",
+        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+        help = "Documents per tier1 superblock. Lower values make block gates finer-grained at higher index/storage cost."
+    )]
+    tier1_superblock_docs: usize,
+    #[arg(
         long = "tier2-superblock-summary-cap-kib",
         default_value_t = DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
         help = "Cap per-superblock summary bytes in KiB. Larger values spend more block-level bytes to reduce coarse-filter collisions."
@@ -4844,6 +4856,12 @@ struct InitArgs {
         help = "Minimum idle time after writes before compaction is allowed to run."
     )]
     compaction_idle_cooldown_s: f64,
+    #[arg(
+        long = "tier1-superblock-docs",
+        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+        help = "Documents per tier1 superblock."
+    )]
+    tier1_superblock_docs: usize,
     #[arg(
         long = "tier2-superblock-summary-cap-kib",
         default_value_t = DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
@@ -5012,6 +5030,7 @@ mod tests {
             tier2_filter_target_fp: None,
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
             disable_pattern_superblocks: false,
         }
@@ -5105,6 +5124,7 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
@@ -5227,6 +5247,7 @@ mod tests {
             0.002,
             3,
             4,
+            DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             8,
             true,
             33.5,
@@ -5251,6 +5272,7 @@ mod tests {
             0.01,
             5,
             4,
+            DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             16,
             false,
             9.25,

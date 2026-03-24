@@ -36,7 +36,7 @@ const DEFAULT_FILTER_BYTES: usize = 2048;
 const DEFAULT_BLOOM_HASHES: usize = 7;
 const DEFAULT_FILTER_MIN_BYTES: usize = 1;
 const DEFAULT_FILTER_MAX_BYTES: usize = 0;
-const DEFAULT_TIER2_SUPERBLOCK_DOCS: usize = 32;
+pub const DEFAULT_TIER1_SUPERBLOCK_DOCS: usize = 32;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
@@ -49,6 +49,7 @@ pub struct CandidateConfig {
     pub store_path: bool,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
+    pub tier1_superblock_docs: usize,
     pub tier2_superblock_summary_cap_bytes: usize,
     pub enable_tier2_superblocks: bool,
     pub tier1_filter_target_fp: Option<f64>,
@@ -65,6 +66,7 @@ impl Default for CandidateConfig {
             store_path: false,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             enable_tier2_superblocks: true,
             tier1_filter_target_fp: None,
@@ -365,6 +367,7 @@ struct ForestMeta {
     store_path: bool,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
+    tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_bytes: usize,
     enable_tier2_superblocks: bool,
     tier1_filter_target_fp: Option<f64>,
@@ -388,6 +391,7 @@ struct LegacyStoreMeta {
     store_path: bool,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
+    tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_bytes: usize,
     enable_tier2_superblocks: bool,
     tier1_filter_target_fp: Option<f64>,
@@ -420,6 +424,7 @@ impl Default for ForestMeta {
             store_path: false,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             enable_tier2_superblocks: true,
             tier1_filter_target_fp: Some(0.35),
@@ -447,6 +452,7 @@ impl Default for LegacyStoreMeta {
             store_path: false,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             enable_tier2_superblocks: true,
             tier1_filter_target_fp: None,
@@ -475,6 +481,7 @@ impl From<&LegacyStoreMeta> for ForestMeta {
             store_path: value.store_path,
             tier2_gram_size: value.tier2_gram_size,
             tier1_gram_size: value.tier1_gram_size,
+            tier1_superblock_docs: value.tier1_superblock_docs.max(1),
             tier2_superblock_summary_cap_bytes: value.tier2_superblock_summary_cap_bytes,
             enable_tier2_superblocks: value.enable_tier2_superblocks,
             tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
@@ -900,7 +907,7 @@ struct Tier2SuperblockIndex {
 impl Default for Tier2SuperblockIndex {
     fn default() -> Self {
         Self {
-            docs_per_block: DEFAULT_TIER2_SUPERBLOCK_DOCS,
+            docs_per_block: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             bucket_for_key: BTreeMap::new(),
             summary_bytes_by_bucket: BTreeMap::new(),
             masks_by_bucket: BTreeMap::new(),
@@ -913,6 +920,13 @@ impl Default for Tier2SuperblockIndex {
 }
 
 impl Tier2SuperblockIndex {
+    fn with_docs_per_block(docs_per_block: usize) -> Self {
+        Self {
+            docs_per_block: docs_per_block.max(1),
+            ..Self::default()
+        }
+    }
+
     fn total_block_count(&self) -> usize {
         self.positions_by_bucket
             .values()
@@ -1657,6 +1671,7 @@ impl CandidateStore {
                 store_path: config.store_path,
                 tier2_gram_size: config.tier2_gram_size,
                 tier1_gram_size: config.tier1_gram_size,
+                tier1_superblock_docs: config.tier1_superblock_docs.max(1),
                 tier2_superblock_summary_cap_bytes: config
                     .tier2_superblock_summary_cap_bytes
                     .max(1),
@@ -1679,8 +1694,12 @@ impl CandidateStore {
             last_write_activity_monotonic: None,
             tree_tier1_gates: TreeBloomGateIndex::default(),
             tree_tier2_gates: TreeBloomGateIndex::default(),
-            tier1_superblocks: Tier2SuperblockIndex::default(),
-            tier2_superblocks: Tier2SuperblockIndex::default(),
+            tier1_superblocks: Tier2SuperblockIndex::with_docs_per_block(
+                config.tier1_superblock_docs,
+            ),
+            tier2_superblocks: Tier2SuperblockIndex::with_docs_per_block(
+                config.tier1_superblock_docs,
+            ),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
@@ -1725,6 +1744,7 @@ impl CandidateStore {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
+        let tier1_superblock_docs = meta.tier1_superblock_docs;
         let sidecars_started = Instant::now();
         let mut store = Self {
             root: root.clone(),
@@ -1743,8 +1763,8 @@ impl CandidateStore {
             last_write_activity_monotonic: None,
             tree_tier1_gates: TreeBloomGateIndex::default(),
             tree_tier2_gates: TreeBloomGateIndex::default(),
-            tier1_superblocks: Tier2SuperblockIndex::default(),
-            tier2_superblocks: Tier2SuperblockIndex::default(),
+            tier1_superblocks: Tier2SuperblockIndex::with_docs_per_block(tier1_superblock_docs),
+            tier2_superblocks: Tier2SuperblockIndex::with_docs_per_block(tier1_superblock_docs),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
@@ -1812,6 +1832,7 @@ impl CandidateStore {
             store_path: self.meta.store_path,
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
+            tier1_superblock_docs: self.meta.tier1_superblock_docs,
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
             enable_tier2_superblocks: self.meta.enable_tier2_superblocks,
             tier1_filter_target_fp,
@@ -4439,14 +4460,8 @@ impl CandidateStore {
 
     fn rebuild_superblocks_with_docs_per_block(&mut self, docs_per_block: usize) -> Result<()> {
         let docs_per_block = docs_per_block.max(1);
-        self.tier1_superblocks = Tier2SuperblockIndex {
-            docs_per_block,
-            ..Tier2SuperblockIndex::default()
-        };
-        self.tier2_superblocks = Tier2SuperblockIndex {
-            docs_per_block,
-            ..Tier2SuperblockIndex::default()
-        };
+        self.tier1_superblocks = Tier2SuperblockIndex::with_docs_per_block(docs_per_block);
+        self.tier2_superblocks = Tier2SuperblockIndex::with_docs_per_block(docs_per_block);
         for pos in 0..self.docs.len() {
             self.update_tier1_superblocks_for_doc_inner(pos)?;
             if self.meta.enable_tier2_superblocks {
@@ -4481,7 +4496,7 @@ impl CandidateStore {
     }
 
     fn rebuild_superblocks(&mut self) -> Result<()> {
-        self.rebuild_superblocks_with_docs_per_block(self.tier1_superblocks.docs_per_block)
+        self.rebuild_superblocks_with_docs_per_block(self.meta.tier1_superblock_docs)
     }
 
     fn record_query_metrics(
@@ -4596,10 +4611,7 @@ impl CandidateStore {
             } else if let Some(snapshot) = maybe_snapshot {
                 let docs_per_block = snapshot.docs_per_block.max(1);
                 self.tier1_superblocks = snapshot;
-                self.tier2_superblocks = Tier2SuperblockIndex {
-                    docs_per_block,
-                    ..Tier2SuperblockIndex::default()
-                };
+                self.tier2_superblocks = Tier2SuperblockIndex::with_docs_per_block(docs_per_block);
                 (true, 0)
             } else {
                 let rebuild_superblocks_started = Instant::now();
@@ -5359,6 +5371,9 @@ fn validate_config(config: &CandidateConfig) -> Result<()> {
     }
     GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)
         .map_err(|err| SspryError::from(format!("invalid gram size pair: {err}")))?;
+    if config.tier1_superblock_docs == 0 {
+        return Err(SspryError::from("tier1_superblock_docs must be > 0"));
+    }
     if config.tier2_superblock_summary_cap_bytes == 0 {
         return Err(SspryError::from(
             "tier2_superblock_summary_cap_bytes must be > 0",
