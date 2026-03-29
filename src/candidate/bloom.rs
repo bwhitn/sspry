@@ -1,15 +1,26 @@
+use std::hash::{BuildHasher, Hasher};
+
+use fastbloom::DefaultHasher as FastBloomDefaultHasher;
+
 use crate::{Result, SspryError};
 
 pub const DEFAULT_BLOOM_POSITION_LANES: usize = 4;
+const FASTBLOOM_SEED: u128 = 0;
 
-fn mix64(mut value: u64, seed: u64) -> u64 {
-    value ^= seed;
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^= value >> 31;
-    value
+fn source_hash(value: u64) -> u64 {
+    let hasher = FastBloomDefaultHasher::seeded(&FASTBLOOM_SEED.to_be_bytes());
+    let mut state = hasher.build_hasher();
+    state.write_u64(value);
+    state.finish()
+}
+
+fn next_hash(h1: &mut u64, h2: u64) -> u64 {
+    *h1 = h1.rotate_left(5).wrapping_add(h2);
+    *h1
+}
+
+fn bloom_index(bits: usize, hash: u64) -> usize {
+    ((hash as u128 * bits as u128) >> 64) as usize
 }
 
 pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec<usize>> {
@@ -19,11 +30,13 @@ pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec
     if hash_count == 0 {
         return Err(SspryError::from("hash_count must be > 0"));
     }
-    let h1 = mix64(value, 0x9E37_79B9_7F4A_7C15);
-    let h2 = mix64(value, 0xD6E8_FEB8_6659_FD93) | 1;
+    let mut h1 = source_hash(value);
+    let h2 = h1.wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
     let mut positions = Vec::with_capacity(hash_count);
-    for index in 0..hash_count {
-        positions.push(h1.wrapping_add((index as u64).wrapping_mul(h2)) as usize % bits);
+    positions.push(bloom_index(bits, h1));
+    for _ in 1..hash_count {
+        let hash = next_hash(&mut h1, h2);
+        positions.push(bloom_index(bits, hash));
     }
     Ok(positions)
 }
@@ -241,8 +254,10 @@ impl BloomFilter {
 
 #[cfg(test)]
 mod tests {
+    use fastbloom::BloomFilter as FastBloomFilter;
+
     use super::{
-        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, bloom_byte_masks, bloom_positions,
+        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, FASTBLOOM_SEED, bloom_byte_masks, bloom_positions,
         bloom_word_masks, bloom_word_masks_in_lane, raw_filter_matches_masks,
         raw_filter_matches_word_masks,
     };
@@ -264,6 +279,32 @@ mod tests {
             bloom_positions(0xAABB_CCDD_1020_3040, 1024, 7).expect("positions"),
             bloom_positions(0xAABB_CCDD_1020_3040, 1024, 7).expect("positions again")
         );
+    }
+
+    #[test]
+    fn bloom_layout_matches_fastbloom_for_non_lane_filter() {
+        let size_bytes = 128usize;
+        let hash_count = 7usize;
+        let values = [0x0102_0304_u64, 0xAABB_CCDD_1020_3040_u64, 0x9988_7766_5544_3322_u64];
+
+        let mut ours = BloomFilter::new(size_bytes, hash_count).expect("ours");
+        for value in values {
+            ours.add(value).expect("ours add");
+        }
+
+        let mut theirs = FastBloomFilter::with_num_bits(size_bytes * 8)
+            .seed(&FASTBLOOM_SEED)
+            .hashes(hash_count as u32);
+        for value in values {
+            theirs.insert(&value);
+        }
+        let mut expected = Vec::with_capacity(size_bytes);
+        for word in theirs.as_slice() {
+            expected.extend_from_slice(&word.to_le_bytes());
+        }
+        expected.truncate(size_bytes);
+
+        assert_eq!(ours.as_bytes(), &expected);
     }
 
     #[test]

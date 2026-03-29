@@ -4733,7 +4733,7 @@ struct IndexArgs {
     #[arg(
         long = "tier1-sizing-mode",
         value_enum,
-        default_value_t = Tier1SizingMode::Current,
+        default_value_t = Tier1SizingMode::Hll,
         help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
     )]
     tier1_sizing_mode: Tier1SizingMode,
@@ -4933,7 +4933,7 @@ struct ServeArgs {
     #[arg(
         long = "tier1-sizing-mode",
         value_enum,
-        default_value_t = Tier1SizingMode::Current,
+        default_value_t = Tier1SizingMode::Hll,
         help = "Tier1 sizing policy persisted in the store. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
     )]
     tier1_sizing_mode: Tier1SizingMode,
@@ -4975,12 +4975,12 @@ struct ServeArgs {
     filter_target_fp: Option<f64>,
     #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.38 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.40 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.21 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.23 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(
@@ -5023,12 +5023,12 @@ struct InitArgs {
     filter_target_fp: Option<f64>,
     #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.38 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.40 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.21 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.23 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(
@@ -5058,7 +5058,7 @@ struct InitArgs {
     #[arg(
         long = "tier1-sizing-mode",
         value_enum,
-        default_value_t = Tier1SizingMode::Current,
+        default_value_t = Tier1SizingMode::Hll,
         help = "Tier1 sizing policy persisted in the store. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
     )]
     tier1_sizing_mode: Tier1SizingMode,
@@ -5095,7 +5095,7 @@ struct InternalIndexArgs {
     #[arg(
         long = "tier1-sizing-mode",
         value_enum,
-        default_value_t = Tier1SizingMode::Current,
+        default_value_t = Tier1SizingMode::Hll,
         help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
     )]
     tier1_sizing_mode: Tier1SizingMode,
@@ -5127,7 +5127,7 @@ struct InternalIndexBatchArgs {
     #[arg(
         long = "tier1-sizing-mode",
         value_enum,
-        default_value_t = Tier1SizingMode::Current,
+        default_value_t = Tier1SizingMode::Hll,
         help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
     )]
     tier1_sizing_mode: Tier1SizingMode,
@@ -5247,7 +5247,7 @@ mod tests {
             compaction_idle_cooldown_s: 5.0,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-            tier1_sizing_mode: Tier1SizingMode::Current,
+            tier1_sizing_mode: Tier1SizingMode::Hll,
             enable_pattern_superblocks: false,
             disable_pattern_superblocks: false,
         }
@@ -5343,7 +5343,7 @@ mod tests {
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-            tier1_sizing_mode: Tier1SizingMode::Current,
+            tier1_sizing_mode: Tier1SizingMode::Hll,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
@@ -6104,8 +6104,8 @@ rule remote_q {
         let policy = server_scan_policy(&connection).expect("scan policy from server");
         assert_eq!(policy.id_source, CandidateIdSource::Sha256);
         assert!(!policy.store_path);
-        assert_eq!(policy.tier1_filter_target_fp, Some(0.38));
-        assert_eq!(policy.tier2_filter_target_fp, Some(0.21));
+        assert_eq!(policy.tier1_filter_target_fp, Some(0.40));
+        assert_eq!(policy.tier2_filter_target_fp, Some(0.23));
         assert_eq!(policy.gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
 
         assert_eq!(

@@ -20,7 +20,7 @@ pub use filter_policy::{
 pub use grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram};
 pub use metadata::{
     extract_compact_document_metadata, metadata_field_is_boolean, metadata_field_is_integer,
-    metadata_field_matches_eq, normalize_query_metadata_field,
+    metadata_field_matches_eq, metadata_pe_entry_point_prefix, normalize_query_metadata_field,
 };
 pub use query_plan::{
     CompiledQueryPlan, PatternPlan, QueryNode, compile_query_plan_from_file_with_gram_sizes,

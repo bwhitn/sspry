@@ -4,7 +4,8 @@ use std::path::Path;
 
 use crate::{Result, SspryError};
 
-const METADATA_VERSION: u8 = 1;
+const METADATA_VERSION: u8 = 2;
+const LEGACY_METADATA_VERSION: u8 = 1;
 const MAX_MACHO_ARCHES: usize = 32;
 const MAX_MACHO_COMMAND_BYTES: usize = 256 * 1024;
 
@@ -41,11 +42,19 @@ enum IntField {
     LnkWriteTime = 11,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BytesField {
+    PeEntryPointPrefix = 0,
+}
+
+const BYTES_FIELD_COUNT: usize = 1;
+
 #[derive(Clone, Debug, Default)]
 struct MetadataBuilder {
     bool_known: u16,
     bool_values: u16,
     ints: [Vec<u64>; 12],
+    bytes: [Vec<u8>; BYTES_FIELD_COUNT],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,6 +62,7 @@ struct DecodedMetadata {
     bool_known: u16,
     bool_values: u16,
     ints: [Vec<u64>; 12],
+    bytes: [Vec<u8>; BYTES_FIELD_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,8 +95,13 @@ impl MetadataBuilder {
         }
     }
 
+    fn set_bytes(&mut self, field: BytesField, value: &[u8]) {
+        self.bytes[field as usize].clear();
+        self.bytes[field as usize].extend_from_slice(value);
+    }
+
     fn encode(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16);
+        let mut out = Vec::with_capacity(32);
         out.push(METADATA_VERSION);
         out.extend_from_slice(&self.bool_known.to_le_bytes());
         out.extend_from_slice(&self.bool_values.to_le_bytes());
@@ -106,6 +121,20 @@ impl MetadataBuilder {
                 encode_varint(value, &mut out);
             }
         }
+        let mut bytes_presence = 0u16;
+        for (idx, value) in self.bytes.iter().enumerate() {
+            if !value.is_empty() {
+                bytes_presence |= 1u16 << idx;
+            }
+        }
+        out.extend_from_slice(&bytes_presence.to_le_bytes());
+        for value in self.bytes {
+            if value.is_empty() {
+                continue;
+            }
+            encode_varint(value.len() as u64, &mut out);
+            out.extend_from_slice(&value);
+        }
         out
     }
 }
@@ -117,10 +146,11 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
     if bytes.len() < 7 {
         return Err(SspryError::from("Invalid compact document metadata."));
     }
-    if bytes[0] != METADATA_VERSION {
+    let version = bytes[0];
+    if version != METADATA_VERSION && version != LEGACY_METADATA_VERSION {
         return Err(SspryError::from(format!(
             "Unsupported compact document metadata version: {}",
-            bytes[0]
+            version
         )));
     }
     let bool_known = u16::from_le_bytes(bytes[1..3].try_into().expect("bool_known"));
@@ -139,6 +169,27 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
         }
         ints[idx] = values;
     }
+    let mut byte_values: [Vec<u8>; BYTES_FIELD_COUNT] = Default::default();
+    if version >= METADATA_VERSION {
+        if offset + 2 > bytes.len() {
+            return Err(SspryError::from("Invalid compact document metadata."));
+        }
+        let bytes_presence =
+            u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("bytes_presence"));
+        offset += 2;
+        for (idx, value) in byte_values.iter_mut().enumerate() {
+            if (bytes_presence & (1u16 << idx)) == 0 {
+                continue;
+            }
+            let count = decode_varint(bytes, &mut offset)? as usize;
+            let end = offset.saturating_add(count);
+            if end > bytes.len() {
+                return Err(SspryError::from("Truncated compact document metadata."));
+            }
+            *value = bytes[offset..end].to_vec();
+            offset = end;
+        }
+    }
     if offset != bytes.len() {
         return Err(SspryError::from(
             "Trailing compact document metadata bytes.",
@@ -148,6 +199,7 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
         bool_known,
         bool_values,
         ints,
+        bytes: byte_values,
     })
 }
 
@@ -352,6 +404,13 @@ fn extract_pe_metadata(
         0x20b => (false, true, 112usize),
         _ => return Ok(()),
     };
+    let number_of_sections = usize::from(le_u16(&file_header[6..8]));
+    let address_of_entry_point = le_u32(&optional[16..20]);
+    let size_of_headers = if optional.len() >= 64 {
+        le_u32(&optional[60..64])
+    } else {
+        0
+    };
     builder.set_bool(BoolField::PeIsPe, true);
     builder.set_bool(BoolField::PeIs32Bit, is_32bit);
     builder.set_bool(BoolField::PeIs64Bit, is_64bit);
@@ -374,7 +433,55 @@ fn extract_pe_metadata(
         let com_size = le_u32(&optional[com_offset + 4..com_offset + 8]);
         builder.set_bool(BoolField::DotnetIsDotnet, com_rva != 0 && com_size != 0);
     }
+    if let Some(entry_offset) = pe_rva_to_file_offset(
+        file,
+        pe_offset,
+        number_of_sections,
+        size_of_optional_header,
+        address_of_entry_point,
+        size_of_headers,
+    )? {
+        if let Some(entry_prefix) = read_at(file, entry_offset, 16)? {
+            builder.set_bytes(BytesField::PeEntryPointPrefix, &entry_prefix);
+        }
+    }
     Ok(())
+}
+
+fn pe_rva_to_file_offset(
+    file: &mut File,
+    pe_offset: u64,
+    number_of_sections: usize,
+    size_of_optional_header: usize,
+    rva: u32,
+    size_of_headers: u32,
+) -> Result<Option<u64>> {
+    if rva == 0 {
+        return Ok(None);
+    }
+    if size_of_headers != 0 && rva < size_of_headers {
+        return Ok(Some(u64::from(rva)));
+    }
+    let table_offset = pe_offset + 24 + size_of_optional_header as u64;
+    let table_len = number_of_sections.saturating_mul(40);
+    let Some(section_table) = read_at(file, table_offset, table_len)? else {
+        return Ok(None);
+    };
+    for entry in section_table.chunks_exact(40) {
+        let virtual_size = le_u32(&entry[8..12]);
+        let virtual_address = le_u32(&entry[12..16]);
+        let size_of_raw_data = le_u32(&entry[16..20]);
+        let pointer_to_raw_data = le_u32(&entry[20..24]);
+        let mapped_size = virtual_size.max(size_of_raw_data);
+        if mapped_size == 0 {
+            continue;
+        }
+        if rva >= virtual_address && rva < virtual_address.saturating_add(mapped_size) {
+            let delta = rva - virtual_address;
+            return Ok(Some(u64::from(pointer_to_raw_data) + u64::from(delta)));
+        }
+    }
+    Ok(None)
 }
 
 fn thin_macho_kind_and_order(magic: [u8; 4]) -> Option<(ThinMachOKind, ByteOrder)> {
@@ -675,6 +782,16 @@ pub fn metadata_field_matches_eq(
     }
 }
 
+pub fn metadata_pe_entry_point_prefix(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let decoded = decode(bytes)?;
+    let value = &decoded.bytes[BytesField::PeEntryPointPrefix as usize];
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -691,12 +808,17 @@ mod tests {
         builder.push_int(IntField::PeMachine, 0x14c);
         builder.push_int(IntField::MachoCpuType, 7);
         builder.push_int(IntField::MachoCpuType, 7);
+        builder.set_bytes(BytesField::PeEntryPointPrefix, b"ABCDEFGHIJKLMNOP");
         let bytes = builder.encode();
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(bool_value(&decoded, BoolField::PeIsPe), Some(true));
         assert_eq!(bool_value(&decoded, BoolField::PeIsDll), Some(false));
         assert_eq!(decoded.ints[IntField::PeMachine as usize], vec![0x14c]);
         assert_eq!(decoded.ints[IntField::MachoCpuType as usize], vec![7]);
+        assert_eq!(
+            decoded.bytes[BytesField::PeEntryPointPrefix as usize],
+            b"ABCDEFGHIJKLMNOP"
+        );
         assert_eq!(
             normalize_query_metadata_field("ELF.OSABI"),
             Some("elf.os_abi")
@@ -763,21 +885,41 @@ mod tests {
     }
 
     #[test]
+    fn decode_legacy_v1_metadata_without_byte_fields() {
+        let legacy = vec![LEGACY_METADATA_VERSION, 0, 0, 0, 0, 0, 0];
+        let decoded = decode(&legacy).expect("decode legacy");
+        assert!(
+            decoded.bytes[BytesField::PeEntryPointPrefix as usize].is_empty(),
+            "legacy metadata should not have byte fields"
+        );
+    }
+
+    #[test]
     fn extracts_basic_module_metadata_from_small_headers() {
         let tmp = tempdir().expect("tmp");
         let pe_path = tmp.path().join("sample.exe");
-        let mut pe = vec![0u8; 512];
+        let mut pe = vec![0u8; 0x240];
         pe[0..2].copy_from_slice(b"MZ");
         pe[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
         pe[0x80..0x84].copy_from_slice(b"PE\0\0");
         pe[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
         pe[0x88..0x8c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         pe[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
         pe[0x96..0x98].copy_from_slice(&0x0200u16.to_le_bytes());
         pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[0x98 + 16..0x98 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0x98 + 60..0x98 + 64].copy_from_slice(&0x200u32.to_le_bytes());
         pe[0x98 + 68..0x98 + 70].copy_from_slice(&3u16.to_le_bytes());
         pe[0x98 + 112 + 32..0x98 + 112 + 40].copy_from_slice(&[1, 0, 0, 0, 8, 0, 0, 0]);
         pe[0x98 + 112 + 112..0x98 + 112 + 120].copy_from_slice(&[1, 0, 0, 0, 8, 0, 0, 0]);
+        let text_section = 0x80 + 24 + 0xf0;
+        pe[text_section..text_section + 8].copy_from_slice(b".text\0\0\0");
+        pe[text_section + 8..text_section + 12].copy_from_slice(&0x20u32.to_le_bytes());
+        pe[text_section + 12..text_section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[text_section + 16..text_section + 20].copy_from_slice(&0x20u32.to_le_bytes());
+        pe[text_section + 20..text_section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x200..0x210].copy_from_slice(b"ENTRYPOINT-PE!!!");
         fs::write(&pe_path, &pe).expect("write pe");
         let pe_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
         assert_eq!(
@@ -803,6 +945,10 @@ mod tests {
         assert_eq!(
             metadata_field_matches_eq(&pe_bytes, "dotnet.is_dotnet", 1).expect("dotnet"),
             Some(true)
+        );
+        assert_eq!(
+            metadata_pe_entry_point_prefix(&pe_bytes).expect("entry point prefix"),
+            Some(b"ENTRYPOINT-PE!!!".to_vec())
         );
 
         let elf_path = tmp.path().join("sample.elf");
@@ -885,7 +1031,7 @@ mod tests {
                 .contains("Unsupported compact document metadata version")
         );
         assert!(
-            decode(&[METADATA_VERSION, 0, 0, 0, 0, 0, 0, 1])
+            decode(&[METADATA_VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 1])
                 .expect_err("trailing bytes")
                 .to_string()
                 .contains("Trailing compact document metadata bytes")

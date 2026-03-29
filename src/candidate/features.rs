@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use hyperloglockless::HyperLogLogPlus;
 use sha2::{Digest, Sha256};
 
 use crate::candidate::BloomFilter;
@@ -65,50 +66,6 @@ fn mix_u64_to_u64(value: u64) -> u64 {
     (x ^ (x >> 31)) & U64_MASK
 }
 
-fn hll_alpha(m: usize) -> f64 {
-    match m {
-        16 => 0.673,
-        32 => 0.697,
-        64 => 0.709,
-        _ => 0.7213 / (1.0 + 1.079 / m as f64),
-    }
-}
-
-fn hll_add(registers: &mut [u8], precision: u8, value: u64) {
-    let hashed = mix_u64_to_u64(value);
-    let idx = (hashed >> (64 - precision)) as usize;
-    let suffix = (hashed << precision) & U64_MASK;
-    let suffix_bits = 64 - precision;
-    let mut rank = if suffix == 0 {
-        suffix_bits + 1
-    } else {
-        (suffix.leading_zeros() as u8) + 1
-    };
-    if rank > suffix_bits + 1 {
-        rank = suffix_bits + 1;
-    }
-    if rank > registers[idx] {
-        registers[idx] = rank;
-    }
-}
-
-fn hll_estimate(registers: &[u8], precision: u8) -> usize {
-    let m = 1usize << precision;
-    let mut inv_sum = 0.0;
-    let mut zeros = 0usize;
-    for register in registers {
-        inv_sum += 2f64.powi(-(*register as i32));
-        if *register == 0 {
-            zeros += 1;
-        }
-    }
-    let mut estimate = hll_alpha(m) * (m * m) as f64 / inv_sum;
-    if estimate <= 2.5 * m as f64 && zeros > 0 {
-        estimate = m as f64 * (m as f64 / zeros as f64).ln();
-    }
-    estimate.round().max(0.0) as usize
-}
-
 fn estimate_unique_grams_hll(
     path: impl AsRef<Path>,
     gram_size: usize,
@@ -125,7 +82,7 @@ fn estimate_unique_grams_hll(
         return Err(SspryError::from("gram_size must be > 0"));
     }
 
-    let mut registers = vec![0u8; 1usize << precision];
+    let mut hll = HyperLogLogPlus::new(precision);
     let mut trailing = Vec::<u8>::new();
     let mut saw_gram = false;
     let mut file = File::open(path)?;
@@ -141,11 +98,7 @@ fn estimate_unique_grams_hll(
         if limit > 0 && data.len() >= gram_size {
             saw_gram = true;
             for idx in 0..limit {
-                hll_add(
-                    &mut registers,
-                    precision,
-                    pack_exact_gram(&data[idx..idx + gram_size]),
-                );
+                hll.insert_hash(mix_u64_to_u64(pack_exact_gram(&data[idx..idx + gram_size])));
             }
             trailing = data[data.len() - (gram_size - 1)..].to_vec();
         } else {
@@ -156,7 +109,7 @@ fn estimate_unique_grams_hll(
     if !saw_gram {
         return Ok(0);
     }
-    Ok(hll_estimate(&registers, precision))
+    Ok(hll.count().max(1))
 }
 
 pub fn estimate_unique_grams_pair_hll(
@@ -180,8 +133,8 @@ pub fn estimate_unique_grams_pair_hll(
         return Ok((estimate, estimate));
     }
 
-    let mut first_registers = vec![0u8; 1usize << precision];
-    let mut second_registers = vec![0u8; 1usize << precision];
+    let mut first_hll = HyperLogLogPlus::new(precision);
+    let mut second_hll = HyperLogLogPlus::new(precision);
     let max_gram_size = first_gram_size.max(second_gram_size);
     let trailing_len = max_gram_size - 1;
     let mut trailing = Vec::<u8>::new();
@@ -199,21 +152,17 @@ pub fn estimate_unique_grams_pair_hll(
         if data.len() >= first_gram_size {
             saw_first = true;
             for idx in 0..=(data.len() - first_gram_size) {
-                hll_add(
-                    &mut first_registers,
-                    precision,
-                    pack_exact_gram(&data[idx..idx + first_gram_size]),
-                );
+                first_hll.insert_hash(mix_u64_to_u64(pack_exact_gram(
+                    &data[idx..idx + first_gram_size],
+                )));
             }
         }
         if data.len() >= second_gram_size {
             saw_second = true;
             for idx in 0..=(data.len() - second_gram_size) {
-                hll_add(
-                    &mut second_registers,
-                    precision,
-                    pack_exact_gram(&data[idx..idx + second_gram_size]),
-                );
+                second_hll.insert_hash(mix_u64_to_u64(pack_exact_gram(
+                    &data[idx..idx + second_gram_size],
+                )));
             }
         }
         trailing = if data.len() >= max_gram_size {
@@ -225,12 +174,12 @@ pub fn estimate_unique_grams_pair_hll(
 
     Ok((
         if saw_first {
-            hll_estimate(&first_registers, precision)
+            first_hll.count().max(1)
         } else {
             0
         },
         if saw_second {
-            hll_estimate(&second_registers, precision)
+            second_hll.count().max(1)
         } else {
             0
         },

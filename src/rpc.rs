@@ -8116,15 +8116,15 @@ rule overflow_rule {
         );
         assert_eq!(
             stats.get("tier1_filter_target_fp").and_then(Value::as_f64),
-            Some(0.38)
+            Some(0.40)
         );
         assert_eq!(
             stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
-            Some(0.21)
+            Some(0.23)
         );
         assert_eq!(
             stats.get("tier1_sizing_mode").and_then(Value::as_str),
-            Some("current")
+            Some("hll")
         );
         assert_eq!(stats.get("filter_target_fp"), None);
     }
