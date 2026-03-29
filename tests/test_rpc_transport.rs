@@ -103,7 +103,7 @@ rule q {
 
     let features_a = scan_file_features_bloom_only_with_gram_sizes(
         &cand_a,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
             .expect("default gram sizes"),
         1024,
         7,
@@ -114,7 +114,7 @@ rule q {
     .expect("features a");
     let features_b = scan_file_features_bloom_only_with_gram_sizes(
         &cand_b,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
             .expect("default gram sizes"),
         1024,
         7,
@@ -158,7 +158,7 @@ rule q {
 
     let plan = compile_query_plan_from_file_with_gram_sizes(
         &rule,
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
             .expect("default gram sizes"),
         8,
         false,

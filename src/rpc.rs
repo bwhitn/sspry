@@ -6559,7 +6559,7 @@ mod tests {
 
     use crate::candidate::BloomFilter;
     use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
-    use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
+    use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, pack_exact_gram};
     use base64::Engine;
     use tempfile::tempdir;
 
@@ -6681,8 +6681,8 @@ mod tests {
         crate::candidate::scan_file_features_bloom_only_with_gram_sizes(
             path,
             crate::candidate::GramSizes::new(
-                crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
                 crate::candidate::DEFAULT_TIER1_GRAM_SIZE,
+                crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
             )
             .expect("default gram sizes"),
             1024,
@@ -6703,8 +6703,8 @@ mod tests {
         crate::candidate::compile_query_plan_from_file_with_gram_sizes(
             rule_path,
             crate::candidate::GramSizes::new(
-                crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
                 crate::candidate::DEFAULT_TIER1_GRAM_SIZE,
+                crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
             )
             .expect("default gram sizes"),
             max_anchors_per_alt,
@@ -6733,7 +6733,7 @@ mod tests {
     fn published_query_waits_for_locked_shard() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
         let plan = CompiledQueryPlan {
@@ -7444,7 +7444,7 @@ rule overflow_rule {
         let state = sample_workspace_server_state(tmp.path(), 1);
         let sample = tmp.path().join("workspace-doc.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let features = scan_features_default_grams(&sample).expect("features");
         state
             .handle_candidate_insert(&CandidateDocumentWire {
@@ -7557,7 +7557,7 @@ rule overflow_rule {
         let state = sample_workspace_server_state(tmp.path(), 1);
         let sample = tmp.path().join("auto-publish.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let features = scan_features_default_grams(&sample).expect("features");
         state
             .handle_begin_index_session()
@@ -8108,11 +8108,11 @@ rule overflow_rule {
         assert!(stats.contains_key("disk_usage_bytes"));
         assert_eq!(
             stats.get("tier2_gram_size").and_then(Value::as_u64),
-            Some(3)
+            Some(4)
         );
         assert_eq!(
             stats.get("tier1_gram_size").and_then(Value::as_u64),
-            Some(4)
+            Some(3)
         );
         assert_eq!(
             stats.get("tier1_filter_target_fp").and_then(Value::as_f64),
@@ -8145,7 +8145,7 @@ rule overflow_rule {
             true,
         )
         .expect("init");
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter = lane_bloom_bytes(32, 7, &[gram]);
 
         for byte in [0x11u8, 0x22u8] {
@@ -8541,11 +8541,11 @@ rule overflow_rule {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
         let query_a = client
-            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"ABCD"))), 0, None)
+            .candidate_query_plan(&plan_for(pack_exact_gram(b"ABC")), 0, None)
             .expect("query published doc a");
         assert_eq!(query_a.total_candidates, 1);
         let query_b_before = client
-            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"WXYZ"))), 0, None)
+            .candidate_query_plan(&plan_for(pack_exact_gram(b"WXY")), 0, None)
             .expect("query unpublished doc b");
         assert_eq!(query_b_before.total_candidates, 0);
 
@@ -8562,11 +8562,11 @@ rule overflow_rule {
         assert!(second_publish.contains("published work root to"));
 
         let query_b_after = client
-            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"WXYZ"))), 0, None)
+            .candidate_query_plan(&plan_for(pack_exact_gram(b"WXY")), 0, None)
             .expect("query published doc b");
         assert_eq!(query_b_after.total_candidates, 1);
         let query_c_after = client
-            .candidate_query_plan(&plan_for(u64::from(u32::from_le_bytes(*b"LMNO"))), 0, None)
+            .candidate_query_plan(&plan_for(pack_exact_gram(b"LMN")), 0, None)
             .expect("query published doc c");
         assert_eq!(query_c_after.total_candidates, 1);
 
@@ -9598,7 +9598,7 @@ rule q {
     fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state_with_shards(tmp.path(), 2);
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
         let plan = CompiledQueryPlan {
@@ -9856,7 +9856,7 @@ rule q {
     fn single_shard_query_with_external_ids_and_client_delete_normalization_work() {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state_with_shards(tmp.path(), 1);
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
         let inserted = state
@@ -9959,7 +9959,7 @@ rule q {
             Arc::new(AtomicBool::new(false)),
         )
         .expect("server state");
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(16, 7, &[gram]));
         let mut docs = Vec::new();
@@ -10095,7 +10095,7 @@ rule q {
             )
             .expect("server state"),
         );
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
 
@@ -10186,7 +10186,7 @@ rule q {
             )
             .expect("server state"),
         );
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
 
@@ -10268,7 +10268,7 @@ rule q {
             )
             .expect("server state"),
         );
-        let gram = u64::from(u32::from_le_bytes(*b"ABCD"));
+        let gram = pack_exact_gram(b"ABC");
         let bloom_filter_b64 =
             base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
 

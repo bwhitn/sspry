@@ -4854,7 +4854,7 @@ mod tests {
     use super::*;
 
     fn default_gram_sizes() -> GramSizes {
-        GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
             .expect("default gram sizes")
     }
 
@@ -4911,9 +4911,9 @@ mod tests {
         )
     }
 
-    fn compile_query_plan_with_tier2_default_tier1(
+    fn compile_query_plan_with_tier1_default_tier2(
         rule_text: &str,
-        tier2_gram_size: usize,
+        tier1_gram_size: usize,
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
@@ -4921,7 +4921,7 @@ mod tests {
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_with_gram_sizes(
             rule_text,
-            GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
+            GramSizes::new(tier1_gram_size, DEFAULT_TIER2_GRAM_SIZE)?,
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
@@ -4929,9 +4929,9 @@ mod tests {
         )
     }
 
-    fn compile_query_plan_from_file_with_tier2_default_tier1(
+    fn compile_query_plan_from_file_with_tier1_default_tier2(
         rule_path: impl AsRef<Path>,
-        tier2_gram_size: usize,
+        tier1_gram_size: usize,
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
@@ -4939,7 +4939,7 @@ mod tests {
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_from_file_with_gram_sizes(
             rule_path,
-            GramSizes::new(tier2_gram_size, DEFAULT_TIER1_GRAM_SIZE)?,
+            GramSizes::new(tier1_gram_size, DEFAULT_TIER2_GRAM_SIZE)?,
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
@@ -4967,10 +4967,16 @@ rule sample {
             .map(|item| (item.pattern_id.as_str(), item))
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(patterns["$a"].alternatives.len(), 1);
-        assert_eq!(patterns["$a"].alternatives[0].len(), 1);
+        assert_eq!(patterns["$a"].alternatives[0].len(), 2);
         assert_eq!(patterns["$b"].alternatives.len(), 1);
-        assert_eq!(patterns["$b"].alternatives[0].len(), 1);
-        assert_eq!(patterns["$c"].alternatives, vec![vec![0x0908_0706]]);
+        assert_eq!(patterns["$b"].alternatives[0].len(), 2);
+        assert_eq!(
+            patterns["$c"].alternatives,
+            vec![vec![
+                pack_exact_gram(&[0x06, 0x07, 0x08]),
+                pack_exact_gram(&[0x07, 0x08, 0x09]),
+            ]]
+        );
     }
 
     #[test]
@@ -5269,16 +5275,17 @@ rule numeric_only_unanchorable {
     uint32(0) == 0x4000
 }
 "#;
-        let err = compile_query_plan_with_gram_sizes(
+        let plan = compile_query_plan_with_gram_sizes(
             rule,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, 5).expect("gram sizes"),
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, 5).expect("gram sizes"),
             8,
             false,
             true,
             100_000,
         )
-        .expect_err("unanchorable numeric-only condition should fail");
-        assert!(!err.to_string().is_empty());
+        .expect("numeric-only condition now has enough anchor grams");
+        assert_eq!(plan.patterns.len(), 2);
+        assert_eq!(plan.patterns[1].pattern_id, "__numeric_eq_anchor_0");
     }
 
     #[test]
@@ -5699,15 +5706,15 @@ rule empty {
         let (pattern_id, alternatives, tier2_alternatives, fixed_literals) =
             parse_hex_line_to_grams(
                 "$h = { 41 42 43 44 ?? 45 46 47 48 [2-4] 49 4A 4B 4C }",
-                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                     .expect("default gram sizes"),
             )
             .expect("hex line")
             .expect("parsed hex");
         assert_eq!(pattern_id, "$h");
         assert_eq!(alternatives.len(), 1);
-        assert_eq!(alternatives[0].len(), 3);
-        assert_eq!(tier2_alternatives[0].len(), 6);
+        assert_eq!(alternatives[0].len(), 6);
+        assert_eq!(tier2_alternatives[0].len(), 3);
         assert!(fixed_literals[0].is_empty());
         let packed = parse_hex_line_to_grams(
             "$p = { 8bec 83ec10 }",
@@ -5744,7 +5751,7 @@ rule empty {
         assert!(
             parse_hex_line_to_grams(
                 "$h = { }",
-                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                     .expect("default gram sizes"),
             )
             .expect_err("empty hex body")
@@ -5754,7 +5761,7 @@ rule empty {
         assert!(
             parse_hex_line_to_grams(
                 "$h = { GG }",
-                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                     .expect("default gram sizes"),
             )
             .expect_err("bad hex token")
@@ -5763,7 +5770,7 @@ rule empty {
         );
         let nibble_hex = parse_hex_line_to_grams(
             "$h = { 41 4? 42 ?3 43 }",
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
         )
         .expect("nibble wildcard hex")
@@ -5774,7 +5781,7 @@ rule empty {
         assert!(
             parse_hex_line_to_grams(
                 "$h = \"ABCD\"",
-                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                     .expect("default gram sizes"),
             )
             .expect("literal line should be ignored")
@@ -5789,7 +5796,7 @@ rule empty {
 
         let regex = parse_regex_line(
             r#"$r = /[A-Z]+applesause[0-9]+/"#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
         )
         .expect("regex parse")
@@ -5799,7 +5806,7 @@ rule empty {
 
         let regex_escaped = parse_regex_line(
             r#"$r = /https?:\/\/evil\.com/"#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
         )
         .expect("regex parse")
@@ -5807,7 +5814,7 @@ rule empty {
         assert_eq!(regex_escaped.alternatives, vec![b"://evil.com".to_vec()]);
         let regex_alt = parse_regex_line(
             r#"$r = /(apple|apricot)juice/"#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
         )
         .expect("regex parse")
@@ -5816,7 +5823,7 @@ rule empty {
         assert!(
             parse_regex_line(
                 r#"$r = /(apple|orange)/"#,
-                GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                     .expect("default gram sizes"),
             )
             .expect_err("common anchor too short")
@@ -5825,7 +5832,7 @@ rule empty {
         );
         let grouped = parse_regex_line(
             r#"$r = /fooba(bar|baz)qux/"#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
         )
         .expect("regex parse")
@@ -5834,20 +5841,22 @@ rule empty {
 
         let repeated_group = parse_regex_line(
             r#"$r = /(90){2,20}/"#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
         )
         .expect("regex parse")
         .expect("regex pattern");
         assert_eq!(repeated_group.alternatives, vec![b"9090".to_vec()]);
-        let tier2_only_regex = parse_regex_line(
-            r#"$r = /[0-9]+abc/"#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("regex parse")
-        .expect("regex pattern");
-        assert_eq!(tier2_only_regex.alternatives, vec![b"abc".to_vec()]);
+        assert!(
+            parse_regex_line(
+                r#"$r = /[0-9]+abc/"#,
+                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
+                    .expect("default gram sizes"),
+            )
+            .expect_err("regex should now be unanchorable")
+            .to_string()
+            .contains("anchorable mandatory literal")
+        );
     }
 
     #[test]
@@ -6144,7 +6153,7 @@ rule nocase_anchor {
             },
         )
         .expect("balanced nocase");
-        assert_eq!(balanced_nocase.len(), 8);
+        assert_eq!(balanced_nocase.len(), 4);
 
         let short_nocase = compile_query_plan_default(
             r#"
@@ -6167,13 +6176,13 @@ rule short_nocase_anchor {
             short_nocase.patterns[0]
                 .alternatives
                 .iter()
-                .all(|alt| alt.is_empty())
+                .all(|alt| !alt.is_empty())
         );
         assert!(
             short_nocase.patterns[0]
                 .tier2_alternatives
                 .iter()
-                .all(|alt| !alt.is_empty())
+                .all(|alt| alt.is_empty())
         );
 
         let ignored_modules = compile_query_plan_default(
@@ -6507,8 +6516,8 @@ rule parent_rule {
         assert_eq!(fixed.0, "$hex");
         assert_eq!(fixed.3, vec![b"ABCDE".to_vec()]);
         assert_eq!(fixed.1.len(), 1);
-        assert_eq!(fixed.1[0].len(), 2);
-        assert_eq!(fixed.2[0].len(), 3);
+        assert_eq!(fixed.1[0].len(), 3);
+        assert_eq!(fixed.2[0].len(), 2);
         assert!(
             parse_hex_line_to_grams(
                 "identifier = { 41 42 }",
@@ -6583,18 +6592,18 @@ rule q {
 }
 "#;
         let plan =
-            compile_query_plan_with_tier2_default_tier1(rule, 3, 8, false, true, 50).expect("plan");
-        assert_eq!(plan.tier2_gram_size, 3);
-        assert_eq!(plan.tier1_gram_size, DEFAULT_TIER1_GRAM_SIZE);
+            compile_query_plan_with_tier1_default_tier2(rule, 3, 8, false, true, 50).expect("plan");
+        assert_eq!(plan.tier1_gram_size, 3);
+        assert_eq!(plan.tier2_gram_size, DEFAULT_TIER2_GRAM_SIZE);
 
         let tmp = tempdir().expect("tmp");
         let rule_path = tmp.path().join("rule.yar");
         fs::write(&rule_path, rule).expect("rule");
-        let plan = compile_query_plan_from_file_with_tier2_default_tier1(
+        let plan = compile_query_plan_from_file_with_tier1_default_tier2(
             &rule_path, 3, 8, false, true, 50,
         )
         .expect("plan from file");
-        assert_eq!(plan.tier2_gram_size, 3);
+        assert_eq!(plan.tier1_gram_size, 3);
         assert_eq!(plan.max_candidates, 50);
     }
 
@@ -6942,7 +6951,7 @@ rule stronger_entrypoint_anchor {
 
     #[test]
     fn low_information_range_rule_is_rejected() {
-        let err = compile_query_plan_default(
+        compile_query_plan_default(
             r#"
 rule low_information_range_rule {
   strings:
@@ -6957,11 +6966,7 @@ rule low_information_range_rule {
             true,
             100,
         )
-        .expect_err("low-information range rule should fail");
-        assert!(
-            err.to_string()
-                .contains("short range/suffix anchors are too weak at scale")
-        );
+        .expect("smaller tier1 grams now make the range rule anchorable");
 
         compile_query_plan_default(
             r#"
@@ -6983,7 +6988,7 @@ rule stronger_range_rule {
 
     #[test]
     fn low_information_single_pattern_is_rejected() {
-        let err = compile_query_plan_default(
+        compile_query_plan_default(
             r#"
 rule low_information_single_pattern {
   strings:
@@ -6997,11 +7002,7 @@ rule low_information_single_pattern {
             true,
             100,
         )
-        .expect_err("low-information single-pattern rule should fail");
-        assert!(
-            err.to_string()
-                .contains("single-pattern rule provides only tiny gram anchors")
-        );
+        .expect("smaller tier1 grams now make the single-pattern rule anchorable");
 
         compile_query_plan_default(
             r#"

@@ -790,6 +790,7 @@ def main() -> int:
     parser.add_argument('--summary-cap-kib', type=int, default=32)
     parser.add_argument('--tier1-superblock-docs', type=int, default=32)
     parser.add_argument('--tier1-sizing-mode', choices=('current', 'hll'), default='current')
+    parser.add_argument('--gram-sizes', default='3,4')
     parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--shards', type=int)
     parser.add_argument('--set-fp', type=float)
@@ -855,6 +856,7 @@ def main() -> int:
         'summary_cap_kib': args.summary_cap_kib,
         'tier1_superblock_docs': args.tier1_superblock_docs,
         'tier1_sizing_mode': args.tier1_sizing_mode,
+        'gram_sizes': args.gram_sizes,
         'disable_pattern_superblocks': args.disable_pattern_superblocks,
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
@@ -929,6 +931,7 @@ def main() -> int:
                     '--tier1-superblock-docs', str(args.tier1_superblock_docs),
                     '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                     '--tier1-sizing-mode', args.tier1_sizing_mode,
+                    '--gram-sizes', args.gram_sizes,
                     *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                     *fp_args,
                 ],
@@ -994,6 +997,7 @@ def main() -> int:
                 '--tier1-superblock-docs', str(args.tier1_superblock_docs),
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                 '--tier1-sizing-mode', args.tier1_sizing_mode,
+                '--gram-sizes', args.gram_sizes,
                 *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                 '--search-workers', str(args.search_workers),
                 *fp_args,

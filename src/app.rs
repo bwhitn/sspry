@@ -914,14 +914,14 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
     let legacy_filter_target_fp = json_f64_opt(&stats, "filter_target_fp");
     let gram_sizes = GramSizes::new(
         stats
-            .get("tier2_gram_size")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| SspryError::from("candidate stats missing tier2_gram_size"))?
-            as usize,
-        stats
             .get("tier1_gram_size")
             .and_then(|value| value.as_u64())
             .ok_or_else(|| SspryError::from("candidate stats missing tier1_gram_size"))?
+            as usize,
+        stats
+            .get("tier2_gram_size")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| SspryError::from("candidate stats missing tier2_gram_size"))?
             as usize,
     )?;
     let id_source = CandidateIdSource::parse_config_value(
@@ -1689,7 +1689,7 @@ fn validate_forest_search_policy(
         for store in &group.stores {
             let config = store.config();
             let candidate_gram_sizes =
-                GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
+                GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)?;
             if let Some(existing) = gram_sizes {
                 if existing != candidate_gram_sizes {
                     return Err(SspryError::from(
@@ -2282,8 +2282,8 @@ fn fixed_literal_plan_from_rule(rule_path: &Path) -> Option<FixedLiteralMatchPla
     let plan = compile_query_plan_from_file_with_gram_sizes(
         rule_path,
         GramSizes::new(
-            crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
             crate::candidate::DEFAULT_TIER1_GRAM_SIZE,
+            crate::candidate::DEFAULT_TIER2_GRAM_SIZE,
         )
         .ok()?,
         16,
@@ -2584,7 +2584,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .config();
             let id_source = CandidateIdSource::parse_config_value(&config.id_source)?;
-            let gram_sizes = GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
+            let gram_sizes = GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)?;
             let mut row = scan_index_batch_row(
                 Path::new(&args.file_path),
                 ScanPolicy {
@@ -2697,7 +2697,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .config();
             let id_source = CandidateIdSource::parse_config_value(&config.id_source)?;
-            let gram_sizes = GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?;
+            let gram_sizes = GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)?;
             let policy = ScanPolicy {
                 fixed_filter_bytes: None,
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
@@ -3715,7 +3715,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 .map(|store| {
                     let config = store.config();
                     Ok::<_, SspryError>((
-                        GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)?,
+                        GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)?,
                         Some(config.id_source),
                     ))
                 })
@@ -4999,7 +4999,7 @@ struct ServeArgs {
     #[arg(
         long = "gram-sizes",
         default_value = "3,4",
-        help = "DB-wide gram-size pair as tier2,tier1. Supported pairs: 3,4 4,5 5,6 7,8."
+        help = "DB-wide gram-size pair as tier1,tier2. Supported pairs: 3,4 4,5 5,6 7,8."
     )]
     gram_sizes: String,
 }
@@ -5034,7 +5034,7 @@ struct InitArgs {
     #[arg(
         long = "gram-sizes",
         default_value = "3,4",
-        help = "DB-wide gram-size pair as tier2,tier1. Supported pairs: 3,4 4,5 5,6 7,8."
+        help = "DB-wide gram-size pair as tier1,tier2. Supported pairs: 3,4 4,5 5,6 7,8."
     )]
     gram_sizes: String,
     #[arg(

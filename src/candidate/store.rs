@@ -5409,7 +5409,7 @@ fn validate_config(config: &CandidateConfig) -> Result<()> {
             "id_source must be one of sha256, md5, sha1, sha512",
         ));
     }
-    GramSizes::new(config.tier2_gram_size, config.tier1_gram_size)
+    GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)
         .map_err(|err| SspryError::from(format!("invalid gram size pair: {err}")))?;
     if config.tier1_superblock_docs == 0 {
         return Err(SspryError::from("tier1_superblock_docs must be > 0"));
@@ -7207,8 +7207,8 @@ mod tests {
         )
         .expect("mask cache");
         let pattern_masks = cache.get("$a").expect("pattern masks");
-        assert!(pattern_masks.tier1[0].shifts.is_empty());
-        assert_eq!(pattern_masks.tier1[0].any_lane_values.len(), 1);
+        assert!(!pattern_masks.tier1[0].shifts.is_empty());
+        assert!(pattern_masks.tier1[0].any_lane_values.is_empty());
     }
 
     #[test]
@@ -7216,9 +7216,9 @@ mod tests {
         let pattern = PatternPlan {
             pattern_id: "$a".to_owned(),
             alternatives: vec![Vec::new()],
-            tier2_alternatives: vec![vec![pack_exact_gram(b"To:")]],
-            anchor_literals: vec![b"To:".to_vec()],
-            fixed_literals: vec![b"To:".to_vec()],
+            tier2_alternatives: vec![vec![pack_exact_gram(b"To:!")]],
+            anchor_literals: vec![b"To:!".to_vec()],
+            fixed_literals: vec![b"To:!".to_vec()],
             fixed_literal_wide: vec![false],
             fixed_literal_fullword: vec![false],
         };
@@ -7271,7 +7271,7 @@ mod tests {
         .expect("evaluate miss");
         assert!(!miss.matched);
 
-        let tier2_bloom = lane_bloom_bytes(64, 3, &[pack_exact_gram(b"To:")]);
+        let tier2_bloom = lane_bloom_bytes(64, 3, &[pack_exact_gram(b"To:!")]);
         let (mut hit_inputs, _load_metadata, mut hit_tier1, mut hit_tier2) =
             prefetched_query_inputs(&doc, &[], &[], &tier2_bloom);
         let hit = evaluate_pattern(
@@ -7288,13 +7288,13 @@ mod tests {
     }
 
     #[test]
-    fn tier2_only_patterns_do_not_require_tier1_tree_or_block_masks() {
+    fn tier2_only_patterns_require_tier1_tree_or_block_masks_with_tier1_primary_grams() {
         let pattern = PatternPlan {
             pattern_id: "$a".to_owned(),
             alternatives: vec![Vec::new()],
-            tier2_alternatives: vec![vec![pack_exact_gram(b"To:")]],
-            anchor_literals: vec![b"To:".to_vec()],
-            fixed_literals: vec![b"To:".to_vec()],
+            tier2_alternatives: vec![vec![pack_exact_gram(b"To:!")]],
+            anchor_literals: vec![b"To:!".to_vec()],
+            fixed_literals: vec![b"To:!".to_vec()],
             fixed_literal_wide: vec![false],
             fixed_literal_fullword: vec![false],
         };
@@ -7308,14 +7308,14 @@ mod tests {
         )
         .expect("mask cache");
         let pattern_masks = cache.get("$a").expect("pattern masks");
-        assert!(pattern_masks.tier1[0].is_empty());
+        assert!(!pattern_masks.tier1[0].is_empty());
         assert!(!pattern_masks.tier2[0].is_empty());
 
         let mut tier2_gates = TreeBloomGateIndex::default();
-        let tier2_bloom = lane_bloom_bytes(64, 3, &[pack_exact_gram(b"To:")]);
+        let tier2_bloom = lane_bloom_bytes(64, 3, &[pack_exact_gram(b"To:!")]);
         update_tree_gate_for_doc_bytes_inner(&mut tier2_gates, 64, 3, &tier2_bloom);
 
-        assert!(tree_gate_matches_pattern(
+        assert!(!tree_gate_matches_pattern(
             "$a",
             &cache,
             &TreeBloomGateIndex::default(),
@@ -7325,7 +7325,7 @@ mod tests {
             true,
         ));
 
-        assert!(block_matches_pattern(
+        assert!(!block_matches_pattern(
             (64, 3),
             0,
             "$a",
@@ -7373,7 +7373,7 @@ mod tests {
     ) -> Result<MatchOutcome> {
         let plan = compile_query_plan_with_gram_sizes_and_identity_source(
             rule_text,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)?,
             Some("sha256"),
             16,
             false,
@@ -7382,7 +7382,7 @@ mod tests {
         )?;
         let features = scan_file_features_bloom_only_with_gram_sizes(
             file_path,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)?,
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)?,
             filter_bytes,
             bloom_hashes,
             tier2_filter_bytes,
@@ -7570,7 +7570,11 @@ rule r {
             None,
             None,
             filter_bytes,
-            &lane_bloom_bytes(filter_bytes, bloom_hashes, &[0x4443_4241]),
+            &lane_bloom_bytes(
+                filter_bytes,
+                bloom_hashes,
+                &[pack_exact_gram(b"ABC"), pack_exact_gram(b"BCD")],
+            ),
             Some("doc-1".to_owned()),
         )
         .expect("insert");
@@ -7580,15 +7584,15 @@ rule r {
             r#"
 rule q {
   strings:
-    $a = "ABCD"
+    $a = "ABC"
   condition:
     $a
 }
 "#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
             8,
-            false,
+            true,
             true,
             100_000,
         )
@@ -7656,7 +7660,7 @@ rule q {
     hash.sha256(0, filesize) == "1111111111111111111111111111111111111111111111111111111111111111"
 }
 "#,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
             Some("sha256"),
             8,

@@ -430,7 +430,7 @@ mod tests {
     ) -> crate::Result<super::DocumentFeatures> {
         scan_file_features_bloom_only_with_gram_sizes(
             path,
-            GramSizes::new(DEFAULT_TIER2_GRAM_SIZE, DEFAULT_TIER1_GRAM_SIZE)
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
                 .expect("default gram sizes"),
             filter_bytes,
             bloom_hashes,
@@ -592,7 +592,7 @@ mod tests {
 
         let features = scan_file_features_bloom_only_with_gram_sizes(
             &path,
-            GramSizes::new(3, DEFAULT_TIER1_GRAM_SIZE).expect("sizes"),
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE).expect("sizes"),
             64,
             4,
             64,

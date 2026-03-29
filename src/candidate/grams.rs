@@ -1,7 +1,7 @@
 use crate::{Result, SspryError};
 
-pub const DEFAULT_TIER2_GRAM_SIZE: usize = 3;
-pub const DEFAULT_TIER1_GRAM_SIZE: usize = 4;
+pub const DEFAULT_TIER1_GRAM_SIZE: usize = 3;
+pub const DEFAULT_TIER2_GRAM_SIZE: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GramSizes {
@@ -12,8 +12,8 @@ pub struct GramSizes {
 impl Default for GramSizes {
     fn default() -> Self {
         Self {
-            tier2: DEFAULT_TIER2_GRAM_SIZE,
             tier1: DEFAULT_TIER1_GRAM_SIZE,
+            tier2: DEFAULT_TIER2_GRAM_SIZE,
         }
     }
 }
@@ -23,7 +23,7 @@ impl GramSizes {
         let raw = text.trim();
         let Some((left, right)) = raw.split_once(',') else {
             return Err(SspryError::from(
-                "candidate-gram-sizes must be '<tier2>,<tier1>' like '3,4'",
+                "candidate-gram-sizes must be '<tier1>,<tier2>' like '3,4'",
             ));
         };
         let left = left
@@ -37,19 +37,17 @@ impl GramSizes {
         Self::new(left, right)
     }
 
-    pub fn new(a: usize, b: usize) -> Result<Self> {
-        let tier2 = a.min(b);
-        let tier1 = a.max(b);
-        if tier2 < 3 || tier1 < 4 || tier2 >= tier1 || tier1 > 8 {
+    pub fn new(tier1: usize, tier2: usize) -> Result<Self> {
+        if tier1 < 3 || tier2 < 4 || tier1 >= tier2 || tier2 > 8 {
             return Err(SspryError::from(
-                "candidate gram sizes must satisfy 3 <= tier2 < tier1 <= 8",
+                "candidate gram sizes must satisfy 3 <= tier1 < tier2 <= 8",
             ));
         }
-        Ok(Self { tier2, tier1 })
+        Ok(Self { tier1, tier2 })
     }
 
     pub fn as_cli_value(self) -> String {
-        format!("{},{}", self.tier2, self.tier1)
+        format!("{},{}", self.tier1, self.tier2)
     }
 
     pub fn tier1_key_bytes(self) -> usize {
@@ -76,25 +74,25 @@ mod tests {
     #[test]
     fn gram_sizes_parse_and_normalize() {
         assert_eq!(
-            GramSizes::parse("4,3").expect("sizes"),
-            GramSizes { tier2: 3, tier1: 4 }
+            GramSizes::parse("3,4").expect("sizes"),
+            GramSizes { tier1: 3, tier2: 4 }
         );
         assert!(GramSizes::parse("3").is_err());
         assert!(GramSizes::parse("2,4").is_err());
         assert!(GramSizes::parse("4,4").is_err());
-        assert!(GramSizes::parse("7,9").is_err());
+        assert!(GramSizes::parse("9,7").is_err());
     }
 
     #[test]
     fn gram_sizes_helpers_cover_defaults_and_errors() {
         let defaults = GramSizes::default();
-        assert_eq!(defaults, GramSizes { tier2: 3, tier1: 4 });
+        assert_eq!(defaults, GramSizes { tier1: 3, tier2: 4 });
         assert_eq!(defaults.as_cli_value(), "3,4");
         assert_eq!(defaults.tier1_key_bytes(), 4);
-        assert_eq!(GramSizes::new(4, 5).expect("sizes").tier1_key_bytes(), 8);
+        assert_eq!(GramSizes::new(5, 6).expect("sizes").tier1_key_bytes(), 8);
         assert_eq!(
-            GramSizes::parse(" 5 , 4 ").expect("normalized"),
-            GramSizes { tier2: 4, tier1: 5 }
+            GramSizes::parse(" 4 , 5 ").expect("normalized"),
+            GramSizes { tier1: 4, tier2: 5 }
         );
         assert!(GramSizes::parse("x,4").is_err());
         assert!(GramSizes::parse("4,y").is_err());
