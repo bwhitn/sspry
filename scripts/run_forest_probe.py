@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -17,6 +18,9 @@ TEMPORARY_SEARCH_MARKERS = (
     'busy during query scan; retry later',
     'busy during document frequency lookup; retry later',
 )
+DOC_META_ROW_BYTES = 56
+TIER2_DOC_META_ROW_BYTES = 24
+DOC_FLAG_DELETED = 0x02
 
 
 def run(cmd, **kwargs):
@@ -109,6 +113,173 @@ def parse_index_metrics(stderr_text: str) -> dict:
         if m:
             out[key.replace('.', '_')] = float(m.group(1))
     return out
+
+
+def weighted_quantile(sorted_values: list[int], percentile: float) -> int:
+    if not sorted_values:
+        return 0
+    idx = int(round((len(sorted_values) - 1) * percentile))
+    idx = max(0, min(idx, len(sorted_values) - 1))
+    return sorted_values[idx]
+
+
+def parse_filter_histogram_paths(
+    meta_paths: list[Path],
+    row_bytes: int,
+    filter_offset: int,
+    hash_offset: int,
+    flags_offset: int | None = None,
+    require_nonzero_filter: bool = False,
+) -> dict:
+    existing_paths = [meta_path for meta_path in meta_paths if meta_path.exists()]
+    if not existing_paths:
+        return {}
+    filter_counts: dict[int, int] = {}
+    key_counts: dict[tuple[int, int], int] = {}
+    expanded_values: list[int] = []
+    rows_total = 0
+    rows_live = 0
+    rows_deleted = 0
+    rows_zero_filter = 0
+    total_filter_bytes = 0
+    for meta_path in existing_paths:
+        data = meta_path.read_bytes()
+        if len(data) % row_bytes != 0:
+            raise RuntimeError(f'invalid meta row size for {meta_path}')
+        rows_total += len(data) // row_bytes
+        for row_offset in range(0, len(data), row_bytes):
+            if flags_offset is not None:
+                flags = data[row_offset + flags_offset]
+                if flags & DOC_FLAG_DELETED:
+                    rows_deleted += 1
+                    continue
+            filter_bytes = struct.unpack_from('<I', data, row_offset + filter_offset)[0]
+            bloom_hashes = data[row_offset + hash_offset]
+            if require_nonzero_filter and filter_bytes == 0:
+                rows_zero_filter += 1
+                continue
+            rows_live += 1
+            total_filter_bytes += filter_bytes
+            filter_counts[filter_bytes] = filter_counts.get(filter_bytes, 0) + 1
+            key = (filter_bytes, bloom_hashes)
+            key_counts[key] = key_counts.get(key, 0) + 1
+            expanded_values.append(filter_bytes)
+    expanded_values.sort()
+    filter_histogram = [
+        {'filter_bytes': filter_bytes, 'count': count}
+        for filter_bytes, count in sorted(filter_counts.items())
+    ]
+    key_histogram = [
+        {'filter_bytes': filter_bytes, 'bloom_hashes': bloom_hashes, 'count': count}
+        for (filter_bytes, bloom_hashes), count in sorted(key_counts.items())
+    ]
+    return {
+        'paths': [str(meta_path) for meta_path in existing_paths],
+        'rows_total': rows_total,
+        'rows_live': rows_live,
+        'rows_deleted': rows_deleted,
+        'rows_zero_filter': rows_zero_filter,
+        'distinct_filter_bytes': len(filter_counts),
+        'distinct_filter_keys': len(key_counts),
+        'avg_filter_bytes': (total_filter_bytes / rows_live) if rows_live > 0 else 0.0,
+        'median_filter_bytes': weighted_quantile(expanded_values, 0.5),
+        'p90_filter_bytes': weighted_quantile(expanded_values, 0.9),
+        'p95_filter_bytes': weighted_quantile(expanded_values, 0.95),
+        'max_filter_bytes': expanded_values[-1] if expanded_values else 0,
+        'filter_bytes_histogram': filter_histogram,
+        'filter_key_histogram': key_histogram,
+    }
+
+
+def shard_roots(current_root: Path) -> list[Path]:
+    manifest_path = current_root / 'shards.json'
+    if not manifest_path.exists():
+        return [current_root]
+    raw = json.loads(manifest_path.read_text())
+    shard_count = max(1, int(raw.get('candidate_shards', 1)))
+    return [current_root / f'shard_{shard_idx:03}' for shard_idx in range(shard_count)]
+
+
+def write_bloom_histograms(out_path: Path, current_root: Path) -> dict:
+    roots = shard_roots(current_root)
+    histograms = {
+        'tier1': parse_filter_histogram_paths(
+            [root / 'doc_meta.bin' for root in roots],
+            DOC_META_ROW_BYTES,
+            filter_offset=8,
+            hash_offset=13,
+            flags_offset=12,
+        ),
+        'tier2': parse_filter_histogram_paths(
+            [root / 'tier2_doc_meta.bin' for root in roots],
+            TIER2_DOC_META_ROW_BYTES,
+            filter_offset=0,
+            hash_offset=4,
+            require_nonzero_filter=True,
+        ),
+    }
+    out_path.write_text(json.dumps(histograms, indent=2, sort_keys=True))
+    return histograms
+
+
+def load_json_if_exists(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def load_reused_tree_record(
+    tree_name: str,
+    addr: str,
+    manifest: dict,
+    tree_run_dir: Path,
+    db_root: Path,
+) -> dict:
+    index_wall_s = 0.0
+    index_wall_path = tree_run_dir / 'index.wall_seconds.txt'
+    if index_wall_path.exists():
+        try:
+            index_wall_s = float(index_wall_path.read_text().strip() or '0')
+        except ValueError:
+            index_wall_s = 0.0
+    current_root = db_root / 'current'
+    bloom_hist_path = tree_run_dir / 'bloom_histograms.json'
+    if bloom_hist_path.exists():
+        bloom_histograms = json.loads(bloom_hist_path.read_text())
+    else:
+        bloom_histograms = write_bloom_histograms(bloom_hist_path, current_root)
+    return {
+        'tree': tree_name,
+        'addr': addr,
+        'manifest': str(manifest['path']),
+        'index_wall_seconds': index_wall_s,
+        'files': manifest['files'],
+        'manifest_bytes': manifest['bytes'],
+        'index_files_per_minute': ((manifest['files'] / index_wall_s) * 60.0) if index_wall_s > 0 else 0.0,
+        'index_metrics': parse_index_metrics((tree_run_dir / 'index.stderr').read_text()) if (tree_run_dir / 'index.stderr').exists() else {},
+        'post_publish_info': load_json_if_exists(tree_run_dir / 'post_publish.info.light.json'),
+        'dir_stats': load_json_if_exists(tree_run_dir / 'final.dir_stats.json') or dir_stats(db_root),
+        'system_before_index': load_json_if_exists(tree_run_dir / 'system.before_index.json'),
+        'system_after_publish': load_json_if_exists(tree_run_dir / 'system.after_publish.json'),
+        'bloom_histograms': bloom_histograms,
+        'reused_existing_db': True,
+    }
+
+
+def tree_index_complete(tree_run_dir: Path, db_root: Path) -> bool:
+    index_exit = tree_run_dir / 'index.exit_code.txt'
+    if not index_exit.exists():
+        return False
+    try:
+        if index_exit.read_text().strip() != '0':
+            return False
+    except OSError:
+        return False
+    return (
+        (tree_run_dir / 'post_publish.info.light.json').exists()
+        and (tree_run_dir / 'final.dir_stats.json').exists()
+        and db_root.exists()
+    )
 
 
 def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_ms_wall: float) -> dict:
@@ -618,6 +789,7 @@ def main() -> int:
     parser.add_argument('--balance-bytes', action='store_true')
     parser.add_argument('--summary-cap-kib', type=int, default=32)
     parser.add_argument('--tier1-superblock-docs', type=int, default=32)
+    parser.add_argument('--tier1-sizing-mode', choices=('current', 'hll'), default='current')
     parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--shards', type=int)
     parser.add_argument('--set-fp', type=float)
@@ -630,6 +802,7 @@ def main() -> int:
     parser.add_argument('--index-mode', choices=('server', 'local-root'), default='server')
     parser.add_argument('--tree-search-workers', type=int, default=0)
     parser.add_argument('--search-timeout-s', type=int, default=100)
+    parser.add_argument('--index-timeout-s', type=int, default=300)
     parser.add_argument('--search-server-start-attempts', type=int, default=1200)
     parser.add_argument('--drain-between-trees', action='store_true')
     parser.add_argument('--drain-sync', action='store_true')
@@ -640,7 +813,7 @@ def main() -> int:
     parser.add_argument('--server-sample-interval-s', type=float, default=0.0)
     parser.add_argument('--per-rule-server-snapshots', action='store_true')
     parser.add_argument('--reuse-existing-db', action='store_true')
-    parser.add_argument('--search-mode', choices=('server', 'local-forest'), default='server')
+    parser.add_argument('--search-mode', choices=('server', 'local-forest'), default='local-forest')
     args = parser.parse_args()
 
     sspry = Path(args.sspry)
@@ -654,7 +827,8 @@ def main() -> int:
     trees_dir = run_dir / 'trees'
     searches_dir = run_dir / 'search'
 
-    shutil.rmtree(run_dir, ignore_errors=True)
+    if not args.reuse_existing_db:
+        shutil.rmtree(run_dir, ignore_errors=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     if args.reuse_existing_db:
         if not db_base.exists():
@@ -680,6 +854,7 @@ def main() -> int:
         'tree_count': len(manifests),
         'summary_cap_kib': args.summary_cap_kib,
         'tier1_superblock_docs': args.tier1_superblock_docs,
+        'tier1_sizing_mode': args.tier1_sizing_mode,
         'disable_pattern_superblocks': args.disable_pattern_superblocks,
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
@@ -687,6 +862,7 @@ def main() -> int:
         'index_mode': args.index_mode,
         'tree_search_workers': args.tree_search_workers,
         'search_mode': args.search_mode,
+        'index_timeout_s': args.index_timeout_s,
         'drain_between_trees': args.drain_between_trees,
         'reused_existing_db': args.reuse_existing_db,
         'trees': [],
@@ -701,22 +877,8 @@ def main() -> int:
         tree_run_dir.mkdir(parents=True, exist_ok=True)
         db_root = db_base / tree_name
         addr = f'127.0.0.1:{args.base_port + idx}'
-        if args.reuse_existing_db:
-            tree_record = {
-                'tree': tree_name,
-                'addr': addr,
-                'manifest': str(manifest['path']),
-                'index_wall_seconds': 0.0,
-                'files': manifest['files'],
-                'manifest_bytes': manifest['bytes'],
-                'index_files_per_minute': 0.0,
-                'index_metrics': {},
-                'post_publish_info': {},
-                'dir_stats': dir_stats(db_root),
-                'system_before_index': {},
-                'system_after_publish': {},
-                'reused_existing_db': True,
-            }
+        if args.reuse_existing_db and tree_index_complete(tree_run_dir, db_root):
+            tree_record = load_reused_tree_record(tree_name, addr, manifest, tree_run_dir, db_root)
             forest_summary['trees'].append(tree_record)
             print(
                 f"index.reuse tree={tree_name} addr={addr} manifest={manifest['path']} "
@@ -724,6 +886,26 @@ def main() -> int:
                 flush=True,
             )
             continue
+        if args.reuse_existing_db:
+            shutil.rmtree(db_root, ignore_errors=True)
+            for stale in (
+                'start.info.light.json',
+                'index.stdout',
+                'index.stderr',
+                'index.exit_code.txt',
+                'index.wall_seconds.txt',
+                'post_publish.info.light.json',
+                'system.before_index.json',
+                'system.after_publish.json',
+                'final.dir_stats.json',
+                'bloom_histograms.json',
+                'server.stdout',
+                'server.stderr',
+                'index.server_samples.json',
+            ):
+                path = tree_run_dir / stale
+                if path.exists():
+                    path.unlink()
         before_index = write_snapshot(tree_run_dir / 'system.before_index.json', system_snapshot())
         print(
             f"index.start tree={tree_name} addr={addr} manifest={manifest['path']} "
@@ -746,6 +928,7 @@ def main() -> int:
                     '--candidate-shards', str(args.shards or 1),
                     '--tier1-superblock-docs', str(args.tier1_superblock_docs),
                     '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
+                    '--tier1-sizing-mode', args.tier1_sizing_mode,
                     *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                     *fp_args,
                 ],
@@ -759,6 +942,8 @@ def main() -> int:
                 str(sspry),
                 'index', '--root', str(current_root), '--path-list', str(manifest['path']),
                 '--batch-size', '64',
+                '--timeout', str(args.index_timeout_s),
+                '--tier1-sizing-mode', args.tier1_sizing_mode,
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
             ]
@@ -777,6 +962,7 @@ def main() -> int:
                 raise RuntimeError(f'index failed for {tree_name} with exit {proc.returncode}')
             after_publish = write_snapshot(tree_run_dir / 'system.after_publish.json', system_snapshot())
             (tree_run_dir / 'final.dir_stats.json').write_text(json.dumps(dir_stats(db_root), indent=2, sort_keys=True))
+            bloom_histograms = write_bloom_histograms(tree_run_dir / 'bloom_histograms.json', current_root)
             index_metrics = parse_index_metrics((tree_run_dir / 'index.stderr').read_text())
             tree_record = {
                 'tree': tree_name,
@@ -791,6 +977,7 @@ def main() -> int:
                 'dir_stats': json.loads((tree_run_dir / 'final.dir_stats.json').read_text()),
                 'system_before_index': before_index,
                 'system_after_publish': after_publish,
+                'bloom_histograms': bloom_histograms,
             }
             forest_summary['trees'].append(tree_record)
             print(
@@ -806,6 +993,7 @@ def main() -> int:
                 '--memory-budget-gb', str(args.memory_budget_gb),
                 '--tier1-superblock-docs', str(args.tier1_superblock_docs),
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
+                '--tier1-sizing-mode', args.tier1_sizing_mode,
                 *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
                 '--search-workers', str(args.search_workers),
                 *fp_args,
@@ -829,6 +1017,8 @@ def main() -> int:
             index_cmd = [
                 str(sspry),
                 'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64',
+                '--timeout', str(args.index_timeout_s),
+                '--tier1-sizing-mode', args.tier1_sizing_mode,
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
             ]
@@ -848,6 +1038,7 @@ def main() -> int:
             post_publish = wait_for_publish(sspry, addr, tree_run_dir / 'post_publish.info.light.json')
             after_publish = write_snapshot(tree_run_dir / 'system.after_publish.json', system_snapshot())
             (tree_run_dir / 'final.dir_stats.json').write_text(json.dumps(dir_stats(db_root), indent=2, sort_keys=True))
+            bloom_histograms = write_bloom_histograms(tree_run_dir / 'bloom_histograms.json', db_root / 'current')
             index_metrics = parse_index_metrics((tree_run_dir / 'index.stderr').read_text())
             tree_record = {
                 'tree': tree_name,
@@ -862,6 +1053,7 @@ def main() -> int:
                 'dir_stats': json.loads((tree_run_dir / 'final.dir_stats.json').read_text()),
                 'system_before_index': before_index,
                 'system_after_publish': after_publish,
+                'bloom_histograms': bloom_histograms,
             }
             if args.drain_between_trees and idx + 1 < len(manifests):
                 drain = drain_writeback(
@@ -933,7 +1125,9 @@ def main() -> int:
             tree_count = len(search_servers)
 
         search_summary = []
-        tree_search_workers = args.tree_search_workers or tree_count
+        tree_search_workers = args.tree_search_workers or (
+            args.search_workers if args.search_mode == 'local-forest' else tree_count
+        )
         tree_search_workers = max(1, min(tree_search_workers, tree_count))
         tree_batches = max(1, math.ceil(tree_count / tree_search_workers))
         effective_search_timeout_s = args.search_timeout_s * tree_batches

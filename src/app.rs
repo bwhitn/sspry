@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -23,15 +23,16 @@ use crate::candidate::query_plan::{
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER1_SUPERBLOCK_DOCS,
+    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER1_FILTER_TARGET_FP,
+    DEFAULT_TIER1_SUPERBLOCK_DOCS, DEFAULT_TIER2_FILTER_TARGET_FP,
     DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, GramSizes, HLL_DEFAULT_PRECISION,
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
+    choose_tier1_filter_class_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata,
-    normalize_tier1_filter_class_bytes, read_candidate_shard_count,
-    scan_file_features_bloom_only_with_gram_sizes,
+    read_candidate_shard_count, scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -895,10 +896,17 @@ const INTERNAL_BLOOM_HASHES: usize = 7;
 struct ServerScanPolicy {
     id_source: CandidateIdSource,
     store_path: bool,
+    tier1_sizing_mode: Tier1SizingMode,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
     memory_budget_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum Tier1SizingMode {
+    Current,
+    Hll,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
@@ -922,12 +930,21 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
             .and_then(|value| value.as_str())
             .unwrap_or("sha256"),
     )?;
+    let tier1_sizing_mode = match stats
+        .get("tier1_sizing_mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("current")
+    {
+        "hll" => Tier1SizingMode::Hll,
+        _ => Tier1SizingMode::Current,
+    };
     Ok(ServerScanPolicy {
         id_source,
         store_path: stats
             .get("store_path")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        tier1_sizing_mode,
         tier1_filter_target_fp: json_f64_opt(&stats, "tier1_filter_target_fp")
             .or(legacy_filter_target_fp),
         tier2_filter_target_fp: json_f64_opt(&stats, "tier2_filter_target_fp")
@@ -1295,6 +1312,7 @@ fn store_config_from_parts(
     root: PathBuf,
     id_source: CandidateIdSource,
     store_path: bool,
+    tier1_sizing_mode: Tier1SizingMode,
     tier1_filter_target_fp: f64,
     tier2_filter_target_fp: f64,
     tier2_gram_size: usize,
@@ -1315,6 +1333,7 @@ fn store_config_from_parts(
             .max(1)
             .saturating_mul(1024),
         enable_tier2_superblocks,
+        tier1_filter_classed_sizing: tier1_sizing_mode == Tier1SizingMode::Current,
         tier1_filter_target_fp: Some(tier1_filter_target_fp),
         tier2_filter_target_fp: Some(tier2_filter_target_fp),
         filter_target_fp: if (tier1_filter_target_fp - tier2_filter_target_fp).abs() < f64::EPSILON
@@ -1328,15 +1347,23 @@ fn store_config_from_parts(
     }
 }
 
+fn enable_tier2_superblocks_from_cli(
+    enable_pattern_superblocks: bool,
+    disable_pattern_superblocks: bool,
+) -> bool {
+    enable_pattern_superblocks && !disable_pattern_superblocks
+}
+
 fn resolve_filter_target_fps(
     filter_target_fp: Option<f64>,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
 ) -> (f64, f64) {
-    let shared = filter_target_fp.unwrap_or(0.35);
+    let tier1_default = filter_target_fp.unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP);
+    let tier2_default = filter_target_fp.unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP);
     (
-        tier1_filter_target_fp.unwrap_or(shared),
-        tier2_filter_target_fp.unwrap_or(shared),
+        tier1_filter_target_fp.unwrap_or(tier1_default),
+        tier2_filter_target_fp.unwrap_or(tier2_default),
     )
 }
 
@@ -1352,13 +1379,17 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         PathBuf::from(&args.root),
         args.id_source,
         args.store_path,
+        args.tier1_sizing_mode,
         tier1_filter_target_fp,
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
-        !args.disable_pattern_superblocks,
+        enable_tier2_superblocks_from_cli(
+            args.enable_pattern_superblocks,
+            args.disable_pattern_superblocks,
+        ),
         CandidateConfig::default().compaction_idle_cooldown_s,
     )
 }
@@ -1375,13 +1406,17 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         PathBuf::from(&args.root),
         CandidateIdSource::Sha256,
         false,
+        args.tier1_sizing_mode,
         tier1_filter_target_fp,
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
-        !args.disable_pattern_superblocks,
+        enable_tier2_superblocks_from_cli(
+            args.enable_pattern_superblocks,
+            args.disable_pattern_superblocks,
+        ),
         args.compaction_idle_cooldown_s,
     )
 }
@@ -1479,6 +1514,10 @@ struct BatchSearchRecord {
     verbose_search_tree_gate_special_docs_bypass: Option<u64>,
     verbose_search_docs_scanned: Option<u64>,
     verbose_search_superblocks_skipped: Option<u64>,
+    verbose_search_tier1_superblock_loads: Option<u64>,
+    verbose_search_tier1_superblock_bytes: Option<u64>,
+    verbose_search_tier2_superblock_loads: Option<u64>,
+    verbose_search_tier2_superblock_bytes: Option<u64>,
     verbose_search_metadata_loads: Option<u64>,
     verbose_search_metadata_bytes: Option<u64>,
     verbose_search_tier1_bloom_loads: Option<u64>,
@@ -1526,6 +1565,77 @@ struct SearchVerificationResult {
     verified_checked: usize,
     verified_matched: usize,
     verified_skipped: usize,
+}
+
+struct BatchSearchRecordStream {
+    json_out: PathBuf,
+    partial_json_out: PathBuf,
+    json_writer: BufWriter<File>,
+    jsonl_out: PathBuf,
+    jsonl_writer: BufWriter<File>,
+    first_record: bool,
+    count: usize,
+}
+
+impl BatchSearchRecordStream {
+    fn new(json_out: &Path) -> Result<Self> {
+        if let Some(parent) = json_out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let partial_json_out = append_path_suffix(json_out, ".partial.json");
+        let jsonl_out = append_path_suffix(json_out, ".jsonl");
+        let mut json_writer = BufWriter::new(File::create(&partial_json_out)?);
+        json_writer.write_all(b"[\n")?;
+        let jsonl_writer = BufWriter::new(File::create(&jsonl_out)?);
+        Ok(Self {
+            json_out: json_out.to_path_buf(),
+            partial_json_out,
+            json_writer,
+            jsonl_out,
+            jsonl_writer,
+            first_record: true,
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, record: &BatchSearchRecord) -> Result<()> {
+        if !self.first_record {
+            self.json_writer.write_all(b",\n")?;
+        } else {
+            self.first_record = false;
+        }
+        serde_json::to_writer_pretty(&mut self.json_writer, record)?;
+        self.json_writer.write_all(b"\n")?;
+        self.json_writer.flush()?;
+
+        serde_json::to_writer(&mut self.jsonl_writer, record)?;
+        self.jsonl_writer.write_all(b"\n")?;
+        self.jsonl_writer.flush()?;
+        self.count += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<usize> {
+        self.json_writer.write_all(b"]\n")?;
+        self.json_writer.flush()?;
+        self.jsonl_writer.flush()?;
+        drop(self.json_writer);
+        drop(self.jsonl_writer);
+        fs::rename(&self.partial_json_out, &self.json_out)?;
+        Ok(self.count)
+    }
+
+    fn jsonl_out(&self) -> &Path {
+        &self.jsonl_out
+    }
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    path.with_file_name(format!("{file_name}{suffix}"))
 }
 
 fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
@@ -1988,6 +2098,7 @@ struct ScanPolicy {
     fixed_filter_bytes: Option<usize>,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
+    tier1_sizing_mode: Tier1SizingMode,
     gram_sizes: GramSizes,
     chunk_size: usize,
     store_path: bool,
@@ -2028,18 +2139,26 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         align_filter_bytes(value)
     } else {
-        let selected = choose_filter_bytes_for_file_size(
-            file_size,
-            INTERNAL_FILTER_BYTES,
-            Some(INTERNAL_FILTER_MIN_BYTES),
-            Some(INTERNAL_FILTER_MAX_BYTES),
-            policy.tier1_filter_target_fp,
-            bloom_item_estimate,
-        )?;
-        if policy.tier1_filter_target_fp.is_some() {
-            normalize_tier1_filter_class_bytes(selected)
+        if policy.tier1_filter_target_fp.is_some()
+            && policy.tier1_sizing_mode == Tier1SizingMode::Current
+        {
+            choose_tier1_filter_class_bytes_for_file_size(
+                file_size,
+                INTERNAL_FILTER_BYTES,
+                Some(INTERNAL_FILTER_MIN_BYTES),
+                Some(INTERNAL_FILTER_MAX_BYTES),
+                policy.tier1_filter_target_fp,
+                bloom_item_estimate,
+            )?
         } else {
-            selected
+            choose_filter_bytes_for_file_size(
+                file_size,
+                INTERNAL_FILTER_BYTES,
+                Some(INTERNAL_FILTER_MIN_BYTES),
+                Some(INTERNAL_FILTER_MAX_BYTES),
+                policy.tier1_filter_target_fp,
+                bloom_item_estimate,
+            )?
         }
     };
     let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
@@ -2472,6 +2591,11 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                     fixed_filter_bytes: None,
                     tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                     tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
+                    tier1_sizing_mode: if config.tier1_filter_classed_sizing {
+                        Tier1SizingMode::Current
+                    } else {
+                        Tier1SizingMode::Hll
+                    },
                     gram_sizes,
                     chunk_size: args.chunk_size,
                     store_path: false,
@@ -2508,6 +2632,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                     fixed_filter_bytes: None,
                     tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
                     tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
+                    tier1_sizing_mode: server_policy.tier1_sizing_mode,
                     gram_sizes: server_policy.gram_sizes,
                     chunk_size: args.chunk_size,
                     store_path: server_policy.store_path,
@@ -2564,11 +2689,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             &input_roots,
             args.root.as_deref().map(Path::new),
         );
-        let workers = if args.root.is_none() && args.workers == 0 {
-            1
-        } else {
-            resolved_workers.workers
-        };
+        let workers = resolved_workers.workers;
         if let Some(root) = &args.root {
             let mut stores = open_stores(Path::new(root))?;
             let config = stores
@@ -2581,6 +2702,11 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 fixed_filter_bytes: None,
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
+                tier1_sizing_mode: if config.tier1_filter_classed_sizing {
+                    Tier1SizingMode::Current
+                } else {
+                    Tier1SizingMode::Hll
+                },
                 gram_sizes,
                 chunk_size: args.chunk_size,
                 store_path: config.store_path,
@@ -2738,6 +2864,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 fixed_filter_bytes: None,
                 tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
                 tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
+                tier1_sizing_mode: server_policy.tier1_sizing_mode,
                 gram_sizes: server_policy.gram_sizes,
                 chunk_size: args.chunk_size,
                 store_path: server_policy.store_path,
@@ -3762,6 +3889,7 @@ fn cmd_index(args: &IndexArgs) -> i32 {
             batch_size: args.batch_size,
             workers: args.workers.unwrap_or(0),
             chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
+            tier1_sizing_mode: args.tier1_sizing_mode,
             external_id_from_path: false,
             verbose: args.verbose,
             rotate_remote_sessions: false,
@@ -3782,6 +3910,7 @@ fn cmd_index(args: &IndexArgs) -> i32 {
         batch_size: args.batch_size,
         workers: args.workers.unwrap_or(0),
         chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
+        tier1_sizing_mode: args.tier1_sizing_mode,
         external_id_from_path: server_policy.store_path,
         verbose: args.verbose,
         rotate_remote_sessions: false,
@@ -4014,6 +4143,22 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 query_profile.superblocks_skipped
             );
             eprintln!(
+                "verbose.search.tier1_superblock_loads: {}",
+                query_profile.tier1_superblock_loads
+            );
+            eprintln!(
+                "verbose.search.tier1_superblock_bytes: {}",
+                query_profile.tier1_superblock_bytes
+            );
+            eprintln!(
+                "verbose.search.tier2_superblock_loads: {}",
+                query_profile.tier2_superblock_loads
+            );
+            eprintln!(
+                "verbose.search.tier2_superblock_bytes: {}",
+                query_profile.tier2_superblock_bytes
+            );
+            eprintln!(
                 "verbose.search.metadata_loads: {}",
                 query_profile.metadata_loads
             );
@@ -4236,7 +4381,12 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
             tree_count,
             tree_search_workers
         );
-        let mut out = Vec::<BatchSearchRecord>::with_capacity(rules.len());
+        let mut out = BatchSearchRecordStream::new(Path::new(&args.json_out))?;
+        eprintln!(
+            "search.batch.stream json_out={} jsonl_out={}",
+            args.json_out,
+            out.jsonl_out().display()
+        );
         for rule in rules {
             let started_total = Instant::now();
             let rule_name = rule
@@ -4311,6 +4461,18 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_docs_scanned: Some(local.query_profile.docs_scanned),
                     verbose_search_superblocks_skipped: Some(
                         local.query_profile.superblocks_skipped,
+                    ),
+                    verbose_search_tier1_superblock_loads: Some(
+                        local.query_profile.tier1_superblock_loads,
+                    ),
+                    verbose_search_tier1_superblock_bytes: Some(
+                        local.query_profile.tier1_superblock_bytes,
+                    ),
+                    verbose_search_tier2_superblock_loads: Some(
+                        local.query_profile.tier2_superblock_loads,
+                    ),
+                    verbose_search_tier2_superblock_bytes: Some(
+                        local.query_profile.tier2_superblock_bytes,
                     ),
                     verbose_search_metadata_loads: Some(local.query_profile.metadata_loads),
                     verbose_search_metadata_bytes: Some(local.query_profile.metadata_bytes),
@@ -4413,6 +4575,10 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_tree_gate_special_docs_bypass: None,
                     verbose_search_docs_scanned: None,
                     verbose_search_superblocks_skipped: None,
+                    verbose_search_tier1_superblock_loads: None,
+                    verbose_search_tier1_superblock_bytes: None,
+                    verbose_search_tier2_superblock_loads: None,
+                    verbose_search_tier2_superblock_bytes: None,
                     verbose_search_metadata_loads: None,
                     verbose_search_metadata_bytes: None,
                     verbose_search_tier1_bloom_loads: None,
@@ -4459,10 +4625,10 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                 "search.batch.rule.done rule={} exit={} wall_ms={:.3}",
                 record.rule, record.exit_code, record.elapsed_ms_wall
             );
-            out.push(record);
+            out.push(&record)?;
         }
-        fs::write(&args.json_out, serde_json::to_string_pretty(&out)?)?;
-        eprintln!("search.batch.done rules={}", out.len());
+        let count = out.finish()?;
+        eprintln!("search.batch.done rules={count}");
         Ok(0)
     })() {
         Ok(code) => code,
@@ -4564,6 +4730,13 @@ struct IndexArgs {
         help = "Process workers for recursive file scan/feature extraction before batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
     )]
     workers: Option<usize>,
+    #[arg(
+        long = "tier1-sizing-mode",
+        value_enum,
+        default_value_t = Tier1SizingMode::Current,
+        help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
+    )]
+    tier1_sizing_mode: Tier1SizingMode,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
 }
@@ -4758,9 +4931,23 @@ struct ServeArgs {
     )]
     tier2_superblock_summary_cap_kib: usize,
     #[arg(
+        long = "tier1-sizing-mode",
+        value_enum,
+        default_value_t = Tier1SizingMode::Current,
+        help = "Tier1 sizing policy persisted in the store. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
+    )]
+    tier1_sizing_mode: Tier1SizingMode,
+    #[arg(
+        long = "enable-pattern-superblocks",
+        action = ArgAction::SetTrue,
+        help = "Enable the tier2/pattern superblock summary layer for this DB. Disabled by default."
+    )]
+    enable_pattern_superblocks: bool,
+    #[arg(
         long = "disable-pattern-superblocks",
         action = ArgAction::SetTrue,
-        help = "Disable the tier2/pattern superblock summary layer for this DB."
+        hide = true,
+        help = "Deprecated alias. Tier2/pattern superblocks are disabled by default."
     )]
     disable_pattern_superblocks: bool,
     #[arg(
@@ -4788,12 +4975,12 @@ struct ServeArgs {
     filter_target_fp: Option<f64>,
     #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.38 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.21 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(
@@ -4836,12 +5023,12 @@ struct InitArgs {
     filter_target_fp: Option<f64>,
     #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.38 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.35 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.21 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(
@@ -4869,9 +5056,23 @@ struct InitArgs {
     )]
     tier2_superblock_summary_cap_kib: usize,
     #[arg(
+        long = "tier1-sizing-mode",
+        value_enum,
+        default_value_t = Tier1SizingMode::Current,
+        help = "Tier1 sizing policy persisted in the store. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
+    )]
+    tier1_sizing_mode: Tier1SizingMode,
+    #[arg(
+        long = "enable-pattern-superblocks",
+        action = ArgAction::SetTrue,
+        help = "Enable the tier2/pattern superblock summary layer for this DB. Disabled by default."
+    )]
+    enable_pattern_superblocks: bool,
+    #[arg(
         long = "disable-pattern-superblocks",
         action = ArgAction::SetTrue,
-        help = "Disable the tier2/pattern superblock summary layer for this DB."
+        hide = true,
+        help = "Deprecated alias. Tier2/pattern superblocks are disabled by default."
     )]
     disable_pattern_superblocks: bool,
 }
@@ -4891,6 +5092,13 @@ struct InternalIndexArgs {
     external_id: Option<String>,
     #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "File read chunk size in bytes.")]
     chunk_size: usize,
+    #[arg(
+        long = "tier1-sizing-mode",
+        value_enum,
+        default_value_t = Tier1SizingMode::Current,
+        help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
+    )]
+    tier1_sizing_mode: Tier1SizingMode,
 }
 
 #[derive(Debug, clap::Args)]
@@ -4916,6 +5124,13 @@ struct InternalIndexBatchArgs {
     workers: usize,
     #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "Client read chunk size in bytes.")]
     chunk_size: usize,
+    #[arg(
+        long = "tier1-sizing-mode",
+        value_enum,
+        default_value_t = Tier1SizingMode::Current,
+        help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
+    )]
+    tier1_sizing_mode: Tier1SizingMode,
     #[arg(long = "external-id-from-path", action = ArgAction::SetTrue, help = "Set external_id=<file path> for each inserted document.")]
     external_id_from_path: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
@@ -5025,13 +5240,15 @@ mod tests {
             root: root.display().to_string(),
             candidate_shards,
             force,
-            filter_target_fp: Some(0.35),
+            filter_target_fp: None,
             tier1_filter_target_fp: None,
             tier2_filter_target_fp: None,
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
+            tier1_sizing_mode: Tier1SizingMode::Current,
+            enable_pattern_superblocks: false,
             disable_pattern_superblocks: false,
         }
     }
@@ -5126,15 +5343,17 @@ mod tests {
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
+            tier1_sizing_mode: Tier1SizingMode::Current,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
-            filter_target_fp: Some(0.35),
+            filter_target_fp: None,
             tier1_filter_target_fp: None,
             tier2_filter_target_fp: None,
             id_source: CandidateIdSource::Sha256,
             store_path: false,
             gram_sizes: "3,4".to_owned(),
+            enable_pattern_superblocks: false,
             disable_pattern_superblocks: false,
         }
     }
@@ -5243,6 +5462,7 @@ mod tests {
             PathBuf::from("root"),
             CandidateIdSource::Sha256,
             true,
+            Tier1SizingMode::Current,
             0.001,
             0.002,
             3,
@@ -5259,6 +5479,7 @@ mod tests {
         assert_eq!(fixed.tier1_gram_size, 4);
         assert_eq!(fixed.tier2_superblock_summary_cap_bytes, 8 * 1024);
         assert!(fixed.enable_tier2_superblocks);
+        assert!(fixed.tier1_filter_classed_sizing);
         assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
         assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
         assert_eq!(fixed.filter_target_fp, None);
@@ -5268,6 +5489,7 @@ mod tests {
             PathBuf::from("root"),
             CandidateIdSource::Sha256,
             false,
+            Tier1SizingMode::Hll,
             0.01,
             0.01,
             5,
@@ -5287,6 +5509,7 @@ mod tests {
         assert_eq!(variable.tier1_gram_size, 4);
         assert_eq!(variable.tier2_superblock_summary_cap_bytes, 16 * 1024);
         assert!(!variable.enable_tier2_superblocks);
+        assert!(!variable.tier1_filter_classed_sizing);
         assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
         let wire = batch_row_to_wire(IndexBatchRow {
@@ -5406,6 +5629,7 @@ mod tests {
                 fixed_filter_bytes: Some(2048),
                 tier1_filter_target_fp: None,
                 tier2_filter_target_fp: None,
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: true,
@@ -5430,6 +5654,7 @@ mod tests {
                 fixed_filter_bytes: Some(2048),
                 tier1_filter_target_fp: None,
                 tier2_filter_target_fp: None,
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: false,
@@ -5451,6 +5676,7 @@ mod tests {
                 fixed_filter_bytes: Some(2051),
                 tier1_filter_target_fp: None,
                 tier2_filter_target_fp: None,
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: false,
@@ -5597,6 +5823,7 @@ rule q {
             root: Some(candidate_root.display().to_string()),
             external_id: Some("manual-a".to_owned()),
             chunk_size: 1024,
+            tier1_sizing_mode: Tier1SizingMode::Current,
         };
         assert_eq!(cmd_internal_index(&ingest_one), 0);
 
@@ -5608,6 +5835,7 @@ rule q {
             batch_size: 1,
             workers: 2,
             chunk_size: 1024,
+            tier1_sizing_mode: Tier1SizingMode::Current,
             external_id_from_path: true,
             verbose: false,
             rotate_remote_sessions: false,
@@ -5764,6 +5992,7 @@ rule q {
                 batch_size: 1,
                 workers: 1,
                 chunk_size: 1024,
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 external_id_from_path: true,
                 verbose: false,
                 rotate_remote_sessions: false,
@@ -5779,6 +6008,7 @@ rule q {
                 batch_size: 1,
                 workers: 1,
                 chunk_size: 1024,
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 external_id_from_path: false,
                 verbose: false,
                 rotate_remote_sessions: false,
@@ -5792,6 +6022,7 @@ rule q {
                 root: Some(candidate_root.display().to_string()),
                 external_id: Some("manual-root-id".to_owned()),
                 chunk_size: 1024,
+                tier1_sizing_mode: Tier1SizingMode::Current,
             }),
             0
         );
@@ -5873,8 +6104,8 @@ rule remote_q {
         let policy = server_scan_policy(&connection).expect("scan policy from server");
         assert_eq!(policy.id_source, CandidateIdSource::Sha256);
         assert!(!policy.store_path);
-        assert_eq!(policy.tier1_filter_target_fp, Some(0.35));
-        assert_eq!(policy.tier2_filter_target_fp, Some(0.35));
+        assert_eq!(policy.tier1_filter_target_fp, Some(0.38));
+        assert_eq!(policy.tier2_filter_target_fp, Some(0.21));
         assert_eq!(policy.gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
 
         assert_eq!(
@@ -5884,6 +6115,7 @@ rule remote_q {
                 root: None,
                 external_id: Some(base.join("missing-match.bin").display().to_string()),
                 chunk_size: 1024,
+                tier1_sizing_mode: Tier1SizingMode::Current,
             }),
             0
         );
@@ -5898,6 +6130,7 @@ rule remote_q {
                 path_list: false,
                 batch_size: 1,
                 workers: Some(2),
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 verbose: false,
             }),
             0
@@ -6051,6 +6284,7 @@ rule remote_q {
                 root: Some(missing_root.display().to_string()),
                 external_id: None,
                 chunk_size: 1024,
+                tier1_sizing_mode: Tier1SizingMode::Current,
             }),
             1
         );
@@ -6117,6 +6351,7 @@ rule remote_q {
                 path_list: false,
                 batch_size: 1,
                 workers: Some(1),
+                tier1_sizing_mode: Tier1SizingMode::Current,
                 verbose: false,
             }),
             0

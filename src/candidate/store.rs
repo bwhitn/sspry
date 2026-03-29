@@ -19,8 +19,8 @@ use crate::candidate::bloom::{
 };
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
-    align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
-    normalize_tier1_filter_class_bytes,
+    align_filter_bytes, choose_filter_bytes_for_file_size,
+    choose_tier1_filter_class_bytes_for_file_size, derive_document_bloom_hash_count,
 };
 use crate::candidate::grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
@@ -36,8 +36,12 @@ const DEFAULT_FILTER_BYTES: usize = 2048;
 const DEFAULT_BLOOM_HASHES: usize = 7;
 const DEFAULT_FILTER_MIN_BYTES: usize = 1;
 const DEFAULT_FILTER_MAX_BYTES: usize = 0;
-pub const DEFAULT_TIER1_SUPERBLOCK_DOCS: usize = 32;
+pub const DEFAULT_TIER1_SUPERBLOCK_DOCS: usize = 2;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
+pub const DEFAULT_TIER1_FILTER_TARGET_FP: f64 = 0.38;
+pub const DEFAULT_TIER2_FILTER_TARGET_FP: f64 = 0.21;
+pub const DEFAULT_TIER1_FILTER_CLASSED_SIZING: bool = true;
+pub const DEFAULT_ENABLE_TIER2_SUPERBLOCKS: bool = false;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
 const DEFAULT_QUERY_SCAN_WORKERS: usize = 4;
@@ -52,6 +56,7 @@ pub struct CandidateConfig {
     pub tier1_superblock_docs: usize,
     pub tier2_superblock_summary_cap_bytes: usize,
     pub enable_tier2_superblocks: bool,
+    pub tier1_filter_classed_sizing: bool,
     pub tier1_filter_target_fp: Option<f64>,
     pub tier2_filter_target_fp: Option<f64>,
     pub filter_target_fp: Option<f64>,
@@ -68,10 +73,11 @@ impl Default for CandidateConfig {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-            enable_tier2_superblocks: true,
-            tier1_filter_target_fp: None,
-            tier2_filter_target_fp: None,
-            filter_target_fp: Some(0.35),
+            enable_tier2_superblocks: DEFAULT_ENABLE_TIER2_SUPERBLOCKS,
+            tier1_filter_classed_sizing: DEFAULT_TIER1_FILTER_CLASSED_SIZING,
+            tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
+            tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
+            filter_target_fp: None,
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
     }
@@ -233,6 +239,10 @@ pub struct CandidateQueryProfile {
     pub tree_gate_special_docs_bypass: u64,
     pub docs_scanned: u64,
     pub superblocks_skipped: u64,
+    pub tier1_superblock_loads: u64,
+    pub tier1_superblock_bytes: u64,
+    pub tier2_superblock_loads: u64,
+    pub tier2_superblock_bytes: u64,
     pub metadata_loads: u64,
     pub metadata_bytes: u64,
     pub tier1_bloom_loads: u64,
@@ -260,6 +270,18 @@ impl CandidateQueryProfile {
         self.superblocks_skipped = self
             .superblocks_skipped
             .saturating_add(other.superblocks_skipped);
+        self.tier1_superblock_loads = self
+            .tier1_superblock_loads
+            .saturating_add(other.tier1_superblock_loads);
+        self.tier1_superblock_bytes = self
+            .tier1_superblock_bytes
+            .saturating_add(other.tier1_superblock_bytes);
+        self.tier2_superblock_loads = self
+            .tier2_superblock_loads
+            .saturating_add(other.tier2_superblock_loads);
+        self.tier2_superblock_bytes = self
+            .tier2_superblock_bytes
+            .saturating_add(other.tier2_superblock_bytes);
         self.metadata_loads = self.metadata_loads.saturating_add(other.metadata_loads);
         self.metadata_bytes = self.metadata_bytes.saturating_add(other.metadata_bytes);
         self.tier1_bloom_loads = self
@@ -318,6 +340,7 @@ pub struct CandidateStats {
     pub deleted_doc_count: usize,
     pub id_source: String,
     pub store_path: bool,
+    pub tier1_filter_classed_sizing: bool,
     pub tier1_filter_target_fp: Option<f64>,
     pub tier2_filter_target_fp: Option<f64>,
     pub tier2_gram_size: usize,
@@ -370,6 +393,7 @@ struct ForestMeta {
     tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_bytes: usize,
     enable_tier2_superblocks: bool,
+    tier1_filter_classed_sizing: bool,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     compaction_idle_cooldown_s: f64,
@@ -394,6 +418,7 @@ struct LegacyStoreMeta {
     tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_bytes: usize,
     enable_tier2_superblocks: bool,
+    tier1_filter_classed_sizing: bool,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     filter_target_fp: Option<f64>,
@@ -426,9 +451,10 @@ impl Default for ForestMeta {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-            enable_tier2_superblocks: true,
-            tier1_filter_target_fp: Some(0.35),
-            tier2_filter_target_fp: Some(0.35),
+            enable_tier2_superblocks: DEFAULT_ENABLE_TIER2_SUPERBLOCKS,
+            tier1_filter_classed_sizing: DEFAULT_TIER1_FILTER_CLASSED_SIZING,
+            tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
+            tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
     }
@@ -454,10 +480,11 @@ impl Default for LegacyStoreMeta {
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-            enable_tier2_superblocks: true,
-            tier1_filter_target_fp: None,
-            tier2_filter_target_fp: None,
-            filter_target_fp: Some(0.35),
+            enable_tier2_superblocks: DEFAULT_ENABLE_TIER2_SUPERBLOCKS,
+            tier1_filter_classed_sizing: DEFAULT_TIER1_FILTER_CLASSED_SIZING,
+            tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
+            tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
+            filter_target_fp: None,
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
         }
     }
@@ -484,6 +511,7 @@ impl From<&LegacyStoreMeta> for ForestMeta {
             tier1_superblock_docs: value.tier1_superblock_docs.max(1),
             tier2_superblock_summary_cap_bytes: value.tier2_superblock_summary_cap_bytes,
             enable_tier2_superblocks: value.enable_tier2_superblocks,
+            tier1_filter_classed_sizing: value.tier1_filter_classed_sizing,
             tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
             tier2_filter_target_fp: value.tier2_filter_target_fp.or(value.filter_target_fp),
             compaction_idle_cooldown_s: value.compaction_idle_cooldown_s,
@@ -1676,6 +1704,7 @@ impl CandidateStore {
                     .tier2_superblock_summary_cap_bytes
                     .max(1),
                 enable_tier2_superblocks: config.enable_tier2_superblocks,
+                tier1_filter_classed_sizing: config.tier1_filter_classed_sizing,
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
@@ -1835,6 +1864,7 @@ impl CandidateStore {
             tier1_superblock_docs: self.meta.tier1_superblock_docs,
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
             enable_tier2_superblocks: self.meta.enable_tier2_superblocks,
+            tier1_filter_classed_sizing: self.meta.tier1_filter_classed_sizing,
             tier1_filter_target_fp,
             tier2_filter_target_fp,
             filter_target_fp: None,
@@ -2055,19 +2085,27 @@ impl CandidateStore {
         file_size: u64,
         bloom_item_estimate: Option<usize>,
     ) -> Result<usize> {
-        let selected = choose_filter_bytes_for_file_size(
-            file_size,
-            DEFAULT_FILTER_BYTES,
-            Some(DEFAULT_FILTER_MIN_BYTES),
-            Some(DEFAULT_FILTER_MAX_BYTES),
-            self.meta.resolved_tier1_filter_target_fp(),
-            bloom_item_estimate,
-        )?;
-        Ok(if self.meta.resolved_tier1_filter_target_fp().is_some() {
-            normalize_tier1_filter_class_bytes(selected)
+        if self.meta.resolved_tier1_filter_target_fp().is_some()
+            && self.meta.tier1_filter_classed_sizing
+        {
+            choose_tier1_filter_class_bytes_for_file_size(
+                file_size,
+                DEFAULT_FILTER_BYTES,
+                Some(DEFAULT_FILTER_MIN_BYTES),
+                Some(DEFAULT_FILTER_MAX_BYTES),
+                self.meta.resolved_tier1_filter_target_fp(),
+                bloom_item_estimate,
+            )
         } else {
-            selected
-        })
+            choose_filter_bytes_for_file_size(
+                file_size,
+                DEFAULT_FILTER_BYTES,
+                Some(DEFAULT_FILTER_MIN_BYTES),
+                Some(DEFAULT_FILTER_MAX_BYTES),
+                self.meta.resolved_tier1_filter_target_fp(),
+                bloom_item_estimate,
+            )
+        }
     }
 
     fn resolve_tier2_filter_bytes_for_file_size(
@@ -3648,6 +3686,7 @@ impl CandidateStore {
                         Some(&self.tier2_superblocks)
                     },
                     true,
+                    &mut query_profile,
                 )?
             {
                 query_profile.superblocks_skipped =
@@ -3778,6 +3817,7 @@ impl CandidateStore {
             deleted_doc_count,
             id_source: self.meta.id_source.clone(),
             store_path: self.meta.store_path,
+            tier1_filter_classed_sizing: self.meta.tier1_filter_classed_sizing,
             tier1_filter_target_fp: self.meta.resolved_tier1_filter_target_fp(),
             tier2_filter_target_fp: self.meta.resolved_tier2_filter_target_fp(),
             tier2_gram_size: self.meta.tier2_gram_size,
@@ -6071,6 +6111,8 @@ fn block_matches_required_masks(
     block_idx: usize,
     by_key: &RequiredMasksByKey,
     superblocks: &Tier2SuperblockIndex,
+    profile: &mut CandidateQueryProfile,
+    tier2: bool,
 ) -> bool {
     if by_key.is_empty() {
         return true;
@@ -6081,6 +6123,17 @@ fn block_matches_required_masks(
     let Some(block) = superblocks.block_bytes(&bucket_key, block_idx) else {
         return false;
     };
+    if tier2 {
+        profile.tier2_superblock_loads = profile.tier2_superblock_loads.saturating_add(1);
+        profile.tier2_superblock_bytes = profile
+            .tier2_superblock_bytes
+            .saturating_add(block.len() as u64);
+    } else {
+        profile.tier1_superblock_loads = profile.tier1_superblock_loads.saturating_add(1);
+        profile.tier1_superblock_bytes = profile
+            .tier1_superblock_bytes
+            .saturating_add(block.len() as u64);
+    }
     raw_filter_matches_word_masks(block, required)
 }
 
@@ -6366,6 +6419,8 @@ fn block_matches_shifted_required_masks(
     block_idx: usize,
     shifted: &ShiftedRequiredMasks,
     superblocks: &Tier2SuperblockIndex,
+    profile: &mut CandidateQueryProfile,
+    tier2: bool,
 ) -> bool {
     if shifted.is_empty() {
         return true;
@@ -6374,6 +6429,17 @@ fn block_matches_shifted_required_masks(
         let Some(block) = superblocks.block_bytes(&bucket_key, block_idx) else {
             return false;
         };
+        if tier2 {
+            profile.tier2_superblock_loads = profile.tier2_superblock_loads.saturating_add(1);
+            profile.tier2_superblock_bytes = profile
+                .tier2_superblock_bytes
+                .saturating_add(block.len() as u64);
+        } else {
+            profile.tier1_superblock_loads = profile.tier1_superblock_loads.saturating_add(1);
+            profile.tier1_superblock_bytes = profile
+                .tier1_superblock_bytes
+                .saturating_add(block.len() as u64);
+        }
         return shifted.any_lane_grams.iter().all(|value| {
             (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
                 bloom_word_masks_in_lane(
@@ -6391,14 +6457,27 @@ fn block_matches_shifted_required_masks(
     if !shifted.any_lane_values.is_empty() {
         return shifted.any_lane_values.iter().all(|lanes| {
             lanes.iter().any(|by_key| {
-                block_matches_required_masks(bucket_key, block_idx, by_key, superblocks)
+                block_matches_required_masks(
+                    bucket_key,
+                    block_idx,
+                    by_key,
+                    superblocks,
+                    profile,
+                    tier2,
+                )
             })
         });
     }
-    shifted
-        .shifts
-        .iter()
-        .any(|by_key| block_matches_required_masks(bucket_key, block_idx, by_key, superblocks))
+    shifted.shifts.iter().any(|by_key| {
+        block_matches_required_masks(
+            bucket_key,
+            block_idx,
+            by_key,
+            superblocks,
+            profile,
+            tier2,
+        )
+    })
 }
 
 fn block_matches_pattern(
@@ -6409,6 +6488,7 @@ fn block_matches_pattern(
     tier1_superblocks: &Tier2SuperblockIndex,
     tier2_superblocks: Option<&Tier2SuperblockIndex>,
     allow_tier2: bool,
+    profile: &mut CandidateQueryProfile,
 ) -> bool {
     let Some(pattern_masks) = mask_cache.get(pattern_id) else {
         return false;
@@ -6423,6 +6503,8 @@ fn block_matches_pattern(
                 block_idx,
                 tier1_by_key,
                 tier1_superblocks,
+                profile,
+                false,
             ) {
                 return false;
             }
@@ -6439,6 +6521,8 @@ fn block_matches_pattern(
                         block_idx,
                         tier2_by_key,
                         superblocks,
+                        profile,
+                        true,
                     )
                 })
                 .unwrap_or(true)
@@ -6453,6 +6537,7 @@ fn block_maybe_matches_node(
     tier1_superblocks: &Tier2SuperblockIndex,
     tier2_superblocks: Option<&Tier2SuperblockIndex>,
     allow_tier2: bool,
+    profile: &mut CandidateQueryProfile,
 ) -> Result<bool> {
     match node.kind.as_str() {
         "pattern" => {
@@ -6468,6 +6553,7 @@ fn block_maybe_matches_node(
                 tier1_superblocks,
                 tier2_superblocks,
                 allow_tier2,
+                profile,
             ))
         }
         "not" => Ok(true),
@@ -6494,6 +6580,7 @@ fn block_maybe_matches_node(
                     tier1_superblocks,
                     tier2_superblocks,
                     allow_tier2,
+                    profile,
                 )? {
                     return Ok(false);
                 }
@@ -6510,6 +6597,7 @@ fn block_maybe_matches_node(
                     tier1_superblocks,
                     tier2_superblocks,
                     allow_tier2,
+                    profile,
                 )? {
                     return Ok(true);
                 }
@@ -6530,6 +6618,7 @@ fn block_maybe_matches_node(
                     tier1_superblocks,
                     tier2_superblocks,
                     allow_tier2,
+                    profile,
                 )? {
                     matched += 1;
                     if matched >= threshold {
@@ -7244,6 +7333,7 @@ mod tests {
             &Tier2SuperblockIndex::default(),
             None,
             true,
+            &mut CandidateQueryProfile::default(),
         ));
     }
 
@@ -7463,6 +7553,8 @@ rule r {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -7524,6 +7616,8 @@ rule q {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -7586,6 +7680,8 @@ rule q {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 compaction_idle_cooldown_s: 0.0,
                 ..CandidateConfig::default()
             },
@@ -7664,6 +7760,8 @@ rule q {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 compaction_idle_cooldown_s: 0.0,
                 ..CandidateConfig::default()
             },
@@ -7720,6 +7818,8 @@ rule q {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 compaction_idle_cooldown_s: 0.0,
                 ..CandidateConfig::default()
             },
@@ -7850,6 +7950,8 @@ rule q {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 compaction_idle_cooldown_s: 0.0,
                 ..CandidateConfig::default()
             },
@@ -7926,6 +8028,8 @@ rule q {
             CandidateConfig {
                 root,
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 compaction_idle_cooldown_s: 60.0,
                 ..CandidateConfig::default()
             },
@@ -7981,6 +8085,8 @@ rule q {
             CandidateConfig {
                 root: tmp.path().join("candidate_db"),
                 filter_target_fp: Some(0.25),
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8000,6 +8106,8 @@ rule q {
             CandidateConfig {
                 root: tmp.path().join("candidate_db"),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8179,6 +8287,8 @@ rule q {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8246,6 +8356,8 @@ rule q {
             CandidateConfig {
                 root: invalid_len_root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8287,6 +8399,8 @@ rule q {
             CandidateConfig {
                 root: mismatch_root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8320,6 +8434,8 @@ rule q {
             CandidateConfig {
                 root: invalid_bloom_root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8362,6 +8478,8 @@ rule q {
             CandidateConfig {
                 root: invalid_utf8_root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8570,6 +8688,8 @@ rule q {
             CandidateConfig {
                 root,
                 filter_target_fp: Some(0.25),
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -8672,6 +8792,8 @@ rule q {
             CandidateConfig {
                 root,
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -9149,6 +9271,8 @@ rule q {
             CandidateConfig {
                 root,
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,
@@ -9479,6 +9603,8 @@ rule q {
             CandidateConfig {
                 root,
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 ..CandidateConfig::default()
             },
             true,

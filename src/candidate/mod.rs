@@ -14,8 +14,8 @@ pub use features::{
     estimate_unique_grams_pair_hll, scan_file_features_bloom_only_with_gram_sizes,
 };
 pub use filter_policy::{
-    choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,
-    normalize_tier1_filter_class_bytes,
+    choose_filter_bytes_for_file_size, choose_tier1_filter_class_bytes_for_file_size,
+    derive_bloom_hash_count, derive_document_bloom_hash_count, normalize_tier1_filter_class_bytes,
 };
 pub use grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram};
 pub use metadata::{
@@ -31,7 +31,8 @@ pub use query_plan::{
 pub use store::{
     CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidatePreparedQueryProfile,
     CandidateQueryProfile, CandidateQueryResult, CandidateStats, CandidateStore,
-    DEFAULT_TIER1_SUPERBLOCK_DOCS, DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
-    candidate_shard_index, candidate_shard_manifest_path, candidate_shard_root,
-    read_candidate_shard_count, write_candidate_shard_count,
+    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER1_SUPERBLOCK_DOCS, DEFAULT_TIER2_FILTER_TARGET_FP,
+    DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, candidate_shard_index,
+    candidate_shard_manifest_path, candidate_shard_root, read_candidate_shard_count,
+    write_candidate_shard_count,
 };

@@ -1607,6 +1607,14 @@ fn candidate_stats_json_from_parts_with_disk_usage(
             .unwrap_or(Value::Null),
     );
     out.insert(
+        "tier1_sizing_mode".to_owned(),
+        Value::from(if stats.tier1_filter_classed_sizing {
+            "current"
+        } else {
+            "hll"
+        }),
+    );
+    out.insert(
         "tier2_filter_target_fp".to_owned(),
         stats
             .tier2_filter_target_fp
@@ -8108,11 +8116,15 @@ rule overflow_rule {
         );
         assert_eq!(
             stats.get("tier1_filter_target_fp").and_then(Value::as_f64),
-            Some(0.35)
+            Some(0.38)
         );
         assert_eq!(
             stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
-            Some(0.35)
+            Some(0.21)
+        );
+        assert_eq!(
+            stats.get("tier1_sizing_mode").and_then(Value::as_str),
+            Some("current")
         );
         assert_eq!(stats.get("filter_target_fp"), None);
     }
@@ -8125,6 +8137,8 @@ rule overflow_rule {
             CandidateConfig {
                 root: root.clone(),
                 filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
                 compaction_idle_cooldown_s: 0.0,
                 ..CandidateConfig::default()
             },
@@ -9929,6 +9943,8 @@ rule q {
                 candidate_config: CandidateConfig {
                     root: tmp.path().join("candidate_db_parallel"),
                     filter_target_fp: None,
+                    tier1_filter_target_fp: None,
+                    tier2_filter_target_fp: None,
                     ..CandidateConfig::default()
                 },
                 candidate_shards: 2,
@@ -10061,6 +10077,8 @@ rule q {
                     candidate_config: CandidateConfig {
                         root: tmp.path().join("candidate_db"),
                         filter_target_fp: None,
+                        tier1_filter_target_fp: None,
+                        tier2_filter_target_fp: None,
                         compaction_idle_cooldown_s: 0.0,
                         ..CandidateConfig::default()
                     },
@@ -10150,6 +10168,8 @@ rule q {
                     candidate_config: CandidateConfig {
                         root: tmp.path().join("candidate_db_4"),
                         filter_target_fp: None,
+                        tier1_filter_target_fp: None,
+                        tier2_filter_target_fp: None,
                         compaction_idle_cooldown_s: 0.0,
                         ..CandidateConfig::default()
                     },
@@ -10230,6 +10250,8 @@ rule q {
                     candidate_config: CandidateConfig {
                         root: tmp.path().join("candidate_db"),
                         filter_target_fp: None,
+                        tier1_filter_target_fp: None,
+                        tier2_filter_target_fp: None,
                         compaction_idle_cooldown_s: 0.0,
                         ..CandidateConfig::default()
                     },

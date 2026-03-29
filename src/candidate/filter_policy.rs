@@ -15,6 +15,13 @@ fn round_up_power_of_two(value: usize) -> usize {
     value.next_power_of_two()
 }
 
+fn floor_power_of_two(value: usize) -> usize {
+    if value <= 1 {
+        return 1;
+    }
+    1usize << ((usize::BITS - 1) - value.leading_zeros())
+}
+
 fn round_to_nearest_kib(value: usize) -> usize {
     if value == 0 {
         return 1024;
@@ -116,10 +123,47 @@ pub fn choose_filter_bytes_for_file_size(
     Ok(target)
 }
 
+pub fn choose_tier1_filter_class_bytes_for_file_size(
+    file_size: u64,
+    base_filter_bytes: usize,
+    filter_min_bytes: Option<usize>,
+    filter_max_bytes: Option<usize>,
+    filter_target_fp: Option<f64>,
+    bloom_item_estimate: Option<usize>,
+) -> Result<usize> {
+    let (_minimum, maximum, target_fp) = normalize_filter_policy(
+        base_filter_bytes,
+        filter_min_bytes,
+        filter_max_bytes,
+        filter_target_fp,
+    )?;
+    let Some(fp) = target_fp else {
+        return choose_filter_bytes_for_file_size(
+            file_size,
+            base_filter_bytes,
+            filter_min_bytes,
+            filter_max_bytes,
+            None,
+            bloom_item_estimate,
+        );
+    };
+    let size = file_size as usize;
+    let gram_count = bloom_item_estimate.unwrap_or_else(|| size.saturating_sub(3).max(1)) as f64;
+    let bits = ((-gram_count * fp.ln()) / LN_2_SQ).ceil() as usize;
+    let scaled = bits / 6 + 1;
+    let normalized = normalize_tier1_filter_class_bytes(floor_power_of_two(scaled.max(1)));
+    Ok(if maximum == 0 {
+        normalized
+    } else {
+        normalized.min(maximum)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        align_filter_bytes, choose_filter_bytes_for_file_size, derive_bloom_hash_count,
+        align_filter_bytes, choose_filter_bytes_for_file_size,
+        choose_tier1_filter_class_bytes_for_file_size, derive_bloom_hash_count,
         derive_document_bloom_hash_count, normalize_filter_policy,
         normalize_tier1_filter_class_bytes,
     };
@@ -169,6 +213,30 @@ mod tests {
         )
         .expect("theoretical size");
         assert_eq!(selected, 52_717_568);
+    }
+
+    #[test]
+    fn tier1_target_fp_mode_uses_scaled_floor_power_of_two_classes() {
+        let small = choose_tier1_filter_class_bytes_for_file_size(
+            4096,
+            2048,
+            Some(1),
+            Some(0),
+            Some(0.38),
+            Some(256),
+        )
+        .expect("small tier1 class");
+        let medium = choose_tier1_filter_class_bytes_for_file_size(
+            4096,
+            2048,
+            Some(1),
+            Some(0),
+            Some(0.38),
+            Some(8192),
+        )
+        .expect("medium tier1 class");
+        assert_eq!(small, 1024);
+        assert_eq!(medium, 2048);
     }
 
     #[test]
