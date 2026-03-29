@@ -1347,11 +1347,8 @@ fn store_config_from_parts(
     }
 }
 
-fn enable_tier2_superblocks_from_cli(
-    enable_pattern_superblocks: bool,
-    disable_pattern_superblocks: bool,
-) -> bool {
-    enable_pattern_superblocks && !disable_pattern_superblocks
+fn enable_tier2_superblocks_from_cli(enable_pattern_superblocks: bool) -> bool {
+    enable_pattern_superblocks
 }
 
 fn resolve_filter_target_fps(
@@ -1386,10 +1383,7 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         gram_sizes.tier1,
         args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
-        enable_tier2_superblocks_from_cli(
-            args.enable_pattern_superblocks,
-            args.disable_pattern_superblocks,
-        ),
+        enable_tier2_superblocks_from_cli(args.enable_pattern_superblocks),
         CandidateConfig::default().compaction_idle_cooldown_s,
     )
 }
@@ -1413,10 +1407,7 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         gram_sizes.tier1,
         args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
-        enable_tier2_superblocks_from_cli(
-            args.enable_pattern_superblocks,
-            args.disable_pattern_superblocks,
-        ),
+        enable_tier2_superblocks_from_cli(args.enable_pattern_superblocks),
         args.compaction_idle_cooldown_s,
     )
 }
@@ -4944,13 +4935,6 @@ struct ServeArgs {
     )]
     enable_pattern_superblocks: bool,
     #[arg(
-        long = "disable-pattern-superblocks",
-        action = ArgAction::SetTrue,
-        hide = true,
-        help = "Deprecated alias. Tier2/pattern superblocks are disabled by default."
-    )]
-    disable_pattern_superblocks: bool,
-    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
@@ -5068,13 +5052,6 @@ struct InitArgs {
         help = "Enable the tier2/pattern superblock summary layer for this DB. Disabled by default."
     )]
     enable_pattern_superblocks: bool,
-    #[arg(
-        long = "disable-pattern-superblocks",
-        action = ArgAction::SetTrue,
-        hide = true,
-        help = "Deprecated alias. Tier2/pattern superblocks are disabled by default."
-    )]
-    disable_pattern_superblocks: bool,
 }
 
 #[cfg(test)]
@@ -5249,7 +5226,6 @@ mod tests {
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
             tier1_sizing_mode: Tier1SizingMode::Hll,
             enable_pattern_superblocks: false,
-            disable_pattern_superblocks: false,
         }
     }
 
@@ -5354,7 +5330,6 @@ mod tests {
             store_path: false,
             gram_sizes: "3,4".to_owned(),
             enable_pattern_superblocks: false,
-            disable_pattern_superblocks: false,
         }
     }
 

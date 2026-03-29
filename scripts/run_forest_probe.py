@@ -796,7 +796,7 @@ def main() -> int:
     parser.add_argument('--set-fp', type=float)
     parser.add_argument('--tier1-set-fp', type=float)
     parser.add_argument('--tier2-set-fp', type=float)
-    parser.add_argument('--disable-pattern-superblocks', action='store_true')
+    parser.add_argument('--enable-pattern-superblocks', action='store_true')
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--index-workers', type=int, default=0)
     parser.add_argument('--collect-perf', action='store_true')
@@ -857,7 +857,7 @@ def main() -> int:
         'tier1_superblock_docs': args.tier1_superblock_docs,
         'tier1_sizing_mode': args.tier1_sizing_mode,
         'gram_sizes': args.gram_sizes,
-        'disable_pattern_superblocks': args.disable_pattern_superblocks,
+        'enable_pattern_superblocks': args.enable_pattern_superblocks,
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'index_workers': args.index_workers,
@@ -932,7 +932,7 @@ def main() -> int:
                     '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                     '--tier1-sizing-mode', args.tier1_sizing_mode,
                     '--gram-sizes', args.gram_sizes,
-                    *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
+                    *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                     *fp_args,
                 ],
                 stdout=(tree_run_dir / 'init.stdout').open('w'),
@@ -998,7 +998,7 @@ def main() -> int:
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                 '--tier1-sizing-mode', args.tier1_sizing_mode,
                 '--gram-sizes', args.gram_sizes,
-                *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
+                *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                 '--search-workers', str(args.search_workers),
                 *fp_args,
                 *(['--shards', str(args.shards)] if args.shards else []),
@@ -1102,7 +1102,7 @@ def main() -> int:
                     [
                         str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
                         '--tier1-superblock-docs', str(args.tier1_superblock_docs),
-                        *( ['--disable-pattern-superblocks'] if args.disable_pattern_superblocks else [] ),
+                        *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                         '--search-workers', str(args.search_workers),
                         *fp_args,
                         *(['--shards', str(args.shards)] if args.shards else []),
