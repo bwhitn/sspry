@@ -4,10 +4,11 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,14 +16,14 @@ use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::bloom::{
-    DEFAULT_BLOOM_POSITION_LANES, bloom_word_masks_in_lane, raw_filter_matches_word_masks,
+    bloom_word_masks_in_lane, raw_filter_matches_word_masks, DEFAULT_BLOOM_POSITION_LANES,
 };
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
     align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
 use crate::candidate::grams::{
-    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
+    pack_exact_gram, GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
 };
 use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
@@ -635,26 +636,60 @@ struct Tier2Telemetry {
     superblocks_skipped_total: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobSidecarAccessMode {
+    MmapWholeFile,
+    PositionedRead,
+}
+
+#[derive(Debug)]
 struct BlobSidecar {
     path: PathBuf,
+    access_mode: BlobSidecarAccessMode,
     mmap: OnceLock<std::result::Result<Option<Mmap>, String>>,
+    file: OnceLock<std::result::Result<fs::File, String>>,
 }
 
 impl BlobSidecar {
-    fn new(path: PathBuf) -> Self {
+    fn with_access_mode(path: PathBuf, access_mode: BlobSidecarAccessMode) -> Self {
         Self {
             path,
+            access_mode,
             mmap: OnceLock::new(),
+            file: OnceLock::new(),
         }
     }
 
     fn map_if_exists(&self) -> Result<()> {
-        let _ = self.mmap_if_exists()?;
+        match self.access_mode {
+            BlobSidecarAccessMode::MmapWholeFile => {
+                let _ = self.mmap_if_exists()?;
+            }
+            BlobSidecarAccessMode::PositionedRead => {
+                if self.path.exists()
+                    && self
+                        .path
+                        .metadata()
+                        .map_err(|err| {
+                            SspryError::from(format!(
+                                "Failed to stat {}: {err}",
+                                self.path.display()
+                            ))
+                        })?
+                        .len()
+                        > 0
+                {
+                    let _ = self.file_handle()?;
+                }
+            }
+        }
         Ok(())
     }
 
     fn mmap_if_exists(&self) -> Result<Option<&Mmap>> {
+        if self.access_mode != BlobSidecarAccessMode::MmapWholeFile {
+            return Ok(None);
+        }
         self.mmap
             .get_or_init(|| {
                 if !self.path.exists() {
@@ -679,13 +714,25 @@ impl BlobSidecar {
             .map(|mmap: &Option<Mmap>| mmap.as_ref())
     }
 
+    fn file_handle(&self) -> Result<&fs::File> {
+        self.file
+            .get_or_init(|| {
+                fs::File::open(&self.path)
+                    .map_err(|err| format!("Failed to open {}: {err}", self.path.display()))
+            })
+            .as_ref()
+            .map_err(|err: &String| SspryError::from(err.clone()))
+    }
+
     fn invalidate(&mut self) {
         self.mmap = OnceLock::new();
+        self.file = OnceLock::new();
     }
 
     fn retarget(&mut self, path: PathBuf) {
         self.path = path;
         self.mmap = OnceLock::new();
+        self.file = OnceLock::new();
     }
 
     fn read_bytes<'a>(
@@ -709,10 +756,8 @@ impl BlobSidecar {
             return Ok(Cow::Borrowed(&mmap[start..end]));
         }
 
-        let mut file = fs::File::open(&self.path)?;
-        file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes).map_err(|err| {
+        read_exact_at(self.file_handle()?, offset, &mut bytes).map_err(|err| {
             SspryError::from(format!(
                 "Invalid {label} payload stored for doc_id {doc_id}: {err}"
             ))
@@ -723,6 +768,9 @@ impl BlobSidecar {
     fn mmap_slice<'a>(&'a self, offset: u64, len: usize, label: &str) -> Result<Option<&'a [u8]>> {
         if len == 0 {
             return Ok(Some(&[]));
+        }
+        if self.access_mode != BlobSidecarAccessMode::MmapWholeFile {
+            return Ok(None);
         }
         let Some(mmap) = self.mmap_if_exists()? else {
             return Ok(None);
@@ -759,10 +807,22 @@ struct StoreSidecars {
 impl StoreSidecars {
     fn new(root: &Path) -> Self {
         Self {
-            blooms: BlobSidecar::new(blooms_path(root)),
-            tier2_blooms: BlobSidecar::new(tier2_blooms_path(root)),
-            metadata: BlobSidecar::new(doc_metadata_path(root)),
-            external_ids: BlobSidecar::new(external_ids_path(root)),
+            blooms: BlobSidecar::with_access_mode(
+                blooms_path(root),
+                BlobSidecarAccessMode::MmapWholeFile,
+            ),
+            tier2_blooms: BlobSidecar::with_access_mode(
+                tier2_blooms_path(root),
+                BlobSidecarAccessMode::PositionedRead,
+            ),
+            metadata: BlobSidecar::with_access_mode(
+                doc_metadata_path(root),
+                BlobSidecarAccessMode::PositionedRead,
+            ),
+            external_ids: BlobSidecar::with_access_mode(
+                external_ids_path(root),
+                BlobSidecarAccessMode::PositionedRead,
+            ),
         }
     }
 
@@ -800,6 +860,21 @@ impl StoreSidecars {
             self.external_ids.mapped_bytes(),
         )
     }
+}
+
+fn read_exact_at(file: &fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut read_total = 0usize;
+    while read_total < buf.len() {
+        let read_now = file.read_at(
+            &mut buf[read_total..],
+            offset.saturating_add(read_total as u64),
+        )?;
+        if read_now == 0 {
+            return Err(std::io::Error::from(ErrorKind::UnexpectedEof));
+        }
+        read_total += read_now;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -7040,10 +7115,9 @@ where
 mod tests {
     use tempfile::tempdir;
 
-    use crate::candidate::BloomFilter;
     use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
+    use crate::candidate::BloomFilter;
     use crate::candidate::{
-        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
         extract_compact_document_metadata,
         features::scan_file_features_bloom_only_with_gram_sizes,
         pack_exact_gram,
@@ -7051,6 +7125,7 @@ mod tests {
             compile_query_plan_with_gram_sizes,
             compile_query_plan_with_gram_sizes_and_identity_source,
         },
+        GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
     };
 
     use super::*;
@@ -7869,13 +7944,11 @@ rule q {
 
         let manifest = ShardCompactionManifest {
             current_generation: 7,
-            retired_roots: vec![
-                retired_root
-                    .file_name()
-                    .expect("retired file name")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
+            retired_roots: vec![retired_root
+                .file_name()
+                .expect("retired file name")
+                .to_string_lossy()
+                .into_owned()],
         };
         fs::create_dir_all(&retired_root).expect("create retired root");
         write_shard_compaction_manifest(&root, &manifest).expect("write manifest");
@@ -7980,12 +8053,10 @@ rule q {
         )
         .expect("insert third");
 
-        assert!(
-            store
-                .apply_compaction_snapshot(&snapshot, &compacted_root)
-                .expect("apply compaction")
-                .is_none()
-        );
+        assert!(store
+            .apply_compaction_snapshot(&snapshot, &compacted_root)
+            .expect("apply compaction")
+            .is_none());
         assert_eq!(store.stats().doc_count, 2);
         assert_eq!(store.stats().deleted_doc_count, 1);
         let _ = fs::remove_dir_all(compacted_root);
@@ -8013,12 +8084,10 @@ rule q {
         bloom.add(0x4443_4241).expect("add gram");
         let bloom_bytes = bloom.into_bytes();
 
-        assert!(
-            store
-                .prepare_compaction_snapshot(false)
-                .expect("snapshot without deletes")
-                .is_none()
-        );
+        assert!(store
+            .prepare_compaction_snapshot(false)
+            .expect("snapshot without deletes")
+            .is_none());
 
         insert_primary(
             &mut store,
@@ -8035,18 +8104,14 @@ rule q {
             .delete_document(&hex::encode([0x11; 32]))
             .expect("delete");
 
-        assert!(
-            store
-                .prepare_compaction_snapshot(false)
-                .expect("cooldown snapshot")
-                .is_none()
-        );
-        assert!(
-            store
-                .prepare_compaction_snapshot(true)
-                .expect("forced snapshot")
-                .is_some()
-        );
+        assert!(store
+            .prepare_compaction_snapshot(false)
+            .expect("cooldown snapshot")
+            .is_none());
+        assert!(store
+            .prepare_compaction_snapshot(true)
+            .expect("forced snapshot")
+            .is_some());
     }
 
     #[test]
@@ -8171,59 +8236,49 @@ rule q {
             true,
         )
         .expect("init");
-        assert!(
-            CandidateStore::init(
-                CandidateConfig {
-                    root: root.clone(),
-                    ..CandidateConfig::default()
-                },
-                false
-            )
-            .expect_err("existing store")
-            .to_string()
-            .contains("already exists")
-        );
+        assert!(CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            false
+        )
+        .expect_err("existing store")
+        .to_string()
+        .contains("already exists"));
 
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                id_source: "filepath".to_owned(),
-                ..CandidateConfig::default()
-            })
-            .expect_err("id source")
-            .to_string()
-            .contains("id_source")
-        );
-        assert!(
-            validate_config(&CandidateConfig {
-                root: root.clone(),
-                filter_target_fp: Some(1.0),
-                ..CandidateConfig::default()
-            })
-            .expect_err("target fp")
-            .to_string()
-            .contains("filter_target_fp")
-        );
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            id_source: "filepath".to_owned(),
+            ..CandidateConfig::default()
+        })
+        .expect_err("id source")
+        .to_string()
+        .contains("id_source"));
+        assert!(validate_config(&CandidateConfig {
+            root: root.clone(),
+            filter_target_fp: Some(1.0),
+            ..CandidateConfig::default()
+        })
+        .expect_err("target fp")
+        .to_string()
+        .contains("filter_target_fp"));
         assert_eq!(
             normalize_sha256_hex(&format!("  {}  ", "AB".repeat(32))).expect("normalize"),
             "ab".repeat(32)
         );
-        assert!(
-            normalize_sha256_hex("not-a-sha")
-                .expect_err("invalid sha")
-                .to_string()
-                .contains("64 hexadecimal")
-        );
+        assert!(normalize_sha256_hex("not-a-sha")
+            .expect_err("invalid sha")
+            .to_string()
+            .contains("64 hexadecimal"));
 
         let open_root = tmp.path().join("open_checks");
         fs::create_dir_all(&open_root).expect("open root");
         fs::write(meta_path(&open_root), b"{").expect("bad meta");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("invalid meta")
-                .to_string()
-                .contains("Invalid candidate metadata")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("invalid meta")
+            .to_string()
+            .contains("Invalid candidate metadata"));
 
         let bad_version = LegacyStoreMeta {
             version: STORE_VERSION + 1,
@@ -8234,12 +8289,10 @@ rule q {
             serde_json::to_vec_pretty(&bad_version).expect("version json"),
         )
         .expect("write version");
-        assert!(
-            CandidateStore::open(&open_root)
-                .expect_err("unsupported version")
-                .to_string()
-                .contains("Unsupported candidate store version")
-        );
+        assert!(CandidateStore::open(&open_root)
+            .expect_err("unsupported version")
+            .to_string()
+            .contains("Unsupported candidate store version"));
 
         fs::write(
             meta_path(&open_root),
@@ -8358,12 +8411,10 @@ rule q {
         )
         .expect("insert invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
-        assert!(
-            load_candidate_binary_store(&invalid_len_root)
-                .expect_err("invalid binary len")
-                .to_string()
-                .contains("Invalid candidate binary document state")
-        );
+        assert!(load_candidate_binary_store(&invalid_len_root)
+            .expect_err("invalid binary len")
+            .to_string()
+            .contains("Invalid candidate binary document state"));
 
         let mismatch_root = tmp.path().join("mismatch_root");
         let mut mismatch_store = CandidateStore::init(
@@ -8393,12 +8444,10 @@ rule q {
         )
         .expect("insert mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
-        assert!(
-            load_candidate_binary_store(&mismatch_root)
-                .expect_err("mismatch state")
-                .to_string()
-                .contains("Mismatched candidate binary document state")
-        );
+        assert!(load_candidate_binary_store(&mismatch_root)
+            .expect_err("mismatch state")
+            .to_string()
+            .contains("Mismatched candidate binary document state"));
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
         let mut invalid_bloom_store = CandidateStore::init(
@@ -8437,12 +8486,10 @@ rule q {
             serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
-        assert!(
-            CandidateStore::open(&invalid_bloom_root)
-                .expect_err("invalid bloom offset")
-                .to_string()
-                .contains("Invalid bloom payload stored")
-        );
+        assert!(CandidateStore::open(&invalid_bloom_root)
+            .expect_err("invalid bloom offset")
+            .to_string()
+            .contains("Invalid bloom payload stored"));
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
         let mut invalid_utf8_store = CandidateStore::init(
@@ -8477,14 +8524,12 @@ rule q {
             serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad utf8 meta"),
         )
         .expect("write bad utf8 meta");
-        assert!(
-            CandidateStore::open(&invalid_utf8_root)
-                .expect("open utf8 root")
-                .doc_external_id(0)
-                .expect_err("invalid external id utf8")
-                .to_string()
-                .contains("Invalid external_id payload stored")
-        );
+        assert!(CandidateStore::open(&invalid_utf8_root)
+            .expect("open utf8 root")
+            .doc_external_id(0)
+            .expect_err("invalid external id utf8")
+            .to_string()
+            .contains("Invalid external_id payload stored"));
     }
 
     #[test]
@@ -8510,12 +8555,10 @@ rule q {
         assert_eq!(decoded.bloom_len, row.bloom_len);
         assert_eq!(decoded.external_id_offset, row.external_id_offset);
         assert_eq!(decoded.external_id_len, row.external_id_len);
-        assert!(
-            DocMetaRow::decode(&encoded[..encoded.len() - 1])
-                .expect_err("short row")
-                .to_string()
-                .contains("Invalid candidate doc meta row size")
-        );
+        assert!(DocMetaRow::decode(&encoded[..encoded.len() - 1])
+            .expect_err("short row")
+            .to_string()
+            .contains("Invalid candidate doc meta row size"));
 
         let tmp = tempdir().expect("tmp");
         let blob_path = tmp.path().join("blob.bin");
@@ -8531,12 +8574,10 @@ rule q {
         write_at(blob_path.clone(), 1, b"Z").expect("write at");
         bytes = fs::read(&blob_path).expect("re-read blob file");
         assert_eq!(&bytes, b"aZcde");
-        assert!(
-            read_blob(&bytes, 99, 1, "blob", 1)
-                .expect_err("invalid blob range")
-                .to_string()
-                .contains("Invalid blob payload stored")
-        );
+        assert!(read_blob(&bytes, 99, 1, "blob", 1)
+            .expect_err("invalid blob range")
+            .to_string()
+            .contains("Invalid blob payload stored"));
 
         let u32_path = tmp.path().join("u32.bin");
         let offset = append_u32_slice(u32_path.clone(), &[7, 8, 9]).expect("append u32");
@@ -8545,12 +8586,10 @@ rule q {
             read_u32_vec(&u32_bytes, offset, 3, "grams", 9).expect("read u32 vec"),
             vec![7, 8, 9]
         );
-        assert!(
-            read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
-                .expect_err("invalid u32 range")
-                .to_string()
-                .contains("Invalid grams payload stored")
-        );
+        assert!(read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
+            .expect_err("invalid u32 range")
+            .to_string()
+            .contains("Invalid grams payload stored"));
     }
 
     #[test]
@@ -8563,7 +8602,10 @@ rule q {
         fs::write(&first_blob_path, b"abcdef").expect("write first blob");
         fs::write(doc_metadata_path(&root), b"meta").expect("write metadata");
 
-        let mut sidecar = BlobSidecar::new(first_blob_path.clone());
+        let mut sidecar = BlobSidecar::with_access_mode(
+            first_blob_path.clone(),
+            BlobSidecarAccessMode::MmapWholeFile,
+        );
         sidecar.map_if_exists().expect("map sidecar");
         assert_eq!(
             sidecar
@@ -8572,13 +8614,11 @@ rule q {
                 .as_ref(),
             b"bcd"
         );
-        assert!(
-            sidecar
-                .read_bytes(99, 1, "blob", 7)
-                .expect_err("invalid range")
-                .to_string()
-                .contains("Invalid blob payload stored")
-        );
+        assert!(sidecar
+            .read_bytes(99, 1, "blob", 7)
+            .expect_err("invalid range")
+            .to_string()
+            .contains("Invalid blob payload stored"));
         sidecar.invalidate();
         assert_eq!(
             sidecar
@@ -8603,6 +8643,26 @@ rule q {
             b"xyz"
         );
 
+        let positioned_path = tmp.path().join("blob_positioned.bin");
+        fs::write(&positioned_path, b"positioned").expect("write positioned blob");
+        let positioned =
+            BlobSidecar::with_access_mode(positioned_path, BlobSidecarAccessMode::PositionedRead);
+        positioned.map_if_exists().expect("open positioned sidecar");
+        assert_eq!(
+            positioned
+                .read_bytes(1, 4, "blob", 11)
+                .expect("positioned read")
+                .as_ref(),
+            b"osit"
+        );
+        assert_eq!(
+            positioned
+                .mmap_slice(0, 4, "blob")
+                .expect("positioned mmap slice"),
+            None
+        );
+        assert_eq!(positioned.mapped_bytes(), 0);
+
         let mut sidecars = StoreSidecars::map_existing(&root).expect("map store sidecars");
         assert_eq!(
             sidecars
@@ -8612,6 +8672,7 @@ rule q {
                 .as_ref(),
             b"meta"
         );
+        assert_eq!(sidecars.metadata.mapped_bytes(), 0);
         sidecars.invalidate_all();
         sidecars.retarget_root(&other_root);
         sidecars.refresh_maps().expect("refresh retargeted maps");
@@ -8667,32 +8728,28 @@ rule q {
         )
         .expect("init");
 
-        assert!(
-            store
-                .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
-                .expect_err("zero filter bytes")
-                .to_string()
-                .contains("filter_bytes must be > 0")
-        );
-        assert!(
-            store
-                .insert_document(
-                    [0x10; 32],
-                    8,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1024,
-                    &vec![0u8; 32],
-                    0,
-                    &[],
-                    None,
-                )
-                .expect_err("length mismatch")
-                .to_string()
-                .contains("bloom_filter length")
-        );
+        assert!(store
+            .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
+            .expect_err("zero filter bytes")
+            .to_string()
+            .contains("filter_bytes must be > 0"));
+        assert!(store
+            .insert_document(
+                [0x10; 32],
+                8,
+                None,
+                None,
+                None,
+                None,
+                1024,
+                &vec![0u8; 32],
+                0,
+                &[],
+                None,
+            )
+            .expect_err("length mismatch")
+            .to_string()
+            .contains("bloom_filter length"));
 
         let inserted = insert_primary(
             &mut store,
@@ -9126,58 +9183,54 @@ rule q {
         assert_eq!(outcome.tiers.as_label(), "tier1");
         assert!(outcome.score > 0);
 
-        assert!(
-            {
-                let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
-                    prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-                evaluate_node(
-                    &QueryNode {
-                        kind: "n_of".to_owned(),
-                        pattern_id: None,
-                        threshold: None,
-                        children: Vec::new(),
-                    },
-                    &mut doc_inputs,
-                    &mut load_metadata,
-                    &mut load_tier1,
-                    &mut load_tier2,
-                    &patterns,
-                    &mask_cache,
-                    &eval_plan,
-                    0,
-                    &mut QueryEvalCache::default(),
-                )
-            }
-            .expect_err("missing threshold")
-            .to_string()
-            .contains("requires threshold")
-        );
-        assert!(
-            {
-                let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
-                    prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-                evaluate_node(
-                    &QueryNode {
-                        kind: "bogus".to_owned(),
-                        pattern_id: None,
-                        threshold: None,
-                        children: Vec::new(),
-                    },
-                    &mut doc_inputs,
-                    &mut load_metadata,
-                    &mut load_tier1,
-                    &mut load_tier2,
-                    &patterns,
-                    &mask_cache,
-                    &eval_plan,
-                    0,
-                    &mut QueryEvalCache::default(),
-                )
-            }
-            .expect_err("unsupported kind")
-            .to_string()
-            .contains("Unsupported ast node kind")
-        );
+        assert!({
+            let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+                prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
+            evaluate_node(
+                &QueryNode {
+                    kind: "n_of".to_owned(),
+                    pattern_id: None,
+                    threshold: None,
+                    children: Vec::new(),
+                },
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                &patterns,
+                &mask_cache,
+                &eval_plan,
+                0,
+                &mut QueryEvalCache::default(),
+            )
+        }
+        .expect_err("missing threshold")
+        .to_string()
+        .contains("requires threshold"));
+        assert!({
+            let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+                prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
+            evaluate_node(
+                &QueryNode {
+                    kind: "bogus".to_owned(),
+                    pattern_id: None,
+                    threshold: None,
+                    children: Vec::new(),
+                },
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                &patterns,
+                &mask_cache,
+                &eval_plan,
+                0,
+                &mut QueryEvalCache::default(),
+            )
+        }
+        .expect_err("unsupported kind")
+        .to_string()
+        .contains("Unsupported ast node kind"));
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
