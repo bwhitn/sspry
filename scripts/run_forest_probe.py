@@ -789,7 +789,6 @@ def main() -> int:
     parser.add_argument('--balance-bytes', action='store_true')
     parser.add_argument('--summary-cap-kib', type=int, default=32)
     parser.add_argument('--tier1-superblock-docs', type=int, default=1)
-    parser.add_argument('--tier1-sizing-mode', choices=('current', 'hll'), default='hll')
     parser.add_argument('--gram-sizes', default='3,4')
     parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--shards', type=int)
@@ -855,7 +854,6 @@ def main() -> int:
         'tree_count': len(manifests),
         'summary_cap_kib': args.summary_cap_kib,
         'tier1_superblock_docs': args.tier1_superblock_docs,
-        'tier1_sizing_mode': args.tier1_sizing_mode,
         'gram_sizes': args.gram_sizes,
         'enable_pattern_superblocks': args.enable_pattern_superblocks,
         'candidate_shards': args.shards,
@@ -930,7 +928,6 @@ def main() -> int:
                     '--candidate-shards', str(args.shards or 1),
                     '--tier1-superblock-docs', str(args.tier1_superblock_docs),
                     '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
-                    '--tier1-sizing-mode', args.tier1_sizing_mode,
                     '--gram-sizes', args.gram_sizes,
                     *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                     *fp_args,
@@ -946,7 +943,6 @@ def main() -> int:
                 'index', '--root', str(current_root), '--path-list', str(manifest['path']),
                 '--batch-size', '64',
                 '--timeout', str(args.index_timeout_s),
-                '--tier1-sizing-mode', args.tier1_sizing_mode,
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
             ]
@@ -996,7 +992,6 @@ def main() -> int:
                 '--memory-budget-gb', str(args.memory_budget_gb),
                 '--tier1-superblock-docs', str(args.tier1_superblock_docs),
                 '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
-                '--tier1-sizing-mode', args.tier1_sizing_mode,
                 '--gram-sizes', args.gram_sizes,
                 *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                 '--search-workers', str(args.search_workers),
@@ -1022,7 +1017,6 @@ def main() -> int:
                 str(sspry),
                 'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64',
                 '--timeout', str(args.index_timeout_s),
-                '--tier1-sizing-mode', args.tier1_sizing_mode,
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
             ]

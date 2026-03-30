@@ -27,12 +27,11 @@ use crate::candidate::{
     DEFAULT_TIER1_SUPERBLOCK_DOCS, DEFAULT_TIER2_FILTER_TARGET_FP,
     DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, GramSizes, HLL_DEFAULT_PRECISION,
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
-    choose_tier1_filter_class_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams_pair_hll, extract_compact_document_metadata,
-    read_candidate_shard_count, scan_file_features_bloom_only_with_gram_sizes,
+    estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
+    scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -53,7 +52,6 @@ pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
 pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
-pub const DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK: usize = DEFAULT_TIER1_SUPERBLOCK_DOCS;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB: usize =
     DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES / 1024;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
@@ -896,17 +894,10 @@ const INTERNAL_BLOOM_HASHES: usize = 7;
 struct ServerScanPolicy {
     id_source: CandidateIdSource,
     store_path: bool,
-    tier1_sizing_mode: Tier1SizingMode,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
     memory_budget_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum Tier1SizingMode {
-    Current,
-    Hll,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
@@ -930,21 +921,12 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
             .and_then(|value| value.as_str())
             .unwrap_or("sha256"),
     )?;
-    let tier1_sizing_mode = match stats
-        .get("tier1_sizing_mode")
-        .and_then(|value| value.as_str())
-        .unwrap_or("current")
-    {
-        "hll" => Tier1SizingMode::Hll,
-        _ => Tier1SizingMode::Current,
-    };
     Ok(ServerScanPolicy {
         id_source,
         store_path: stats
             .get("store_path")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
-        tier1_sizing_mode,
         tier1_filter_target_fp: json_f64_opt(&stats, "tier1_filter_target_fp")
             .or(legacy_filter_target_fp),
         tier2_filter_target_fp: json_f64_opt(&stats, "tier2_filter_target_fp")
@@ -1312,7 +1294,6 @@ fn store_config_from_parts(
     root: PathBuf,
     id_source: CandidateIdSource,
     store_path: bool,
-    tier1_sizing_mode: Tier1SizingMode,
     tier1_filter_target_fp: f64,
     tier2_filter_target_fp: f64,
     tier2_gram_size: usize,
@@ -1333,7 +1314,6 @@ fn store_config_from_parts(
             .max(1)
             .saturating_mul(1024),
         enable_tier2_superblocks,
-        tier1_filter_classed_sizing: tier1_sizing_mode == Tier1SizingMode::Current,
         tier1_filter_target_fp: Some(tier1_filter_target_fp),
         tier2_filter_target_fp: Some(tier2_filter_target_fp),
         filter_target_fp: if (tier1_filter_target_fp - tier2_filter_target_fp).abs() < f64::EPSILON
@@ -1343,12 +1323,7 @@ fn store_config_from_parts(
             None
         },
         compaction_idle_cooldown_s: compaction_idle_cooldown_s.max(0.0),
-        ..CandidateConfig::default()
     }
-}
-
-fn enable_tier2_superblocks_from_cli(enable_pattern_superblocks: bool) -> bool {
-    enable_pattern_superblocks
 }
 
 fn resolve_filter_target_fps(
@@ -1376,14 +1351,13 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         PathBuf::from(&args.root),
         args.id_source,
         args.store_path,
-        args.tier1_sizing_mode,
         tier1_filter_target_fp,
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
-        enable_tier2_superblocks_from_cli(args.enable_pattern_superblocks),
+        args.enable_pattern_superblocks,
         CandidateConfig::default().compaction_idle_cooldown_s,
     )
 }
@@ -1400,14 +1374,13 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         PathBuf::from(&args.root),
         CandidateIdSource::Sha256,
         false,
-        args.tier1_sizing_mode,
         tier1_filter_target_fp,
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.tier1_superblock_docs,
         args.tier2_superblock_summary_cap_kib,
-        enable_tier2_superblocks_from_cli(args.enable_pattern_superblocks),
+        args.enable_pattern_superblocks,
         args.compaction_idle_cooldown_s,
     )
 }
@@ -2089,7 +2062,6 @@ struct ScanPolicy {
     fixed_filter_bytes: Option<usize>,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
-    tier1_sizing_mode: Tier1SizingMode,
     gram_sizes: GramSizes,
     chunk_size: usize,
     store_path: bool,
@@ -2130,27 +2102,14 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         align_filter_bytes(value)
     } else {
-        if policy.tier1_filter_target_fp.is_some()
-            && policy.tier1_sizing_mode == Tier1SizingMode::Current
-        {
-            choose_tier1_filter_class_bytes_for_file_size(
-                file_size,
-                INTERNAL_FILTER_BYTES,
-                Some(INTERNAL_FILTER_MIN_BYTES),
-                Some(INTERNAL_FILTER_MAX_BYTES),
-                policy.tier1_filter_target_fp,
-                bloom_item_estimate,
-            )?
-        } else {
-            choose_filter_bytes_for_file_size(
-                file_size,
-                INTERNAL_FILTER_BYTES,
-                Some(INTERNAL_FILTER_MIN_BYTES),
-                Some(INTERNAL_FILTER_MAX_BYTES),
-                policy.tier1_filter_target_fp,
-                bloom_item_estimate,
-            )?
-        }
+        choose_filter_bytes_for_file_size(
+            file_size,
+            INTERNAL_FILTER_BYTES,
+            Some(INTERNAL_FILTER_MIN_BYTES),
+            Some(INTERNAL_FILTER_MAX_BYTES),
+            policy.tier1_filter_target_fp,
+            bloom_item_estimate,
+        )?
     };
     let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
         align_filter_bytes(value)
@@ -2582,11 +2541,6 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                     fixed_filter_bytes: None,
                     tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                     tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
-                    tier1_sizing_mode: if config.tier1_filter_classed_sizing {
-                        Tier1SizingMode::Current
-                    } else {
-                        Tier1SizingMode::Hll
-                    },
                     gram_sizes,
                     chunk_size: args.chunk_size,
                     store_path: false,
@@ -2623,7 +2577,6 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                     fixed_filter_bytes: None,
                     tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
                     tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
-                    tier1_sizing_mode: server_policy.tier1_sizing_mode,
                     gram_sizes: server_policy.gram_sizes,
                     chunk_size: args.chunk_size,
                     store_path: server_policy.store_path,
@@ -2693,11 +2646,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 fixed_filter_bytes: None,
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
-                tier1_sizing_mode: if config.tier1_filter_classed_sizing {
-                    Tier1SizingMode::Current
-                } else {
-                    Tier1SizingMode::Hll
-                },
                 gram_sizes,
                 chunk_size: args.chunk_size,
                 store_path: config.store_path,
@@ -2855,7 +2803,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 fixed_filter_bytes: None,
                 tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
                 tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
-                tier1_sizing_mode: server_policy.tier1_sizing_mode,
                 gram_sizes: server_policy.gram_sizes,
                 chunk_size: args.chunk_size,
                 store_path: server_policy.store_path,
@@ -3880,7 +3827,6 @@ fn cmd_index(args: &IndexArgs) -> i32 {
             batch_size: args.batch_size,
             workers: args.workers.unwrap_or(0),
             chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
-            tier1_sizing_mode: args.tier1_sizing_mode,
             external_id_from_path: false,
             verbose: args.verbose,
             rotate_remote_sessions: false,
@@ -3901,7 +3847,6 @@ fn cmd_index(args: &IndexArgs) -> i32 {
         batch_size: args.batch_size,
         workers: args.workers.unwrap_or(0),
         chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
-        tier1_sizing_mode: args.tier1_sizing_mode,
         external_id_from_path: server_policy.store_path,
         verbose: args.verbose,
         rotate_remote_sessions: false,
@@ -4722,13 +4667,10 @@ struct IndexArgs {
     )]
     workers: Option<usize>,
     #[arg(
-        long = "tier1-sizing-mode",
-        value_enum,
-        default_value_t = Tier1SizingMode::Hll,
-        help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
+        long = "verbose",
+        action = ArgAction::SetTrue,
+        help = "Print timing details to stderr."
     )]
-    tier1_sizing_mode: Tier1SizingMode,
-    #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
 }
 
@@ -4911,7 +4853,7 @@ struct ServeArgs {
     tier2_superblock_budget_divisor: u64,
     #[arg(
         long = "tier1-superblock-docs",
-        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS,
         help = "Documents per tier1 superblock. Lower values make block gates finer-grained at higher index/storage cost."
     )]
     tier1_superblock_docs: usize,
@@ -4921,13 +4863,6 @@ struct ServeArgs {
         help = "Cap per-superblock summary bytes in KiB. Larger values spend more block-level bytes to reduce coarse-filter collisions."
     )]
     tier2_superblock_summary_cap_kib: usize,
-    #[arg(
-        long = "tier1-sizing-mode",
-        value_enum,
-        default_value_t = Tier1SizingMode::Hll,
-        help = "Tier1 sizing policy persisted in the store. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
-    )]
-    tier1_sizing_mode: Tier1SizingMode,
     #[arg(
         long = "enable-pattern-superblocks",
         action = ArgAction::SetTrue,
@@ -5029,7 +4964,7 @@ struct InitArgs {
     compaction_idle_cooldown_s: f64,
     #[arg(
         long = "tier1-superblock-docs",
-        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS,
         help = "Documents per tier1 superblock."
     )]
     tier1_superblock_docs: usize,
@@ -5039,13 +4974,6 @@ struct InitArgs {
         help = "Cap per-superblock summary bytes in KiB."
     )]
     tier2_superblock_summary_cap_kib: usize,
-    #[arg(
-        long = "tier1-sizing-mode",
-        value_enum,
-        default_value_t = Tier1SizingMode::Hll,
-        help = "Tier1 sizing policy persisted in the store. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
-    )]
-    tier1_sizing_mode: Tier1SizingMode,
     #[arg(
         long = "enable-pattern-superblocks",
         action = ArgAction::SetTrue,
@@ -5069,13 +4997,6 @@ struct InternalIndexArgs {
     external_id: Option<String>,
     #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "File read chunk size in bytes.")]
     chunk_size: usize,
-    #[arg(
-        long = "tier1-sizing-mode",
-        value_enum,
-        default_value_t = Tier1SizingMode::Hll,
-        help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
-    )]
-    tier1_sizing_mode: Tier1SizingMode,
 }
 
 #[derive(Debug, clap::Args)]
@@ -5101,13 +5022,6 @@ struct InternalIndexBatchArgs {
     workers: usize,
     #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "Client read chunk size in bytes.")]
     chunk_size: usize,
-    #[arg(
-        long = "tier1-sizing-mode",
-        value_enum,
-        default_value_t = Tier1SizingMode::Hll,
-        help = "Tier1 sizing policy. `current` uses the classed tier1 sizing rule; `hll` uses direct HLL/theoretical sizing."
-    )]
-    tier1_sizing_mode: Tier1SizingMode,
     #[arg(long = "external-id-from-path", action = ArgAction::SetTrue, help = "Set external_id=<file path> for each inserted document.")]
     external_id_from_path: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
@@ -5222,9 +5136,8 @@ mod tests {
             tier2_filter_target_fp: None,
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
-            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-            tier1_sizing_mode: Tier1SizingMode::Hll,
             enable_pattern_superblocks: false,
         }
     }
@@ -5317,9 +5230,8 @@ mod tests {
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-            tier1_sizing_mode: Tier1SizingMode::Hll,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
@@ -5437,12 +5349,11 @@ mod tests {
             PathBuf::from("root"),
             CandidateIdSource::Sha256,
             true,
-            Tier1SizingMode::Current,
             0.001,
             0.002,
             3,
             4,
-            DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+            DEFAULT_TIER1_SUPERBLOCK_DOCS,
             8,
             true,
             33.5,
@@ -5454,7 +5365,6 @@ mod tests {
         assert_eq!(fixed.tier1_gram_size, 4);
         assert_eq!(fixed.tier2_superblock_summary_cap_bytes, 8 * 1024);
         assert!(fixed.enable_tier2_superblocks);
-        assert!(fixed.tier1_filter_classed_sizing);
         assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
         assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
         assert_eq!(fixed.filter_target_fp, None);
@@ -5464,12 +5374,11 @@ mod tests {
             PathBuf::from("root"),
             CandidateIdSource::Sha256,
             false,
-            Tier1SizingMode::Hll,
             0.01,
             0.01,
             5,
             4,
-            DEFAULT_TIER1_SUPERBLOCK_DOCS_PER_BLOCK,
+            DEFAULT_TIER1_SUPERBLOCK_DOCS,
             16,
             false,
             9.25,
@@ -5484,7 +5393,6 @@ mod tests {
         assert_eq!(variable.tier1_gram_size, 4);
         assert_eq!(variable.tier2_superblock_summary_cap_bytes, 16 * 1024);
         assert!(!variable.enable_tier2_superblocks);
-        assert!(!variable.tier1_filter_classed_sizing);
         assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
         let wire = batch_row_to_wire(IndexBatchRow {
@@ -5604,7 +5512,6 @@ mod tests {
                 fixed_filter_bytes: Some(2048),
                 tier1_filter_target_fp: None,
                 tier2_filter_target_fp: None,
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: true,
@@ -5629,7 +5536,6 @@ mod tests {
                 fixed_filter_bytes: Some(2048),
                 tier1_filter_target_fp: None,
                 tier2_filter_target_fp: None,
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: false,
@@ -5651,7 +5557,6 @@ mod tests {
                 fixed_filter_bytes: Some(2051),
                 tier1_filter_target_fp: None,
                 tier2_filter_target_fp: None,
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
                 chunk_size: 4,
                 store_path: false,
@@ -5798,7 +5703,6 @@ rule q {
             root: Some(candidate_root.display().to_string()),
             external_id: Some("manual-a".to_owned()),
             chunk_size: 1024,
-            tier1_sizing_mode: Tier1SizingMode::Current,
         };
         assert_eq!(cmd_internal_index(&ingest_one), 0);
 
@@ -5810,7 +5714,6 @@ rule q {
             batch_size: 1,
             workers: 2,
             chunk_size: 1024,
-            tier1_sizing_mode: Tier1SizingMode::Current,
             external_id_from_path: true,
             verbose: false,
             rotate_remote_sessions: false,
@@ -5967,7 +5870,6 @@ rule q {
                 batch_size: 1,
                 workers: 1,
                 chunk_size: 1024,
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 external_id_from_path: true,
                 verbose: false,
                 rotate_remote_sessions: false,
@@ -5983,7 +5885,6 @@ rule q {
                 batch_size: 1,
                 workers: 1,
                 chunk_size: 1024,
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 external_id_from_path: false,
                 verbose: false,
                 rotate_remote_sessions: false,
@@ -5997,7 +5898,6 @@ rule q {
                 root: Some(candidate_root.display().to_string()),
                 external_id: Some("manual-root-id".to_owned()),
                 chunk_size: 1024,
-                tier1_sizing_mode: Tier1SizingMode::Current,
             }),
             0
         );
@@ -6090,7 +5990,6 @@ rule remote_q {
                 root: None,
                 external_id: Some(base.join("missing-match.bin").display().to_string()),
                 chunk_size: 1024,
-                tier1_sizing_mode: Tier1SizingMode::Current,
             }),
             0
         );
@@ -6105,7 +6004,6 @@ rule remote_q {
                 path_list: false,
                 batch_size: 1,
                 workers: Some(2),
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 verbose: false,
             }),
             0
@@ -6259,7 +6157,6 @@ rule remote_q {
                 root: Some(missing_root.display().to_string()),
                 external_id: None,
                 chunk_size: 1024,
-                tier1_sizing_mode: Tier1SizingMode::Current,
             }),
             1
         );
@@ -6326,7 +6223,6 @@ rule remote_q {
                 path_list: false,
                 batch_size: 1,
                 workers: Some(1),
-                tier1_sizing_mode: Tier1SizingMode::Current,
                 verbose: false,
             }),
             0

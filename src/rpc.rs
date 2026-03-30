@@ -1607,14 +1607,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
             .unwrap_or(Value::Null),
     );
     out.insert(
-        "tier1_sizing_mode".to_owned(),
-        Value::from(if stats.tier1_filter_classed_sizing {
-            "current"
-        } else {
-            "hll"
-        }),
-    );
-    out.insert(
         "tier2_filter_target_fp".to_owned(),
         stats
             .tier2_filter_target_fp
@@ -8121,10 +8113,6 @@ rule overflow_rule {
         assert_eq!(
             stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
             Some(0.23)
-        );
-        assert_eq!(
-            stats.get("tier1_sizing_mode").and_then(Value::as_str),
-            Some("hll")
         );
         assert_eq!(stats.get("filter_target_fp"), None);
     }

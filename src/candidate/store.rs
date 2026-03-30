@@ -19,8 +19,7 @@ use crate::candidate::bloom::{
 };
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
-    align_filter_bytes, choose_filter_bytes_for_file_size,
-    choose_tier1_filter_class_bytes_for_file_size, derive_document_bloom_hash_count,
+    align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
 use crate::candidate::grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
@@ -40,7 +39,6 @@ pub const DEFAULT_TIER1_SUPERBLOCK_DOCS: usize = 1;
 pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES: usize = 4096;
 pub const DEFAULT_TIER1_FILTER_TARGET_FP: f64 = 0.40;
 pub const DEFAULT_TIER2_FILTER_TARGET_FP: f64 = 0.23;
-pub const DEFAULT_TIER1_FILTER_CLASSED_SIZING: bool = false;
 pub const DEFAULT_ENABLE_TIER2_SUPERBLOCKS: bool = false;
 const DEFAULT_COMPACTION_IDLE_COOLDOWN_S: f64 = 5.0;
 const PREPARED_QUERY_CACHE_CAPACITY: usize = 32;
@@ -56,7 +54,6 @@ pub struct CandidateConfig {
     pub tier1_superblock_docs: usize,
     pub tier2_superblock_summary_cap_bytes: usize,
     pub enable_tier2_superblocks: bool,
-    pub tier1_filter_classed_sizing: bool,
     pub tier1_filter_target_fp: Option<f64>,
     pub tier2_filter_target_fp: Option<f64>,
     pub filter_target_fp: Option<f64>,
@@ -74,7 +71,6 @@ impl Default for CandidateConfig {
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             enable_tier2_superblocks: DEFAULT_ENABLE_TIER2_SUPERBLOCKS,
-            tier1_filter_classed_sizing: DEFAULT_TIER1_FILTER_CLASSED_SIZING,
             tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
             tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
             filter_target_fp: None,
@@ -340,7 +336,6 @@ pub struct CandidateStats {
     pub deleted_doc_count: usize,
     pub id_source: String,
     pub store_path: bool,
-    pub tier1_filter_classed_sizing: bool,
     pub tier1_filter_target_fp: Option<f64>,
     pub tier2_filter_target_fp: Option<f64>,
     pub tier2_gram_size: usize,
@@ -393,7 +388,6 @@ struct ForestMeta {
     tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_bytes: usize,
     enable_tier2_superblocks: bool,
-    tier1_filter_classed_sizing: bool,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     compaction_idle_cooldown_s: f64,
@@ -418,7 +412,6 @@ struct LegacyStoreMeta {
     tier1_superblock_docs: usize,
     tier2_superblock_summary_cap_bytes: usize,
     enable_tier2_superblocks: bool,
-    tier1_filter_classed_sizing: bool,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     filter_target_fp: Option<f64>,
@@ -452,7 +445,6 @@ impl Default for ForestMeta {
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             enable_tier2_superblocks: DEFAULT_ENABLE_TIER2_SUPERBLOCKS,
-            tier1_filter_classed_sizing: DEFAULT_TIER1_FILTER_CLASSED_SIZING,
             tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
             tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
@@ -481,7 +473,6 @@ impl Default for LegacyStoreMeta {
             tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
             tier2_superblock_summary_cap_bytes: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES,
             enable_tier2_superblocks: DEFAULT_ENABLE_TIER2_SUPERBLOCKS,
-            tier1_filter_classed_sizing: DEFAULT_TIER1_FILTER_CLASSED_SIZING,
             tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
             tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
             filter_target_fp: None,
@@ -511,7 +502,6 @@ impl From<&LegacyStoreMeta> for ForestMeta {
             tier1_superblock_docs: value.tier1_superblock_docs.max(1),
             tier2_superblock_summary_cap_bytes: value.tier2_superblock_summary_cap_bytes,
             enable_tier2_superblocks: value.enable_tier2_superblocks,
-            tier1_filter_classed_sizing: value.tier1_filter_classed_sizing,
             tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
             tier2_filter_target_fp: value.tier2_filter_target_fp.or(value.filter_target_fp),
             compaction_idle_cooldown_s: value.compaction_idle_cooldown_s,
@@ -1704,7 +1694,6 @@ impl CandidateStore {
                     .tier2_superblock_summary_cap_bytes
                     .max(1),
                 enable_tier2_superblocks: config.enable_tier2_superblocks,
-                tier1_filter_classed_sizing: config.tier1_filter_classed_sizing,
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
@@ -1864,7 +1853,6 @@ impl CandidateStore {
             tier1_superblock_docs: self.meta.tier1_superblock_docs,
             tier2_superblock_summary_cap_bytes: self.meta.tier2_superblock_summary_cap_bytes,
             enable_tier2_superblocks: self.meta.enable_tier2_superblocks,
-            tier1_filter_classed_sizing: self.meta.tier1_filter_classed_sizing,
             tier1_filter_target_fp,
             tier2_filter_target_fp,
             filter_target_fp: None,
@@ -2085,27 +2073,14 @@ impl CandidateStore {
         file_size: u64,
         bloom_item_estimate: Option<usize>,
     ) -> Result<usize> {
-        if self.meta.resolved_tier1_filter_target_fp().is_some()
-            && self.meta.tier1_filter_classed_sizing
-        {
-            choose_tier1_filter_class_bytes_for_file_size(
-                file_size,
-                DEFAULT_FILTER_BYTES,
-                Some(DEFAULT_FILTER_MIN_BYTES),
-                Some(DEFAULT_FILTER_MAX_BYTES),
-                self.meta.resolved_tier1_filter_target_fp(),
-                bloom_item_estimate,
-            )
-        } else {
-            choose_filter_bytes_for_file_size(
-                file_size,
-                DEFAULT_FILTER_BYTES,
-                Some(DEFAULT_FILTER_MIN_BYTES),
-                Some(DEFAULT_FILTER_MAX_BYTES),
-                self.meta.resolved_tier1_filter_target_fp(),
-                bloom_item_estimate,
-            )
-        }
+        choose_filter_bytes_for_file_size(
+            file_size,
+            DEFAULT_FILTER_BYTES,
+            Some(DEFAULT_FILTER_MIN_BYTES),
+            Some(DEFAULT_FILTER_MAX_BYTES),
+            self.meta.resolved_tier1_filter_target_fp(),
+            bloom_item_estimate,
+        )
     }
 
     fn resolve_tier2_filter_bytes_for_file_size(
@@ -3817,7 +3792,6 @@ impl CandidateStore {
             deleted_doc_count,
             id_source: self.meta.id_source.clone(),
             store_path: self.meta.store_path,
-            tier1_filter_classed_sizing: self.meta.tier1_filter_classed_sizing,
             tier1_filter_target_fp: self.meta.resolved_tier1_filter_target_fp(),
             tier2_filter_target_fp: self.meta.resolved_tier2_filter_target_fp(),
             tier2_gram_size: self.meta.tier2_gram_size,
@@ -6469,14 +6443,7 @@ fn block_matches_shifted_required_masks(
         });
     }
     shifted.shifts.iter().any(|by_key| {
-        block_matches_required_masks(
-            bucket_key,
-            block_idx,
-            by_key,
-            superblocks,
-            profile,
-            tier2,
-        )
+        block_matches_required_masks(bucket_key, block_idx, by_key, superblocks, profile, tier2)
     })
 }
 

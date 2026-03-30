@@ -257,8 +257,8 @@ mod tests {
     use fastbloom::BloomFilter as FastBloomFilter;
 
     use super::{
-        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, FASTBLOOM_SEED, bloom_byte_masks, bloom_positions,
-        bloom_word_masks, bloom_word_masks_in_lane, raw_filter_matches_masks,
+        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, FASTBLOOM_SEED, bloom_byte_masks,
+        bloom_positions, bloom_word_masks, bloom_word_masks_in_lane, raw_filter_matches_masks,
         raw_filter_matches_word_masks,
     };
 
@@ -285,7 +285,11 @@ mod tests {
     fn bloom_layout_matches_fastbloom_for_non_lane_filter() {
         let size_bytes = 128usize;
         let hash_count = 7usize;
-        let values = [0x0102_0304_u64, 0xAABB_CCDD_1020_3040_u64, 0x9988_7766_5544_3322_u64];
+        let values = [
+            0x0102_0304_u64,
+            0xAABB_CCDD_1020_3040_u64,
+            0x9988_7766_5544_3322_u64,
+        ];
 
         let mut ours = BloomFilter::new(size_bytes, hash_count).expect("ours");
         for value in values {

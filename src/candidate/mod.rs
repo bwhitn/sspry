@@ -14,8 +14,7 @@ pub use features::{
     estimate_unique_grams_pair_hll, scan_file_features_bloom_only_with_gram_sizes,
 };
 pub use filter_policy::{
-    choose_filter_bytes_for_file_size, choose_tier1_filter_class_bytes_for_file_size,
-    derive_bloom_hash_count, derive_document_bloom_hash_count, normalize_tier1_filter_class_bytes,
+    choose_filter_bytes_for_file_size, derive_bloom_hash_count, derive_document_bloom_hash_count,
 };
 pub use grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram};
 pub use metadata::{

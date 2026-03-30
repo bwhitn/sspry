@@ -174,8 +174,11 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
         if offset + 2 > bytes.len() {
             return Err(SspryError::from("Invalid compact document metadata."));
         }
-        let bytes_presence =
-            u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("bytes_presence"));
+        let bytes_presence = u16::from_le_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .expect("bytes_presence"),
+        );
         offset += 2;
         for (idx, value) in byte_values.iter_mut().enumerate() {
             if (bytes_presence & (1u16 << idx)) == 0 {
