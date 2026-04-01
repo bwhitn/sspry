@@ -257,12 +257,20 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     let mut file = File::open(file_path)?;
     let declared_file_size = file.metadata()?.len();
     let mut digest = Sha256::new();
-    let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes)?;
+    let mut bloom = Some(BloomFilter::new(filter_bytes, bloom_hashes)?);
     let mut tier2_bloom = if tier2_filter_bytes > 0 && tier2_bloom_hashes > 0 {
         Some(BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes)?)
     } else {
         None
     };
+    let tier1_lane_geometry = bloom
+        .as_ref()
+        .map(|bloom_ref| bloom_ref.lane_geometry(DEFAULT_BLOOM_POSITION_LANES))
+        .transpose()?;
+    let tier2_lane_geometry = tier2_bloom
+        .as_ref()
+        .map(|bloom_ref| bloom_ref.lane_geometry(DEFAULT_BLOOM_POSITION_LANES))
+        .transpose()?;
     let trailing_bytes = if tier2_bloom.is_some() {
         gram_sizes.tier2 - 1
     } else {
@@ -304,24 +312,36 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
         let mut data = trailing.clone();
         data.extend_from_slice(chunk);
         let data_start_offset = processed_bytes.saturating_sub(trailing.len() as u64);
-        if data.len() < gram_sizes.tier1 {
+        let min_gram_size = if tier2_bloom.is_some() {
+            gram_sizes.tier1.min(gram_sizes.tier2)
+        } else {
+            gram_sizes.tier1
+        };
+        if data.len() < min_gram_size {
             trailing = data;
             processed_bytes = processed_bytes.saturating_add(read_len as u64);
             continue;
         }
-        for idx in 0..=(data.len() - gram_sizes.tier1) {
-            let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier1]);
-            let lane = ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
-            bloom.add_in_lane(gram, lane, DEFAULT_BLOOM_POSITION_LANES)?;
-            gram_windows = gram_windows.saturating_add(1);
+        if let Some(bloom_ref) = bloom.as_mut() {
+            let (lane_bytes, lane_bits) =
+                tier1_lane_geometry.expect("tier1 lane geometry when tier1 bloom exists");
+            for idx in 0..=(data.len() - gram_sizes.tier1) {
+                let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier1]);
+                let lane =
+                    ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
+                bloom_ref.add_in_lane_prevalidated(gram, lane * lane_bytes, lane_bits);
+                gram_windows = gram_windows.saturating_add(1);
+            }
         }
         if let Some(tier2_bloom_ref) = tier2_bloom.as_mut() {
             if data.len() >= gram_sizes.tier2 {
+                let (lane_bytes, lane_bits) =
+                    tier2_lane_geometry.expect("tier2 lane geometry when tier2 bloom exists");
                 for idx in 0..=(data.len() - gram_sizes.tier2) {
                     let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier2]);
                     let lane =
                         ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
-                    tier2_bloom_ref.add_in_lane(gram, lane, DEFAULT_BLOOM_POSITION_LANES)?;
+                    tier2_bloom_ref.add_in_lane_prevalidated(gram, lane * lane_bytes, lane_bits);
                 }
             }
         }
@@ -347,7 +367,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     Ok(DocumentFeatures {
         sha256,
         file_size,
-        bloom_filter: bloom.into_bytes(),
+        bloom_filter: bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
         tier2_bloom_filter: tier2_bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
         special_population: classify_special_population(file_size, sampled_entropy),
     })
@@ -444,7 +464,6 @@ mod tests {
         assert!(!features.bloom_filter.is_empty());
         assert!(!features.tier2_bloom_filter.is_empty());
     }
-
     #[test]
     fn sampled_entropy_classifier_distinguishes_special_population() {
         assert!(!super::classify_special_population(1024, 8.0));

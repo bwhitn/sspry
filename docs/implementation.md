@@ -44,7 +44,7 @@ The query path is:
 4. Query shards in parallel.
 5. Use Tier2 superblock summaries to skip groups of files.
 6. Use per-document Tier1 and Tier2 blooms to refine candidates.
-7. Rank and page candidates.
+7. Collect candidate digests without ranking guarantees.
 8. Optionally verify file paths locally.
 
 In direct forest mode, the query path adds one layer above shard search:
@@ -180,7 +180,6 @@ Current search improvements include:
 - prepared-query artifact cache inside the store
 - per-rule prepared-query memory profiling
 - preserved selected anchor literals for prepared masks so chosen anchors do not silently degrade into broad any-lane masks
-- candidate scoring before verification/pagination
 
 These are intended to be recall-safe planner/runtime improvements.
 
@@ -198,12 +197,14 @@ The planner also treats Tier2-only searchable patterns as anchorable for these s
 
 Search without `--verify` returns candidate digests.
 
+Candidate order is not part of the search contract. The current runtime preserves match-set semantics, not ranked or deterministic ordering.
+
 Search with `--verify`:
 
 1. requires stored paths (`--store-path` at `serve` time)
 2. reopens candidate files locally
 3. runs `yara-x` verification
-4. returns verified matches
+4. returns verified matches as an unordered set
 
 This means verified search quality depends on:
 

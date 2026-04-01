@@ -1,29 +1,30 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapOptions};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::bloom::{
-    bloom_word_masks_in_lane, raw_filter_matches_word_masks, DEFAULT_BLOOM_POSITION_LANES,
+    DEFAULT_BLOOM_POSITION_LANES, bloom_word_masks_in_lane, raw_filter_matches_word_masks,
 };
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
     align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
 use crate::candidate::grams::{
-    pack_exact_gram, GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
+    DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
 };
 use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
@@ -195,7 +196,6 @@ pub struct ImportedCandidateDocument {
 #[derive(Clone, Debug)]
 pub struct CandidateQueryResult {
     pub sha256: Vec<String>,
-    pub scores: Vec<u32>,
     pub total_candidates: usize,
     pub returned_count: usize,
     pub cursor: usize,
@@ -543,6 +543,105 @@ const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const MIN_SUPERBLOCK_MEMORY_BUDGET_BYTES: u64 = 1 * 1024 * 1024;
 const DOC_FLAG_DELETED: u8 = 0x02;
 const DOC_FLAG_SPECIAL_POPULATION: u8 = 0x04;
+
+fn experiment_tier2_only_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SSPRY_EXPERIMENT_TIER2_ONLY")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn experiment_tier2_and_metadata_only_enabled() -> bool {
+    #[cfg(test)]
+    {
+        let override_value = EXPERIMENT_TIER2_AND_METADATA_ONLY_OVERRIDE.with(|value| value.get());
+        if override_value != 0 {
+            return override_value == 2;
+        }
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SSPRY_EXPERIMENT_TIER2_AND_METADATA_ONLY")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPERIMENT_TIER2_AND_METADATA_ONLY_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn experiment_no_superblock_gate_enabled() -> bool {
+    #[cfg(test)]
+    {
+        let override_value = EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE.with(|value| value.get());
+        if override_value != 0 {
+            return override_value == 2;
+        }
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SSPRY_EXPERIMENT_NO_SUPERBLOCK_GATE")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn experiment_disable_tree_gates_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SSPRY_EXPERIMENT_DISABLE_TREE_GATES")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn experiment_disable_superblocks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SSPRY_EXPERIMENT_DISABLE_SUPERBLOCKS")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct DocMetaRow {
@@ -988,11 +1087,11 @@ impl StoreAppendWriters {
 #[derive(Clone, Debug)]
 struct Tier2SuperblockIndex {
     docs_per_block: usize,
-    bucket_for_key: BTreeMap<(usize, usize), (usize, usize)>,
-    summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
-    masks_by_bucket: BTreeMap<(usize, usize), Vec<Vec<u8>>>,
-    mapped_block_ranges_by_bucket: BTreeMap<(usize, usize), Vec<(usize, usize)>>,
-    positions_by_bucket: BTreeMap<(usize, usize), Vec<Vec<u32>>>,
+    bucket_for_key: FxHashMap<(usize, usize), (usize, usize)>,
+    summary_bytes_by_bucket: FxHashMap<(usize, usize), usize>,
+    masks_by_bucket: FxHashMap<(usize, usize), Vec<Vec<u8>>>,
+    mapped_block_ranges_by_bucket: FxHashMap<(usize, usize), Vec<(usize, usize)>>,
+    positions_by_bucket: FxHashMap<(usize, usize), Vec<Vec<u32>>>,
     summary_memory_bytes: u64,
     snapshot_mmap: Option<Arc<Mmap>>,
 }
@@ -1001,11 +1100,11 @@ impl Default for Tier2SuperblockIndex {
     fn default() -> Self {
         Self {
             docs_per_block: DEFAULT_TIER1_SUPERBLOCK_DOCS,
-            bucket_for_key: BTreeMap::new(),
-            summary_bytes_by_bucket: BTreeMap::new(),
-            masks_by_bucket: BTreeMap::new(),
-            mapped_block_ranges_by_bucket: BTreeMap::new(),
-            positions_by_bucket: BTreeMap::new(),
+            bucket_for_key: FxHashMap::default(),
+            summary_bytes_by_bucket: FxHashMap::default(),
+            masks_by_bucket: FxHashMap::default(),
+            mapped_block_ranges_by_bucket: FxHashMap::default(),
+            positions_by_bucket: FxHashMap::default(),
             summary_memory_bytes: 0,
             snapshot_mmap: None,
         }
@@ -1077,9 +1176,9 @@ impl Tier2SuperblockIndex {
 
 #[derive(Clone, Debug, Default)]
 struct TreeBloomGateIndex {
-    bucket_for_key: BTreeMap<(usize, usize), (usize, usize)>,
-    summary_bytes_by_bucket: BTreeMap<(usize, usize), usize>,
-    masks_by_bucket: BTreeMap<(usize, usize), Vec<u8>>,
+    bucket_for_key: FxHashMap<(usize, usize), (usize, usize)>,
+    summary_bytes_by_bucket: FxHashMap<(usize, usize), usize>,
+    masks_by_bucket: FxHashMap<(usize, usize), Vec<u8>>,
     summary_memory_bytes: u64,
 }
 
@@ -1243,7 +1342,7 @@ fn update_superblocks_for_doc_bytes_batch<'a>(
     if updates.is_empty() {
         return;
     }
-    let mut aggregated = BTreeMap::<(usize, (usize, usize)), Vec<u8>>::new();
+    let mut aggregated = FxHashMap::<(usize, (usize, usize)), Vec<u8>>::default();
 
     for (pos, filter_bytes, bloom_hashes, bloom_bytes) in updates {
         let block_idx = locate_or_assign_superblock_for_pos(
@@ -1434,7 +1533,6 @@ struct TierFlags {
 struct MatchOutcome {
     matched: bool,
     tiers: TierFlags,
-    score: u32,
 }
 
 #[derive(Default)]
@@ -1560,27 +1658,18 @@ impl TierFlags {
 }
 
 fn paginate_query_hits(
-    matched_hits: &mut Vec<(String, u32)>,
+    matched_hits: &[String],
     cursor: usize,
     chunk_size: usize,
-) -> (Vec<String>, Vec<u32>, usize, usize, usize, Option<usize>) {
-    matched_hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-
+) -> (Vec<String>, usize, usize, usize, Option<usize>) {
     let total = matched_hits.len();
     let start = cursor.min(total);
     let size = chunk_size.max(1);
     let end = (start + size).min(total);
-    let page = matched_hits[start..end]
-        .iter()
-        .map(|(sha256, _)| sha256.clone())
-        .collect::<Vec<_>>();
-    let page_scores = matched_hits[start..end]
-        .iter()
-        .map(|(_, score)| *score)
-        .collect::<Vec<_>>();
+    let page = matched_hits[start..end].to_vec();
     let next_cursor = if end < total { Some(end) } else { None };
 
-    (page, page_scores, total, start, end, next_cursor)
+    (page, total, start, end, next_cursor)
 }
 
 pub(crate) fn candidate_limit_exceeded_error(
@@ -3311,7 +3400,7 @@ impl CandidateStore {
         &self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-    ) -> Result<Option<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)>> {
+    ) -> Result<Option<(Vec<String>, TierFlags, CandidateQueryProfile)>> {
         let Some(seed_hashes) = Self::identity_seed_hashes(&plan.root) else {
             return Ok(None);
         };
@@ -3319,7 +3408,7 @@ impl CandidateStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut matched_hits = Vec::<(String, u32)>::new();
+        let mut matched_hits = Vec::<String>::new();
         let mut used_tiers = TierFlags::default();
         let mut query_profile = CandidateQueryProfile::default();
         for sha256 in seed_hashes {
@@ -3349,7 +3438,7 @@ impl CandidateStore {
                 &mut eval_cache,
             )?;
             if outcome.matched {
-                matched_hits.push((doc.sha256.clone(), outcome.score));
+                matched_hits.push(doc.sha256.clone());
                 used_tiers.merge(outcome.tiers);
             }
             query_profile.merge_from(&doc_inputs.into_profile());
@@ -3411,7 +3500,6 @@ impl CandidateStore {
         if prepared.impossible_query {
             return Ok(CandidateQueryResult {
                 sha256: Vec::new(),
-                scores: Vec::new(),
                 total_candidates: 0,
                 returned_count: 0,
                 cursor: 0,
@@ -3420,7 +3508,7 @@ impl CandidateStore {
                 query_profile: CandidateQueryProfile::default(),
             });
         }
-        let (mut matched_hits, used_tiers, query_profile) =
+        let (matched_hits, used_tiers, query_profile) =
             if let Some(identity_hits) = self.query_identity_seed_hits(plan, prepared)? {
                 identity_hits
             } else {
@@ -3498,12 +3586,11 @@ impl CandidateStore {
                 plan.max_candidates,
             ));
         }
-        let (page, page_scores, total, start, end, next_cursor) =
-            paginate_query_hits(&mut matched_hits, cursor, chunk_size);
+        let (page, total, start, end, next_cursor) =
+            paginate_query_hits(&matched_hits, cursor, chunk_size);
 
         Ok(CandidateQueryResult {
             sha256: page,
-            scores: page_scores,
             total_candidates: total,
             returned_count: end.saturating_sub(start),
             cursor: start,
@@ -3518,6 +3605,19 @@ impl CandidateStore {
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(bool, bool, CandidateQueryProfile)> {
+        if experiment_no_superblock_gate_enabled() {
+            let mut query_profile = CandidateQueryProfile::default();
+            query_profile.tree_gate_trees_considered = 1;
+            query_profile.tree_gate_passed = 1;
+            return Ok((true, self.has_live_special_docs(), query_profile));
+        }
+        if experiment_tier2_and_metadata_only_enabled() {
+            let mut query_profile = CandidateQueryProfile::default();
+            query_profile.tree_gate_trees_considered = 1;
+            query_profile.tree_gate_passed = 1;
+            return Ok((true, self.has_live_special_docs(), query_profile));
+        }
+        let tier2_only = experiment_tier2_only_enabled();
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
         let mut query_profile = CandidateQueryProfile::default();
         query_profile.tree_gate_trees_considered = 1;
@@ -3526,6 +3626,26 @@ impl CandidateStore {
         } else {
             Some(&self.tier2_superblocks)
         };
+        if tier2_only {
+            let normal_tree_match = tree_maybe_matches_node(
+                &plan.root,
+                &prepared.mask_cache,
+                &self.tree_tier1_gates,
+                &self.tier1_superblocks,
+                &self.tree_tier2_gates,
+                tier2_superblocks,
+                true,
+            )?;
+            let has_special_docs = self.has_live_special_docs();
+            if normal_tree_match {
+                query_profile.tree_gate_passed = 1;
+            } else if has_special_docs {
+                query_profile.tree_gate_special_docs_bypass = 1;
+            } else {
+                query_profile.tree_gate_tier2_pruned = 1;
+            }
+            return Ok((normal_tree_match, has_special_docs, query_profile));
+        }
         let tier1_tree_match = tree_maybe_matches_node(
             &plan.root,
             &prepared.mask_cache,
@@ -3565,8 +3685,10 @@ impl CandidateStore {
         &self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-    ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
         let allow_block_skip = !plan.force_tier1_only && plan.allow_tier2_fallback;
+        let tier2_and_metadata_only = experiment_tier2_and_metadata_only_enabled();
+        let no_superblock_gate = experiment_no_superblock_gate_enabled();
         let (normal_tree_match, has_special_docs, mut query_profile) =
             self.tree_gate_profile(plan, prepared)?;
         if !normal_tree_match && !has_special_docs {
@@ -3574,15 +3696,22 @@ impl CandidateStore {
         }
         let block_refs = self.tier1_superblocks.block_refs();
         let block_count = block_refs.len();
-        let prefetch_tier1_by_block = query_node_uses_pattern_blooms(&plan.root);
+        let prefetch_tier1_by_block =
+            !tier2_and_metadata_only && query_node_uses_pattern_blooms(&plan.root);
         let query_now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut matched_hits = Vec::<(String, u32)>::new();
+        let mut matched_hits = Vec::<String>::new();
         let mut used_tiers = TierFlags::default();
 
-        if normal_tree_match && block_count > 0 {
+        if no_superblock_gate {
+            let (hits, tiers, profile) =
+                self.scan_query_hits_all_docs(plan, prepared, query_now_unix)?;
+            matched_hits.extend(hits);
+            used_tiers.merge(tiers);
+            query_profile.merge_from(&profile);
+        } else if normal_tree_match && block_count > 0 {
             let worker_count = query_scan_worker_count(block_count);
             if worker_count <= 1 {
                 let (hits, tiers, profile) = self.scan_query_hits_worker(
@@ -3590,6 +3719,8 @@ impl CandidateStore {
                     prepared,
                     &block_refs,
                     allow_block_skip,
+                    tier2_and_metadata_only,
+                    no_superblock_gate,
                     prefetch_tier1_by_block,
                     query_now_unix,
                     None,
@@ -3610,6 +3741,8 @@ impl CandidateStore {
                                 prepared,
                                 block_refs,
                                 allow_block_skip,
+                                tier2_and_metadata_only,
+                                no_superblock_gate,
                                 prefetch_tier1_by_block,
                                 query_now_unix,
                                 Some(next_block),
@@ -3624,9 +3757,7 @@ impl CandidateStore {
                             .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
                         merged.push(partial);
                     }
-                    Ok::<Vec<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)>, SspryError>(
-                        merged,
-                    )
+                    Ok::<Vec<(Vec<String>, TierFlags, CandidateQueryProfile)>, SspryError>(merged)
                 })?;
 
                 for (hits, tiers, profile) in partials {
@@ -3653,8 +3784,8 @@ impl CandidateStore {
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
         query_now_unix: u64,
-    ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
-        let mut matched_hits = Vec::<(String, u32)>::new();
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<String>::new();
         let mut used_tiers = TierFlags::default();
         let mut query_profile = CandidateQueryProfile::default();
         for pos in &self.special_doc_positions {
@@ -3683,7 +3814,47 @@ impl CandidateStore {
                 &mut eval_cache,
             )?;
             if outcome.matched {
-                matched_hits.push((doc.sha256.clone(), outcome.score));
+                matched_hits.push(doc.sha256.clone());
+                used_tiers.merge(outcome.tiers);
+            }
+            query_profile.merge_from(&doc_inputs.into_profile());
+        }
+        Ok((matched_hits, used_tiers, query_profile))
+    }
+
+    fn scan_query_hits_all_docs(
+        &self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+        query_now_unix: u64,
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<String>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for (pos, doc) in self.docs.iter().enumerate() {
+            if doc.deleted || doc.special_population {
+                continue;
+            }
+            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+            let mut doc_inputs = LazyDocQueryInputs::new(doc);
+            let mut load_metadata = || self.doc_metadata_bytes(pos);
+            let mut load_tier1 = || self.doc_bloom_bytes(pos);
+            let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+            let mut eval_cache = QueryEvalCache::default();
+            let outcome = evaluate_node(
+                &plan.root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                &prepared.patterns,
+                &prepared.mask_cache,
+                plan,
+                query_now_unix,
+                &mut eval_cache,
+            )?;
+            if outcome.matched {
+                matched_hits.push(doc.sha256.clone());
                 used_tiers.merge(outcome.tiers);
             }
             query_profile.merge_from(&doc_inputs.into_profile());
@@ -3698,11 +3869,13 @@ impl CandidateStore {
         prepared: &PreparedQueryArtifacts,
         block_refs: &[((usize, usize), usize)],
         allow_block_skip: bool,
+        tier2_and_metadata_only: bool,
+        no_superblock_gate: bool,
         prefetch_tier1_by_block: bool,
         query_now_unix: u64,
         next_block: Option<&AtomicUsize>,
-    ) -> Result<(Vec<(String, u32)>, TierFlags, CandidateQueryProfile)> {
-        let mut matched_hits = Vec::<(String, u32)>::new();
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<String>::new();
         let mut used_tiers = TierFlags::default();
         let mut query_profile = CandidateQueryProfile::default();
 
@@ -3723,7 +3896,9 @@ impl CandidateStore {
                 idx
             };
             let (bucket_key, local_block_idx) = block_refs[block_idx];
-            if allow_block_skip
+            if !tier2_and_metadata_only
+                && !no_superblock_gate
+                && allow_block_skip
                 && !block_maybe_matches_node(
                     bucket_key,
                     local_block_idx,
@@ -3792,7 +3967,7 @@ impl CandidateStore {
                     &mut eval_cache,
                 )?;
                 if outcome.matched {
-                    matched_hits.push((doc.sha256.clone(), outcome.score));
+                    matched_hits.push(doc.sha256.clone());
                     used_tiers.merge(outcome.tiers);
                 }
                 query_profile.merge_from(&doc_inputs.into_profile());
@@ -4337,6 +4512,9 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
+        if experiment_disable_tree_gates_enabled() {
+            return Ok(());
+        }
         if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
@@ -4355,6 +4533,9 @@ impl CandidateStore {
         &mut self,
         updates: &[(usize, usize, usize, &[u8])],
     ) -> Result<()> {
+        if experiment_disable_tree_gates_enabled() {
+            return Ok(());
+        }
         update_tree_gate_for_doc_bytes_batch(&mut self.tree_tier1_gates, updates);
         Ok(())
     }
@@ -4364,6 +4545,9 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
+        if experiment_disable_tree_gates_enabled() {
+            return Ok(());
+        }
         if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
@@ -4385,6 +4569,9 @@ impl CandidateStore {
         &mut self,
         updates: &[(usize, usize, usize, &[u8])],
     ) -> Result<()> {
+        if experiment_disable_tree_gates_enabled() {
+            return Ok(());
+        }
         update_tree_gate_for_doc_bytes_batch(&mut self.tree_tier2_gates, updates);
         Ok(())
     }
@@ -4394,6 +4581,9 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
+        if experiment_disable_superblocks_enabled() {
+            return Ok(());
+        }
         if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
             return Ok(());
         }
@@ -4427,6 +4617,9 @@ impl CandidateStore {
         pos: usize,
         bloom_bytes: &[u8],
     ) -> Result<()> {
+        if experiment_disable_superblocks_enabled() {
+            return Ok(());
+        }
         if !self.meta.enable_tier2_superblocks {
             return Ok(());
         }
@@ -4453,6 +4646,9 @@ impl CandidateStore {
         &mut self,
         updates: &[(usize, usize, usize, &[u8])],
     ) -> Result<()> {
+        if experiment_disable_superblocks_enabled() {
+            return Ok(());
+        }
         if !self.meta.enable_tier2_superblocks {
             return Ok(());
         }
@@ -4540,6 +4736,9 @@ impl CandidateStore {
     fn rebuild_tree_gates(&mut self) -> Result<()> {
         self.tree_tier1_gates = TreeBloomGateIndex::default();
         self.tree_tier2_gates = TreeBloomGateIndex::default();
+        if experiment_disable_tree_gates_enabled() {
+            return Ok(());
+        }
         for pos in 0..self.docs.len() {
             self.update_tree_tier1_gates_for_doc_inner(pos)?;
             self.update_tree_tier2_gates_for_doc_inner(pos)?;
@@ -4548,6 +4747,11 @@ impl CandidateStore {
     }
 
     fn rebuild_superblocks_with_docs_per_block(&mut self, docs_per_block: usize) -> Result<()> {
+        if experiment_disable_superblocks_enabled() {
+            self.tier1_superblocks = Tier2SuperblockIndex::default();
+            self.tier2_superblocks = Tier2SuperblockIndex::default();
+            return Ok(());
+        }
         let docs_per_block = docs_per_block.max(1);
         self.tier1_superblocks = Tier2SuperblockIndex::with_docs_per_block(docs_per_block);
         self.tier2_superblocks = Tier2SuperblockIndex::with_docs_per_block(docs_per_block);
@@ -4561,6 +4765,9 @@ impl CandidateStore {
     }
 
     fn maybe_rebalance_superblocks(&mut self) -> Result<()> {
+        if experiment_disable_superblocks_enabled() {
+            return Ok(());
+        }
         let budget_bytes = self.superblock_memory_budget_bytes;
         let current_bytes = self
             .tier1_superblocks
@@ -4635,6 +4842,21 @@ impl CandidateStore {
         let expected_active_doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
         self.tree_tier1_gates = TreeBloomGateIndex::default();
         self.tree_tier2_gates = TreeBloomGateIndex::default();
+        if experiment_disable_superblocks_enabled() {
+            self.tier1_superblocks = Tier2SuperblockIndex::default();
+            self.tier2_superblocks = Tier2SuperblockIndex::default();
+            return Ok(CandidateStoreRebuildProfile {
+                sha_index_ms,
+                load_superblock_snapshots_ms: 0,
+                rebuild_superblocks_ms: 0,
+                loaded_superblocks_from_snapshot: false,
+                total_ms: started_total
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            });
+        }
         let using_new_snapshot_layout = tier1_superblocks_path(&self.root).exists();
         let maybe_snapshot = if using_new_snapshot_layout {
             self.load_superblocks_snapshot(
@@ -4726,6 +4948,13 @@ impl CandidateStore {
     }
 
     pub(crate) fn persist_superblock_snapshots(&self) -> Result<()> {
+        if experiment_disable_superblocks_enabled() {
+            let _ = fs::remove_file(tier1_superblocks_path(&self.root));
+            let _ = fs::remove_file(tier2_superblocks_path(&self.root));
+            let _ = fs::remove_file(legacy_primary_superblocks_path(&self.root));
+            let _ = fs::remove_file(legacy_tier2_superblocks_path(&self.root));
+            return Ok(());
+        }
         self.persist_superblocks_snapshot(
             &self.tier1_superblocks,
             &tier1_superblocks_path(&self.root),
@@ -4758,25 +4987,32 @@ impl CandidateStore {
         );
         append_u64(&mut payload, index.docs_per_block as u64);
         append_u64(&mut payload, index.masks_by_bucket.len() as u64);
-        for ((filter_bucket, bloom_hashes), blocks) in &index.masks_by_bucket {
-            append_u64(&mut payload, *filter_bucket as u64);
-            append_u64(&mut payload, *bloom_hashes as u64);
+        let mut bucket_keys = index.masks_by_bucket.keys().copied().collect::<Vec<_>>();
+        bucket_keys.sort_unstable();
+        for (filter_bucket, bloom_hashes) in bucket_keys {
+            let blocks = index
+                .masks_by_bucket
+                .get(&(filter_bucket, bloom_hashes))
+                .expect("snapshot bucket key must exist");
+            append_u64(&mut payload, filter_bucket as u64);
+            append_u64(&mut payload, bloom_hashes as u64);
             let summary_bytes = index
                 .summary_bytes_by_bucket
-                .get(&(*filter_bucket, *bloom_hashes))
+                .get(&(filter_bucket, bloom_hashes))
                 .copied()
-                .unwrap_or_else(|| self.superblock_summary_bytes(*filter_bucket));
+                .unwrap_or_else(|| self.superblock_summary_bytes(filter_bucket));
             append_u64(&mut payload, summary_bytes as u64);
             append_u64(&mut payload, blocks.len() as u64);
             let position_blocks = index
                 .positions_by_bucket
-                .get(&(*filter_bucket, *bloom_hashes))
-                .cloned()
-                .unwrap_or_default();
+                .get(&(filter_bucket, bloom_hashes));
             for (block_idx, block) in blocks.iter().enumerate() {
                 append_u64(&mut payload, block.len() as u64);
                 payload.extend_from_slice(block);
-                let positions = position_blocks.get(block_idx).cloned().unwrap_or_default();
+                let positions = position_blocks
+                    .and_then(|blocks| blocks.get(block_idx))
+                    .cloned()
+                    .unwrap_or_default();
                 append_u64(&mut payload, positions.len() as u64);
                 for pos in positions {
                     append_u64(&mut payload, pos as u64);
@@ -4821,12 +5057,12 @@ impl CandidateStore {
             return Ok(None);
         }
         let docs_per_block = read_u64(&bytes, &mut cursor)? as usize;
-        let mut bucket_for_key = BTreeMap::new();
+        let mut bucket_for_key = FxHashMap::default();
         let bucket_count = read_u64(&bytes, &mut cursor)? as usize;
-        let mut summary_bytes_by_bucket = BTreeMap::new();
-        let masks_by_bucket = BTreeMap::new();
-        let mut mapped_block_ranges_by_bucket = BTreeMap::new();
-        let mut positions_by_bucket = BTreeMap::new();
+        let mut summary_bytes_by_bucket = FxHashMap::default();
+        let masks_by_bucket = FxHashMap::default();
+        let mut mapped_block_ranges_by_bucket = FxHashMap::default();
+        let mut positions_by_bucket = FxHashMap::default();
         let mut summary_memory_bytes = 0u64;
         for _ in 0..bucket_count {
             let filter_bucket = read_u64(&bytes, &mut cursor)? as usize;
@@ -5497,7 +5733,7 @@ fn normalize_sha256_hex(value: &str) -> Result<String> {
     Ok(text)
 }
 
-type RequiredMasksByKey = BTreeMap<(usize, usize), Vec<(usize, u64)>>;
+type RequiredMasksByKey = FxHashMap<(usize, usize), Vec<(usize, u64)>>;
 
 #[derive(Clone, Debug, Default)]
 struct ShiftedRequiredMasks {
@@ -5508,11 +5744,11 @@ struct ShiftedRequiredMasks {
 
 impl ShiftedRequiredMasks {
     fn is_empty(&self) -> bool {
-        self.shifts.iter().all(BTreeMap::is_empty)
+        self.shifts.iter().all(RequiredMasksByKey::is_empty)
             && self
                 .any_lane_values
                 .iter()
-                .all(|lanes| lanes.iter().all(BTreeMap::is_empty))
+                .all(|lanes| lanes.iter().all(RequiredMasksByKey::is_empty))
             && self.any_lane_grams.is_empty()
     }
 }
@@ -5844,7 +6080,7 @@ fn merge_cached_lane_bloom_word_masks(
     lane_count: usize,
     cache: &mut HashMap<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>,
 ) -> Result<Vec<(usize, u64)>> {
-    let mut merged = BTreeMap::<usize, u64>::new();
+    let mut merged = FxHashMap::<usize, u64>::default();
     for (gram_idx, value) in values.iter().enumerate() {
         let cached_masks = if let Some(lane) = lanes.get(gram_idx).copied() {
             let key = (*value, size_bytes, hash_count, lane, lane_count);
@@ -5857,7 +6093,7 @@ fn merge_cached_lane_bloom_word_masks(
                 entry
             }
         } else {
-            let mut any_lane = BTreeMap::<usize, u64>::new();
+            let mut any_lane = FxHashMap::<usize, u64>::default();
             for lane in 0..lane_count.max(1) {
                 let key = (*value, size_bytes, hash_count, lane, lane_count);
                 let cached = if let Some(entry) = cache.get(&key) {
@@ -5896,7 +6132,7 @@ fn build_any_lane_required_masks(
     for value in values {
         let mut per_lane = Vec::with_capacity(lane_count.max(1));
         for lane in 0..lane_count.max(1) {
-            let mut by_key = RequiredMasksByKey::new();
+            let mut by_key = RequiredMasksByKey::default();
             for (filter_bytes, bloom_hashes) in filter_keys {
                 let key = (*value, *filter_bytes, *bloom_hashes, lane, lane_count);
                 let cached = if let Some(entry) = cache.get(&key) {
@@ -6040,7 +6276,7 @@ fn build_pattern_mask_cache(
                 );
                 shifted_tier1.shifts = Vec::with_capacity(lane_variants.len());
                 for lanes in &lane_variants {
-                    let mut by_key = RequiredMasksByKey::new();
+                    let mut by_key = RequiredMasksByKey::default();
                     for (filter_bytes, bloom_hashes) in tier1_filter_keys {
                         let required = merge_cached_lane_bloom_word_masks(
                             alternative,
@@ -6094,7 +6330,7 @@ fn build_pattern_mask_cache(
                 );
                 shifted_tier2.shifts = Vec::with_capacity(lane_variants.len());
                 for lanes in &lane_variants {
-                    let mut by_key = RequiredMasksByKey::new();
+                    let mut by_key = RequiredMasksByKey::default();
                     for (filter_bytes, bloom_hashes) in tier2_filter_keys {
                         let required = merge_cached_lane_bloom_word_masks(
                             alternative,
@@ -6284,7 +6520,7 @@ fn tree_gate_matches_shifted_required_masks(
                                 )
                                 .ok()
                                 .is_some_and(|required| {
-                                    let mut by_key = RequiredMasksByKey::new();
+                                    let mut by_key = RequiredMasksByKey::default();
                                     by_key.insert((*filter_bytes, *bloom_hashes), required);
                                     tree_superblocks_match_required_masks(&by_key, superblocks)
                                 })
@@ -6341,11 +6577,25 @@ fn tree_gate_matches_pattern(
     let Some(pattern_masks) = mask_cache.get(pattern_id) else {
         return false;
     };
+    let tier2_only = experiment_tier2_only_enabled();
     pattern_masks
         .tier1
         .iter()
         .enumerate()
         .any(|(alt_index, tier1_by_key)| {
+            if tier2_only {
+                let Some(tier2_by_key) = pattern_masks.tier2.get(alt_index) else {
+                    return true;
+                };
+                if tier2_by_key.is_empty() {
+                    return true;
+                }
+                return tree_gate_matches_shifted_required_masks(
+                    tier2_by_key,
+                    tier2_gates,
+                    tier2_superblocks,
+                );
+            }
             if !tree_gate_matches_shifted_required_masks(
                 tier1_by_key,
                 tier1_gates,
@@ -6701,6 +6951,8 @@ where
     FT2: FnMut() -> Result<Cow<'a, [u8]>>,
 {
     let allow_tier2 = !plan.force_tier1_only && plan.allow_tier2_fallback;
+    let tier2_only =
+        experiment_tier2_only_enabled() || experiment_tier2_and_metadata_only_enabled();
     for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
         let tier2_alternative = pattern
             .tier2_alternatives
@@ -6711,15 +6963,14 @@ where
             return Ok(MatchOutcome {
                 matched: true,
                 tiers: TierFlags {
-                    used_tier1: true,
+                    used_tier1: !tier2_only,
                     used_tier2: false,
                 },
-                score: 10_000,
             });
         }
         let doc = doc_inputs.doc;
         let mut used_tier1 = false;
-        if !alternative.is_empty() {
+        if !tier2_only && !alternative.is_empty() {
             let bloom_bytes = doc_inputs.tier1_bloom_bytes(load_tier1)?;
             let primary_match = pattern_masks.tier1.get(alt_index).is_some_and(|shifted| {
                 if !shifted.any_lane_grams.is_empty() {
@@ -6764,56 +7015,103 @@ where
             used_tier1 = true;
         }
         let mut used_tier2 = false;
-        if allow_tier2
-            && !tier2_alternative.is_empty()
-            && doc.tier2_filter_bytes > 0
-            && doc.tier2_bloom_hashes > 0
-        {
-            let tier2_bloom_bytes = doc_inputs.tier2_bloom_bytes(load_tier2)?;
-            if tier2_bloom_bytes.is_empty() {
-                continue;
-            }
-            let tier2_match = pattern_masks.tier2.get(alt_index).is_some_and(|shifted| {
-                if !shifted.any_lane_grams.is_empty() {
-                    shifted.any_lane_grams.iter().all(|value| {
-                        (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
-                            bloom_word_masks_in_lane(
-                                &[*value],
-                                doc.tier2_filter_bytes,
-                                doc.tier2_bloom_hashes,
-                                lane,
-                                DEFAULT_BLOOM_POSITION_LANES,
-                            )
-                            .ok()
-                            .is_some_and(|required| {
-                                raw_filter_matches_word_masks(tier2_bloom_bytes, &required)
+        if !tier2_alternative.is_empty() {
+            if tier2_only {
+                if doc.tier2_filter_bytes == 0 || doc.tier2_bloom_hashes == 0 {
+                    continue;
+                }
+                let tier2_bloom_bytes = doc_inputs.tier2_bloom_bytes(load_tier2)?;
+                if tier2_bloom_bytes.is_empty() {
+                    continue;
+                }
+                let tier2_match = pattern_masks.tier2.get(alt_index).is_some_and(|shifted| {
+                    if !shifted.any_lane_grams.is_empty() {
+                        shifted.any_lane_grams.iter().all(|value| {
+                            (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                                bloom_word_masks_in_lane(
+                                    &[*value],
+                                    doc.tier2_filter_bytes,
+                                    doc.tier2_bloom_hashes,
+                                    lane,
+                                    DEFAULT_BLOOM_POSITION_LANES,
+                                )
+                                .ok()
+                                .is_some_and(|required| {
+                                    raw_filter_matches_word_masks(tier2_bloom_bytes, &required)
+                                })
                             })
                         })
-                    })
-                } else if !shifted.any_lane_values.is_empty() {
-                    shifted.any_lane_values.iter().all(|lanes| {
-                        lanes.iter().any(|by_key| {
+                    } else if !shifted.any_lane_values.is_empty() {
+                        shifted.any_lane_values.iter().all(|lanes| {
+                            lanes.iter().any(|by_key| {
+                                by_key
+                                    .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
+                                    .is_some_and(|required| {
+                                        raw_filter_matches_word_masks(tier2_bloom_bytes, required)
+                                    })
+                            })
+                        })
+                    } else {
+                        shifted.shifts.iter().any(|by_key| {
                             by_key
                                 .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
                                 .is_some_and(|required| {
                                     raw_filter_matches_word_masks(tier2_bloom_bytes, required)
                                 })
                         })
-                    })
-                } else {
-                    shifted.shifts.iter().any(|by_key| {
-                        by_key
-                            .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
-                            .is_some_and(|required| {
-                                raw_filter_matches_word_masks(tier2_bloom_bytes, required)
-                            })
-                    })
+                    }
+                });
+                if !tier2_match {
+                    continue;
                 }
-            });
-            if !tier2_match {
-                continue;
+                used_tier2 = true;
+            } else if allow_tier2 && doc.tier2_filter_bytes > 0 && doc.tier2_bloom_hashes > 0 {
+                let tier2_bloom_bytes = doc_inputs.tier2_bloom_bytes(load_tier2)?;
+                if tier2_bloom_bytes.is_empty() {
+                    continue;
+                }
+                let tier2_match = pattern_masks.tier2.get(alt_index).is_some_and(|shifted| {
+                    if !shifted.any_lane_grams.is_empty() {
+                        shifted.any_lane_grams.iter().all(|value| {
+                            (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
+                                bloom_word_masks_in_lane(
+                                    &[*value],
+                                    doc.tier2_filter_bytes,
+                                    doc.tier2_bloom_hashes,
+                                    lane,
+                                    DEFAULT_BLOOM_POSITION_LANES,
+                                )
+                                .ok()
+                                .is_some_and(|required| {
+                                    raw_filter_matches_word_masks(tier2_bloom_bytes, &required)
+                                })
+                            })
+                        })
+                    } else if !shifted.any_lane_values.is_empty() {
+                        shifted.any_lane_values.iter().all(|lanes| {
+                            lanes.iter().any(|by_key| {
+                                by_key
+                                    .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
+                                    .is_some_and(|required| {
+                                        raw_filter_matches_word_masks(tier2_bloom_bytes, required)
+                                    })
+                            })
+                        })
+                    } else {
+                        shifted.shifts.iter().any(|by_key| {
+                            by_key
+                                .get(&(doc.tier2_filter_bytes, doc.tier2_bloom_hashes))
+                                .is_some_and(|required| {
+                                    raw_filter_matches_word_masks(tier2_bloom_bytes, required)
+                                })
+                        })
+                    }
+                });
+                if !tier2_match {
+                    continue;
+                }
+                used_tier2 = true;
             }
-            used_tier2 = true;
         }
         return Ok(MatchOutcome {
             matched: true,
@@ -6821,15 +7119,6 @@ where
                 used_tier1,
                 used_tier2,
             },
-            score: 1_000u32
-                .saturating_add((alternative.len() as u32).saturating_mul(16))
-                .saturating_add(
-                    tier2_alternative
-                        .len()
-                        .saturating_mul(8)
-                        .try_into()
-                        .unwrap_or(u32::MAX),
-                ),
         });
     }
     Ok(MatchOutcome::default())
@@ -6888,7 +7177,6 @@ where
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.sha256 == *expected,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "not" => {
@@ -6900,7 +7188,6 @@ where
                 return Ok(MatchOutcome {
                     matched: true,
                     tiers: TierFlags::default(),
-                    score: 0,
                 });
             }
             let outcome = evaluate_node(
@@ -6918,7 +7205,6 @@ where
             Ok(MatchOutcome {
                 matched: !outcome.matched,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "verifier_only_eq"
@@ -6928,7 +7214,6 @@ where
         | "verifier_only_loop" => Ok(MatchOutcome {
             matched: true,
             tiers: TierFlags::default(),
-            score: 0,
         }),
         "filesize_eq" => {
             let expected_size = node
@@ -6938,7 +7223,6 @@ where
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.file_size == expected_size,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "filesize_lt" => {
@@ -6949,7 +7233,6 @@ where
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.file_size < expected_size,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "filesize_le" => {
@@ -6960,7 +7243,6 @@ where
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.file_size <= expected_size,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "filesize_gt" => {
@@ -6971,7 +7253,6 @@ where
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.file_size > expected_size,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "filesize_ge" => {
@@ -6982,7 +7263,6 @@ where
             Ok(MatchOutcome {
                 matched: doc_inputs.doc.file_size >= expected_size,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "metadata_eq" => {
@@ -7000,7 +7280,6 @@ where
             Ok(MatchOutcome {
                 matched,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "time_now_eq" => {
@@ -7011,12 +7290,10 @@ where
             Ok(MatchOutcome {
                 matched: query_now_unix == expected,
                 tiers: TierFlags::default(),
-                score: 0,
             })
         }
         "and" => {
             let mut merged = TierFlags::default();
-            let mut score = 0u32;
             for child in &node.children {
                 let outcome = evaluate_node(
                     child,
@@ -7034,12 +7311,10 @@ where
                     return Ok(MatchOutcome::default());
                 }
                 merged.merge(outcome.tiers);
-                score = score.saturating_add(outcome.score);
             }
             Ok(MatchOutcome {
                 matched: true,
                 tiers: merged,
-                score,
             })
         }
         "or" => {
@@ -7068,7 +7343,6 @@ where
                 .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
             let mut matched_count = 0usize;
             let mut merged = TierFlags::default();
-            let mut score = 0u32;
             for child in &node.children {
                 let outcome = evaluate_node(
                     child,
@@ -7085,12 +7359,10 @@ where
                 if outcome.matched {
                     matched_count += 1;
                     merged.merge(outcome.tiers);
-                    score = score.saturating_add(outcome.score);
                     if matched_count >= threshold {
                         return Ok(MatchOutcome {
                             matched: true,
                             tiers: merged,
-                            score,
                         });
                     }
                 }
@@ -7102,7 +7374,6 @@ where
                 } else {
                     TierFlags::default()
                 },
-                score: if matched_count >= threshold { score } else { 0 },
             })
         }
         other => Err(SspryError::from(format!(
@@ -7115,9 +7386,10 @@ where
 mod tests {
     use tempfile::tempdir;
 
-    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::BloomFilter;
+    use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
     use crate::candidate::{
+        DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
         extract_compact_document_metadata,
         features::scan_file_features_bloom_only_with_gram_sizes,
         pack_exact_gram,
@@ -7125,13 +7397,50 @@ mod tests {
             compile_query_plan_with_gram_sizes,
             compile_query_plan_with_gram_sizes_and_identity_source,
         },
-        GramSizes, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE,
     };
 
     use super::*;
 
     fn borrowed_bytes<'a>(bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         Ok(Cow::Borrowed(bytes))
+    }
+
+    struct Tier2AndMetadataOnlyOverrideGuard {
+        previous: u8,
+    }
+
+    impl Drop for Tier2AndMetadataOnlyOverrideGuard {
+        fn drop(&mut self) {
+            EXPERIMENT_TIER2_AND_METADATA_ONLY_OVERRIDE.with(|value| value.set(self.previous));
+        }
+    }
+
+    fn tier2_and_metadata_only_override(enabled: bool) -> Tier2AndMetadataOnlyOverrideGuard {
+        let previous = EXPERIMENT_TIER2_AND_METADATA_ONLY_OVERRIDE.with(|value| {
+            let previous = value.get();
+            value.set(if enabled { 2 } else { 1 });
+            previous
+        });
+        Tier2AndMetadataOnlyOverrideGuard { previous }
+    }
+
+    struct NoSuperblockGateOverrideGuard {
+        previous: u8,
+    }
+
+    impl Drop for NoSuperblockGateOverrideGuard {
+        fn drop(&mut self) {
+            EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE.with(|value| value.set(self.previous));
+        }
+    }
+
+    fn no_superblock_gate_override(enabled: bool) -> NoSuperblockGateOverrideGuard {
+        let previous = EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE.with(|value| {
+            let previous = value.get();
+            value.set(if enabled { 2 } else { 1 });
+            previous
+        });
+        NoSuperblockGateOverrideGuard { previous }
     }
 
     fn lane_bloom_bytes(filter_bytes: usize, bloom_hashes: usize, grams: &[u64]) -> Vec<u8> {
@@ -7944,11 +8253,13 @@ rule q {
 
         let manifest = ShardCompactionManifest {
             current_generation: 7,
-            retired_roots: vec![retired_root
-                .file_name()
-                .expect("retired file name")
-                .to_string_lossy()
-                .into_owned()],
+            retired_roots: vec![
+                retired_root
+                    .file_name()
+                    .expect("retired file name")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
         };
         fs::create_dir_all(&retired_root).expect("create retired root");
         write_shard_compaction_manifest(&root, &manifest).expect("write manifest");
@@ -8053,10 +8364,12 @@ rule q {
         )
         .expect("insert third");
 
-        assert!(store
-            .apply_compaction_snapshot(&snapshot, &compacted_root)
-            .expect("apply compaction")
-            .is_none());
+        assert!(
+            store
+                .apply_compaction_snapshot(&snapshot, &compacted_root)
+                .expect("apply compaction")
+                .is_none()
+        );
         assert_eq!(store.stats().doc_count, 2);
         assert_eq!(store.stats().deleted_doc_count, 1);
         let _ = fs::remove_dir_all(compacted_root);
@@ -8084,10 +8397,12 @@ rule q {
         bloom.add(0x4443_4241).expect("add gram");
         let bloom_bytes = bloom.into_bytes();
 
-        assert!(store
-            .prepare_compaction_snapshot(false)
-            .expect("snapshot without deletes")
-            .is_none());
+        assert!(
+            store
+                .prepare_compaction_snapshot(false)
+                .expect("snapshot without deletes")
+                .is_none()
+        );
 
         insert_primary(
             &mut store,
@@ -8104,14 +8419,18 @@ rule q {
             .delete_document(&hex::encode([0x11; 32]))
             .expect("delete");
 
-        assert!(store
-            .prepare_compaction_snapshot(false)
-            .expect("cooldown snapshot")
-            .is_none());
-        assert!(store
-            .prepare_compaction_snapshot(true)
-            .expect("forced snapshot")
-            .is_some());
+        assert!(
+            store
+                .prepare_compaction_snapshot(false)
+                .expect("cooldown snapshot")
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_compaction_snapshot(true)
+                .expect("forced snapshot")
+                .is_some()
+        );
     }
 
     #[test]
@@ -8236,49 +8555,59 @@ rule q {
             true,
         )
         .expect("init");
-        assert!(CandidateStore::init(
-            CandidateConfig {
-                root: root.clone(),
-                ..CandidateConfig::default()
-            },
-            false
-        )
-        .expect_err("existing store")
-        .to_string()
-        .contains("already exists"));
+        assert!(
+            CandidateStore::init(
+                CandidateConfig {
+                    root: root.clone(),
+                    ..CandidateConfig::default()
+                },
+                false
+            )
+            .expect_err("existing store")
+            .to_string()
+            .contains("already exists")
+        );
 
-        assert!(validate_config(&CandidateConfig {
-            root: root.clone(),
-            id_source: "filepath".to_owned(),
-            ..CandidateConfig::default()
-        })
-        .expect_err("id source")
-        .to_string()
-        .contains("id_source"));
-        assert!(validate_config(&CandidateConfig {
-            root: root.clone(),
-            filter_target_fp: Some(1.0),
-            ..CandidateConfig::default()
-        })
-        .expect_err("target fp")
-        .to_string()
-        .contains("filter_target_fp"));
+        assert!(
+            validate_config(&CandidateConfig {
+                root: root.clone(),
+                id_source: "filepath".to_owned(),
+                ..CandidateConfig::default()
+            })
+            .expect_err("id source")
+            .to_string()
+            .contains("id_source")
+        );
+        assert!(
+            validate_config(&CandidateConfig {
+                root: root.clone(),
+                filter_target_fp: Some(1.0),
+                ..CandidateConfig::default()
+            })
+            .expect_err("target fp")
+            .to_string()
+            .contains("filter_target_fp")
+        );
         assert_eq!(
             normalize_sha256_hex(&format!("  {}  ", "AB".repeat(32))).expect("normalize"),
             "ab".repeat(32)
         );
-        assert!(normalize_sha256_hex("not-a-sha")
-            .expect_err("invalid sha")
-            .to_string()
-            .contains("64 hexadecimal"));
+        assert!(
+            normalize_sha256_hex("not-a-sha")
+                .expect_err("invalid sha")
+                .to_string()
+                .contains("64 hexadecimal")
+        );
 
         let open_root = tmp.path().join("open_checks");
         fs::create_dir_all(&open_root).expect("open root");
         fs::write(meta_path(&open_root), b"{").expect("bad meta");
-        assert!(CandidateStore::open(&open_root)
-            .expect_err("invalid meta")
-            .to_string()
-            .contains("Invalid candidate metadata"));
+        assert!(
+            CandidateStore::open(&open_root)
+                .expect_err("invalid meta")
+                .to_string()
+                .contains("Invalid candidate metadata")
+        );
 
         let bad_version = LegacyStoreMeta {
             version: STORE_VERSION + 1,
@@ -8289,10 +8618,12 @@ rule q {
             serde_json::to_vec_pretty(&bad_version).expect("version json"),
         )
         .expect("write version");
-        assert!(CandidateStore::open(&open_root)
-            .expect_err("unsupported version")
-            .to_string()
-            .contains("Unsupported candidate store version"));
+        assert!(
+            CandidateStore::open(&open_root)
+                .expect_err("unsupported version")
+                .to_string()
+                .contains("Unsupported candidate store version")
+        );
 
         fs::write(
             meta_path(&open_root),
@@ -8411,10 +8742,12 @@ rule q {
         )
         .expect("insert invalid len root");
         fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
-        assert!(load_candidate_binary_store(&invalid_len_root)
-            .expect_err("invalid binary len")
-            .to_string()
-            .contains("Invalid candidate binary document state"));
+        assert!(
+            load_candidate_binary_store(&invalid_len_root)
+                .expect_err("invalid binary len")
+                .to_string()
+                .contains("Invalid candidate binary document state")
+        );
 
         let mismatch_root = tmp.path().join("mismatch_root");
         let mut mismatch_store = CandidateStore::init(
@@ -8444,10 +8777,12 @@ rule q {
         )
         .expect("insert mismatch root");
         fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
-        assert!(load_candidate_binary_store(&mismatch_root)
-            .expect_err("mismatch state")
-            .to_string()
-            .contains("Mismatched candidate binary document state"));
+        assert!(
+            load_candidate_binary_store(&mismatch_root)
+                .expect_err("mismatch state")
+                .to_string()
+                .contains("Mismatched candidate binary document state")
+        );
 
         let invalid_bloom_root = tmp.path().join("invalid_bloom_root");
         let mut invalid_bloom_store = CandidateStore::init(
@@ -8486,10 +8821,12 @@ rule q {
             serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
-        assert!(CandidateStore::open(&invalid_bloom_root)
-            .expect_err("invalid bloom offset")
-            .to_string()
-            .contains("Invalid bloom payload stored"));
+        assert!(
+            CandidateStore::open(&invalid_bloom_root)
+                .expect_err("invalid bloom offset")
+                .to_string()
+                .contains("Invalid bloom payload stored")
+        );
 
         let invalid_utf8_root = tmp.path().join("invalid_utf8_root");
         let mut invalid_utf8_store = CandidateStore::init(
@@ -8524,12 +8861,14 @@ rule q {
             serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad utf8 meta"),
         )
         .expect("write bad utf8 meta");
-        assert!(CandidateStore::open(&invalid_utf8_root)
-            .expect("open utf8 root")
-            .doc_external_id(0)
-            .expect_err("invalid external id utf8")
-            .to_string()
-            .contains("Invalid external_id payload stored"));
+        assert!(
+            CandidateStore::open(&invalid_utf8_root)
+                .expect("open utf8 root")
+                .doc_external_id(0)
+                .expect_err("invalid external id utf8")
+                .to_string()
+                .contains("Invalid external_id payload stored")
+        );
     }
 
     #[test]
@@ -8555,10 +8894,12 @@ rule q {
         assert_eq!(decoded.bloom_len, row.bloom_len);
         assert_eq!(decoded.external_id_offset, row.external_id_offset);
         assert_eq!(decoded.external_id_len, row.external_id_len);
-        assert!(DocMetaRow::decode(&encoded[..encoded.len() - 1])
-            .expect_err("short row")
-            .to_string()
-            .contains("Invalid candidate doc meta row size"));
+        assert!(
+            DocMetaRow::decode(&encoded[..encoded.len() - 1])
+                .expect_err("short row")
+                .to_string()
+                .contains("Invalid candidate doc meta row size")
+        );
 
         let tmp = tempdir().expect("tmp");
         let blob_path = tmp.path().join("blob.bin");
@@ -8574,10 +8915,12 @@ rule q {
         write_at(blob_path.clone(), 1, b"Z").expect("write at");
         bytes = fs::read(&blob_path).expect("re-read blob file");
         assert_eq!(&bytes, b"aZcde");
-        assert!(read_blob(&bytes, 99, 1, "blob", 1)
-            .expect_err("invalid blob range")
-            .to_string()
-            .contains("Invalid blob payload stored"));
+        assert!(
+            read_blob(&bytes, 99, 1, "blob", 1)
+                .expect_err("invalid blob range")
+                .to_string()
+                .contains("Invalid blob payload stored")
+        );
 
         let u32_path = tmp.path().join("u32.bin");
         let offset = append_u32_slice(u32_path.clone(), &[7, 8, 9]).expect("append u32");
@@ -8586,10 +8929,12 @@ rule q {
             read_u32_vec(&u32_bytes, offset, 3, "grams", 9).expect("read u32 vec"),
             vec![7, 8, 9]
         );
-        assert!(read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
-            .expect_err("invalid u32 range")
-            .to_string()
-            .contains("Invalid grams payload stored"));
+        assert!(
+            read_u32_vec(&u32_bytes, 0, 99, "grams", 9)
+                .expect_err("invalid u32 range")
+                .to_string()
+                .contains("Invalid grams payload stored")
+        );
     }
 
     #[test]
@@ -8614,11 +8959,13 @@ rule q {
                 .as_ref(),
             b"bcd"
         );
-        assert!(sidecar
-            .read_bytes(99, 1, "blob", 7)
-            .expect_err("invalid range")
-            .to_string()
-            .contains("Invalid blob payload stored"));
+        assert!(
+            sidecar
+                .read_bytes(99, 1, "blob", 7)
+                .expect_err("invalid range")
+                .to_string()
+                .contains("Invalid blob payload stored")
+        );
         sidecar.invalidate();
         assert_eq!(
             sidecar
@@ -8728,28 +9075,32 @@ rule q {
         )
         .expect("init");
 
-        assert!(store
-            .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
-            .expect_err("zero filter bytes")
-            .to_string()
-            .contains("filter_bytes must be > 0"));
-        assert!(store
-            .insert_document(
-                [0x10; 32],
-                8,
-                None,
-                None,
-                None,
-                None,
-                1024,
-                &vec![0u8; 32],
-                0,
-                &[],
-                None,
-            )
-            .expect_err("length mismatch")
-            .to_string()
-            .contains("bloom_filter length"));
+        assert!(
+            store
+                .insert_document([0x10; 32], 8, None, None, None, None, 0, &[], 0, &[], None,)
+                .expect_err("zero filter bytes")
+                .to_string()
+                .contains("filter_bytes must be > 0")
+        );
+        assert!(
+            store
+                .insert_document(
+                    [0x10; 32],
+                    8,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1024,
+                    &vec![0u8; 32],
+                    0,
+                    &[],
+                    None,
+                )
+                .expect_err("length mismatch")
+                .to_string()
+                .contains("bloom_filter length")
+        );
 
         let inserted = insert_primary(
             &mut store,
@@ -9013,7 +9364,6 @@ rule q {
         .expect("empty pattern");
         assert!(outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "tier1");
-        assert!(outcome.score > 0);
 
         let no_fallback_plan = CompiledQueryPlan {
             force_tier1_only: false,
@@ -9034,7 +9384,6 @@ rule q {
         .expect("no match");
         assert!(!outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "none");
-        assert_eq!(outcome.score, 0);
 
         let allow_fallback_plan = CompiledQueryPlan {
             force_tier1_only: false,
@@ -9054,7 +9403,6 @@ rule q {
         .expect("complete doc should match via bloom path");
         assert!(outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "tier1");
-        assert!(outcome.score > 0);
 
         let no_overlap_doc = doc.clone();
         let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
@@ -9070,7 +9418,6 @@ rule q {
         .expect("bloom-only path should match from bloom anchors");
         assert!(outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "tier1");
-        assert!(outcome.score > 0);
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
@@ -9107,7 +9454,6 @@ rule q {
         .expect("and");
         assert!(!outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "none");
-        assert_eq!(outcome.score, 0);
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
@@ -9144,7 +9490,6 @@ rule q {
         .expect("or");
         assert!(outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "tier1");
-        assert!(outcome.score > 0);
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
@@ -9181,56 +9526,59 @@ rule q {
         .expect("n_of");
         assert!(outcome.matched);
         assert_eq!(outcome.tiers.as_label(), "tier1");
-        assert!(outcome.score > 0);
 
-        assert!({
-            let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
-                prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-            evaluate_node(
-                &QueryNode {
-                    kind: "n_of".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &mut doc_inputs,
-                &mut load_metadata,
-                &mut load_tier1,
-                &mut load_tier2,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                0,
-                &mut QueryEvalCache::default(),
-            )
-        }
-        .expect_err("missing threshold")
-        .to_string()
-        .contains("requires threshold"));
-        assert!({
-            let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
-                prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-            evaluate_node(
-                &QueryNode {
-                    kind: "bogus".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &mut doc_inputs,
-                &mut load_metadata,
-                &mut load_tier1,
-                &mut load_tier2,
-                &patterns,
-                &mask_cache,
-                &eval_plan,
-                0,
-                &mut QueryEvalCache::default(),
-            )
-        }
-        .expect_err("unsupported kind")
-        .to_string()
-        .contains("Unsupported ast node kind"));
+        assert!(
+            {
+                let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+                    prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
+                evaluate_node(
+                    &QueryNode {
+                        kind: "n_of".to_owned(),
+                        pattern_id: None,
+                        threshold: None,
+                        children: Vec::new(),
+                    },
+                    &mut doc_inputs,
+                    &mut load_metadata,
+                    &mut load_tier1,
+                    &mut load_tier2,
+                    &patterns,
+                    &mask_cache,
+                    &eval_plan,
+                    0,
+                    &mut QueryEvalCache::default(),
+                )
+            }
+            .expect_err("missing threshold")
+            .to_string()
+            .contains("requires threshold")
+        );
+        assert!(
+            {
+                let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+                    prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
+                evaluate_node(
+                    &QueryNode {
+                        kind: "bogus".to_owned(),
+                        pattern_id: None,
+                        threshold: None,
+                        children: Vec::new(),
+                    },
+                    &mut doc_inputs,
+                    &mut load_metadata,
+                    &mut load_tier1,
+                    &mut load_tier2,
+                    &patterns,
+                    &mask_cache,
+                    &eval_plan,
+                    0,
+                    &mut QueryEvalCache::default(),
+                )
+            }
+            .expect_err("unsupported kind")
+            .to_string()
+            .contains("Unsupported ast node kind")
+        );
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
@@ -9692,6 +10040,179 @@ rule q {
         assert_eq!(result.query_profile.docs_scanned, 1);
         assert_eq!(result.query_profile.tier1_bloom_loads, 1);
         assert_eq!(result.query_profile.superblocks_skipped, 0);
+    }
+
+    #[test]
+    fn query_candidates_tier2_and_metadata_only_scans_docs_without_tier1_loads() {
+        let _guard = tier2_and_metadata_only_override(true);
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root,
+                filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let gram = pack_exact_gram(&[1, 2, 3, 4]);
+        for idx in 0..2u8 {
+            let sha256 = [idx + 1; 32];
+            let filter_bytes = store
+                .resolve_filter_bytes_for_file_size(123, None)
+                .expect("filter bytes");
+            let tier2_filter_bytes = filter_bytes;
+            let tier2_bloom_hashes =
+                store.resolve_bloom_hashes_for_document(tier2_filter_bytes, None, None);
+            let tier2_bloom_bytes = if idx == 0 {
+                lane_bloom_bytes(tier2_filter_bytes, tier2_bloom_hashes, &[gram])
+            } else {
+                vec![0u8; tier2_filter_bytes]
+            };
+            store
+                .insert_document_with_metadata(
+                    sha256,
+                    123,
+                    None,
+                    None,
+                    None,
+                    None,
+                    filter_bytes,
+                    &vec![0u8; filter_bytes],
+                    tier2_filter_bytes,
+                    &tier2_bloom_bytes,
+                    &[],
+                    false,
+                    None,
+                )
+                .expect("insert doc");
+        }
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "tier1".to_owned(),
+                alternatives: vec![Vec::new()],
+                tier2_alternatives: vec![vec![gram]],
+                anchor_literals: vec![vec![1, 2, 3, 4]],
+                fixed_literals: vec![vec![1, 2, 3, 4]],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("tier1".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+
+        let result = store.query_candidates(&plan, 0, 8).expect("query");
+        assert_eq!(result.total_candidates, 1);
+        assert_eq!(result.returned_count, 1);
+        assert_eq!(result.query_profile.docs_scanned, 2);
+        assert_eq!(result.query_profile.tree_gate_passed, 1);
+        assert_eq!(result.query_profile.tier1_bloom_loads, 0);
+        assert_eq!(result.query_profile.tier2_bloom_loads, 2);
+        assert_eq!(result.query_profile.superblocks_skipped, 0);
+        assert_eq!(result.tier_used, "tier2");
+    }
+
+    #[test]
+    fn query_candidates_without_superblock_gate_still_uses_tier1_and_tier2_doc_blooms() {
+        let _guard = no_superblock_gate_override(true);
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root,
+                filter_target_fp: None,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let gram = pack_exact_gram(&[1, 2, 3, 4]);
+        for idx in 0..2u8 {
+            let sha256 = [idx + 1; 32];
+            let filter_bytes = store
+                .resolve_filter_bytes_for_file_size(123, None)
+                .expect("filter bytes");
+            let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, None, None);
+            let tier2_filter_bytes = filter_bytes;
+            let tier2_bloom_hashes =
+                store.resolve_bloom_hashes_for_document(tier2_filter_bytes, None, None);
+            let bloom_bytes = if idx == 0 {
+                lane_bloom_bytes(filter_bytes, bloom_hashes, &[gram])
+            } else {
+                vec![0u8; filter_bytes]
+            };
+            let tier2_bloom_bytes = if idx == 0 {
+                lane_bloom_bytes(tier2_filter_bytes, tier2_bloom_hashes, &[gram])
+            } else {
+                vec![0u8; tier2_filter_bytes]
+            };
+            store
+                .insert_document_with_metadata(
+                    sha256,
+                    123,
+                    None,
+                    None,
+                    None,
+                    None,
+                    filter_bytes,
+                    &bloom_bytes,
+                    tier2_filter_bytes,
+                    &tier2_bloom_bytes,
+                    &[],
+                    false,
+                    None,
+                )
+                .expect("insert doc");
+        }
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "both".to_owned(),
+                alternatives: vec![vec![gram]],
+                tier2_alternatives: vec![vec![gram]],
+                anchor_literals: vec![vec![1, 2, 3, 4]],
+                fixed_literals: vec![vec![1, 2, 3, 4]],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("both".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: false,
+            allow_tier2_fallback: true,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+
+        let result = store.query_candidates(&plan, 0, 8).expect("query");
+        assert_eq!(result.total_candidates, 1);
+        assert_eq!(result.returned_count, 1);
+        assert_eq!(result.query_profile.docs_scanned, 2);
+        assert_eq!(result.query_profile.tree_gate_passed, 1);
+        assert_eq!(result.query_profile.superblocks_skipped, 0);
+        assert_eq!(result.query_profile.tier1_superblock_loads, 0);
+        assert_eq!(result.query_profile.tier1_bloom_loads, 2);
+        assert_eq!(result.query_profile.tier2_bloom_loads, 1);
+        assert_eq!(result.tier_used, "tier1+tier2");
     }
 
     #[test]

@@ -1421,6 +1421,7 @@ dependencies = [
  "hyperloglockless",
  "md-5",
  "memmap2",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "sha1",

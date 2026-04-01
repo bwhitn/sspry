@@ -71,7 +71,7 @@ If `cargo-llvm-cov` is installed:
 
 - The workspace layout is `current/`, `work_a/`, `work_b/`, and `retired/`.
 - The default ingest/search path is bloom-only; the retired exact-gram / DF path has been removed from the normal runtime.
-- Search can return candidate digests directly or optionally verify matches locally with `yara-x` when stored paths are available.
+- Search returns candidate digests as an unordered candidate set and can optionally verify matches locally with `yara-x` when stored paths are available.
 - `search --root <forest_root>` is the direct forest path for tree-level threaded search experiments and one-off local queries.
 - For large repeated tuning sweeps, use `search-batch` or a persistent server path.
 - A bare `search --root` per rule is intentionally still a one-shot path and will reopen the forest each time.

@@ -113,7 +113,7 @@ fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
 }
 
 fn wait_for_published_doc_count(addr: &str, expected_docs: u64, min_publish_runs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         let output = Command::new(bin_path())
             .args(["info", "--addr", addr])

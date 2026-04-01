@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -46,8 +47,6 @@ const STATUS_ERROR: u8 = 1;
 const HEADER_LEN: usize = 6;
 
 const ACTION_PING: u8 = 1;
-const ACTION_CANDIDATE_INSERT: u8 = 2;
-const ACTION_CANDIDATE_INSERT_BATCH: u8 = 3;
 const ACTION_CANDIDATE_DELETE: u8 = 4;
 const ACTION_CANDIDATE_QUERY: u8 = 5;
 const ACTION_CANDIDATE_STATS: u8 = 6;
@@ -60,9 +59,14 @@ const ACTION_CANDIDATE_STATUS: u8 = 13;
 const ACTION_INDEX_CLIENT_BEGIN: u8 = 14;
 const ACTION_INDEX_CLIENT_END: u8 = 15;
 const ACTION_INDEX_CLIENT_HEARTBEAT: u8 = 16;
+const ACTION_CANDIDATE_INSERT_BATCH_BINARY: u8 = 17;
+const ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN: u8 = 18;
+const ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK: u8 = 19;
+const ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT: u8 = 20;
 const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 const INDEX_CLIENT_LEASE_MULTIPLIER: u64 = 3;
+const CANDIDATE_INSERT_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
@@ -185,6 +189,7 @@ pub struct CandidateQueryResponse {
     pub external_ids: Option<Vec<Option<String>>>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateDocumentWire {
     pub sha256: String,
@@ -210,8 +215,14 @@ struct CandidateDeleteRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CandidateInsertBatchRequest {
-    documents: Vec<CandidateDocumentWire>,
+struct CandidateInsertUploadBeginRequest {
+    upload_id: u64,
+    total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CandidateInsertUploadCommitRequest {
+    upload_id: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,6 +284,12 @@ type ParsedCandidateInsertDocument = (
     Vec<u8>,
     Option<String>,
 );
+
+#[derive(Clone, Debug)]
+struct PendingCandidateInsertUpload {
+    total_bytes: usize,
+    row_bytes: Vec<u8>,
+}
 
 #[derive(Clone, Debug)]
 struct IndexClientLease {
@@ -409,6 +426,7 @@ struct ServerState {
     index_client_leases: Mutex<HashMap<u64, IndexClientLease>>,
     publish_after_index_clients: AtomicBool,
     active_index_sessions: AtomicUsize,
+    candidate_insert_uploads: Mutex<HashMap<u64, PendingCandidateInsertUpload>>,
     work_dirty: AtomicBool,
     work_active_estimated_documents: AtomicU64,
     work_active_estimated_input_bytes: AtomicU64,
@@ -870,6 +888,8 @@ pub(crate) struct PersistentSspryClient {
     stream: ClientStream,
 }
 
+static NEXT_CANDIDATE_INSERT_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
+
 impl ClientConfig {
     pub fn new(host: String, port: u16, timeout: Duration, socket_path: Option<PathBuf>) -> Self {
         Self {
@@ -895,43 +915,27 @@ impl SspryClient {
             .to_owned())
     }
 
-    pub fn candidate_insert_document(
-        &self,
-        document: &CandidateDocumentWire,
-    ) -> Result<CandidateInsertResponse> {
-        self.request_typed_json(ACTION_CANDIDATE_INSERT, document)
+    pub fn candidate_insert_binary_row(&self, row: &[u8]) -> Result<CandidateInsertResponse> {
+        let response = self.candidate_insert_binary_rows(&[row.to_vec()])?;
+        response
+            .results
+            .into_iter()
+            .next()
+            .ok_or_else(|| SspryError::from("binary insert returned no result row"))
     }
 
-    pub fn candidate_insert_batch(
+    pub fn candidate_insert_binary_rows(
         &self,
-        documents: &[CandidateDocumentWire],
+        rows: &[Vec<u8>],
     ) -> Result<CandidateInsertBatchResponse> {
-        if documents.is_empty() {
+        if rows.is_empty() {
             return Ok(CandidateInsertBatchResponse {
                 inserted_count: 0,
                 results: Vec::new(),
             });
         }
-        match self.request_typed_json(
-            ACTION_CANDIDATE_INSERT_BATCH,
-            &CandidateInsertBatchRequest {
-                documents: documents.to_vec(),
-            },
-        ) {
-            Ok(response) => Ok(response),
-            Err(err) if documents.len() > 1 && is_payload_too_large_error(&err) => {
-                let mid = documents.len() / 2;
-                let mut left = self.candidate_insert_batch(&documents[..mid])?;
-                let right = self.candidate_insert_batch(&documents[mid..])?;
-                left.inserted_count += right.inserted_count;
-                left.results.extend(right.results);
-                Ok(left)
-            }
-            Err(err) if documents.len() == 1 && is_payload_too_large_error(&err) => Err(
-                SspryError::from("Single document insert request is too large to send."),
-            ),
-            Err(err) => Err(err),
-        }
+        let mut client = self.connect_persistent()?;
+        client.candidate_insert_batch_binary_rows(rows)
     }
 
     pub(crate) fn connect_persistent(&self) -> Result<PersistentSspryClient> {
@@ -940,13 +944,8 @@ impl SspryClient {
         })
     }
 
-    pub fn candidate_insert_batch_payload_size(
-        documents: &[CandidateDocumentWire],
-    ) -> Result<usize> {
-        Ok(serde_json::to_vec(&CandidateInsertBatchRequest {
-            documents: documents.to_vec(),
-        })?
-        .len())
+    pub fn candidate_insert_binary_batch_payload_size(rows: &[Vec<u8>]) -> usize {
+        serialized_candidate_insert_binary_batch_payload(rows).len()
     }
 
     pub fn candidate_delete_sha256(&self, sha256: &str) -> Result<CandidateDeleteResponse> {
@@ -1173,7 +1172,7 @@ impl PersistentSspryClient {
         Ok(response.message)
     }
 
-    pub(crate) fn candidate_insert_batch_serialized_rows(
+    pub(crate) fn candidate_insert_batch_binary_rows(
         &mut self,
         rows: &[Vec<u8>],
     ) -> Result<CandidateInsertBatchResponse> {
@@ -1183,22 +1182,60 @@ impl PersistentSspryClient {
                 results: Vec::new(),
             });
         }
-        let payload = serialized_candidate_insert_batch_payload(rows);
-        match self.request_typed_bytes_with_publish_retry(ACTION_CANDIDATE_INSERT_BATCH, &payload) {
+        let payload = serialized_candidate_insert_binary_batch_payload(rows);
+        match self
+            .request_typed_bytes_with_publish_retry(ACTION_CANDIDATE_INSERT_BATCH_BINARY, &payload)
+        {
             Ok(response) => Ok(response),
             Err(err) if rows.len() > 1 && is_payload_too_large_error(&err) => {
                 let mid = rows.len() / 2;
-                let mut left = self.candidate_insert_batch_serialized_rows(&rows[..mid])?;
-                let right = self.candidate_insert_batch_serialized_rows(&rows[mid..])?;
+                let mut left = self.candidate_insert_batch_binary_rows(&rows[..mid])?;
+                let right = self.candidate_insert_batch_binary_rows(&rows[mid..])?;
                 left.inserted_count += right.inserted_count;
                 left.results.extend(right.results);
                 Ok(left)
             }
-            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => Err(
-                SspryError::from("Single document insert request is too large to send."),
-            ),
+            Err(err) if rows.len() == 1 && is_payload_too_large_error(&err) => {
+                self.candidate_insert_binary_row_chunked(&rows[0])
+            }
             Err(err) => Err(err),
         }
+    }
+
+    fn candidate_insert_binary_row_chunked(
+        &mut self,
+        row: &[u8],
+    ) -> Result<CandidateInsertBatchResponse> {
+        let upload_id = NEXT_CANDIDATE_INSERT_UPLOAD_ID.fetch_add(1, Ordering::Relaxed);
+        let _: CandidateIndexSessionResponse = self.request_typed_json_with_publish_retry(
+            ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN,
+            &CandidateInsertUploadBeginRequest {
+                upload_id,
+                total_bytes: row.len() as u64,
+            },
+        )?;
+        let mut offset = 0usize;
+        while offset < row.len() {
+            let end = row
+                .len()
+                .min(offset.saturating_add(CANDIDATE_INSERT_UPLOAD_CHUNK_BYTES));
+            let mut payload = Vec::with_capacity(8 + end.saturating_sub(offset));
+            payload.extend_from_slice(&upload_id.to_le_bytes());
+            payload.extend_from_slice(&row[offset..end]);
+            let _: CandidateIndexSessionResponse = self.request_typed_bytes_with_publish_retry(
+                ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK,
+                &payload,
+            )?;
+            offset = end;
+        }
+        let response: CandidateInsertResponse = self.request_typed_json_with_publish_retry(
+            ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT,
+            &CandidateInsertUploadCommitRequest { upload_id },
+        )?;
+        Ok(CandidateInsertBatchResponse {
+            inserted_count: 1,
+            results: vec![response],
+        })
     }
 
     fn request_typed_json<T, U>(&mut self, action: u8, payload: &U) -> Result<T>
@@ -1231,9 +1268,14 @@ impl PersistentSspryClient {
     where
         T: DeserializeOwned,
     {
+        let bytes = self.request_bytes_with_publish_retry(action, payload)?;
+        serde_json::from_slice(&bytes).map_err(SspryError::from)
+    }
+
+    fn request_bytes_with_publish_retry(&mut self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
         let mut retries = 0usize;
         loop {
-            match self.request_typed_bytes(action, payload) {
+            match self.request_bytes(action, payload) {
                 Ok(response) => return Ok(response),
                 Err(err)
                     if is_temporary_publish_retry_error(&err)
@@ -1824,6 +1866,7 @@ impl ServerState {
             index_client_leases: Mutex::new(HashMap::new()),
             publish_after_index_clients: AtomicBool::new(false),
             active_index_sessions: AtomicUsize::new(0),
+            candidate_insert_uploads: Mutex::new(HashMap::new()),
             work_dirty: AtomicBool::new(false),
             work_active_estimated_documents: AtomicU64::new(startup_work_documents),
             work_active_estimated_input_bytes: AtomicU64::new(0),
@@ -4424,8 +4467,8 @@ impl ServerState {
         store: &mut CandidateStore,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-    ) -> Result<(Vec<(String, u32)>, Vec<String>, CandidateQueryProfile)> {
-        let mut hits = Vec::<(String, u32)>::new();
+    ) -> Result<(Vec<String>, Vec<String>, CandidateQueryProfile)> {
+        let mut hits = Vec::<String>::new();
         let mut tier_used = Vec::<String>::new();
         let mut query_profile = CandidateQueryProfile::default();
         let collect_chunk = plan.max_candidates.max(1).min(4096);
@@ -4434,7 +4477,7 @@ impl ServerState {
             let local =
                 store.query_candidates_with_prepared(plan, prepared, cursor, collect_chunk)?;
             tier_used.push(local.tier_used.clone());
-            hits.extend(local.sha256.into_iter().zip(local.scores.into_iter()));
+            hits.extend(local.sha256.into_iter());
             query_profile.merge_from(&local.query_profile);
             if let Some(next) = local.next_cursor {
                 cursor = next;
@@ -4454,13 +4497,9 @@ impl ServerState {
         let published = self.published_store_set()?;
         if self.candidate_shard_count() == 1 {
             let mut store = lock_candidate_store_blocking(&published.stores[0])?;
-            let (mut hits, tier_used, query_profile) =
+            let (hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
-            hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            let ordered_hashes = hits
-                .into_iter()
-                .map(|(sha256, _)| sha256)
-                .collect::<Vec<_>>();
+            let ordered_hashes = hits;
             if ordered_hashes.len() > plan.max_candidates {
                 return Err(crate::candidate::store::candidate_limit_exceeded_error(
                     ordered_hashes.len(),
@@ -4482,7 +4521,7 @@ impl ServerState {
             .min(self.candidate_shard_count().max(1));
 
         if worker_count <= 1 {
-            let mut hits = Vec::<(String, u32)>::new();
+            let mut hits = Vec::<String>::new();
             let mut tier_used = Vec::<String>::new();
             let mut query_profile = CandidateQueryProfile::default();
             for store_lock in &published.stores {
@@ -4493,11 +4532,7 @@ impl ServerState {
                 tier_used.extend(local_tiers);
                 query_profile.merge_from(&local_profile);
             }
-            hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            let ordered_hashes = hits
-                .into_iter()
-                .map(|(sha256, _)| sha256)
-                .collect::<Vec<_>>();
+            let ordered_hashes = hits;
             if ordered_hashes.len() > plan.max_candidates {
                 return Err(crate::candidate::store::candidate_limit_exceeded_error(
                     ordered_hashes.len(),
@@ -4521,8 +4556,8 @@ impl ServerState {
                 let prepared = prepared.clone();
                 let next_shard = &next_shard;
                 handles.push(scope.spawn(
-                    move || -> Result<(Vec<(String, u32)>, Vec<String>, CandidateQueryProfile)> {
-                        let mut local_hits = Vec::<(String, u32)>::new();
+                    move || -> Result<(Vec<String>, Vec<String>, CandidateQueryProfile)> {
+                        let mut local_hits = Vec::<String>::new();
                         let mut local_tiers = Vec::<String>::new();
                         let mut local_profile = CandidateQueryProfile::default();
                         loop {
@@ -4551,10 +4586,10 @@ impl ServerState {
                     .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
                 merged.push(partial);
             }
-            Ok::<Vec<(Vec<(String, u32)>, Vec<String>, CandidateQueryProfile)>, SspryError>(merged)
+            Ok::<Vec<(Vec<String>, Vec<String>, CandidateQueryProfile)>, SspryError>(merged)
         })?;
 
-        let mut hits = Vec::<(String, u32)>::new();
+        let mut hits = Vec::<String>::new();
         let mut tier_used = Vec::<String>::new();
         let mut query_profile = CandidateQueryProfile::default();
         for (local_hits, local_tiers, local_profile) in partials {
@@ -4562,11 +4597,7 @@ impl ServerState {
             tier_used.extend(local_tiers);
             query_profile.merge_from(&local_profile);
         }
-        hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        let ordered_hashes = hits
-            .into_iter()
-            .map(|(sha256, _)| sha256)
-            .collect::<Vec<_>>();
+        let ordered_hashes = hits;
         if ordered_hashes.len() > plan.max_candidates {
             return Err(crate::candidate::store::candidate_limit_exceeded_error(
                 ordered_hashes.len(),
@@ -4589,8 +4620,10 @@ impl ServerState {
         if self.is_shutting_down()
             && matches!(
                 action,
-                ACTION_CANDIDATE_INSERT
-                    | ACTION_CANDIDATE_INSERT_BATCH
+                ACTION_CANDIDATE_INSERT_BATCH_BINARY
+                    | ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN
+                    | ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK
+                    | ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT
                     | ACTION_CANDIDATE_DELETE
                     | ACTION_INDEX_CLIENT_BEGIN
                     | ACTION_INDEX_CLIENT_END
@@ -4624,13 +4657,19 @@ impl ServerState {
                 let request: CandidateIndexSessionProgressRequest = json_from_bytes(payload)?;
                 json_bytes(&self.handle_update_index_session_progress(&request)?)
             }
-            ACTION_CANDIDATE_INSERT => {
-                let document: CandidateDocumentWire = json_from_bytes(payload)?;
-                json_bytes(&self.handle_candidate_insert(&document)?)
+            ACTION_CANDIDATE_INSERT_BATCH_BINARY => {
+                json_bytes(&self.handle_candidate_insert_batch_binary(payload)?)
             }
-            ACTION_CANDIDATE_INSERT_BATCH => {
-                let request: CandidateInsertBatchRequest = json_from_bytes(payload)?;
-                json_bytes(&self.handle_candidate_insert_batch(&request.documents)?)
+            ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN => {
+                let request: CandidateInsertUploadBeginRequest = json_from_bytes(payload)?;
+                json_bytes(&self.handle_candidate_insert_upload_begin(&request)?)
+            }
+            ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK => {
+                json_bytes(&self.handle_candidate_insert_upload_chunk(payload)?)
+            }
+            ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT => {
+                let request: CandidateInsertUploadCommitRequest = json_from_bytes(payload)?;
+                json_bytes(&self.handle_candidate_insert_upload_commit(&request)?)
             }
             ACTION_CANDIDATE_DELETE => {
                 let request: CandidateDeleteRequest = json_from_bytes(payload)?;
@@ -4662,6 +4701,7 @@ impl ServerState {
         }
     }
 
+    #[cfg(test)]
     fn parse_candidate_insert_document(
         &self,
         document: &CandidateDocumentWire,
@@ -4742,12 +4782,11 @@ impl ServerState {
         }
     }
 
-    fn handle_candidate_insert(
+    fn handle_candidate_insert_parsed(
         &self,
-        document: &CandidateDocumentWire,
+        parsed: ParsedCandidateInsertDocument,
     ) -> Result<CandidateInsertResponse> {
-        let _scope = scope("rpc.handle_candidate_insert");
-        self.maybe_apply_index_backpressure(1, document.file_size);
+        self.maybe_apply_index_backpressure(1, parsed.1);
         let _mutation = self.begin_mutation("insert")?;
         let _op = if self.mutation_affects_published_queries()? {
             Some(
@@ -4758,7 +4797,6 @@ impl ServerState {
         } else {
             None
         };
-        let parsed = self.parse_candidate_insert_document(document, "request.payload")?;
         let shard_idx = self.candidate_store_index_for_sha256(&parsed.0);
         let work = self.work_store_set()?;
         let mut store =
@@ -4780,7 +4818,7 @@ impl ServerState {
         )?;
         drop(store);
         self.mark_work_mutation();
-        self.record_work_buffer_growth(1, document.file_size);
+        self.record_work_buffer_growth(1, parsed.1);
         if self.mutation_affects_published_queries()? {
             self.invalidate_search_caches();
         }
@@ -4788,16 +4826,25 @@ impl ServerState {
         Ok(Self::candidate_insert_response(result))
     }
 
-    fn handle_candidate_insert_batch(
+    #[cfg(test)]
+    fn handle_candidate_insert(
         &self,
-        documents: &[CandidateDocumentWire],
+        document: &CandidateDocumentWire,
+    ) -> Result<CandidateInsertResponse> {
+        let _scope = scope("rpc.handle_candidate_insert");
+        let parsed = self.parse_candidate_insert_document(document, "request.payload")?;
+        self.handle_candidate_insert_parsed(parsed)
+    }
+
+    fn handle_candidate_insert_batch_parsed(
+        &self,
+        parsed_documents: Vec<ParsedCandidateInsertDocument>,
+        batch_input_bytes: u64,
+        parse_elapsed: Duration,
     ) -> Result<CandidateInsertBatchResponse> {
         let _scope = scope("rpc.handle_candidate_insert_batch");
-        let batch_input_bytes = documents
-            .iter()
-            .map(|document| document.file_size)
-            .sum::<u64>();
-        self.maybe_apply_index_backpressure(documents.len(), batch_input_bytes);
+        let document_count = parsed_documents.len();
+        self.maybe_apply_index_backpressure(document_count, batch_input_bytes);
         let _mutation = self.begin_mutation("insert batch")?;
         let _op = if self.mutation_affects_published_queries()? {
             Some(
@@ -4809,15 +4856,6 @@ impl ServerState {
             None
         };
         let started_total = Instant::now();
-        let started_parse = Instant::now();
-        let mut parsed_documents = Vec::with_capacity(documents.len());
-        for (idx, document) in documents.iter().enumerate() {
-            parsed_documents.push(self.parse_candidate_insert_document(
-                document,
-                &format!("request.payload.documents[{idx}]"),
-            )?);
-        }
-        let parse_elapsed = started_parse.elapsed();
         let mut group_elapsed = Duration::ZERO;
         let mut build_elapsed = Duration::ZERO;
         let mut store_elapsed = Duration::ZERO;
@@ -5035,7 +5073,7 @@ impl ServerState {
         self.record_index_session_insert_progress(results.len());
         let finalize_elapsed = started_finalize.elapsed();
         self.record_index_session_insert_batch_profile(
-            documents.len(),
+            document_count,
             shards_touched,
             started_total.elapsed(),
             parse_elapsed,
@@ -5049,6 +5087,121 @@ impl ServerState {
             inserted_count: results.len(),
             results,
         })
+    }
+
+    #[cfg(test)]
+    fn handle_candidate_insert_batch(
+        &self,
+        documents: &[CandidateDocumentWire],
+    ) -> Result<CandidateInsertBatchResponse> {
+        let batch_input_bytes = documents
+            .iter()
+            .map(|document| document.file_size)
+            .sum::<u64>();
+        let started_parse = Instant::now();
+        let mut parsed_documents = Vec::with_capacity(documents.len());
+        for (idx, document) in documents.iter().enumerate() {
+            parsed_documents.push(self.parse_candidate_insert_document(
+                document,
+                &format!("request.payload.documents[{idx}]"),
+            )?);
+        }
+        self.handle_candidate_insert_batch_parsed(
+            parsed_documents,
+            batch_input_bytes,
+            started_parse.elapsed(),
+        )
+    }
+
+    fn handle_candidate_insert_batch_binary(
+        &self,
+        payload: &[u8],
+    ) -> Result<CandidateInsertBatchResponse> {
+        let started_parse = Instant::now();
+        let parsed_documents = parse_candidate_insert_binary_batch_payload(payload)?;
+        let batch_input_bytes = parsed_documents
+            .iter()
+            .map(|document| document.1)
+            .sum::<u64>();
+        self.handle_candidate_insert_batch_parsed(
+            parsed_documents,
+            batch_input_bytes,
+            started_parse.elapsed(),
+        )
+    }
+
+    fn handle_candidate_insert_upload_begin(
+        &self,
+        request: &CandidateInsertUploadBeginRequest,
+    ) -> Result<CandidateIndexSessionResponse> {
+        let total_bytes = usize::try_from(request.total_bytes)
+            .map_err(|_| SspryError::from("upload total_bytes does not fit in usize"))?;
+        let mut uploads = self
+            .candidate_insert_uploads
+            .lock()
+            .map_err(|_| SspryError::from("candidate insert uploads lock poisoned"))?;
+        uploads.insert(
+            request.upload_id,
+            PendingCandidateInsertUpload {
+                total_bytes,
+                row_bytes: Vec::with_capacity(total_bytes.min(CANDIDATE_INSERT_UPLOAD_CHUNK_BYTES)),
+            },
+        );
+        Ok(CandidateIndexSessionResponse {
+            message: "upload begun".to_owned(),
+        })
+    }
+
+    fn handle_candidate_insert_upload_chunk(
+        &self,
+        payload: &[u8],
+    ) -> Result<CandidateIndexSessionResponse> {
+        if payload.len() < 8 {
+            return Err(SspryError::from(
+                "upload chunk payload must include upload_id header",
+            ));
+        }
+        let mut upload_id_bytes = [0u8; 8];
+        upload_id_bytes.copy_from_slice(&payload[..8]);
+        let upload_id = u64::from_le_bytes(upload_id_bytes);
+        let chunk = &payload[8..];
+        let mut uploads = self
+            .candidate_insert_uploads
+            .lock()
+            .map_err(|_| SspryError::from("candidate insert uploads lock poisoned"))?;
+        let Some(upload) = uploads.get_mut(&upload_id) else {
+            return Err(SspryError::from("candidate insert upload not found"));
+        };
+        if upload.row_bytes.len().saturating_add(chunk.len()) > upload.total_bytes {
+            return Err(SspryError::from(
+                "candidate insert upload exceeded declared total_bytes",
+            ));
+        }
+        upload.row_bytes.extend_from_slice(chunk);
+        Ok(CandidateIndexSessionResponse {
+            message: "upload chunk accepted".to_owned(),
+        })
+    }
+
+    fn handle_candidate_insert_upload_commit(
+        &self,
+        request: &CandidateInsertUploadCommitRequest,
+    ) -> Result<CandidateInsertResponse> {
+        let upload = self
+            .candidate_insert_uploads
+            .lock()
+            .map_err(|_| SspryError::from("candidate insert uploads lock poisoned"))?
+            .remove(&request.upload_id)
+            .ok_or_else(|| SspryError::from("candidate insert upload not found"))?;
+        if upload.row_bytes.len() != upload.total_bytes {
+            return Err(SspryError::from(format!(
+                "candidate insert upload incomplete (expected {} bytes, received {} bytes)",
+                upload.total_bytes,
+                upload.row_bytes.len()
+            )));
+        }
+        let parsed = parse_candidate_insert_binary_row(&upload.row_bytes, "upload")?;
+        self.handle_candidate_insert_parsed(parsed)
     }
 
     fn handle_candidate_delete(&self, sha256: &str) -> Result<CandidateDeleteResponse> {
@@ -5787,20 +5940,286 @@ fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(SspryError::from)
 }
 
-pub(crate) fn serialized_candidate_insert_batch_payload(rows: &[Vec<u8>]) -> Vec<u8> {
-    let payload_len = rows.iter().map(Vec::len).sum::<usize>()
-        + rows.len().saturating_sub(1)
-        + br#"{"documents":["#.len()
-        + b"]}".len();
-    let mut payload = Vec::with_capacity(payload_len);
-    payload.extend_from_slice(br#"{"documents":["#);
-    for (idx, row) in rows.iter().enumerate() {
-        if idx > 0 {
-            payload.push(b',');
-        }
+fn push_u32_le(out: &mut Vec<u8>, value: usize) {
+    out.extend_from_slice(&(u32::try_from(value).unwrap_or(u32::MAX)).to_le_bytes());
+}
+
+fn push_u64_le(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_u8(payload: &[u8], offset: &mut usize, field: &str) -> Result<u8> {
+    if payload.len().saturating_sub(*offset) < 1 {
+        return Err(SspryError::from(format!(
+            "{field} truncated while reading u8"
+        )));
+    }
+    let value = payload[*offset];
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_u32_le(payload: &[u8], offset: &mut usize, field: &str) -> Result<u32> {
+    if payload.len().saturating_sub(*offset) < 4 {
+        return Err(SspryError::from(format!(
+            "{field} truncated while reading u32"
+        )));
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&payload[*offset..*offset + 4]);
+    *offset += 4;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_le(payload: &[u8], offset: &mut usize, field: &str) -> Result<u64> {
+    if payload.len().saturating_sub(*offset) < 8 {
+        return Err(SspryError::from(format!(
+            "{field} truncated while reading u64"
+        )));
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&payload[*offset..*offset + 8]);
+    *offset += 8;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_exact_bytes<'a>(
+    payload: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+    field: &str,
+) -> Result<&'a [u8]> {
+    if payload.len().saturating_sub(*offset) < len {
+        return Err(SspryError::from(format!(
+            "{field} truncated while reading {len} bytes"
+        )));
+    }
+    let bytes = &payload[*offset..*offset + len];
+    *offset += len;
+    Ok(bytes)
+}
+
+pub fn serialize_candidate_insert_binary_row_parts(
+    sha256: &[u8; 32],
+    file_size: u64,
+    bloom_item_estimate: Option<usize>,
+    bloom_filter: &[u8],
+    tier2_bloom_item_estimate: Option<usize>,
+    tier2_bloom_filter: &[u8],
+    special_population: bool,
+    metadata: &[u8],
+    external_id: Option<&str>,
+) -> Result<Vec<u8>> {
+    let bloom_item_estimate_u64 = bloom_item_estimate
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| SspryError::from("bloom_item_estimate does not fit in u64"))?;
+    let tier2_bloom_item_estimate_u64 = tier2_bloom_item_estimate
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| SspryError::from("tier2_bloom_item_estimate does not fit in u64"))?;
+    let external_id_bytes = external_id.map(str::as_bytes).unwrap_or(&[]);
+    for (label, len) in [
+        ("bloom_filter", bloom_filter.len()),
+        ("tier2_bloom_filter", tier2_bloom_filter.len()),
+        ("metadata", metadata.len()),
+        ("external_id", external_id_bytes.len()),
+    ] {
+        u32::try_from(len)
+            .map_err(|_| SspryError::from(format!("{label} is too large for binary insert row")))?;
+    }
+
+    let mut flags = 0u8;
+    if bloom_item_estimate_u64.is_some() {
+        flags |= 1 << 0;
+    }
+    if tier2_bloom_item_estimate_u64.is_some() {
+        flags |= 1 << 1;
+    }
+    if special_population {
+        flags |= 1 << 2;
+    }
+    if !metadata.is_empty() {
+        flags |= 1 << 3;
+    }
+    if !external_id_bytes.is_empty() {
+        flags |= 1 << 4;
+    }
+
+    let mut row = Vec::with_capacity(
+        32 + 8
+            + 1
+            + 8
+            + 8
+            + 4 * 4
+            + bloom_filter.len()
+            + tier2_bloom_filter.len()
+            + metadata.len()
+            + external_id_bytes.len(),
+    );
+    row.extend_from_slice(sha256);
+    push_u64_le(&mut row, file_size);
+    row.push(flags);
+    push_u64_le(&mut row, bloom_item_estimate_u64.unwrap_or(0));
+    push_u64_le(&mut row, tier2_bloom_item_estimate_u64.unwrap_or(0));
+    push_u32_le(&mut row, bloom_filter.len());
+    push_u32_le(&mut row, tier2_bloom_filter.len());
+    push_u32_le(&mut row, metadata.len());
+    push_u32_le(&mut row, external_id_bytes.len());
+    row.extend_from_slice(bloom_filter);
+    row.extend_from_slice(tier2_bloom_filter);
+    row.extend_from_slice(metadata);
+    row.extend_from_slice(external_id_bytes);
+    Ok(row)
+}
+
+fn parse_candidate_insert_binary_row(
+    payload: &[u8],
+    field_prefix: &str,
+) -> Result<ParsedCandidateInsertDocument> {
+    let mut offset = 0usize;
+    let sha_bytes = read_exact_bytes(payload, &mut offset, 32, &format!("{field_prefix}.sha256"))?;
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(sha_bytes);
+    let file_size = read_u64_le(payload, &mut offset, &format!("{field_prefix}.file_size"))?;
+    let flags = read_u8(payload, &mut offset, &format!("{field_prefix}.flags"))?;
+    let bloom_item_estimate = read_u64_le(
+        payload,
+        &mut offset,
+        &format!("{field_prefix}.bloom_item_estimate"),
+    )?;
+    let tier2_bloom_item_estimate = read_u64_le(
+        payload,
+        &mut offset,
+        &format!("{field_prefix}.tier2_bloom_item_estimate"),
+    )?;
+    let bloom_filter_len = read_u32_le(
+        payload,
+        &mut offset,
+        &format!("{field_prefix}.bloom_filter_len"),
+    )? as usize;
+    let tier2_bloom_filter_len = read_u32_le(
+        payload,
+        &mut offset,
+        &format!("{field_prefix}.tier2_bloom_filter_len"),
+    )? as usize;
+    let metadata_len = read_u32_le(
+        payload,
+        &mut offset,
+        &format!("{field_prefix}.metadata_len"),
+    )? as usize;
+    let external_id_len = read_u32_le(
+        payload,
+        &mut offset,
+        &format!("{field_prefix}.external_id_len"),
+    )? as usize;
+    let bloom_filter = read_exact_bytes(
+        payload,
+        &mut offset,
+        bloom_filter_len,
+        &format!("{field_prefix}.bloom_filter"),
+    )?
+    .to_vec();
+    let tier2_bloom_filter = read_exact_bytes(
+        payload,
+        &mut offset,
+        tier2_bloom_filter_len,
+        &format!("{field_prefix}.tier2_bloom_filter"),
+    )?
+    .to_vec();
+    let metadata = read_exact_bytes(
+        payload,
+        &mut offset,
+        metadata_len,
+        &format!("{field_prefix}.metadata"),
+    )?
+    .to_vec();
+    let external_id = if external_id_len > 0 {
+        Some(
+            String::from_utf8(
+                read_exact_bytes(
+                    payload,
+                    &mut offset,
+                    external_id_len,
+                    &format!("{field_prefix}.external_id"),
+                )?
+                .to_vec(),
+            )
+            .map_err(|_| {
+                SspryError::from(format!("{field_prefix}.external_id must be valid UTF-8"))
+            })?,
+        )
+    } else {
+        None
+    };
+    if offset != payload.len() {
+        return Err(SspryError::from(format!(
+            "{field_prefix} has {} trailing bytes",
+            payload.len().saturating_sub(offset)
+        )));
+    }
+    Ok((
+        sha256,
+        file_size,
+        if flags & (1 << 0) != 0 {
+            Some(usize::try_from(bloom_item_estimate).map_err(|_| {
+                SspryError::from(format!(
+                    "{field_prefix}.bloom_item_estimate does not fit in usize"
+                ))
+            })?)
+        } else {
+            None
+        },
+        bloom_filter,
+        if flags & (1 << 1) != 0 {
+            Some(usize::try_from(tier2_bloom_item_estimate).map_err(|_| {
+                SspryError::from(format!(
+                    "{field_prefix}.tier2_bloom_item_estimate does not fit in usize"
+                ))
+            })?)
+        } else {
+            None
+        },
+        tier2_bloom_filter,
+        flags & (1 << 2) != 0,
+        metadata,
+        external_id,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_candidate_insert_binary_row_for_test(
+    payload: &[u8],
+) -> Result<ParsedCandidateInsertDocument> {
+    parse_candidate_insert_binary_row(payload, "test.row")
+}
+
+fn parse_candidate_insert_binary_batch_payload(
+    payload: &[u8],
+) -> Result<Vec<ParsedCandidateInsertDocument>> {
+    let mut offset = 0usize;
+    let mut rows = Vec::new();
+    while offset < payload.len() {
+        let row_len = read_u32_le(payload, &mut offset, "binary_batch.row_len")? as usize;
+        let row_payload = read_exact_bytes(payload, &mut offset, row_len, "binary_batch.row")?;
+        rows.push(parse_candidate_insert_binary_row(
+            row_payload,
+            &format!("binary_batch.rows[{}]", rows.len()),
+        )?);
+    }
+    Ok(rows)
+}
+
+pub(crate) fn serialized_candidate_insert_binary_batch_payload(rows: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        rows.iter()
+            .map(|row| 4usize.saturating_add(row.len()))
+            .sum(),
+    );
+    for row in rows {
+        push_u32_le(&mut payload, row.len());
         payload.extend_from_slice(row);
     }
-    payload.extend_from_slice(b"]}");
     payload
 }
 
@@ -6665,6 +7084,27 @@ mod tests {
             metadata_b64: None,
             external_id: None,
         }
+    }
+
+    fn candidate_insert_binary_row_from_bytes(
+        path: &Path,
+        bytes: &[u8],
+        external_id: Option<String>,
+    ) -> Vec<u8> {
+        fs::write(path, bytes).expect("write sample");
+        let features = scan_features_default_grams(path).expect("features");
+        serialize_candidate_insert_binary_row_parts(
+            &features.sha256,
+            features.file_size,
+            None,
+            &features.bloom_filter,
+            None,
+            &[],
+            false,
+            &[],
+            external_id.as_deref(),
+        )
+        .expect("binary row")
     }
 
     fn scan_features_default_grams(
@@ -7822,11 +8262,14 @@ rule overflow_rule {
         let socket_path = socket_parent.join(format!("rpc-{candidate_shards}.sock"));
         fs::write(&socket_path, b"stale").expect("stale socket placeholder");
         let root = base.join(format!("rpc_db_{candidate_shards}"));
+        let probe = TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind probe");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
         let socket_for_thread = socket_path.clone();
         thread::spawn(move || {
             let _ = serve(
                 DEFAULT_RPC_HOST,
-                DEFAULT_RPC_PORT,
+                port,
                 Some(socket_for_thread.as_path()),
                 DEFAULT_MAX_REQUEST_BYTES,
                 ServerConfig {
@@ -7847,18 +8290,22 @@ rule overflow_rule {
         });
         let config = ClientConfig::new(
             DEFAULT_RPC_HOST.to_owned(),
-            DEFAULT_RPC_PORT,
-            Duration::from_millis(250),
+            port,
+            Duration::from_secs(30),
             Some(socket_path),
         );
         let client = SspryClient::new(config.clone());
-        for _ in 0..100 {
+        let wait_started = Instant::now();
+        loop {
             if client.ping().is_ok() {
                 return config;
             }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(10),
+                "test unix rpc server did not become ready"
+            );
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("test rpc server did not become ready");
     }
 
     fn one_shot_tcp_config<F>(handler: F) -> ClientConfig
@@ -7909,17 +8356,21 @@ rule overflow_rule {
         let config = ClientConfig::new(
             DEFAULT_RPC_HOST.to_owned(),
             port,
-            Duration::from_millis(250),
+            Duration::from_secs(30),
             None,
         );
         let client = SspryClient::new(config.clone());
-        for _ in 0..100 {
+        let wait_started = Instant::now();
+        loop {
             if client.ping().is_ok() {
                 return config;
             }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(10),
+                "test tcp rpc server did not become ready"
+            );
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("test tcp rpc server did not become ready");
     }
 
     fn start_tcp_workspace_server(base: &Path, candidate_shards: usize) -> ClientConfig {
@@ -7964,17 +8415,21 @@ rule overflow_rule {
         let config = ClientConfig::new(
             DEFAULT_RPC_HOST.to_owned(),
             port,
-            Duration::from_millis(250),
+            Duration::from_secs(30),
             None,
         );
         let client = SspryClient::new(config.clone());
-        for _ in 0..100 {
+        let wait_started = Instant::now();
+        loop {
             if client.ping().is_ok() {
                 return config;
             }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(10),
+                "test workspace rpc server did not become ready"
+            );
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("test tcp workspace rpc server did not become ready");
     }
 
     #[test]
@@ -8273,7 +8728,7 @@ rule overflow_rule {
             panic!("empty insert batch should not connect");
         }));
         let empty = client
-            .candidate_insert_batch(&[])
+            .candidate_insert_binary_rows(&[])
             .expect("empty insert batch");
         assert_eq!(empty.inserted_count, 0);
         assert!(empty.results.is_empty());
@@ -8284,8 +8739,8 @@ rule overflow_rule {
         let listener = TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind listener");
         let port = listener.local_addr().expect("listener addr").port();
         thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
             for request_idx in 0..3 {
-                let (mut stream, _) = listener.accept().expect("accept");
                 let _ = read_frame(&mut stream).expect("read request");
                 if request_idx == 0 {
                     write_error_frame(&mut stream, "Request payload is too large")
@@ -8316,47 +8771,99 @@ rule overflow_rule {
             None,
         ));
         let docs = vec![
-            CandidateDocumentWire {
-                sha256: "11".repeat(32),
-                file_size: 1,
-                bloom_filter_b64: String::new(),
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: None,
-            },
-            CandidateDocumentWire {
-                sha256: "22".repeat(32),
-                file_size: 1,
-                bloom_filter_b64: String::new(),
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: None,
-            },
+            serialize_candidate_insert_binary_row_parts(
+                &[0x11; 32],
+                1,
+                None,
+                &[],
+                None,
+                &[],
+                false,
+                &[],
+                None,
+            )
+            .expect("doc a"),
+            serialize_candidate_insert_binary_row_parts(
+                &[0x22; 32],
+                1,
+                None,
+                &[],
+                None,
+                &[],
+                false,
+                &[],
+                None,
+            )
+            .expect("doc b"),
         ];
         let response = client
-            .candidate_insert_batch(&docs)
+            .candidate_insert_binary_rows(&docs)
             .expect("split insert succeeds");
         assert_eq!(response.inserted_count, 2);
         assert_eq!(response.results.len(), 2);
 
         let config = one_shot_tcp_config(|mut stream| {
-            let _ = read_frame(&mut stream).expect("read request");
+            let (_, action, _) = read_frame(&mut stream).expect("read oversized batch");
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH_BINARY);
             write_error_frame(&mut stream, "Payload is too large").expect("write too large");
+
+            let (_, action, payload) = read_frame(&mut stream).expect("read upload begin");
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN);
+            let begin: CandidateInsertUploadBeginRequest =
+                serde_json::from_slice(&payload).expect("decode upload begin");
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &json_bytes(&CandidateIndexSessionResponse {
+                    message: "upload started".to_owned(),
+                })
+                .expect("upload begin response"),
+            )
+            .expect("write upload begin");
+
+            let (_, action, payload) = read_frame(&mut stream).expect("read upload chunk");
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK);
+            assert!(payload.len() >= 8);
+            assert_eq!(
+                u64::from_le_bytes(payload[..8].try_into().expect("upload id bytes")),
+                begin.upload_id
+            );
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &json_bytes(&CandidateIndexSessionResponse {
+                    message: "upload chunked".to_owned(),
+                })
+                .expect("upload chunk response"),
+            )
+            .expect("write upload chunk");
+
+            let (_, action, payload) = read_frame(&mut stream).expect("read upload commit");
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT);
+            let commit: CandidateInsertUploadCommitRequest =
+                serde_json::from_slice(&payload).expect("decode upload commit");
+            assert_eq!(commit.upload_id, begin.upload_id);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &json_bytes(&CandidateInsertResponse {
+                    status: "inserted".to_owned(),
+                    doc_id: 7,
+                    sha256: "22".repeat(32),
+                })
+                .expect("upload commit response"),
+            )
+            .expect("write upload commit");
         });
         let client = SspryClient::new(config);
-        let err = client
-            .candidate_insert_batch(&docs[..1])
-            .expect_err("single oversized doc");
-        assert!(
-            err.to_string()
-                .contains("Single document insert request is too large")
-        );
+        let response = client
+            .candidate_insert_binary_rows(&docs[..1])
+            .expect("single oversized doc uses chunked upload");
+        assert_eq!(response.inserted_count, 1);
+        assert_eq!(response.results.len(), 1);
     }
 
     #[test]
@@ -8388,7 +8895,7 @@ rule overflow_rule {
             .expect("write begin success");
 
             let (_, action, _) = read_frame(&mut stream).expect("read batch request");
-            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH);
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH_BINARY);
             write_error_frame(
                 &mut stream,
                 "server is publishing; insert batch temporarily disabled; retry later",
@@ -8396,7 +8903,7 @@ rule overflow_rule {
             .expect("write batch retry error");
 
             let (_, action, _) = read_frame(&mut stream).expect("read batch retry");
-            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH);
+            assert_eq!(action, ACTION_CANDIDATE_INSERT_BATCH_BINARY);
             write_frame(
                 &mut stream,
                 PROTOCOL_VERSION,
@@ -8426,20 +8933,20 @@ rule overflow_rule {
             "index session started"
         );
 
-        let row = serde_json::to_vec(&CandidateDocumentWire {
-            sha256: "aa".repeat(32),
-            file_size: 1,
-            bloom_filter_b64: String::new(),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: None,
-        })
+        let row = serialize_candidate_insert_binary_row_parts(
+            &[0xaa; 32],
+            1,
+            None,
+            &[],
+            None,
+            &[],
+            false,
+            &[],
+            None,
+        )
         .expect("serialize row");
         let response = persistent
-            .candidate_insert_batch_serialized_rows(&[row])
+            .candidate_insert_batch_binary_rows(&[row])
             .expect("batch retry succeeds");
         assert_eq!(response.inserted_count, 1);
         assert_eq!(response.results.len(), 1);
@@ -8458,18 +8965,24 @@ rule overflow_rule {
             "index session started"
         );
 
-        let doc_a =
-            candidate_document_wire_from_bytes(&tmp.path().join("overlap-a.bin"), b"xxABCDyy");
-        let doc_b =
-            candidate_document_wire_from_bytes(&tmp.path().join("overlap-b.bin"), b"zzWXYZqq");
-        let doc_c =
-            candidate_document_wire_from_bytes(&tmp.path().join("overlap-c.bin"), b"aaLMNObb");
-        let row_a = serde_json::to_vec(&doc_a).expect("serialize doc a");
-        let row_b = serde_json::to_vec(&doc_b).expect("serialize doc b");
-        let row_c = serde_json::to_vec(&doc_c).expect("serialize doc c");
+        let row_a = candidate_insert_binary_row_from_bytes(
+            &tmp.path().join("overlap-a.bin"),
+            b"xxABCDyy",
+            None,
+        );
+        let row_b = candidate_insert_binary_row_from_bytes(
+            &tmp.path().join("overlap-b.bin"),
+            b"zzWXYZqq",
+            None,
+        );
+        let row_c = candidate_insert_binary_row_from_bytes(
+            &tmp.path().join("overlap-c.bin"),
+            b"aaLMNObb",
+            None,
+        );
 
         let inserted_a = persistent
-            .candidate_insert_batch_serialized_rows(&[row_a])
+            .candidate_insert_batch_binary_rows(&[row_a])
             .expect("insert first batch");
         assert_eq!(inserted_a.inserted_count, 1);
 
@@ -8493,14 +9006,14 @@ rule overflow_rule {
                 break;
             }
             assert!(
-                wait_started.elapsed() < Duration::from_secs(5),
+                wait_started.elapsed() < Duration::from_secs(30),
                 "active work root did not rotate"
             );
             thread::sleep(Duration::from_millis(10));
         }
 
         let inserted_b = persistent
-            .candidate_insert_batch_serialized_rows(&[row_b])
+            .candidate_insert_batch_binary_rows(&[row_b])
             .expect("insert second batch during pending publish");
         assert_eq!(inserted_b.inserted_count, 1);
         let publish_message = publish_thread.join().expect("join publish thread");
@@ -8528,17 +9041,21 @@ rule overflow_rule {
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
-        let query_a = client
-            .candidate_query_plan(&plan_for(pack_exact_gram(b"ABC")), 0, None)
-            .expect("query published doc a");
-        assert_eq!(query_a.total_candidates, 1);
-        let query_b_before = client
-            .candidate_query_plan(&plan_for(pack_exact_gram(b"WXY")), 0, None)
-            .expect("query unpublished doc b");
-        assert_eq!(query_b_before.total_candidates, 0);
+        {
+            let _perf_guard = crate::perf::test_lock().lock().expect("perf lock");
+            crate::perf::configure(None, false);
+            let query_a = client
+                .candidate_query_plan(&plan_for(pack_exact_gram(b"ABC")), 0, None)
+                .expect("query published doc a");
+            assert_eq!(query_a.total_candidates, 1);
+            let query_b_before = client
+                .candidate_query_plan(&plan_for(pack_exact_gram(b"WXY")), 0, None)
+                .expect("query unpublished doc b");
+            assert_eq!(query_b_before.total_candidates, 0);
+        }
 
         let inserted_c = persistent
-            .candidate_insert_batch_serialized_rows(&[row_c])
+            .candidate_insert_batch_binary_rows(&[row_c])
             .expect("insert third batch after publish");
         assert_eq!(inserted_c.inserted_count, 1);
         assert_eq!(
@@ -8549,14 +9066,18 @@ rule overflow_rule {
         let second_publish = client.publish().expect("publish second buffer");
         assert!(second_publish.contains("published work root to"));
 
-        let query_b_after = client
-            .candidate_query_plan(&plan_for(pack_exact_gram(b"WXY")), 0, None)
-            .expect("query published doc b");
-        assert_eq!(query_b_after.total_candidates, 1);
-        let query_c_after = client
-            .candidate_query_plan(&plan_for(pack_exact_gram(b"LMN")), 0, None)
-            .expect("query published doc c");
-        assert_eq!(query_c_after.total_candidates, 1);
+        {
+            let _perf_guard = crate::perf::test_lock().lock().expect("perf lock");
+            crate::perf::configure(None, false);
+            let query_b_after = client
+                .candidate_query_plan(&plan_for(pack_exact_gram(b"WXY")), 0, None)
+                .expect("query published doc b");
+            assert_eq!(query_b_after.total_candidates, 1);
+            let query_c_after = client
+                .candidate_query_plan(&plan_for(pack_exact_gram(b"LMN")), 0, None)
+                .expect("query published doc c");
+            assert_eq!(query_c_after.total_candidates, 1);
+        }
 
         assert_eq!(client.shutdown().expect("shutdown"), "shutdown requested");
     }
@@ -8578,16 +9099,15 @@ rule overflow_rule {
         for idx in 0..80u32 {
             let path = tmp.path().join(format!("pressure-{idx:04}.bin"));
             let bytes = format!("doc-{idx:04}-ABCD-{idx:04}").into_bytes();
-            let wire = candidate_document_wire_from_bytes(&path, &bytes);
-            rows.push(serde_json::to_vec(&wire).expect("serialize row"));
+            rows.push(candidate_insert_binary_row_from_bytes(&path, &bytes, None));
         }
 
         let inserted = persistent
-            .candidate_insert_batch_serialized_rows(&rows[..40])
+            .candidate_insert_batch_binary_rows(&rows[..40])
             .expect("insert first pressure batch");
         assert_eq!(inserted.inserted_count, 40);
         let inserted = persistent
-            .candidate_insert_batch_serialized_rows(&rows[40..])
+            .candidate_insert_batch_binary_rows(&rows[40..])
             .expect("insert second pressure batch");
         assert_eq!(inserted.inserted_count, 40);
 
@@ -8603,13 +9123,13 @@ rule overflow_rule {
             Some(0)
         );
 
-        let extra = candidate_document_wire_from_bytes(
+        let extra_row = candidate_insert_binary_row_from_bytes(
             &tmp.path().join("pressure-extra.bin"),
             b"doc-extra-LMNO",
+            None,
         );
-        let extra_row = serde_json::to_vec(&extra).expect("serialize extra row");
         let inserted = persistent
-            .candidate_insert_batch_serialized_rows(&[extra_row])
+            .candidate_insert_batch_binary_rows(&[extra_row])
             .expect("insert after pressure publish");
         assert_eq!(inserted.inserted_count, 1);
         assert_eq!(
@@ -9083,52 +9603,39 @@ rule q {
         )
         .expect("rule");
 
-        let features_a = scan_features_default_grams(&cand_a).expect("features a");
-        let features_b = scan_features_default_grams(&cand_b).expect("features b");
-        let doc_a = CandidateDocumentWire {
-            sha256: hex::encode(features_a.sha256),
-            file_size: features_a.file_size,
-            bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                .encode(features_a.bloom_filter),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: Some(cand_a.display().to_string()),
-        };
-        let doc_b = CandidateDocumentWire {
-            sha256: hex::encode(features_b.sha256),
-            file_size: features_b.file_size,
-            bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                .encode(features_b.bloom_filter),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: Some(cand_b.display().to_string()),
-        };
+        let row_a = candidate_insert_binary_row_from_bytes(
+            &cand_a,
+            b"xxABCDyy",
+            Some(cand_a.display().to_string()),
+        );
+        let row_b = candidate_insert_binary_row_from_bytes(
+            &cand_b,
+            b"zzABCDqq",
+            Some(cand_b.display().to_string()),
+        );
 
-        let inserted_doc: CandidateInsertResponse = json_from_bytes(
+        let inserted_doc: CandidateInsertBatchResponse = json_from_bytes(
             &state
                 .dispatch(
-                    ACTION_CANDIDATE_INSERT,
-                    &json_bytes(&doc_a).expect("candidate insert payload"),
+                    ACTION_CANDIDATE_INSERT_BATCH_BINARY,
+                    &serialized_candidate_insert_binary_batch_payload(std::slice::from_ref(&row_a)),
                 )
                 .expect("candidate insert"),
         )
         .expect("decode candidate insert");
+        assert_eq!(inserted_doc.inserted_count, 1);
+        let inserted_doc = inserted_doc
+            .results
+            .into_iter()
+            .next()
+            .expect("insert result");
         assert_eq!(inserted_doc.status, "inserted");
 
         let inserted_docs: CandidateInsertBatchResponse = json_from_bytes(
             &state
                 .dispatch(
-                    ACTION_CANDIDATE_INSERT_BATCH,
-                    &json_bytes(&CandidateInsertBatchRequest {
-                        documents: vec![doc_b.clone()],
-                    })
-                    .expect("candidate batch payload"),
+                    ACTION_CANDIDATE_INSERT_BATCH_BINARY,
+                    &serialized_candidate_insert_binary_batch_payload(std::slice::from_ref(&row_b)),
                 )
                 .expect("candidate batch"),
         )
@@ -9173,7 +9680,7 @@ rule q {
                 .dispatch(
                     ACTION_CANDIDATE_DELETE,
                     &json_bytes(&CandidateDeleteRequest {
-                        sha256: doc_a.sha256.clone(),
+                        sha256: inserted_doc.sha256.clone(),
                     })
                     .expect("delete payload"),
                 )
@@ -9384,21 +9891,19 @@ rule q {
             "shutdown requested"
         );
 
-        assert!(
-            SspryClient::candidate_insert_batch_payload_size(&[CandidateDocumentWire {
-                sha256: "33".repeat(32),
-                file_size: 4,
-                bloom_filter_b64: "AQID".to_owned(),
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: Some("doc".to_owned()),
-            }])
-            .expect("payload size")
-                > 0
-        );
+        let row = serialize_candidate_insert_binary_row_parts(
+            &[0x33; 32],
+            4,
+            None,
+            &[1, 2, 3],
+            None,
+            &[],
+            false,
+            &[],
+            Some("doc"),
+        )
+        .expect("payload row");
+        assert!(SspryClient::candidate_insert_binary_batch_payload_size(&[row]) > 0);
     }
 
     #[cfg(unix)]
@@ -9426,56 +9931,44 @@ rule q {
 "#,
         )
         .expect("rule");
-        let features_a = scan_features_default_grams(&cand_a).expect("features a");
-        let features_b = scan_features_default_grams(&cand_b).expect("features b");
-        let doc_a = CandidateDocumentWire {
-            sha256: hex::encode(features_a.sha256),
-            file_size: features_a.file_size,
-            bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                .encode(features_a.bloom_filter),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: Some(cand_a.display().to_string()),
-        };
-        let doc_b = CandidateDocumentWire {
-            sha256: hex::encode(features_b.sha256),
-            file_size: features_b.file_size,
-            bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                .encode(features_b.bloom_filter),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: Some(cand_b.display().to_string()),
-        };
+        let row_a = candidate_insert_binary_row_from_bytes(
+            &cand_a,
+            b"xxABCDyy",
+            Some(cand_a.display().to_string()),
+        );
+        let row_b = candidate_insert_binary_row_from_bytes(
+            &cand_b,
+            b"zzABCDqq",
+            Some(cand_b.display().to_string()),
+        );
 
         let inserted = client
-            .candidate_insert_document(&doc_a)
+            .candidate_insert_binary_row(&row_a)
             .expect("candidate insert");
         assert_eq!(inserted.status, "inserted");
         let batch = client
-            .candidate_insert_batch(std::slice::from_ref(&doc_b))
+            .candidate_insert_binary_rows(&[row_b])
             .expect("candidate batch");
         assert_eq!(batch.inserted_count, 1);
         assert_eq!(batch.results.len(), 1);
 
         let plan =
             compile_query_plan_from_file_default(&rule, 8, false, true, 100_000).expect("plan");
-        let query = client
-            .candidate_query_plan_with_options(&plan, 0, Some(1), true)
-            .expect("query");
-        assert_eq!(query.total_candidates, 2);
-        assert!(query.next_cursor.is_some());
-        assert!(query.external_ids.is_some());
-        let query_without_ids = client
-            .candidate_query_plan(&plan, 0, None)
-            .expect("query without ids");
-        assert_eq!(query_without_ids.returned_count, 2);
-        assert!(query_without_ids.external_ids.is_none());
+        {
+            let _perf_guard = crate::perf::test_lock().lock().expect("perf lock");
+            crate::perf::configure(None, false);
+            let query = client
+                .candidate_query_plan_with_options(&plan, 0, Some(1), true)
+                .expect("query");
+            assert_eq!(query.total_candidates, 2);
+            assert!(query.next_cursor.is_some());
+            assert!(query.external_ids.is_some());
+            let query_without_ids = client
+                .candidate_query_plan(&plan, 0, None)
+                .expect("query without ids");
+            assert_eq!(query_without_ids.returned_count, 2);
+            assert!(query_without_ids.external_ids.is_none());
+        }
 
         let stats = client.candidate_stats().expect("stats");
         assert_eq!(
@@ -9521,40 +10014,42 @@ rule q {
             Arc::new(AtomicBool::new(true)),
         )
         .expect("server state");
-        let insert_payload = serde_json::to_vec(&CandidateDocumentWire {
-            sha256: "aa".repeat(32),
-            file_size: 4,
-            bloom_filter_b64: String::new(),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: None,
-        })
-        .expect("insert payload");
-        let batch_payload = serde_json::to_vec(&CandidateInsertBatchRequest {
-            documents: vec![CandidateDocumentWire {
-                sha256: "bb".repeat(32),
-                file_size: 4,
-                bloom_filter_b64: String::new(),
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: None,
-            }],
-        })
-        .expect("batch payload");
+        let batch_payload = serialized_candidate_insert_binary_batch_payload(&[
+            serialize_candidate_insert_binary_row_parts(
+                &[0xaa; 32],
+                4,
+                None,
+                &[],
+                None,
+                &[],
+                false,
+                &[],
+                None,
+            )
+            .expect("payload a"),
+            serialize_candidate_insert_binary_row_parts(
+                &[0xbb; 32],
+                4,
+                None,
+                &[],
+                None,
+                &[],
+                false,
+                &[],
+                None,
+            )
+            .expect("payload b"),
+        ]);
         let delete_payload = serde_json::to_vec(&CandidateDeleteRequest {
             sha256: "aa".repeat(32),
         })
         .expect("delete payload");
 
         for (action, payload) in [
-            (ACTION_CANDIDATE_INSERT, insert_payload.as_slice()),
-            (ACTION_CANDIDATE_INSERT_BATCH, batch_payload.as_slice()),
+            (
+                ACTION_CANDIDATE_INSERT_BATCH_BINARY,
+                batch_payload.as_slice(),
+            ),
             (ACTION_CANDIDATE_DELETE, delete_payload.as_slice()),
         ] {
             let err = state

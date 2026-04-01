@@ -5,14 +5,13 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use tempfile::tempdir;
 
 use sspry::candidate::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes,
     compile_query_plan_from_file_with_gram_sizes, scan_file_features_bloom_only_with_gram_sizes,
 };
-use sspry::rpc::{CandidateDocumentWire, ClientConfig, SspryClient};
+use sspry::rpc::{ClientConfig, SspryClient, serialize_candidate_insert_binary_row_parts};
 
 fn bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sspry"))
@@ -123,34 +122,34 @@ rule q {
         4096,
     )
     .expect("features b");
-    let docs = vec![
-        CandidateDocumentWire {
-            sha256: hex::encode(features_a.sha256),
-            file_size: features_a.file_size,
-            bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                .encode(features_a.bloom_filter),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: Some("cand-a".to_owned()),
-        },
-        CandidateDocumentWire {
-            sha256: hex::encode(features_b.sha256),
-            file_size: features_b.file_size,
-            bloom_filter_b64: base64::engine::general_purpose::STANDARD
-                .encode(features_b.bloom_filter),
-            bloom_item_estimate: None,
-            tier2_bloom_filter_b64: None,
-            tier2_bloom_item_estimate: None,
-            special_population: false,
-            metadata_b64: None,
-            external_id: Some("cand-b".to_owned()),
-        },
+    let rows = vec![
+        serialize_candidate_insert_binary_row_parts(
+            &features_a.sha256,
+            features_a.file_size,
+            None,
+            &features_a.bloom_filter,
+            None,
+            &[],
+            false,
+            &[],
+            Some("cand-a"),
+        )
+        .expect("row a"),
+        serialize_candidate_insert_binary_row_parts(
+            &features_b.sha256,
+            features_b.file_size,
+            None,
+            &features_b.bloom_filter,
+            None,
+            &[],
+            false,
+            &[],
+            Some("cand-b"),
+        )
+        .expect("row b"),
     ];
     let inserted_docs = client
-        .candidate_insert_batch(&docs)
+        .candidate_insert_binary_rows(&rows)
         .expect("candidate insert batch");
     assert_eq!(inserted_docs.inserted_count, 2);
     let publish = client.publish().expect("publish");
@@ -171,13 +170,15 @@ rule q {
         .expect("candidate query");
     assert_eq!(result.total_candidates, 2);
     assert_eq!(result.sha256.len(), 2);
+    let mut external_ids = result.external_ids.expect("external ids");
+    external_ids.sort();
     assert_eq!(
-        result.external_ids,
-        Some(vec![Some("cand-a".to_owned()), Some("cand-b".to_owned())])
+        external_ids,
+        vec![Some("cand-a".to_owned()), Some("cand-b".to_owned())]
     );
 
     let delete_result = client
-        .candidate_delete_sha256(&docs[0].sha256)
+        .candidate_delete_sha256(&hex::encode(features_a.sha256))
         .expect("candidate delete");
     assert_eq!(delete_result.status, "deleted");
 

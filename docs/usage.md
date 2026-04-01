@@ -129,6 +129,7 @@ Behavior:
   - `--root` opens the forest locally in-process
 - `--tree-search-workers` only affects `--root`
 - verified search requires stored file paths to still exist on disk
+- candidate order is not guaranteed; search returns an unordered match set
 - indexed search currently supports:
   - literal string anchors with:
     - `ascii`

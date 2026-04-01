@@ -1,4 +1,4 @@
-use std::hash::{BuildHasher, Hasher};
+use std::hash::BuildHasher;
 
 use fastbloom::DefaultHasher as FastBloomDefaultHasher;
 
@@ -9,9 +9,7 @@ const FASTBLOOM_SEED: u128 = 0;
 
 fn source_hash(value: u64) -> u64 {
     let hasher = FastBloomDefaultHasher::seeded(&FASTBLOOM_SEED.to_be_bytes());
-    let mut state = hasher.build_hasher();
-    state.write_u64(value);
-    state.finish()
+    hasher.hash_one(value)
 }
 
 fn next_hash(h1: &mut u64, h2: u64) -> u64 {
@@ -23,6 +21,22 @@ fn bloom_index(bits: usize, hash: u64) -> usize {
     ((hash as u128 * bits as u128) >> 64) as usize
 }
 
+#[inline]
+fn for_each_bloom_position(
+    mut value: u64,
+    bits: usize,
+    hash_count: usize,
+    mut f: impl FnMut(usize),
+) {
+    value = source_hash(value);
+    let h2 = value.wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    f(bloom_index(bits, value));
+    for _ in 1..hash_count {
+        let hash = next_hash(&mut value, h2);
+        f(bloom_index(bits, hash));
+    }
+}
+
 pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec<usize>> {
     if bits == 0 {
         return Err(SspryError::from("bits must be > 0"));
@@ -30,14 +44,8 @@ pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec
     if hash_count == 0 {
         return Err(SspryError::from("hash_count must be > 0"));
     }
-    let mut h1 = source_hash(value);
-    let h2 = h1.wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
     let mut positions = Vec::with_capacity(hash_count);
-    positions.push(bloom_index(bits, h1));
-    for _ in 1..hash_count {
-        let hash = next_hash(&mut h1, h2);
-        positions.push(bloom_index(bits, hash));
-    }
+    for_each_bloom_position(value, bits, hash_count, |pos| positions.push(pos));
     Ok(positions)
 }
 
@@ -199,39 +207,54 @@ impl BloomFilter {
 
     pub fn add(&mut self, value: u64) -> Result<()> {
         let bits = self.data.len() * 8;
-        for pos in bloom_positions(value, bits, self.hash_count)? {
+        for_each_bloom_position(value, bits, self.hash_count, |pos| {
             let byte_idx = pos / 8;
             let bit_idx = pos % 8;
             self.data[byte_idx] |= 1 << bit_idx;
-        }
+        });
         Ok(())
     }
 
-    pub fn add_in_lane(&mut self, value: u64, lane_idx: usize, lane_count: usize) -> Result<()> {
+    pub fn lane_geometry(&self, lane_count: usize) -> Result<(usize, usize)> {
         let lane_bytes = validate_lane_layout(self.data.len(), lane_count)?;
-        if lane_idx >= lane_count {
-            return Err(SspryError::from("lane_idx must be < lane_count"));
-        }
-        let lane_bits = lane_bytes * 8;
-        let lane_byte_offset = lane_idx * lane_bytes;
-        for pos in bloom_positions(value, lane_bits, self.hash_count)? {
+        Ok((lane_bytes, lane_bytes * 8))
+    }
+
+    #[inline]
+    pub fn add_in_lane_prevalidated(
+        &mut self,
+        value: u64,
+        lane_byte_offset: usize,
+        lane_bits: usize,
+    ) {
+        for_each_bloom_position(value, lane_bits, self.hash_count, |pos| {
             let byte_idx = lane_byte_offset + (pos / 8);
             let bit_idx = pos % 8;
             self.data[byte_idx] |= 1 << bit_idx;
+        });
+    }
+
+    pub fn add_in_lane(&mut self, value: u64, lane_idx: usize, lane_count: usize) -> Result<()> {
+        let (lane_bytes, lane_bits) = self.lane_geometry(lane_count)?;
+        if lane_idx >= lane_count {
+            return Err(SspryError::from("lane_idx must be < lane_count"));
         }
+        let lane_byte_offset = lane_idx * lane_bytes;
+        self.add_in_lane_prevalidated(value, lane_byte_offset, lane_bits);
         Ok(())
     }
 
     pub fn maybe_contains(&self, value: u64) -> Result<bool> {
         let bits = self.data.len() * 8;
-        for pos in bloom_positions(value, bits, self.hash_count)? {
+        let mut matched = true;
+        for_each_bloom_position(value, bits, self.hash_count, |pos| {
             let byte_idx = pos / 8;
             let bit_idx = pos % 8;
             if (self.data[byte_idx] & (1 << bit_idx)) == 0 {
-                return Ok(false);
+                matched = false;
             }
-        }
-        Ok(true)
+        });
+        Ok(matched)
     }
 
     pub fn maybe_contains_all(&self, values: &[u64]) -> Result<bool> {
