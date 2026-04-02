@@ -1,6 +1,6 @@
 # Implementation
 
-`sspry` is a mutable file-search engine built around per-document bloom filters, per-superblock Tier2 summaries, and optional local YARA verification.
+`sspry` is a mutable file-search engine built around per-document bloom filters, an optional Tier2 superblock-summary layer, and optional local YARA verification.
 
 ## Architecture
 
@@ -8,12 +8,12 @@
 
 At a high level:
 
-1. `serve` starts the TCP server and owns the store.
+1. `serve` starts the TCP server and owns either a mutable store/workspace or a read-only forest root.
 2. `index` scans files client-side and sends batched documents.
 3. The server stores:
    - per-document Tier1 bloom filters
    - per-document Tier2 bloom filters
-   - per-superblock Tier2 summaries
+   - optional per-superblock Tier2 summaries when `--enable-pattern-superblocks` is enabled
    - metadata and optional stored file paths
 4. `search` compiles a restricted YARA rule into a query plan.
 5. The store returns candidate digests.
@@ -23,6 +23,11 @@ At a high level:
 
 - RPC mode: query one running `serve` process via `--addr`
 - direct forest mode: query one forest root in-process via `--root`
+
+RPC mode itself now has two useful server shapes:
+
+- mutable workspace/direct-store servers for remote ingest and query
+- forest-root servers that open `tree_*/current` read-only and answer one RPC query across the whole forest
 
 Direct forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
 
@@ -42,7 +47,7 @@ The query path is:
 2. Extract Tier1 and Tier2 grams from the rule using the DB-wide gram sizes.
 3. Build an anchor plan with branch ordering, per-pattern anchor reduction, and preserved selected anchor literals.
 4. Query shards in parallel.
-5. Use Tier2 superblock summaries to skip groups of files.
+5. If enabled for the DB, use Tier2 superblock summaries to skip groups of files.
 6. Use per-document Tier1 and Tier2 blooms to refine candidates.
 7. Collect candidate digests without ranking guarantees.
 8. Optionally verify file paths locally.
@@ -69,7 +74,7 @@ Per shard, the implementation persists binary sidecars for:
 - normalized document ids
 - Tier1 bloom blobs
 - Tier2 bloom blobs
-- Tier2 superblock summaries
+- optional Tier2 superblock summaries
 - deleted state
 - optional `external_id` values
 
@@ -90,6 +95,8 @@ Deletes are immediate logically:
 - Tier2 summaries are updated so deleted docs stop contributing to future block checks
 
 Physical reclaim is deferred.
+
+This section applies to mutable workspace/direct-store roots. Forest-root servers are read-only views over published `tree_*/current` stores and do not expose ingest/delete/publish.
 
 Each shard now keeps a small compaction manifest with:
 
@@ -227,6 +234,6 @@ These are the main implementation gaps worth keeping in view:
 The current tradeoffs are deliberate:
 
 - mutable store instead of rebuild-only index
-- bloom tiers and superblock summaries instead of retained exact gram postings
+- bloom tiers and optional superblock summaries instead of retained exact gram postings
 - server-owned store policy so clients stay simple
 - narrow public CLI so alpha users only touch meaningful knobs

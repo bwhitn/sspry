@@ -35,7 +35,12 @@ Options:
 - `--search-workers <n>`
   - server-side shard search concurrency
 - `--root <path>`
-  - store root directory
+  - root path to open
+  - auto-detected as one of:
+    - mutable workspace root
+    - direct published store root
+    - forest root containing `tree_*/current`
+  - forest-root servers are read-only and are intended for search/info
 - `--shards <n>`
   - fixed hash shard count
 - `--set-fp <p>`
@@ -53,12 +58,18 @@ Example:
 ./target/release/sspry serve \
   --addr 127.0.0.1:17653 \
   --root ./candidate_db \
-  --shards 256 \
+  --shards 8 \
   --set-fp 0.35 \
   --id-source sha256 \
   --gram-sizes 3,4 \
   --store-path
 ```
+
+Behavior:
+
+- mutable workspace/direct-store roots support ingest, delete, publish, and search
+- forest-root servers open all published `tree_*/current` stores once and answer search/info requests across the forest
+- forest-root servers are read-only; use them for persistent RPC search over a finished forest, not for remote ingest
 
 ## index
 
@@ -125,7 +136,7 @@ Behavior:
 - default search is unverified
 - `--verify` reopens candidate file paths and runs local YARA verification
 - `--addr` and `--root` are the two search transports:
-  - `--addr` uses a persistent RPC server
+  - `--addr` uses a persistent RPC server over either a direct store/workspace or a forest-root server
   - `--root` opens the forest locally in-process
 - `--tree-search-workers` only affects `--root`
 - verified search requires stored file paths to still exist on disk

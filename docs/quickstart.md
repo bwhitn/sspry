@@ -82,7 +82,7 @@ Signals:
 ./target/release/sspry serve \
   --addr 127.0.0.1:17653 \
   --root ./candidate_db \
-  --shards 256 \
+  --shards 8 \
   --set-fp 0.35 \
   --id-source sha256 \
   --gram-sizes 3,4 \
@@ -94,3 +94,4 @@ Signals:
 - Change `--gram-sizes` if you want a different recall/precision/storage tradeoff.
 - Change `--set-fp` if you want smaller or larger bloom filters.
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
+- Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with a lower shard count than `256` reduces open and publish fanout.

@@ -76,7 +76,7 @@ const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
 pub const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
-const DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP: usize = 1;
+const DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP: usize = 0;
 
 fn lock_candidate_store_with_timeout<'a>(
     store_lock: &'a Mutex<CandidateStore>,
@@ -403,11 +403,14 @@ enum StoreMode {
     Direct {
         stores: Arc<StoreSet>,
     },
+    Forest {
+        root: PathBuf,
+        trees: Vec<Arc<StoreSet>>,
+    },
     Workspace {
         root: PathBuf,
         published: Arc<StoreSet>,
-        work_active: Arc<StoreSet>,
-        work_idle: Option<Arc<StoreSet>>,
+        work_active: Option<Arc<StoreSet>>,
     },
 }
 
@@ -1699,6 +1702,68 @@ fn candidate_stats_json_from_parts(
     candidate_stats_json_from_parts_with_disk_usage(stats_rows, disk_usage_under(root))
 }
 
+fn empty_candidate_stats_json_for_config(
+    config: &ServerConfig,
+    root: &Path,
+    shard_count: usize,
+) -> Map<String, Value> {
+    let stats = crate::candidate::CandidateStats {
+        doc_count: 0,
+        deleted_doc_count: 0,
+        id_source: config.candidate_config.id_source.clone(),
+        store_path: config.candidate_config.store_path,
+        tier1_filter_target_fp: config.candidate_config.tier1_filter_target_fp,
+        tier2_filter_target_fp: config.candidate_config.tier2_filter_target_fp,
+        tier2_gram_size: config.candidate_config.tier2_gram_size,
+        tier1_gram_size: config.candidate_config.tier1_gram_size,
+        compaction_idle_cooldown_s: config.candidate_config.compaction_idle_cooldown_s,
+        compaction_cooldown_remaining_s: 0.0,
+        compaction_waiting_for_cooldown: false,
+        compaction_generation: 1,
+        retired_generation_count: 0,
+        query_count: 0,
+        tier2_scanned_docs_total: 0,
+        tier2_docs_matched_total: 0,
+        superblocks_skipped_total: 0,
+        tier2_match_ratio: 0.0,
+        tier1_superblock_count: 0,
+        tier1_superblock_docs: config.candidate_config.tier1_superblock_docs,
+        tier1_superblock_summary_bytes: 0,
+        tier2_superblock_summary_bytes: 0,
+        tier1_superblock_positions_bytes: 0,
+        tier2_superblock_positions_bytes: 0,
+        tree_tier1_gate_bytes: 0,
+        tree_tier2_gate_bytes: 0,
+        superblock_summary_bytes_total: 0,
+        superblock_positions_bytes_total: 0,
+        mapped_superblock_snapshot_bytes_total: 0,
+        mapped_tier1_superblock_snapshot_bytes: 0,
+        mapped_tier2_superblock_snapshot_bytes: 0,
+        docs_vector_bytes: 0,
+        doc_rows_bytes: 0,
+        tier2_doc_rows_bytes: 0,
+        sha_index_bytes: 0,
+        special_doc_positions_bytes: 0,
+        prepared_query_cache_entries: 0,
+        prepared_query_cache_bytes: 0,
+        mapped_bloom_bytes: 0,
+        mapped_tier2_bloom_bytes: 0,
+        mapped_metadata_bytes: 0,
+        mapped_external_id_bytes: 0,
+        superblock_memory_budget_bytes: 0,
+    };
+    let mut out = candidate_stats_json_from_parts_with_disk_usage(
+        &[stats],
+        if root.exists() {
+            disk_usage_under(root)
+        } else {
+            0
+        },
+    );
+    out.insert("candidate_shards".to_owned(), json!(shard_count.max(1)));
+    out
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct CandidateStatsBuildProfile {
     collect_store_stats_ms: u64,
@@ -1847,7 +1912,7 @@ impl ServerState {
         startup_profile.total_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let startup_work_documents = match &store_mode {
             StoreMode::Workspace { .. } => startup_profile.work.doc_count,
-            StoreMode::Direct { .. } => 0,
+            StoreMode::Direct { .. } | StoreMode::Forest { .. } => 0,
         };
         let auto_publish_storage_class = config.auto_publish_storage_class.clone();
         let auto_publish_initial_idle_ms = config.auto_publish_initial_idle_ms;
@@ -2010,18 +2075,75 @@ impl ServerState {
             .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
             StoreMode::Direct { stores } => stores.clone(),
+            StoreMode::Forest { .. } => {
+                return Err(SspryError::from(
+                    "forest-root server has no single published store set; use candidate_query against the forest.",
+                ));
+            }
             StoreMode::Workspace { published, .. } => published.clone(),
         })
     }
 
     fn work_store_set(&self) -> Result<Arc<StoreSet>> {
+        let mut mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+        Ok(match &mut *mode {
+            StoreMode::Direct { stores } => stores.clone(),
+            StoreMode::Forest { .. } => {
+                return Err(SspryError::from(
+                    "forest-root server is read-only; work store is unavailable.",
+                ));
+            }
+            StoreMode::Workspace {
+                root, work_active, ..
+            } => {
+                if let Some(work_active) = work_active.as_ref() {
+                    work_active.clone()
+                } else {
+                    let work_root = preferred_workspace_work_root(root);
+                    let (stores, _, _) = ensure_candidate_stores_at_root(&self.config, &work_root)?;
+                    let work_set = Arc::new(StoreSet::new(work_root, stores));
+                    *work_active = Some(work_set.clone());
+                    work_set
+                }
+            }
+        })
+    }
+
+    fn work_store_set_if_present(&self) -> Result<Option<Arc<StoreSet>>> {
         let mode = self
             .store_mode
             .lock()
             .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
-            StoreMode::Direct { stores } => stores.clone(),
+            StoreMode::Direct { stores } => Some(stores.clone()),
+            StoreMode::Forest { .. } => None,
             StoreMode::Workspace { work_active, .. } => work_active.clone(),
+        })
+    }
+
+    fn published_query_store_sets(&self) -> Result<Vec<Arc<StoreSet>>> {
+        let mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+        Ok(match &*mode {
+            StoreMode::Direct { stores } => vec![stores.clone()],
+            StoreMode::Forest { trees, .. } => trees.clone(),
+            StoreMode::Workspace { published, .. } => vec![published.clone()],
+        })
+    }
+
+    fn forest_mode_info(&self) -> Result<Option<(PathBuf, usize)>> {
+        let mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+        Ok(match &*mode {
+            StoreMode::Forest { root, trees } => Some((root.clone(), trees.len())),
+            _ => None,
         })
     }
 
@@ -2038,10 +2160,21 @@ impl ServerState {
                     let _ = store.persist_meta_if_dirty()?;
                 }
             }
+            StoreMode::Forest { trees, .. } => {
+                for stores in trees {
+                    for (shard_idx, store_lock) in stores.stores.iter().enumerate() {
+                        let mut store = lock_candidate_store_with_timeout(
+                            store_lock,
+                            shard_idx,
+                            "flush forest meta",
+                        )?;
+                        let _ = store.persist_meta_if_dirty()?;
+                    }
+                }
+            }
             StoreMode::Workspace {
                 published,
                 work_active,
-                work_idle,
                 ..
             } => {
                 for (shard_idx, store_lock) in published.stores.iter().enumerate() {
@@ -2052,20 +2185,12 @@ impl ServerState {
                     )?;
                     let _ = store.persist_meta_if_dirty()?;
                 }
-                for (shard_idx, store_lock) in work_active.stores.iter().enumerate() {
-                    let mut store = lock_candidate_store_with_timeout(
-                        store_lock,
-                        shard_idx,
-                        "flush active work meta",
-                    )?;
-                    let _ = store.persist_meta_if_dirty()?;
-                }
-                if let Some(work_idle) = work_idle {
-                    for (shard_idx, store_lock) in work_idle.stores.iter().enumerate() {
+                if let Some(work_active) = work_active {
+                    for (shard_idx, store_lock) in work_active.stores.iter().enumerate() {
                         let mut store = lock_candidate_store_with_timeout(
                             store_lock,
                             shard_idx,
-                            "flush idle work meta",
+                            "flush active work meta",
                         )?;
                         let _ = store.persist_meta_if_dirty()?;
                     }
@@ -2082,11 +2207,20 @@ impl ServerState {
             .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
             StoreMode::Direct { .. } => None,
+            StoreMode::Forest { .. } => None,
             StoreMode::Workspace {
+                root,
                 published,
                 work_active,
                 ..
-            } => Some((published.root()?, work_active.root()?)),
+            } => Some((
+                published.root()?,
+                work_active
+                    .as_ref()
+                    .map(|work_active| work_active.root())
+                    .transpose()?
+                    .unwrap_or_else(|| preferred_workspace_work_root(root)),
+            )),
         })
     }
 
@@ -2117,8 +2251,10 @@ impl ServerState {
     }
 
     fn invalidate_work_stats_cache(&self) -> Result<()> {
-        let work = self.work_store_set()?;
-        work.invalidate_stats_cache()
+        if let Some(work) = self.work_store_set_if_present()? {
+            work.invalidate_stats_cache()?;
+        }
+        Ok(())
     }
 
     fn invalidate_published_stats_cache(&self) -> Result<()> {
@@ -3046,7 +3182,7 @@ impl ServerState {
                 .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
             match &*store_mode {
                 StoreMode::Workspace { root, .. } => workspace_retired_root(root),
-                StoreMode::Direct { .. } => return Ok(()),
+                StoreMode::Direct { .. } | StoreMode::Forest { .. } => return Ok(()),
             }
         };
         let _ =
@@ -3095,6 +3231,64 @@ impl ServerState {
             .try_into()
             .unwrap_or(u64::MAX);
         store_set.set_cached_stats(stats.clone(), deleted_storage_bytes)?;
+        Ok((
+            stats,
+            deleted_storage_bytes,
+            CandidateStatsBuildProfile {
+                collect_store_stats_ms,
+                disk_usage_ms,
+                build_json_ms,
+            },
+        ))
+    }
+
+    fn candidate_stats_json_for_query_store_sets_profiled(
+        &self,
+        operation: &str,
+    ) -> Result<(Map<String, Value>, u64, CandidateStatsBuildProfile)> {
+        let store_sets = self.published_query_store_sets()?;
+        if store_sets.len() == 1 {
+            return self.candidate_stats_json_for_store_set_profiled(&store_sets[0], operation);
+        }
+        let started_collect = Instant::now();
+        let mut stats_rows = Vec::new();
+        let mut deleted_storage_bytes = 0u64;
+        for store_set in &store_sets {
+            for (shard_idx, store_lock) in store_set.stores.iter().enumerate() {
+                let store = lock_candidate_store_with_timeout(store_lock, shard_idx, operation)?;
+                stats_rows.push(store.stats());
+                deleted_storage_bytes =
+                    deleted_storage_bytes.saturating_add(store.deleted_storage_bytes());
+            }
+        }
+        let collect_store_stats_ms = started_collect
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let started_disk_usage = Instant::now();
+        let mut disk_usage_bytes = 0u64;
+        for store_set in &store_sets {
+            disk_usage_bytes =
+                disk_usage_bytes.saturating_add(disk_usage_under(&store_set.root()?));
+        }
+        let disk_usage_ms = started_disk_usage
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let started_build_json = Instant::now();
+        let mut stats =
+            candidate_stats_json_from_parts_with_disk_usage(&stats_rows, disk_usage_bytes);
+        stats.insert(
+            "candidate_shards".to_owned(),
+            json!(self.candidate_shard_count()),
+        );
+        let build_json_ms = started_build_json
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         Ok((
             stats,
             deleted_storage_bytes,
@@ -3165,9 +3359,8 @@ impl ServerState {
             .operation_gate
             .read()
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
-        let published = self.published_store_set()?;
         let (mut stats, deleted_storage_bytes, published_stats_profile) =
-            self.candidate_stats_json_for_store_set_profiled(&published, "stats")?;
+            self.candidate_stats_json_for_query_store_sets_profiled("stats")?;
         let mut work_stats_profile = CandidateStatsBuildProfile::default();
         let mut retired_stats_ms = 0u64;
         stats.insert("draining".to_owned(), json!(self.is_shutting_down()));
@@ -3393,11 +3586,31 @@ impl ServerState {
             "deleted_storage_bytes".to_owned(),
             json!(deleted_storage_bytes),
         );
-        if let Some((published_root, work_root)) = self.workspace_roots()? {
-            let work = self.work_store_set()?;
-            let (work_stats, work_deleted_storage_bytes, work_profile) =
-                self.candidate_stats_json_for_store_set_profiled(&work, "work stats")?;
-            work_stats_profile = work_profile;
+        if let Some((forest_root, tree_count)) = self.forest_mode_info()? {
+            stats.insert("workspace_mode".to_owned(), json!(false));
+            stats.insert("forest_mode".to_owned(), json!(true));
+            stats.insert(
+                "forest_root".to_owned(),
+                Value::String(forest_root.display().to_string()),
+            );
+            stats.insert("forest_tree_count".to_owned(), json!(tree_count));
+        } else if let Some((published_root, work_root)) = self.workspace_roots()? {
+            let (mut work_stats, work_deleted_storage_bytes) =
+                if let Some(work) = self.work_store_set_if_present()? {
+                    let (work_stats, work_deleted_storage_bytes, work_profile) =
+                        self.candidate_stats_json_for_store_set_profiled(&work, "work stats")?;
+                    work_stats_profile = work_profile;
+                    (work_stats, work_deleted_storage_bytes)
+                } else {
+                    (
+                        empty_candidate_stats_json_for_config(
+                            &self.config,
+                            &work_root,
+                            self.candidate_shard_count(),
+                        ),
+                        0,
+                    )
+                };
             let retired_root = workspace_retired_root(&self.config.candidate_config.root);
             let started_retired = Instant::now();
             let (retired_published_root_count, retired_published_disk_usage_bytes) =
@@ -3416,7 +3629,6 @@ impl ServerState {
                 "work_root".to_owned(),
                 Value::String(work_root.display().to_string()),
             );
-            let mut work_stats = work_stats;
             work_stats.insert(
                 "deleted_storage_bytes".to_owned(),
                 json!(work_deleted_storage_bytes),
@@ -3942,7 +4154,15 @@ impl ServerState {
             }),
         );
 
-        if let Some((published_root, work_root)) = self.workspace_roots()? {
+        if let Some((forest_root, tree_count)) = self.forest_mode_info()? {
+            stats.insert("workspace_mode".to_owned(), json!(false));
+            stats.insert("forest_mode".to_owned(), json!(true));
+            stats.insert(
+                "forest_root".to_owned(),
+                Value::String(forest_root.display().to_string()),
+            );
+            stats.insert("forest_tree_count".to_owned(), json!(tree_count));
+        } else if let Some((published_root, work_root)) = self.workspace_roots()? {
             let retired_root = workspace_retired_root(&self.config.candidate_config.root);
             let (retired_published_root_count, retired_published_disk_usage_bytes) =
                 workspace_retired_stats(&retired_root);
@@ -3957,6 +4177,35 @@ impl ServerState {
                 "work_root".to_owned(),
                 Value::String(work_root.display().to_string()),
             );
+            let (mut work_stats, work_deleted_storage_bytes) =
+                if let Some(work) = self.work_store_set_if_present()? {
+                    if let Some((work_stats, work_deleted_storage_bytes)) = work.cached_stats()? {
+                        (work_stats, work_deleted_storage_bytes)
+                    } else {
+                        (
+                            empty_candidate_stats_json_for_config(
+                                &self.config,
+                                &work_root,
+                                self.candidate_shard_count(),
+                            ),
+                            0,
+                        )
+                    }
+                } else {
+                    (
+                        empty_candidate_stats_json_for_config(
+                            &self.config,
+                            &work_root,
+                            self.candidate_shard_count(),
+                        ),
+                        0,
+                    )
+                };
+            work_stats.insert(
+                "deleted_storage_bytes".to_owned(),
+                json!(work_deleted_storage_bytes),
+            );
+            stats.insert("work".to_owned(), Value::Object(work_stats));
             let mut publish = Map::new();
             publish.insert(
                 "pending".to_owned(),
@@ -4206,6 +4455,7 @@ impl ServerState {
             );
         } else {
             stats.insert("workspace_mode".to_owned(), json!(false));
+            stats.insert("forest_mode".to_owned(), json!(false));
         }
         Ok(stats)
     }
@@ -4418,22 +4668,23 @@ impl ServerState {
         record_counter("rpc.handle_candidate_query_prepared_cache_misses_total", 1);
         let mut filter_keys = HashSet::<(usize, usize)>::new();
         let mut tier2_doc_filter_keys = HashSet::<(usize, usize)>::new();
-        let published = self.published_store_set()?;
         let mut summary_cap_bytes = None::<usize>;
-        for store_lock in &published.stores {
-            let store = lock_candidate_store_blocking(store_lock)?;
-            let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
-            if let Some(existing) = summary_cap_bytes {
-                if existing != shard_summary_cap {
-                    return Err(SspryError::from(
-                        "published shards use mixed tier2 superblock summary caps",
-                    ));
+        for store_set in self.published_query_store_sets()? {
+            for store_lock in &store_set.stores {
+                let store = lock_candidate_store_blocking(store_lock)?;
+                let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
+                if let Some(existing) = summary_cap_bytes {
+                    if existing != shard_summary_cap {
+                        return Err(SspryError::from(
+                            "query stores use mixed tier2 superblock summary caps",
+                        ));
+                    }
+                } else {
+                    summary_cap_bytes = Some(shard_summary_cap);
                 }
-            } else {
-                summary_cap_bytes = Some(shard_summary_cap);
+                filter_keys.extend(store.tier1_superblock_filter_keys());
+                tier2_doc_filter_keys.extend(store.tier2_doc_filter_keys());
             }
-            filter_keys.extend(store.tier1_superblock_filter_keys());
-            tier2_doc_filter_keys.extend(store.tier2_doc_filter_keys());
         }
         let mut ordered_filter_keys = filter_keys.into_iter().collect::<Vec<_>>();
         ordered_filter_keys.sort_unstable();
@@ -4494,9 +4745,9 @@ impl ServerState {
     ) -> Result<CachedCandidateQuery> {
         let prepared = self.shared_prepared_query_artifacts(plan)?;
         let prepared_query_profile = prepared_query_artifacts_profile(prepared.as_ref());
-        let published = self.published_store_set()?;
-        if self.candidate_shard_count() == 1 {
-            let mut store = lock_candidate_store_blocking(&published.stores[0])?;
+        let store_sets = self.published_query_store_sets()?;
+        if store_sets.len() == 1 && self.candidate_shard_count() == 1 {
+            let mut store = lock_candidate_store_blocking(&store_sets[0].stores[0])?;
             let (hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
             let ordered_hashes = hits;
@@ -4514,25 +4765,34 @@ impl ServerState {
             });
         }
 
-        let worker_count = self
-            .config
-            .search_workers
-            .max(1)
-            .min(self.candidate_shard_count().max(1));
+        let worker_count = self.config.search_workers.max(1).min(
+            store_sets
+                .iter()
+                .map(|stores| stores.stores.len())
+                .sum::<usize>()
+                .max(1),
+        );
+
+        let store_units = store_sets
+            .iter()
+            .flat_map(|stores| {
+                (0..stores.stores.len()).map(move |shard_idx| (stores.clone(), shard_idx))
+            })
+            .collect::<Vec<_>>();
 
         if worker_count <= 1 {
-            let mut hits = Vec::<String>::new();
+            let mut hits = HashSet::<String>::new();
             let mut tier_used = Vec::<String>::new();
             let mut query_profile = CandidateQueryProfile::default();
-            for store_lock in &published.stores {
-                let mut store = lock_candidate_store_blocking(store_lock)?;
+            for (stores, shard_idx) in &store_units {
+                let mut store = lock_candidate_store_blocking(&stores.stores[*shard_idx])?;
                 let (local_hits, local_tiers, local_profile) =
                     Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
                 hits.extend(local_hits);
                 tier_used.extend(local_tiers);
                 query_profile.merge_from(&local_profile);
             }
-            let ordered_hashes = hits;
+            let ordered_hashes = hits.into_iter().collect::<Vec<_>>();
             if ordered_hashes.len() > plan.max_candidates {
                 return Err(crate::candidate::store::candidate_limit_exceeded_error(
                     ordered_hashes.len(),
@@ -4551,22 +4811,23 @@ impl ServerState {
         let partials = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
-                let stores = published.clone();
+                let store_units = &store_units;
                 let plan = plan;
                 let prepared = prepared.clone();
                 let next_shard = &next_shard;
                 handles.push(scope.spawn(
-                    move || -> Result<(Vec<String>, Vec<String>, CandidateQueryProfile)> {
-                        let mut local_hits = Vec::<String>::new();
+                    move || -> Result<(HashSet<String>, Vec<String>, CandidateQueryProfile)> {
+                        let mut local_hits = HashSet::<String>::new();
                         let mut local_tiers = Vec::<String>::new();
                         let mut local_profile = CandidateQueryProfile::default();
                         loop {
                             let shard_idx = next_shard.fetch_add(1, Ordering::Relaxed);
-                            if shard_idx >= stores.stores.len() {
+                            if shard_idx >= store_units.len() {
                                 break;
                             }
+                            let (stores, store_shard_idx) = &store_units[shard_idx];
                             let mut store =
-                                lock_candidate_store_blocking(&stores.stores[shard_idx])?;
+                                lock_candidate_store_blocking(&stores.stores[*store_shard_idx])?;
                             let (hits, tiers, profile) = Self::collect_query_matches_single_store(
                                 &mut store, plan, &prepared,
                             )?;
@@ -4586,10 +4847,10 @@ impl ServerState {
                     .map_err(|_| SspryError::from("Candidate query worker panicked."))??;
                 merged.push(partial);
             }
-            Ok::<Vec<(Vec<String>, Vec<String>, CandidateQueryProfile)>, SspryError>(merged)
+            Ok::<Vec<(HashSet<String>, Vec<String>, CandidateQueryProfile)>, SspryError>(merged)
         })?;
 
-        let mut hits = Vec::<String>::new();
+        let mut hits = HashSet::<String>::new();
         let mut tier_used = Vec::<String>::new();
         let mut query_profile = CandidateQueryProfile::default();
         for (local_hits, local_tiers, local_profile) in partials {
@@ -4597,7 +4858,7 @@ impl ServerState {
             tier_used.extend(local_tiers);
             query_profile.merge_from(&local_profile);
         }
-        let ordered_hashes = hits;
+        let ordered_hashes = hits.into_iter().collect::<Vec<_>>();
         if ordered_hashes.len() > plan.max_candidates {
             return Err(crate::candidate::store::candidate_limit_exceeded_error(
                 ordered_hashes.len(),
@@ -5307,7 +5568,7 @@ impl ServerState {
         let external_ids = if request.include_external_ids {
             let mut values = vec![None; page.len()];
             let mut by_shard = HashMap::<usize, Vec<(usize, String)>>::new();
-            let published = self.published_store_set()?;
+            let query_store_sets = self.published_query_store_sets()?;
             for (idx, sha256_hex) in page.iter().enumerate() {
                 let mut decoded = [0u8; 32];
                 hex::decode_to_slice(sha256_hex, &mut decoded)?;
@@ -5317,21 +5578,29 @@ impl ServerState {
                     .or_default()
                     .push((idx, sha256_hex.clone()));
             }
-            for (shard_idx, items) in by_shard {
-                let store = lock_candidate_store_with_timeout(
-                    &published.stores[shard_idx],
-                    shard_idx,
-                    "query external ids",
-                )?;
-                let hashes = items
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .collect::<Vec<_>>();
-                for ((idx, _), external_id) in items
-                    .into_iter()
-                    .zip(store.external_ids_for_sha256(&hashes))
-                {
-                    values[idx] = external_id;
+            for stores in query_store_sets {
+                for (shard_idx, items) in &by_shard {
+                    let Some(store_lock) = stores.stores.get(*shard_idx) else {
+                        continue;
+                    };
+                    let store = lock_candidate_store_with_timeout(
+                        store_lock,
+                        *shard_idx,
+                        "query external ids",
+                    )?;
+                    let hashes = items
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .collect::<Vec<_>>();
+                    for ((idx, _), external_id) in items
+                        .iter()
+                        .cloned()
+                        .zip(store.external_ids_for_sha256(&hashes))
+                    {
+                        if values[idx].is_none() && external_id.is_some() {
+                            values[idx] = external_id;
+                        }
+                    }
                 }
             }
             Some(values)
@@ -5410,6 +5679,7 @@ impl ServerState {
                 retired_parent,
                 publish_work,
                 publish_work_root,
+                next_work_root,
                 published_store_set,
                 published_is_empty,
             ) = {
@@ -5423,13 +5693,20 @@ impl ServerState {
                             "publish is only available for workspace stores",
                         ));
                     }
+                    StoreMode::Forest { .. } => {
+                        return Err(SspryError::from(
+                            "publish is not available for forest-root servers",
+                        ));
+                    }
                     StoreMode::Workspace { root, .. } => root.clone(),
                 };
                 let current_root = workspace_current_root(&workspace_root);
                 let retired_parent = workspace_retired_root(&workspace_root);
                 let published_store_set = match &*store_mode {
                     StoreMode::Workspace { published, .. } => published.clone(),
-                    StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                    StoreMode::Direct { .. } | StoreMode::Forest { .. } => {
+                        unreachable!("workspace already checked")
+                    }
                 };
                 let published_is_empty = published_store_set.stores.iter().all(|store_lock| {
                     store_lock
@@ -5437,22 +5714,31 @@ impl ServerState {
                         .map(|store| store.stats().doc_count == 0)
                         .unwrap_or(false)
                 });
-                let (publish_work, publish_work_root) = match &mut *store_mode {
+                let (publish_work, publish_work_root, next_work_root) = match &mut *store_mode {
                     StoreMode::Workspace {
-                        work_active,
-                        work_idle,
-                        ..
+                        root, work_active, ..
                     } => {
-                        let next_active = work_idle.take().ok_or_else(|| {
-                            SspryError::from(
-                                "idle work buffer is unavailable during publish; retry later",
-                            )
-                        })?;
-                        let publish_work = std::mem::replace(work_active, next_active);
-                        let publish_work_root = publish_work.root()?;
-                        (publish_work, publish_work_root)
+                        let publish_work = work_active.take();
+                        let publish_work_root = publish_work
+                            .as_ref()
+                            .map(|stores| stores.root())
+                            .transpose()?;
+                        let next_work_root =
+                            if self.active_index_sessions.load(Ordering::Acquire) > 0 {
+                                Some(match publish_work_root.as_deref() {
+                                    Some(active_root) => {
+                                        alternate_workspace_work_root(root, active_root)
+                                    }
+                                    None => preferred_workspace_work_root(root),
+                                })
+                            } else {
+                                None
+                            };
+                        (publish_work, publish_work_root, next_work_root)
                     }
-                    StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                    StoreMode::Direct { .. } | StoreMode::Forest { .. } => {
+                        unreachable!("workspace already checked")
+                    }
                 };
                 (
                     workspace_root,
@@ -5460,6 +5746,7 @@ impl ServerState {
                     retired_parent,
                     publish_work,
                     publish_work_root,
+                    next_work_root,
                     published_store_set,
                     published_is_empty,
                 )
@@ -5470,177 +5757,187 @@ impl ServerState {
             self.mutations_paused.store(false, Ordering::SeqCst);
             let publish_shard_count = self.candidate_shard_count();
             let removed_current = 0usize;
+            let mut removed_work = 0usize;
             let mut reuse_work_stores = false;
             let mut changed_shards = vec![false; publish_shard_count];
-            let published_store_set = if published_is_empty {
-                let swap_started = Instant::now();
-                if current_root.exists() {
-                    fs::create_dir_all(&retired_parent)?;
-                    let retired_root = next_workspace_retired_root_path(&retired_parent);
-                    fs::rename(&current_root, &retired_root)?;
-                }
-                fs::rename(&publish_work_root, &current_root)?;
-                self.last_publish_swap_ms.store(
-                    swap_started
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                    Ordering::SeqCst,
-                );
-                let promote_started = Instant::now();
-                self.last_publish_promote_work_export_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_resolve_doc_state_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_build_payloads_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_append_sidecars_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_install_docs_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_tier2_update_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_persist_meta_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_import_rebalance_tier2_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_remove_work_root_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_other_ms
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_imported_docs
-                    .store(0, Ordering::SeqCst);
-                self.last_publish_promote_work_imported_shards
-                    .store(0, Ordering::SeqCst);
-                publish_work.retarget_root(&current_root, publish_shard_count)?;
-                reuse_work_stores = true;
-                let published_store_set = publish_work;
-                self.last_publish_promote_work_ms.store(
-                    promote_started
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                    Ordering::SeqCst,
-                );
-                for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
-                    let store = store_lock
-                        .lock()
-                        .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
-                    if store.stats().doc_count > 0 {
-                        changed_shards[shard_idx] = true;
+            let published_store_set = if let Some(publish_work) = publish_work {
+                let publish_work_root = publish_work_root
+                    .ok_or_else(|| SspryError::from("active work root is unavailable"))?;
+                if published_is_empty {
+                    let swap_started = Instant::now();
+                    if current_root.exists() {
+                        fs::create_dir_all(&retired_parent)?;
+                        let retired_root = next_workspace_retired_root_path(&retired_parent);
+                        fs::rename(&current_root, &retired_root)?;
                     }
+                    fs::rename(&publish_work_root, &current_root)?;
+                    self.last_publish_swap_ms.store(
+                        swap_started
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        Ordering::SeqCst,
+                    );
+                    let promote_started = Instant::now();
+                    self.last_publish_promote_work_export_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_resolve_doc_state_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_build_payloads_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_append_sidecars_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_install_docs_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_tier2_update_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_persist_meta_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_rebalance_tier2_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_remove_work_root_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_other_ms
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_imported_docs
+                        .store(0, Ordering::SeqCst);
+                    self.last_publish_promote_work_imported_shards
+                        .store(0, Ordering::SeqCst);
+                    publish_work.retarget_root(&current_root, publish_shard_count)?;
+                    reuse_work_stores = true;
+                    let published_store_set = publish_work;
+                    self.last_publish_promote_work_ms.store(
+                        promote_started
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        Ordering::SeqCst,
+                    );
+                    for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
+                        let store = store_lock
+                            .lock()
+                            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
+                        if store.stats().doc_count > 0 {
+                            changed_shards[shard_idx] = true;
+                        }
+                    }
+                    published_store_set
+                } else {
+                    self.last_publish_swap_ms.store(0, Ordering::SeqCst);
+                    let promote_started = Instant::now();
+                    let mut export_ms_total = 0u128;
+                    let mut import_ms_total = 0u128;
+                    let mut import_profile_total = CandidateImportBatchProfile::default();
+                    let mut imported_docs_total = 0u64;
+                    let mut imported_shards_total = 0u64;
+                    for (shard_idx, store_lock) in publish_work.stores.iter().enumerate() {
+                        let mut work_store = lock_candidate_store_with_timeout(
+                            store_lock,
+                            shard_idx,
+                            "publish export work",
+                        )?;
+                        let export_started = Instant::now();
+                        let imported = work_store.export_live_documents()?;
+                        export_ms_total =
+                            export_ms_total.saturating_add(export_started.elapsed().as_millis());
+                        if imported.is_empty() {
+                            continue;
+                        }
+                        changed_shards[shard_idx] = true;
+                        imported_docs_total =
+                            imported_docs_total.saturating_add(imported.len() as u64);
+                        imported_shards_total = imported_shards_total.saturating_add(1);
+                        let import_started = Instant::now();
+                        let mut published_store = published_store_set.stores[shard_idx]
+                            .lock()
+                            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
+                        let all_known_new = imported.iter().all(|document| {
+                            !published_store.contains_live_document_sha256(&document.sha256)
+                        });
+                        if all_known_new {
+                            published_store.import_documents_batch_known_new_quiet(&imported)?
+                        } else {
+                            published_store.import_documents_batch_quiet(&imported)?
+                        }
+                        let import_profile = published_store.last_import_batch_profile();
+                        import_profile_total.resolve_doc_state_ms = import_profile_total
+                            .resolve_doc_state_ms
+                            .saturating_add(import_profile.resolve_doc_state_ms);
+                        import_profile_total.build_payloads_ms = import_profile_total
+                            .build_payloads_ms
+                            .saturating_add(import_profile.build_payloads_ms);
+                        import_profile_total.append_sidecars_ms = import_profile_total
+                            .append_sidecars_ms
+                            .saturating_add(import_profile.append_sidecars_ms);
+                        import_profile_total.install_docs_ms = import_profile_total
+                            .install_docs_ms
+                            .saturating_add(import_profile.install_docs_ms);
+                        import_profile_total.tier2_update_ms = import_profile_total
+                            .tier2_update_ms
+                            .saturating_add(import_profile.tier2_update_ms);
+                        import_profile_total.persist_meta_ms = import_profile_total
+                            .persist_meta_ms
+                            .saturating_add(import_profile.persist_meta_ms);
+                        import_profile_total.rebalance_tier2_ms = import_profile_total
+                            .rebalance_tier2_ms
+                            .saturating_add(import_profile.rebalance_tier2_ms);
+                        import_ms_total =
+                            import_ms_total.saturating_add(import_started.elapsed().as_millis());
+                    }
+                    let remove_started = Instant::now();
+                    if publish_work_root.exists() {
+                        fs::remove_dir_all(&publish_work_root)?;
+                    }
+                    let remove_ms = remove_started.elapsed().as_millis();
+                    let promote_ms = promote_started.elapsed().as_millis();
+                    self.last_publish_promote_work_ms
+                        .store(promote_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
+                    self.last_publish_promote_work_export_ms.store(
+                        export_ms_total.try_into().unwrap_or(u64::MAX),
+                        Ordering::SeqCst,
+                    );
+                    self.last_publish_promote_work_import_ms.store(
+                        import_ms_total.try_into().unwrap_or(u64::MAX),
+                        Ordering::SeqCst,
+                    );
+                    self.last_publish_promote_work_import_resolve_doc_state_ms
+                        .store(import_profile_total.resolve_doc_state_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_build_payloads_ms
+                        .store(import_profile_total.build_payloads_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_append_sidecars_ms
+                        .store(import_profile_total.append_sidecars_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_install_docs_ms
+                        .store(import_profile_total.install_docs_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_tier2_update_ms
+                        .store(import_profile_total.tier2_update_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_persist_meta_ms
+                        .store(import_profile_total.persist_meta_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_import_rebalance_tier2_ms
+                        .store(import_profile_total.rebalance_tier2_ms, Ordering::SeqCst);
+                    self.last_publish_promote_work_remove_work_root_ms
+                        .store(remove_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
+                    self.last_publish_promote_work_other_ms.store(
+                        promote_ms
+                            .saturating_sub(export_ms_total)
+                            .saturating_sub(import_ms_total)
+                            .saturating_sub(remove_ms)
+                            .try_into()
+                            .unwrap_or(0),
+                        Ordering::SeqCst,
+                    );
+                    self.last_publish_promote_work_imported_docs
+                        .store(imported_docs_total, Ordering::SeqCst);
+                    self.last_publish_promote_work_imported_shards
+                        .store(imported_shards_total, Ordering::SeqCst);
+                    published_store_set
                 }
-                published_store_set
             } else {
                 self.last_publish_swap_ms.store(0, Ordering::SeqCst);
-                let promote_started = Instant::now();
-                let mut export_ms_total = 0u128;
-                let mut import_ms_total = 0u128;
-                let mut import_profile_total = CandidateImportBatchProfile::default();
-                let mut imported_docs_total = 0u64;
-                let mut imported_shards_total = 0u64;
-                for (shard_idx, store_lock) in publish_work.stores.iter().enumerate() {
-                    let mut work_store = lock_candidate_store_with_timeout(
-                        store_lock,
-                        shard_idx,
-                        "publish export work",
-                    )?;
-                    let export_started = Instant::now();
-                    let imported = work_store.export_live_documents()?;
-                    export_ms_total =
-                        export_ms_total.saturating_add(export_started.elapsed().as_millis());
-                    if imported.is_empty() {
-                        continue;
-                    }
-                    changed_shards[shard_idx] = true;
-                    imported_docs_total = imported_docs_total.saturating_add(imported.len() as u64);
-                    imported_shards_total = imported_shards_total.saturating_add(1);
-                    let import_started = Instant::now();
-                    let mut published_store = published_store_set.stores[shard_idx]
-                        .lock()
-                        .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
-                    let all_known_new = imported.iter().all(|document| {
-                        !published_store.contains_live_document_sha256(&document.sha256)
-                    });
-                    if all_known_new {
-                        published_store.import_documents_batch_known_new_quiet(&imported)?
-                    } else {
-                        published_store.import_documents_batch_quiet(&imported)?
-                    }
-                    let import_profile = published_store.last_import_batch_profile();
-                    import_profile_total.resolve_doc_state_ms = import_profile_total
-                        .resolve_doc_state_ms
-                        .saturating_add(import_profile.resolve_doc_state_ms);
-                    import_profile_total.build_payloads_ms = import_profile_total
-                        .build_payloads_ms
-                        .saturating_add(import_profile.build_payloads_ms);
-                    import_profile_total.append_sidecars_ms = import_profile_total
-                        .append_sidecars_ms
-                        .saturating_add(import_profile.append_sidecars_ms);
-                    import_profile_total.install_docs_ms = import_profile_total
-                        .install_docs_ms
-                        .saturating_add(import_profile.install_docs_ms);
-                    import_profile_total.tier2_update_ms = import_profile_total
-                        .tier2_update_ms
-                        .saturating_add(import_profile.tier2_update_ms);
-                    import_profile_total.persist_meta_ms = import_profile_total
-                        .persist_meta_ms
-                        .saturating_add(import_profile.persist_meta_ms);
-                    import_profile_total.rebalance_tier2_ms = import_profile_total
-                        .rebalance_tier2_ms
-                        .saturating_add(import_profile.rebalance_tier2_ms);
-                    import_ms_total =
-                        import_ms_total.saturating_add(import_started.elapsed().as_millis());
-                }
-                let remove_started = Instant::now();
-                if publish_work_root.exists() {
-                    fs::remove_dir_all(&publish_work_root)?;
-                }
-                let remove_ms = remove_started.elapsed().as_millis();
-                let promote_ms = promote_started.elapsed().as_millis();
-                self.last_publish_promote_work_ms
-                    .store(promote_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
-                self.last_publish_promote_work_export_ms.store(
-                    export_ms_total.try_into().unwrap_or(u64::MAX),
-                    Ordering::SeqCst,
-                );
-                self.last_publish_promote_work_import_ms.store(
-                    import_ms_total.try_into().unwrap_or(u64::MAX),
-                    Ordering::SeqCst,
-                );
-                self.last_publish_promote_work_import_resolve_doc_state_ms
-                    .store(import_profile_total.resolve_doc_state_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_build_payloads_ms
-                    .store(import_profile_total.build_payloads_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_append_sidecars_ms
-                    .store(import_profile_total.append_sidecars_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_install_docs_ms
-                    .store(import_profile_total.install_docs_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_tier2_update_ms
-                    .store(import_profile_total.tier2_update_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_persist_meta_ms
-                    .store(import_profile_total.persist_meta_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_import_rebalance_tier2_ms
-                    .store(import_profile_total.rebalance_tier2_ms, Ordering::SeqCst);
-                self.last_publish_promote_work_remove_work_root_ms
-                    .store(remove_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
-                self.last_publish_promote_work_other_ms.store(
-                    promote_ms
-                        .saturating_sub(export_ms_total)
-                        .saturating_sub(import_ms_total)
-                        .saturating_sub(remove_ms)
-                        .try_into()
-                        .unwrap_or(0),
-                    Ordering::SeqCst,
-                );
-                self.last_publish_promote_work_imported_docs
-                    .store(imported_docs_total, Ordering::SeqCst);
-                self.last_publish_promote_work_imported_shards
-                    .store(imported_shards_total, Ordering::SeqCst);
+                self.last_publish_promote_work_ms.store(0, Ordering::SeqCst);
                 published_store_set
             };
             let persisted_snapshot_shards =
@@ -5668,21 +5965,31 @@ impl ServerState {
             self.last_publish_tier2_snapshot_persist_failures
                 .store(0, Ordering::SeqCst);
 
-            let removed_retired_roots = 0usize;
+            let removed_retired_roots = prune_workspace_retired_roots(
+                &retired_parent,
+                DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP,
+            )?;
             self.last_publish_reused_work_stores
                 .store(reuse_work_stores, Ordering::SeqCst);
 
-            let init_work_started = Instant::now();
-            let (idle_work_stores, removed_work, _) =
-                ensure_candidate_stores_at_root(&self.config, &publish_work_root)?;
-            self.last_publish_init_work_ms.store(
-                init_work_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                Ordering::SeqCst,
-            );
+            let next_work_active = if let Some(next_work_root) = next_work_root {
+                let init_work_started = Instant::now();
+                let (next_work_stores, removed, _) =
+                    ensure_candidate_stores_at_root(&self.config, &next_work_root)?;
+                removed_work = removed;
+                self.last_publish_init_work_ms.store(
+                    init_work_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+                Some(Arc::new(StoreSet::new(next_work_root, next_work_stores)))
+            } else {
+                self.last_publish_init_work_ms.store(0, Ordering::SeqCst);
+                None
+            };
             {
                 let mut store_mode = self
                     .store_mode
@@ -5692,17 +5999,16 @@ impl ServerState {
                     StoreMode::Workspace {
                         root,
                         published,
-                        work_idle,
+                        work_active,
                         ..
                     } => {
                         *root = workspace_root.clone();
                         *published = published_store_set;
-                        *work_idle = Some(Arc::new(StoreSet::new(
-                            publish_work_root.clone(),
-                            idle_work_stores,
-                        )));
+                        *work_active = next_work_active;
                     }
-                    StoreMode::Direct { .. } => unreachable!("workspace already checked"),
+                    StoreMode::Direct { .. } | StoreMode::Forest { .. } => {
+                        unreachable!("workspace already checked")
+                    }
                 }
             }
             if self.active_index_sessions.load(Ordering::Acquire) == 0 {
@@ -6701,8 +7007,9 @@ fn apply_store_open_profile(
 fn ensure_candidate_store_profiled(
     config: CandidateConfig,
 ) -> Result<(CandidateStore, bool, CandidateStoreOpenProfile)> {
-    let meta_path = config.root.join("meta.json");
-    if !meta_path.exists() {
+    let has_store_meta =
+        config.root.join("store_meta.json").exists() || config.root.join("meta.json").exists();
+    if !has_store_meta {
         let started = Instant::now();
         let store = CandidateStore::init(config, false)?;
         return Ok((
@@ -6728,6 +7035,26 @@ fn workspace_work_root_a(root: &Path) -> PathBuf {
 
 fn workspace_work_root_b(root: &Path) -> PathBuf {
     root.join("work_b")
+}
+
+fn preferred_workspace_work_root(root: &Path) -> PathBuf {
+    let work_root_a = workspace_work_root_a(root);
+    let work_root_b = workspace_work_root_b(root);
+    if work_root_a.exists() && !work_root_b.exists() {
+        work_root_a
+    } else if work_root_b.exists() && !work_root_a.exists() {
+        work_root_b
+    } else {
+        work_root_a
+    }
+}
+
+fn alternate_workspace_work_root(root: &Path, active_root: &Path) -> PathBuf {
+    if active_root == workspace_work_root_a(root) {
+        workspace_work_root_b(root)
+    } else {
+        workspace_work_root_a(root)
+    }
 }
 
 fn workspace_retired_root(root: &Path) -> PathBuf {
@@ -6760,6 +7087,75 @@ fn workspace_retired_stats(root: &Path) -> (u64, u64) {
     let retired = workspace_retired_roots(root);
     let bytes = retired.iter().map(|path| disk_usage_under(path)).sum();
     (retired.len() as u64, bytes)
+}
+
+fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut tree_roots = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            let current = path.join("current");
+            if current.is_dir() { current } else { path }
+        })
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .parent()
+                    .and_then(|value| value.file_name().or_else(|| path.file_name()))
+                    .and_then(|value| value.to_str())
+                    .map(|name| name.starts_with("tree_"))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    tree_roots.sort();
+    Ok(tree_roots)
+}
+
+fn merge_store_root_startup_profile(
+    dst: &mut StoreRootStartupProfile,
+    src: &StoreRootStartupProfile,
+) {
+    dst.total_ms = dst.total_ms.saturating_add(src.total_ms);
+    dst.opened_existing_shards = dst
+        .opened_existing_shards
+        .saturating_add(src.opened_existing_shards);
+    dst.initialized_new_shards = dst
+        .initialized_new_shards
+        .saturating_add(src.initialized_new_shards);
+    dst.doc_count = dst.doc_count.saturating_add(src.doc_count);
+    dst.store_open_total_ms = dst
+        .store_open_total_ms
+        .saturating_add(src.store_open_total_ms);
+    dst.store_open_manifest_ms = dst
+        .store_open_manifest_ms
+        .saturating_add(src.store_open_manifest_ms);
+    dst.store_open_meta_ms = dst
+        .store_open_meta_ms
+        .saturating_add(src.store_open_meta_ms);
+    dst.store_open_load_state_ms = dst
+        .store_open_load_state_ms
+        .saturating_add(src.store_open_load_state_ms);
+    dst.store_open_sidecars_ms = dst
+        .store_open_sidecars_ms
+        .saturating_add(src.store_open_sidecars_ms);
+    dst.store_open_rebuild_indexes_ms = dst
+        .store_open_rebuild_indexes_ms
+        .saturating_add(src.store_open_rebuild_indexes_ms);
+    dst.store_open_rebuild_sha_index_ms = dst
+        .store_open_rebuild_sha_index_ms
+        .saturating_add(src.store_open_rebuild_sha_index_ms);
+    dst.store_open_load_superblock_snapshots_ms = dst
+        .store_open_load_superblock_snapshots_ms
+        .saturating_add(src.store_open_load_superblock_snapshots_ms);
+    dst.store_open_loaded_superblocks_from_snapshot_shards = dst
+        .store_open_loaded_superblocks_from_snapshot_shards
+        .saturating_add(src.store_open_loaded_superblocks_from_snapshot_shards);
+    dst.store_open_rebuild_superblocks_ms = dst
+        .store_open_rebuild_superblocks_ms
+        .saturating_add(src.store_open_rebuild_superblocks_ms);
 }
 
 fn next_workspace_retired_root_path(root: &Path) -> PathBuf {
@@ -6861,6 +7257,30 @@ fn ensure_candidate_stores_at_root(
 fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, StartupProfile)> {
     let root = &config.candidate_config.root;
     if !config.workspace_mode {
+        let forest_roots = forest_tree_roots(root)?;
+        if !forest_roots.is_empty() && !root.join("current").is_dir() {
+            let mut trees = Vec::with_capacity(forest_roots.len());
+            let mut removed_roots = 0usize;
+            let mut current_profile = StoreRootStartupProfile::default();
+            for tree_root in forest_roots {
+                let (stores, tree_removed_roots, tree_profile) =
+                    ensure_candidate_stores_at_root(config, &tree_root)?;
+                removed_roots = removed_roots.saturating_add(tree_removed_roots);
+                merge_store_root_startup_profile(&mut current_profile, &tree_profile);
+                trees.push(Arc::new(StoreSet::new(tree_root, stores)));
+            }
+            return Ok((
+                StoreMode::Forest {
+                    root: root.clone(),
+                    trees,
+                },
+                removed_roots,
+                StartupProfile {
+                    current: current_profile,
+                    ..StartupProfile::default()
+                },
+            ));
+        }
         let (stores, removed_roots, current_profile) =
             ensure_candidate_stores_at_root(config, root)?;
         return Ok((
@@ -6884,8 +7304,6 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     }
 
     let current_root = workspace_current_root(root);
-    let work_root_a = workspace_work_root_a(root);
-    let work_root_b = workspace_work_root_b(root);
     if root.join("work").exists() {
         return Err(SspryError::from(format!(
             "{} contains the retired workspace work/ root; move or remove it before restarting.",
@@ -6897,23 +7315,15 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
         prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
     let (published, removed_current, current_profile) =
         ensure_candidate_stores_at_root(config, &current_root)?;
-    let (work_active, removed_work_active, work_profile) =
-        ensure_candidate_stores_at_root(config, &work_root_a)?;
-    let (work_idle, removed_work_idle, _) = ensure_candidate_stores_at_root(config, &work_root_b)?;
     Ok((
         StoreMode::Workspace {
             root: root.clone(),
             published: Arc::new(StoreSet::new(current_root, published)),
-            work_active: Arc::new(StoreSet::new(work_root_a, work_active)),
-            work_idle: Some(Arc::new(StoreSet::new(work_root_b, work_idle))),
+            work_active: None,
         },
-        removed_current
-            .saturating_add(removed_work_active)
-            .saturating_add(removed_work_idle)
-            .saturating_add(removed_retired),
+        removed_current.saturating_add(removed_retired),
         StartupProfile {
             current: current_profile,
-            work: work_profile,
             ..StartupProfile::default()
         },
     ))
@@ -7032,6 +7442,64 @@ mod tests {
             )
             .expect("server state"),
         )
+    }
+
+    fn sample_forest_server_state(base: &Path, candidate_shards: usize) -> Arc<ServerState> {
+        let forest_root = base.join(format!("candidate_forest_{candidate_shards}"));
+        let config = ServerConfig {
+            candidate_config: CandidateConfig {
+                root: forest_root.clone(),
+                ..CandidateConfig::default()
+            },
+            candidate_shards,
+            search_workers: 2,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
+            auto_publish_initial_idle_ms: 500,
+            auto_publish_storage_class: "unknown".to_owned(),
+            workspace_mode: false,
+        };
+        for tree_idx in [0usize, 1usize] {
+            let tree_root = forest_root
+                .join(format!("tree_{tree_idx:02}"))
+                .join("current");
+            let _ = ensure_candidate_stores_at_root(&config, &tree_root).expect("tree stores");
+        }
+        let state = Arc::new(
+            ServerState::new(config, Arc::new(AtomicBool::new(false))).expect("forest state"),
+        );
+        for (tree_idx, stores) in state
+            .published_query_store_sets()
+            .expect("forest query stores")
+            .into_iter()
+            .enumerate()
+        {
+            let store_lock = stores.stores.first().expect("single shard");
+            let mut store = store_lock.lock().expect("lock tree store");
+            let doc_path = base.join(format!("forest_doc_{tree_idx:02}.bin"));
+            let features = scan_features_default_grams(&doc_path).unwrap_or_else(|_| {
+                let payload = format!("xxABCyy{tree_idx}");
+                fs::write(&doc_path, payload.as_bytes()).expect("write forest sample");
+                scan_features_default_grams(&doc_path).expect("forest features")
+            });
+            store
+                .insert_document(
+                    features.sha256,
+                    features.file_size,
+                    None,
+                    None,
+                    None,
+                    None,
+                    features.bloom_filter.len(),
+                    &features.bloom_filter,
+                    features.tier2_bloom_filter.len(),
+                    &features.tier2_bloom_filter,
+                    Some(format!("tree_{tree_idx:02}.bin")),
+                )
+                .expect("insert tree doc");
+            let _ = store.persist_meta_if_dirty().expect("persist tree meta");
+        }
+        state
     }
 
     fn sample_workspace_server_state(base: &Path, candidate_shards: usize) -> Arc<ServerState> {
@@ -7158,6 +7626,354 @@ mod tests {
         assert!(
             err.to_string().contains("busy during stats"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_candidate_store_blocking_reports_poison_and_success() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        let work = state.work_store_set().expect("work stores");
+        let guard = lock_candidate_store_blocking(&work.stores[0]).expect("lock succeeds");
+        drop(guard);
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = work.stores[0].lock().expect("poison lock");
+            panic!("poison candidate store mutex");
+        }));
+        assert!(poison_result.is_err(), "poison block should panic");
+
+        let err = lock_candidate_store_blocking(&work.stores[0]).expect_err("poisoned lock");
+        assert!(
+            err.to_string().contains("Candidate store lock poisoned"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn forest_root_server_queries_across_all_trees() {
+        let tmp = tempdir().expect("tmp");
+        let _guard = crate::candidate::store::no_superblock_gate_override_for_tests(true);
+        let state = sample_forest_server_state(tmp.path(), 1);
+        let stores = state
+            .published_query_store_sets()
+            .expect("forest query stores");
+        assert_eq!(stores.len(), 2);
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "$a".to_owned(),
+                alternatives: vec![vec![pack_exact_gram(b"ABC")]],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: true,
+            allow_tier2_fallback: false,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+        let prepared = state
+            .shared_prepared_query_artifacts(&plan)
+            .expect("prepared query");
+        for stores in &stores {
+            let mut store = lock_candidate_store_blocking(&stores.stores[0]).expect("lock store");
+            assert_eq!(store.stats().doc_count, 1);
+            let (hits, _, _) =
+                ServerState::collect_query_matches_single_store(&mut store, &plan, &prepared)
+                    .expect("single-store query");
+            assert_eq!(hits.len(), 1);
+        }
+        let result = state
+            .handle_candidate_query(
+                CandidateQueryRequest {
+                    plan: Value::Null,
+                    cursor: 0,
+                    chunk_size: None,
+                    include_external_ids: true,
+                },
+                &plan,
+            )
+            .expect("forest query");
+        assert_eq!(result.total_candidates, 2);
+        assert_eq!(result.returned_count, 2);
+        assert_eq!(result.external_ids.as_ref().map(Vec::len), Some(2));
+        assert!(
+            result
+                .external_ids
+                .expect("external ids")
+                .iter()
+                .all(|value| value.is_some())
+        );
+    }
+
+    #[test]
+    fn forest_root_server_reports_forest_mode_and_stays_read_only() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_forest_server_state(tmp.path(), 1);
+
+        state
+            .flush_store_meta_if_dirty()
+            .expect("flush forest meta");
+
+        let status = state.status_json().expect("status");
+        assert_eq!(
+            status.get("workspace_mode").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status.get("forest_mode").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            status.get("forest_tree_count").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert!(
+            status
+                .get("forest_root")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("candidate_forest_1")
+        );
+
+        let stats = state.current_stats_json().expect("stats");
+        assert_eq!(
+            stats.get("workspace_mode").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            stats.get("forest_mode").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            stats.get("forest_tree_count").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            stats.get("candidate_shards").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(stats.get("work").is_none());
+
+        let err = state
+            .published_store_set()
+            .expect_err("forest root should reject single published store access");
+        assert!(
+            err.to_string()
+                .contains("forest-root server has no single published store set"),
+            "unexpected published_store_set error: {err}"
+        );
+
+        let err = state
+            .work_store_set()
+            .expect_err("forest root should reject work store access");
+        assert!(
+            err.to_string()
+                .contains("forest-root server is read-only; work store is unavailable"),
+            "unexpected work_store_set error: {err}"
+        );
+
+        let err = state
+            .handle_publish()
+            .expect_err("forest root should reject publish");
+        assert!(
+            err.to_string()
+                .contains("publish is not available for forest-root servers"),
+            "unexpected publish error: {err}"
+        );
+    }
+
+    #[test]
+    fn direct_server_query_caches_results_and_external_ids() {
+        let tmp = tempdir().expect("tmp");
+        let _guard = crate::candidate::store::no_superblock_gate_override_for_tests(true);
+        let state = sample_server_state(tmp.path());
+        let sample = tmp.path().join("direct-cache.bin");
+        fs::write(&sample, b"xxABCyy").expect("sample");
+        let features = scan_features_default_grams(&sample).expect("features");
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(features.sha256),
+                file_size: features.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features.bloom_filter),
+                bloom_item_estimate: None,
+                tier2_bloom_filter_b64: None,
+                tier2_bloom_item_estimate: None,
+                special_population: false,
+                metadata_b64: None,
+                external_id: Some("direct-cache.bin".to_owned()),
+            })
+            .expect("insert doc");
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "$a".to_owned(),
+                alternatives: vec![vec![pack_exact_gram(b"ABC")]],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: true,
+            allow_tier2_fallback: false,
+            max_candidates: 8,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+        let request = CandidateQueryRequest {
+            plan: Value::Null,
+            cursor: 0,
+            chunk_size: Some(8),
+            include_external_ids: true,
+        };
+
+        let first = state
+            .handle_candidate_query(request.clone(), &plan)
+            .expect("first query");
+        let second = state
+            .handle_candidate_query(request, &plan)
+            .expect("second query");
+
+        for result in [first, second] {
+            assert_eq!(result.total_candidates, 1);
+            assert_eq!(result.returned_count, 1);
+            assert_eq!(
+                result.external_ids,
+                Some(vec![Some("direct-cache.bin".to_owned())])
+            );
+        }
+
+        assert_eq!(
+            state.query_cache.lock().expect("query cache").len(),
+            1,
+            "query cache should hold the single compiled-plan result"
+        );
+        assert_eq!(
+            state
+                .prepared_plan_cache
+                .lock()
+                .expect("prepared plan cache")
+                .len(),
+            1,
+            "prepared plan cache should hold the single compiled-plan artifacts"
+        );
+    }
+
+    #[test]
+    fn candidate_insert_upload_round_trip_inserts_document() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        let sample = tmp.path().join("upload-round-trip.bin");
+        let row = candidate_insert_binary_row_from_bytes(
+            &sample,
+            b"xxABCyy",
+            Some("upload-round-trip.bin".to_owned()),
+        );
+
+        let response = state
+            .handle_candidate_insert_upload_begin(&CandidateInsertUploadBeginRequest {
+                upload_id: 7,
+                total_bytes: row.len().try_into().expect("row bytes fits u64"),
+            })
+            .expect("upload begin");
+        assert_eq!(response.message, "upload begun");
+
+        let mut payload = Vec::with_capacity(8 + row.len());
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&row);
+        let response = state
+            .handle_candidate_insert_upload_chunk(&payload)
+            .expect("upload chunk");
+        assert_eq!(response.message, "upload chunk accepted");
+
+        let inserted = state
+            .handle_candidate_insert_upload_commit(&CandidateInsertUploadCommitRequest {
+                upload_id: 7,
+            })
+            .expect("upload commit");
+        assert_eq!(inserted.status, "inserted");
+
+        let stats = state.current_stats_json().expect("stats");
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(1));
+    }
+
+    #[test]
+    fn candidate_insert_upload_validates_chunk_headers_and_lengths() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        let sample = tmp.path().join("upload-validate.bin");
+        let row = candidate_insert_binary_row_from_bytes(
+            &sample,
+            b"xxABCyy",
+            Some("upload-validate.bin".to_owned()),
+        );
+
+        let err = state
+            .handle_candidate_insert_upload_chunk(&[1, 2, 3])
+            .expect_err("short payload should fail");
+        assert!(
+            err.to_string()
+                .contains("upload chunk payload must include upload_id header"),
+            "unexpected short-payload error: {err}"
+        );
+
+        state
+            .handle_candidate_insert_upload_begin(&CandidateInsertUploadBeginRequest {
+                upload_id: 8,
+                total_bytes: row.len().saturating_sub(1).try_into().expect("fits u64"),
+            })
+            .expect("begin oversize test");
+        let mut oversize = Vec::with_capacity(8 + row.len());
+        oversize.extend_from_slice(&8u64.to_le_bytes());
+        oversize.extend_from_slice(&row);
+        let err = state
+            .handle_candidate_insert_upload_chunk(&oversize)
+            .expect_err("oversize chunk should fail");
+        assert!(
+            err.to_string()
+                .contains("candidate insert upload exceeded declared total_bytes"),
+            "unexpected oversize error: {err}"
+        );
+
+        state
+            .handle_candidate_insert_upload_begin(&CandidateInsertUploadBeginRequest {
+                upload_id: 9,
+                total_bytes: row.len().try_into().expect("fits u64"),
+            })
+            .expect("begin incomplete test");
+        let mut partial = Vec::with_capacity(8 + row.len().saturating_sub(1));
+        partial.extend_from_slice(&9u64.to_le_bytes());
+        partial.extend_from_slice(&row[..row.len().saturating_sub(1)]);
+        state
+            .handle_candidate_insert_upload_chunk(&partial)
+            .expect("partial chunk");
+        let err = state
+            .handle_candidate_insert_upload_commit(&CandidateInsertUploadCommitRequest {
+                upload_id: 9,
+            })
+            .expect_err("incomplete upload should fail");
+        assert!(
+            err.to_string()
+                .contains("candidate insert upload incomplete"),
+            "unexpected incomplete-upload error: {err}"
         );
     }
 
@@ -7314,6 +8130,38 @@ rule overflow_rule {
     }
 
     #[test]
+    fn store_set_root_and_retarget_root_clear_cache() {
+        let tmp = tempdir().expect("tmp");
+        let root_a = tmp.path().join("candidate_db_a");
+        let root_b = tmp.path().join("candidate_db_b");
+        let store = CandidateStore::init(
+            CandidateConfig {
+                root: root_a.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init store");
+        let store_set = StoreSet::new(root_a.clone(), vec![store]);
+        assert_eq!(store_set.root().expect("root"), root_a);
+        store_set
+            .set_cached_stats(Map::from_iter([("docs".to_owned(), Value::from(9u64))]), 99)
+            .expect("set cache");
+        assert!(store_set.cached_stats().expect("cached").is_some());
+
+        store_set.retarget_root(&root_b, 1).expect("retarget root");
+
+        assert_eq!(store_set.root().expect("retargeted root"), root_b);
+        assert!(
+            store_set
+                .cached_stats()
+                .expect("cache after retarget")
+                .is_none(),
+            "retargeting should invalidate cached stats"
+        );
+    }
+
+    #[test]
     fn status_json_does_not_require_shard_locks() {
         let tmp = tempdir().expect("tmp");
         let state = sample_server_state(tmp.path());
@@ -7427,6 +8275,89 @@ rule overflow_rule {
     }
 
     #[test]
+    fn index_client_heartbeat_updates_stats_and_end_client_clears_state() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let started = state
+            .handle_begin_index_client(&CandidateIndexClientBeginRequest {
+                heartbeat_interval_ms: 10,
+            })
+            .expect("start client");
+        assert_eq!(started.message, "index client started");
+        assert_eq!(started.heartbeat_interval_ms, 10);
+        assert_eq!(
+            state.active_index_clients.load(Ordering::Acquire),
+            1,
+            "client should be active"
+        );
+
+        let before = {
+            let leases = state.index_client_leases.lock().expect("lease lock");
+            leases
+                .get(&started.client_id)
+                .expect("client lease")
+                .last_heartbeat_unix_ms
+        };
+        thread::sleep(Duration::from_millis(2));
+
+        let heartbeat = state
+            .handle_heartbeat_index_client(&CandidateIndexClientHeartbeatRequest {
+                client_id: started.client_id,
+            })
+            .expect("heartbeat");
+        assert_eq!(heartbeat.message, "index client heartbeat updated");
+
+        let after = {
+            let leases = state.index_client_leases.lock().expect("lease lock");
+            leases
+                .get(&started.client_id)
+                .expect("client lease")
+                .last_heartbeat_unix_ms
+        };
+        assert!(
+            after >= before,
+            "heartbeat should refresh the lease timestamp"
+        );
+
+        let stats = state.current_stats_json().expect("stats");
+        assert_eq!(
+            stats.get("active_index_clients").and_then(Value::as_u64),
+            Some(1)
+        );
+        let index_session = stats
+            .get("index_session")
+            .and_then(Value::as_object)
+            .expect("index session object");
+        assert_eq!(
+            index_session.get("client_active").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let finished = state
+            .handle_end_index_client(&CandidateIndexClientHeartbeatRequest {
+                client_id: started.client_id,
+            })
+            .expect("finish client");
+        assert_eq!(finished.message, "index client finished");
+        assert_eq!(state.active_index_clients.load(Ordering::Acquire), 0);
+        assert!(
+            state.publish_after_index_clients.load(Ordering::Acquire),
+            "ending the final client should request publish"
+        );
+
+        let err = state
+            .handle_heartbeat_index_client(&CandidateIndexClientHeartbeatRequest {
+                client_id: started.client_id,
+            })
+            .expect_err("stale heartbeat should fail");
+        assert!(
+            err.to_string()
+                .contains("no active index client; heartbeat rejected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn insert_batch_advances_active_index_session_progress() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
@@ -7532,9 +8463,9 @@ rule overflow_rule {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         state.mark_work_mutation();
+        let work = state.work_store_set().expect("work");
         let _ = state.current_stats_json().expect("prime stats cache");
         let published = state.published_store_set().expect("published");
-        let work = state.work_store_set().expect("work");
         let _published_guard = published.stores[0].lock().expect("lock published");
         let _work_guard = work.stores[0].lock().expect("lock work");
         let stats = state.current_stats_json().expect("cached stats");
@@ -7603,7 +8534,7 @@ rule overflow_rule {
             publish_after
                 .get("last_publish_reused_work_stores")
                 .and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert!(
             publish_after
@@ -7768,7 +8699,7 @@ rule overflow_rule {
     }
 
     #[test]
-    fn publish_prunes_workspace_retired_roots_to_keep_last_one() {
+    fn publish_prunes_workspace_retired_roots_immediately_when_keep_is_zero() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         let workspace_root = tmp.path().join("candidate_workspace_1");
@@ -7798,8 +8729,8 @@ rule overflow_rule {
 
         let retained = workspace_retired_roots(&retired_root);
         assert_eq!(retained.len(), DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP);
-        assert_eq!(retained[0], second_retired);
         assert!(!first_retired.exists());
+        assert!(!second_retired.exists());
     }
 
     #[test]
@@ -7816,8 +8747,8 @@ rule overflow_rule {
         let state = sample_workspace_server_state(tmp.path(), 1);
         let retained = workspace_retired_roots(&retired_root);
         assert_eq!(retained.len(), DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP);
-        assert_eq!(retained[0], newer);
         assert!(!older.exists());
+        assert!(!newer.exists());
         assert!(state.startup_cleanup_removed_roots >= 1);
     }
 
@@ -7871,9 +8802,48 @@ rule overflow_rule {
     }
 
     #[test]
+    fn workspace_work_roots_are_lazy_and_removed_when_idle() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let workspace_root = tmp.path().join("candidate_workspace_1");
+        let work_root_a = workspace_work_root_a(&workspace_root);
+        let work_root_b = workspace_work_root_b(&workspace_root);
+
+        assert!(!work_root_a.exists());
+        assert!(!work_root_b.exists());
+
+        let sample = tmp.path().join("lazy-work-doc.bin");
+        fs::write(&sample, b"xxABCDyy").expect("sample");
+        let features = scan_features_default_grams(&sample).expect("features");
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(features.sha256),
+                file_size: features.file_size,
+                bloom_filter_b64: base64::engine::general_purpose::STANDARD
+                    .encode(features.bloom_filter),
+                bloom_item_estimate: None,
+                tier2_bloom_filter_b64: None,
+                tier2_bloom_item_estimate: None,
+                special_population: false,
+                metadata_b64: None,
+                external_id: Some("lazy-work-doc".to_owned()),
+            })
+            .expect("insert doc");
+
+        assert!(work_root_a.exists());
+        assert!(!work_root_b.exists());
+
+        state.handle_publish().expect("publish");
+
+        assert!(!work_root_a.exists());
+        assert!(!work_root_b.exists());
+    }
+
+    #[test]
     fn workspace_mode_keeps_queries_on_published_root_until_publish() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
+        let workspace_root = tmp.path().join("candidate_workspace_1");
         let sample = tmp.path().join("workspace-doc.bin");
         fs::write(&sample, b"xxABCDyy").expect("sample");
         let gram = pack_exact_gram(b"ABC");
@@ -7981,6 +8951,8 @@ rule overflow_rule {
                 .and_then(Value::as_u64),
             Some(1)
         );
+        assert!(!workspace_work_root_a(&workspace_root).exists());
+        assert!(!workspace_work_root_b(&workspace_root).exists());
     }
 
     #[test]
@@ -8243,7 +9215,7 @@ rule overflow_rule {
                 .and_then(Value::as_object)
                 .and_then(|publish| publish.get("retired_published_root_count"))
                 .and_then(Value::as_u64),
-            Some(1)
+            Some(0)
         );
         assert_eq!(
             stats
@@ -8703,6 +9675,80 @@ rule overflow_rule {
             err.to_string()
                 .contains("RPC read timed out while waiting for a server response.")
         );
+    }
+
+    #[test]
+    fn json_and_frame_helpers_cover_additional_types_and_writers() {
+        let begin = CandidateIndexClientBeginResponse {
+            message: "index client started".to_owned(),
+            client_id: 7,
+            heartbeat_interval_ms: 5,
+            lease_timeout_ms: 20,
+        };
+        let begin_bytes = json_bytes(&begin).expect("encode begin");
+        let begin_roundtrip: CandidateIndexClientBeginResponse =
+            json_from_bytes(&begin_bytes).expect("decode begin");
+        assert_eq!(begin_roundtrip.client_id, 7);
+
+        let publish = CandidatePublishResponse {
+            message: "published".to_owned(),
+        };
+        let publish_bytes = json_bytes(&publish).expect("encode publish");
+        let publish_roundtrip: CandidatePublishResponse =
+            json_from_bytes(&publish_bytes).expect("decode publish");
+        assert_eq!(publish_roundtrip.message, "published");
+
+        let mut frame = Vec::new();
+        write_frame(&mut frame, PROTOCOL_VERSION, ACTION_PING, &publish_bytes)
+            .expect("write frame");
+        let (version, action, payload) = read_frame(&mut Cursor::new(frame)).expect("read frame");
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(action, ACTION_PING);
+        let parsed_publish: CandidatePublishResponse =
+            json_from_bytes(&payload).expect("decode payload");
+        assert_eq!(parsed_publish.message, "published");
+
+        let mut error_frame = Vec::new();
+        write_error_frame(&mut error_frame, "frame boom").expect("write error");
+        let (version, status, payload) = read_frame_optional(&mut Cursor::new(error_frame))
+            .expect("optional frame")
+            .expect("frame");
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(status, STATUS_ERROR);
+        let error_payload: Map<String, Value> = json_from_bytes(&payload).expect("decode error");
+        assert_eq!(
+            error_payload.get("message").and_then(Value::as_str),
+            Some("frame boom")
+        );
+    }
+
+    #[test]
+    fn workspace_and_forest_root_helpers_filter_expected_directories() {
+        let tmp = tempdir().expect("tmp");
+        let workspace_root = tmp.path().join("workspace");
+        let forest_root = tmp.path().join("forest");
+        fs::create_dir_all(workspace_root.join("published_002")).expect("published 2");
+        fs::create_dir_all(workspace_root.join("published_001")).expect("published 1");
+        fs::create_dir_all(workspace_root.join("ignored_dir")).expect("ignored dir");
+        fs::write(workspace_root.join("published_003.txt"), b"ignore").expect("ignored file");
+
+        let retired = workspace_retired_roots(&workspace_root);
+        assert_eq!(retired.len(), 2);
+        assert!(retired[0].ends_with("published_001"));
+        assert!(retired[1].ends_with("published_002"));
+        let (retired_count, retired_bytes) = workspace_retired_stats(&workspace_root);
+        assert_eq!(retired_count, 2);
+        assert_eq!(retired_bytes, 0);
+
+        fs::create_dir_all(forest_root.join("tree_00/current")).expect("tree 00 current");
+        fs::create_dir_all(forest_root.join("tree_01/current")).expect("tree 01 current");
+        fs::create_dir_all(forest_root.join("noise/current")).expect("noise current");
+        fs::write(forest_root.join("tree_02.txt"), b"ignore").expect("tree file");
+
+        let trees = forest_tree_roots(&forest_root).expect("forest roots");
+        assert_eq!(trees.len(), 2);
+        assert!(trees[0].ends_with("tree_00/current"));
+        assert!(trees[1].ends_with("tree_01/current"));
     }
 
     #[test]
@@ -9855,6 +10901,54 @@ rule q {
             .update_index_session_progress(Some(12), 7, 5)
             .expect("update progress");
 
+        let begin_index_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, payload) = read_frame(&mut stream).expect("read begin client frame");
+            assert_eq!(action, ACTION_INDEX_CLIENT_BEGIN);
+            let parsed: CandidateIndexClientBeginRequest =
+                serde_json::from_slice(&payload).expect("begin client payload");
+            assert_eq!(parsed.heartbeat_interval_ms, 25);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidateIndexClientBeginResponse {
+                    message: "index client started".to_owned(),
+                    client_id: 77,
+                    heartbeat_interval_ms: 25,
+                    lease_timeout_ms: 100,
+                })
+                .expect("begin client response"),
+            )
+            .expect("write begin client frame");
+        }));
+        assert_eq!(
+            begin_index_client
+                .begin_index_client(25)
+                .expect("begin client"),
+            (77, 100)
+        );
+
+        let heartbeat_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, payload) = read_frame(&mut stream).expect("read heartbeat frame");
+            assert_eq!(action, ACTION_INDEX_CLIENT_HEARTBEAT);
+            let parsed: CandidateIndexClientHeartbeatRequest =
+                serde_json::from_slice(&payload).expect("heartbeat payload");
+            assert_eq!(parsed.client_id, 77);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidateIndexSessionResponse {
+                    message: "index client heartbeat updated".to_owned(),
+                })
+                .expect("heartbeat response"),
+            )
+            .expect("write heartbeat frame");
+        }));
+        heartbeat_client
+            .heartbeat_index_client(77)
+            .expect("heartbeat index client");
+
         let end_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
             let (_, action, _) = read_frame(&mut stream).expect("read end frame");
             assert_eq!(action, ACTION_INDEX_SESSION_END);
@@ -9872,6 +10966,31 @@ rule q {
         assert_eq!(
             end_client.end_index_session().expect("end session"),
             "index session finished"
+        );
+
+        let end_index_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
+            let (_, action, payload) =
+                read_frame(&mut stream).expect("read end index client frame");
+            assert_eq!(action, ACTION_INDEX_CLIENT_END);
+            let parsed: CandidateIndexClientHeartbeatRequest =
+                serde_json::from_slice(&payload).expect("end client payload");
+            assert_eq!(parsed.client_id, 77);
+            write_frame(
+                &mut stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&CandidateIndexSessionResponse {
+                    message: "index client finished".to_owned(),
+                })
+                .expect("end client response"),
+            )
+            .expect("write end client frame");
+        }));
+        assert_eq!(
+            end_index_client
+                .end_index_client(77)
+                .expect("end index client"),
+            "index client finished"
         );
 
         let shutdown_client = SspryClient::new(one_shot_tcp_config(|mut stream| {
@@ -10310,6 +11429,7 @@ rule q {
         assert_eq!(
             match stores {
                 StoreMode::Direct { stores } => stores.stores.len(),
+                StoreMode::Forest { .. } => 0,
                 StoreMode::Workspace { .. } => 0,
             },
             2
@@ -10543,6 +11663,7 @@ rule q {
         assert_eq!(
             match stores {
                 StoreMode::Direct { stores } => stores.stores.len(),
+                StoreMode::Forest { .. } => 0,
                 StoreMode::Workspace { .. } => 0,
             },
             2
@@ -10639,6 +11760,37 @@ rule q {
                 .get("retired_generation_count")
                 .and_then(Value::as_u64),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn record_compaction_error_updates_runtime_and_stats() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        {
+            let mut runtime = state.compaction_runtime.lock().expect("runtime lock");
+            runtime.running_shard = Some(3);
+        }
+
+        state.record_compaction_error("compaction boom".to_owned());
+
+        {
+            let runtime = state.compaction_runtime.lock().expect("runtime lock");
+            assert_eq!(runtime.running_shard, None);
+            assert_eq!(runtime.last_error.as_deref(), Some("compaction boom"));
+        }
+
+        let stats = state.current_stats_json().expect("stats");
+        assert_eq!(
+            stats.get("last_compaction_error").and_then(Value::as_str),
+            Some("compaction boom")
+        );
+        assert!(
+            !stats
+                .get("compaction_running")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            "compaction should no longer be marked running"
         );
     }
 

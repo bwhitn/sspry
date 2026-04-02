@@ -26,8 +26,11 @@ use crate::candidate::filter_policy::{
 use crate::candidate::grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
 };
-use crate::candidate::metadata_field_matches_eq;
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
+use crate::candidate::{
+    MetadataCompareOp, metadata_field_matches_compare, metadata_fields_compare,
+    metadata_file_prefix_8,
+};
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
 
@@ -611,6 +614,30 @@ fn experiment_no_superblock_gate_enabled() -> bool {
 #[cfg(test)]
 thread_local! {
     static EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) struct NoSuperblockGateOverrideGuard {
+    previous: u8,
+}
+
+#[cfg(test)]
+impl Drop for NoSuperblockGateOverrideGuard {
+    fn drop(&mut self) {
+        EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE.with(|value| value.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn no_superblock_gate_override_for_tests(
+    enabled: bool,
+) -> NoSuperblockGateOverrideGuard {
+    let previous = EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE.with(|value| {
+        let previous = value.get();
+        value.set(if enabled { 2 } else { 1 });
+        previous
+    });
+    NoSuperblockGateOverrideGuard { previous }
 }
 
 fn experiment_disable_tree_gates_enabled() -> bool {
@@ -2263,7 +2290,7 @@ impl CandidateStore {
     }
 
     #[cfg(test)]
-    fn resolve_filter_bytes_for_file_size(
+    pub(crate) fn resolve_filter_bytes_for_file_size(
         &self,
         file_size: u64,
         bloom_item_estimate: Option<usize>,
@@ -6187,12 +6214,35 @@ fn node_structurally_impossible(node: &QueryNode) -> bool {
         "verifier_only_in_range" => false,
         "verifier_only_loop" => false,
         "filesize_eq" => false,
+        "filesize_ne" => false,
         "filesize_lt" => false,
         "filesize_le" => false,
         "filesize_gt" => false,
         "filesize_ge" => false,
         "metadata_eq" => false,
+        "metadata_ne" => false,
+        "metadata_lt" => false,
+        "metadata_le" => false,
+        "metadata_gt" => false,
+        "metadata_ge" => false,
+        "metadata_time_eq" => false,
+        "metadata_time_ne" => false,
+        "metadata_time_lt" => false,
+        "metadata_time_le" => false,
+        "metadata_time_gt" => false,
+        "metadata_time_ge" => false,
+        "metadata_field_eq" => false,
+        "metadata_field_ne" => false,
+        "metadata_field_lt" => false,
+        "metadata_field_le" => false,
+        "metadata_field_gt" => false,
+        "metadata_field_ge" => false,
         "time_now_eq" => false,
+        "time_now_ne" => false,
+        "time_now_lt" => false,
+        "time_now_le" => false,
+        "time_now_gt" => false,
+        "time_now_ge" => false,
         "and" => node.children.iter().any(node_structurally_impossible),
         "or" => !node.children.is_empty() && node.children.iter().all(node_structurally_impossible),
         "n_of" => {
@@ -6646,12 +6696,31 @@ fn tree_maybe_matches_node(
         | "verifier_only_in_range"
         | "verifier_only_loop"
         | "filesize_eq"
+        | "filesize_ne"
         | "filesize_lt"
         | "filesize_le"
         | "filesize_gt"
         | "filesize_ge"
         | "metadata_eq"
+        | "metadata_ne"
+        | "metadata_lt"
+        | "metadata_le"
+        | "metadata_gt"
+        | "metadata_ge"
+        | "metadata_time_eq"
+        | "metadata_time_ne"
+        | "metadata_time_lt"
+        | "metadata_time_le"
+        | "metadata_time_gt"
+        | "metadata_time_ge"
+        | "metadata_field_eq"
+        | "metadata_field_ne"
+        | "metadata_field_lt"
+        | "metadata_field_le"
+        | "metadata_field_gt"
+        | "metadata_field_ge"
         | "time_now_eq" => Ok(true),
+        "time_now_ne" | "time_now_lt" | "time_now_le" | "time_now_gt" | "time_now_ge" => Ok(true),
         "and" => {
             for child in &node.children {
                 if !tree_maybe_matches_node(
@@ -6856,12 +6925,35 @@ fn block_maybe_matches_node(
         "verifier_only_in_range" => Ok(true),
         "verifier_only_loop" => Ok(true),
         "filesize_eq" => Ok(true),
+        "filesize_ne" => Ok(true),
         "filesize_lt" => Ok(true),
         "filesize_le" => Ok(true),
         "filesize_gt" => Ok(true),
         "filesize_ge" => Ok(true),
         "metadata_eq" => Ok(true),
+        "metadata_ne" => Ok(true),
+        "metadata_lt" => Ok(true),
+        "metadata_le" => Ok(true),
+        "metadata_gt" => Ok(true),
+        "metadata_ge" => Ok(true),
+        "metadata_time_eq" => Ok(true),
+        "metadata_time_ne" => Ok(true),
+        "metadata_time_lt" => Ok(true),
+        "metadata_time_le" => Ok(true),
+        "metadata_time_gt" => Ok(true),
+        "metadata_time_ge" => Ok(true),
+        "metadata_field_eq" => Ok(true),
+        "metadata_field_ne" => Ok(true),
+        "metadata_field_lt" => Ok(true),
+        "metadata_field_le" => Ok(true),
+        "metadata_field_gt" => Ok(true),
+        "metadata_field_ge" => Ok(true),
         "time_now_eq" => Ok(true),
+        "time_now_ne" => Ok(true),
+        "time_now_lt" => Ok(true),
+        "time_now_le" => Ok(true),
+        "time_now_gt" => Ok(true),
+        "time_now_ge" => Ok(true),
         "and" => {
             for child in &node.children {
                 if !block_maybe_matches_node(
@@ -6936,6 +7028,264 @@ fn query_scan_worker_count(block_count: usize) -> usize {
         .min(DEFAULT_QUERY_SCAN_WORKERS)
         .min(block_count.max(1))
         .max(1)
+}
+
+fn numeric_read_literal_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> {
+    match name {
+        "int16" => Ok(literal_text
+            .parse::<i16>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_le_bytes()
+            .to_vec()),
+        "uint16" => Ok(literal_text
+            .parse::<u16>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_le_bytes()
+            .to_vec()),
+        "int16be" => Ok(literal_text
+            .parse::<i16>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_be_bytes()
+            .to_vec()),
+        "uint16be" => Ok(literal_text
+            .parse::<u16>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_be_bytes()
+            .to_vec()),
+        "int32" => Ok(literal_text
+            .parse::<i32>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_le_bytes()
+            .to_vec()),
+        "uint32" => Ok(literal_text
+            .parse::<u32>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_le_bytes()
+            .to_vec()),
+        "int32be" => Ok(literal_text
+            .parse::<i32>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_be_bytes()
+            .to_vec()),
+        "uint32be" => Ok(literal_text
+            .parse::<u32>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_be_bytes()
+            .to_vec()),
+        "int64" => Ok(literal_text
+            .parse::<i64>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_le_bytes()
+            .to_vec()),
+        "uint64" => Ok(literal_text
+            .parse::<u64>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_le_bytes()
+            .to_vec()),
+        "int64be" => Ok(literal_text
+            .parse::<i64>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_be_bytes()
+            .to_vec()),
+        "uint64be" => Ok(literal_text
+            .parse::<u64>()
+            .map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?
+            .to_be_bytes()
+            .to_vec()),
+        "float32" => Ok(literal_text
+            .parse::<f32>()
+            .map_err(|_| {
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
+            })?
+            .to_bits()
+            .to_le_bytes()
+            .to_vec()),
+        "float32be" => Ok(literal_text
+            .parse::<f32>()
+            .map_err(|_| {
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
+            })?
+            .to_bits()
+            .to_be_bytes()
+            .to_vec()),
+        "float64" => Ok(literal_text
+            .parse::<f64>()
+            .map_err(|_| {
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
+            })?
+            .to_bits()
+            .to_le_bytes()
+            .to_vec()),
+        "float64be" => Ok(literal_text
+            .parse::<f64>()
+            .map_err(|_| {
+                SspryError::from(format!("Invalid float literal for {name}: {literal_text}"))
+            })?
+            .to_bits()
+            .to_be_bytes()
+            .to_vec()),
+        _ => Err(SspryError::from(format!(
+            "Unsupported numeric read anchor function: {name}"
+        ))),
+    }
+}
+
+fn verifier_only_eq_matches_file_prefix(
+    expr: &str,
+    file_prefix: &[u8],
+    file_size: u64,
+) -> Result<Option<bool>> {
+    let Some((name, rest)) = expr.split_once('(') else {
+        return Ok(None);
+    };
+    let Some((offset_text, literal_text)) = rest.split_once(")==") else {
+        return Ok(None);
+    };
+    let Ok(offset) = offset_text.parse::<usize>() else {
+        return Ok(None);
+    };
+    if offset != 0 {
+        return Ok(None);
+    }
+    let expected = match numeric_read_literal_bytes(name, literal_text) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    if expected.len() > 8 {
+        return Ok(None);
+    }
+    if file_size < expected.len() as u64 || file_prefix.len() < expected.len() {
+        return Ok(Some(false));
+    }
+    Ok(Some(file_prefix[..expected.len()] == expected))
+}
+
+fn pattern_matches_file_prefix_at_zero(
+    pattern: &PatternPlan,
+    file_prefix: &[u8],
+    file_size: u64,
+) -> Option<bool> {
+    let mut saw_supported = false;
+    let mut all_supported = true;
+    for idx in 0..pattern.alternatives.len() {
+        let literal = pattern.fixed_literals.get(idx)?;
+        let wide = pattern
+            .fixed_literal_wide
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
+        let fullword = pattern
+            .fixed_literal_fullword
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
+        if literal.is_empty() || wide || fullword || literal.len() > 8 {
+            all_supported = false;
+            continue;
+        }
+        saw_supported = true;
+        if file_size < literal.len() as u64 || file_prefix.len() < literal.len() {
+            continue;
+        }
+        if file_prefix[..literal.len()] == *literal {
+            return Some(true);
+        }
+    }
+    if saw_supported && all_supported {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn compare_u64(lhs: u64, rhs: u64, op: MetadataCompareOp) -> bool {
+    match op {
+        MetadataCompareOp::Eq => lhs == rhs,
+        MetadataCompareOp::Ne => lhs != rhs,
+        MetadataCompareOp::Lt => lhs < rhs,
+        MetadataCompareOp::Le => lhs <= rhs,
+        MetadataCompareOp::Gt => lhs > rhs,
+        MetadataCompareOp::Ge => lhs >= rhs,
+    }
+}
+
+fn compare_op_for_node_kind(kind: &str) -> Option<MetadataCompareOp> {
+    if kind.ends_with("_eq") {
+        Some(MetadataCompareOp::Eq)
+    } else if kind.ends_with("_ne") {
+        Some(MetadataCompareOp::Ne)
+    } else if kind.ends_with("_lt") {
+        Some(MetadataCompareOp::Lt)
+    } else if kind.ends_with("_le") {
+        Some(MetadataCompareOp::Le)
+    } else if kind.ends_with("_gt") {
+        Some(MetadataCompareOp::Gt)
+    } else if kind.ends_with("_ge") {
+        Some(MetadataCompareOp::Ge)
+    } else {
+        None
+    }
+}
+
+fn metadata_field_pair(node: &QueryNode, kind_name: &str) -> Result<(String, String)> {
+    let pair = node
+        .pattern_id
+        .as_deref()
+        .ok_or_else(|| SspryError::from(format!("{kind_name} node requires pattern_id")))?;
+    let Some((lhs, rhs)) = pair.split_once('|') else {
+        return Err(SspryError::from(format!(
+            "{kind_name} node requires lhs|rhs pattern_id"
+        )));
+    };
+    Ok((lhs.to_owned(), rhs.to_owned()))
 }
 
 fn evaluate_pattern<'a, FT1, FT2>(
@@ -7207,88 +7557,142 @@ where
                 tiers: TierFlags::default(),
             })
         }
-        "verifier_only_eq"
-        | "verifier_only_at"
-        | "verifier_only_count"
-        | "verifier_only_in_range"
-        | "verifier_only_loop" => Ok(MatchOutcome {
-            matched: true,
-            tiers: TierFlags::default(),
-        }),
-        "filesize_eq" => {
-            let expected_size = node
-                .threshold
-                .ok_or_else(|| SspryError::from("filesize_eq node requires threshold"))?
-                as u64;
-            Ok(MatchOutcome {
-                matched: doc_inputs.doc.file_size == expected_size,
-                tiers: TierFlags::default(),
-            })
-        }
-        "filesize_lt" => {
-            let expected_size = node
-                .threshold
-                .ok_or_else(|| SspryError::from("filesize_lt node requires threshold"))?
-                as u64;
-            Ok(MatchOutcome {
-                matched: doc_inputs.doc.file_size < expected_size,
-                tiers: TierFlags::default(),
-            })
-        }
-        "filesize_le" => {
-            let expected_size = node
-                .threshold
-                .ok_or_else(|| SspryError::from("filesize_le node requires threshold"))?
-                as u64;
-            Ok(MatchOutcome {
-                matched: doc_inputs.doc.file_size <= expected_size,
-                tiers: TierFlags::default(),
-            })
-        }
-        "filesize_gt" => {
-            let expected_size = node
-                .threshold
-                .ok_or_else(|| SspryError::from("filesize_gt node requires threshold"))?
-                as u64;
-            Ok(MatchOutcome {
-                matched: doc_inputs.doc.file_size > expected_size,
-                tiers: TierFlags::default(),
-            })
-        }
-        "filesize_ge" => {
-            let expected_size = node
-                .threshold
-                .ok_or_else(|| SspryError::from("filesize_ge node requires threshold"))?
-                as u64;
-            Ok(MatchOutcome {
-                matched: doc_inputs.doc.file_size >= expected_size,
-                tiers: TierFlags::default(),
-            })
-        }
-        "metadata_eq" => {
-            let field = node
-                .pattern_id
-                .as_deref()
-                .ok_or_else(|| SspryError::from("metadata_eq node requires pattern_id"))?;
-            let expected = node
-                .threshold
-                .ok_or_else(|| SspryError::from("metadata_eq node requires threshold"))?
-                as u64;
-            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
-            let matched =
-                metadata_field_matches_eq(metadata_bytes, field, expected)?.unwrap_or(true);
+        "verifier_only_eq" => {
+            let matched = if let Some(expr) = node.pattern_id.as_deref() {
+                let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+                if let Some(file_prefix) = metadata_file_prefix_8(metadata_bytes)? {
+                    verifier_only_eq_matches_file_prefix(
+                        expr,
+                        &file_prefix,
+                        doc_inputs.doc.file_size,
+                    )?
+                    .unwrap_or(true)
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
             Ok(MatchOutcome {
                 matched,
                 tiers: TierFlags::default(),
             })
         }
-        "time_now_eq" => {
+        "verifier_only_at" => {
+            let matched = if let Some(expr) = node.pattern_id.as_deref() {
+                if let Some((pattern_id, offset_text)) = expr.split_once('@') {
+                    if offset_text == "0" {
+                        let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+                        if let Some(file_prefix) = metadata_file_prefix_8(metadata_bytes)? {
+                            if let Some(pattern) = patterns.get(pattern_id) {
+                                pattern_matches_file_prefix_at_zero(
+                                    pattern,
+                                    &file_prefix,
+                                    doc_inputs.doc.file_size,
+                                )
+                                .unwrap_or(true)
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            Ok(MatchOutcome {
+                matched,
+                tiers: TierFlags::default(),
+            })
+        }
+        "verifier_only_count" | "verifier_only_in_range" | "verifier_only_loop" => {
+            Ok(MatchOutcome {
+                matched: true,
+                tiers: TierFlags::default(),
+            })
+        }
+        "filesize_eq" | "filesize_ne" | "filesize_lt" | "filesize_le" | "filesize_gt"
+        | "filesize_ge" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u64;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported filesize node: {}", node.kind))
+            })?;
+            Ok(MatchOutcome {
+                matched: compare_u64(doc_inputs.doc.file_size, expected_size, op),
+                tiers: TierFlags::default(),
+            })
+        }
+        "metadata_eq" | "metadata_ne" | "metadata_lt" | "metadata_le" | "metadata_gt"
+        | "metadata_ge" => {
+            let field = node.pattern_id.as_deref().ok_or_else(|| {
+                SspryError::from(format!("{} node requires pattern_id", node.kind))
+            })?;
             let expected = node
                 .threshold
-                .ok_or_else(|| SspryError::from("time_now_eq node requires threshold"))?
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
                 as u64;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched = metadata_field_matches_compare(metadata_bytes, field, op, expected)?
+                .unwrap_or(true);
             Ok(MatchOutcome {
-                matched: query_now_unix == expected,
+                matched,
+                tiers: TierFlags::default(),
+            })
+        }
+        "metadata_time_eq" | "metadata_time_ne" | "metadata_time_lt" | "metadata_time_le"
+        | "metadata_time_gt" | "metadata_time_ge" => {
+            let field = node.pattern_id.as_deref().ok_or_else(|| {
+                SspryError::from(format!("{} node requires pattern_id", node.kind))
+            })?;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata-time node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched =
+                metadata_field_matches_compare(metadata_bytes, field, op, query_now_unix)?
+                    .unwrap_or(true);
+            Ok(MatchOutcome {
+                matched,
+                tiers: TierFlags::default(),
+            })
+        }
+        "metadata_field_eq" | "metadata_field_ne" | "metadata_field_lt" | "metadata_field_le"
+        | "metadata_field_gt" | "metadata_field_ge" => {
+            let (lhs_field, rhs_field) = metadata_field_pair(node, &node.kind)?;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata-field node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched = metadata_fields_compare(metadata_bytes, &lhs_field, op, &rhs_field)?
+                .unwrap_or(true);
+            Ok(MatchOutcome {
+                matched,
+                tiers: TierFlags::default(),
+            })
+        }
+        "time_now_eq" | "time_now_ne" | "time_now_lt" | "time_now_le" | "time_now_gt"
+        | "time_now_ge" => {
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u64;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported time.now node: {}", node.kind))
+            })?;
+            Ok(MatchOutcome {
+                matched: compare_u64(query_now_unix, expected, op),
                 tiers: TierFlags::default(),
             })
         }
@@ -7424,7 +7828,7 @@ mod tests {
         Tier2AndMetadataOnlyOverrideGuard { previous }
     }
 
-    struct NoSuperblockGateOverrideGuard {
+    pub(crate) struct NoSuperblockGateOverrideGuard {
         previous: u8,
     }
 
@@ -7434,7 +7838,7 @@ mod tests {
         }
     }
 
-    fn no_superblock_gate_override(enabled: bool) -> NoSuperblockGateOverrideGuard {
+    pub(crate) fn no_superblock_gate_override(enabled: bool) -> NoSuperblockGateOverrideGuard {
         let previous = EXPERIMENT_NO_SUPERBLOCK_GATE_OVERRIDE.with(|value| {
             let previous = value.get();
             value.set(if enabled { 2 } else { 1 });
@@ -7810,6 +8214,75 @@ mod tests {
         )
     }
 
+    #[test]
+    fn legacy_store_meta_conversion_preserves_filter_targets() {
+        let legacy = LegacyStoreMeta {
+            version: 7,
+            next_doc_id: 11,
+            id_source: "md5".to_owned(),
+            store_path: true,
+            tier2_gram_size: 5,
+            tier1_gram_size: 4,
+            tier1_superblock_docs: 0,
+            tier2_superblock_summary_cap_bytes: 1234,
+            enable_tier2_superblocks: true,
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: Some(0.18),
+            filter_target_fp: Some(0.39),
+            compaction_idle_cooldown_s: 12.5,
+        };
+
+        let forest = ForestMeta::from(&legacy);
+        assert_eq!(forest.version, 7);
+        assert_eq!(forest.id_source, "md5");
+        assert!(forest.store_path);
+        assert_eq!(forest.tier1_gram_size, 4);
+        assert_eq!(forest.tier2_gram_size, 5);
+        assert_eq!(forest.tier1_superblock_docs, 1);
+        assert_eq!(forest.tier1_filter_target_fp, Some(0.39));
+        assert_eq!(forest.tier2_filter_target_fp, Some(0.18));
+        assert!(forest.enable_tier2_superblocks);
+
+        let local = StoreLocalMeta::from(&legacy);
+        assert_eq!(local.version, 7);
+        assert_eq!(local.next_doc_id, 11);
+    }
+
+    #[test]
+    fn coarsen_superblocks_merges_masks_and_positions() {
+        let bucket_key = (64usize, 3usize);
+        let mut index = Tier2SuperblockIndex::with_docs_per_block(1);
+        index.bucket_for_key.insert(bucket_key, bucket_key);
+        index.summary_bytes_by_bucket.insert(bucket_key, 2);
+        index.masks_by_bucket.insert(
+            bucket_key,
+            vec![vec![0x03, 0x00], vec![0x0c, 0x00], vec![0xf0, 0x00]],
+        );
+        index
+            .positions_by_bucket
+            .insert(bucket_key, vec![vec![0], vec![1, 2], vec![3]]);
+
+        let out = coarsen_superblocks(&index, 2);
+        assert_eq!(out.docs_per_block, 2);
+        assert_eq!(
+            out.bucket_for_key.get(&bucket_key).copied(),
+            Some(bucket_key)
+        );
+        let masks = out
+            .masks_by_bucket
+            .get(&bucket_key)
+            .expect("coarsened masks");
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[0], vec![0x0f, 0x00]);
+        assert_eq!(masks[1], vec![0xf0, 0x00]);
+        let positions = out
+            .positions_by_bucket
+            .get(&bucket_key)
+            .expect("coarsened positions");
+        assert_eq!(positions, &vec![vec![0, 1, 2], vec![3]]);
+        assert_eq!(out.summary_memory_bytes, 4);
+    }
+
     fn dir_size(root: &Path) -> u64 {
         fn walk(path: &Path) -> u64 {
             let Ok(metadata) = fs::metadata(path) else {
@@ -7847,6 +8320,39 @@ rule r {
             3,
             2048,
             3,
+            true,
+        )
+        .expect("evaluate");
+        assert!(outcome.matched);
+    }
+
+    #[test]
+    fn borrowed_bytes_returns_borrowed_slice() {
+        let bytes = b"borrowed";
+        let borrowed = borrowed_bytes(bytes).expect("borrowed bytes");
+        assert!(matches!(borrowed, Cow::Borrowed(_)));
+        assert_eq!(borrowed.as_ref(), bytes);
+    }
+
+    #[test]
+    fn evaluate_rule_against_file_blooms_matches_simple_literal_rule() {
+        let tmp = tempdir().expect("tmp");
+        let sample = tmp.path().join("sample.bin");
+        fs::write(&sample, b"xxABCDyy").expect("sample");
+        let outcome = evaluate_rule_against_file_blooms(
+            r#"
+rule r {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+            sample.to_str().expect("sample path"),
+            1024,
+            7,
+            1024,
+            7,
             true,
         )
         .expect("evaluate");
@@ -9855,10 +10361,32 @@ rule q {
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let time_gt_outcome = evaluate_node(
+            &QueryNode {
+                kind: "time_now_gt".to_owned(),
+                pattern_id: Some("time.now".to_owned()),
+                threshold: Some(1000),
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            1234,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("time now gt");
+        assert!(time_gt_outcome.matched);
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
         let verifier_outcome = evaluate_node(
             &QueryNode {
                 kind: "verifier_only_eq".to_owned(),
-                pattern_id: Some("uint32(0)==332".to_owned()),
+                pattern_id: Some("uint16(0)==23117".to_owned()),
                 threshold: None,
                 children: Vec::new(),
             },
@@ -9874,6 +10402,191 @@ rule q {
         )
         .expect("verifier only eq");
         assert!(verifier_outcome.matched);
+
+        let numeric_path = tmp.path().join("numeric.bin");
+        fs::write(&numeric_path, 0x1122_3344_5566_7788u64.to_le_bytes()).expect("write numeric");
+        let numeric_metadata = extract_compact_document_metadata(&numeric_path).expect("metadata");
+        let numeric_doc = CandidateDoc {
+            file_size: 8,
+            ..doc.clone()
+        };
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
+        let numeric_true = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_eq".to_owned(),
+                pattern_id: Some("uint64(0)==1234605616436508552".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("uint64 prefix eq");
+        assert!(numeric_true.matched);
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
+        let numeric_false = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_eq".to_owned(),
+                pattern_id: Some("int16be(0)==-2".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("int16be prefix eq");
+        assert!(!numeric_false.matched);
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let metadata_ne = evaluate_node(
+            &QueryNode {
+                kind: "metadata_ne".to_owned(),
+                pattern_id: Some("pe.machine".to_owned()),
+                threshold: Some(0x8664),
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            200_000_000,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("metadata ne");
+        assert!(metadata_ne.matched);
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let metadata_time = evaluate_node(
+            &QueryNode {
+                kind: "metadata_time_lt".to_owned(),
+                pattern_id: Some("pe.timestamp".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            400_000_000,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("metadata time lt");
+        assert!(metadata_time.matched);
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let metadata_field = evaluate_node(
+            &QueryNode {
+                kind: "metadata_field_lt".to_owned(),
+                pattern_id: Some("pe.subsystem|pe.machine".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("metadata field lt");
+        assert!(metadata_field.matched);
+
+        let at_zero_patterns = HashMap::from([(
+            "$mz".to_owned(),
+            PatternPlan {
+                pattern_id: "$mz".to_owned(),
+                alternatives: vec![Vec::new()],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![b"MZ".to_vec()],
+                fixed_literals: vec![b"MZ".to_vec()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            },
+        )]);
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let at_zero_true = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_at".to_owned(),
+                pattern_id: Some("$mz@0".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &at_zero_patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("at zero prefix true");
+        assert!(at_zero_true.matched);
+
+        let at_zero_patterns = HashMap::from([(
+            "$pk".to_owned(),
+            PatternPlan {
+                pattern_id: "$pk".to_owned(),
+                alternatives: vec![Vec::new()],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![b"PK".to_vec()],
+                fixed_literals: vec![b"PK".to_vec()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            },
+        )]);
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let at_zero_false = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_at".to_owned(),
+                pattern_id: Some("$pk@0".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &at_zero_patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("at zero prefix false");
+        assert!(!at_zero_false.matched);
     }
 
     #[test]
@@ -9965,6 +10678,266 @@ rule q {
 
         let _third = store.query_candidates(&plan, 0, 64).expect("third query");
         assert_eq!(store.prepared_query_cache.len(), 1);
+    }
+
+    #[test]
+    fn clear_search_caches_empties_prepared_query_cache() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(8, None)
+            .expect("filter bytes");
+        insert_primary(
+            &mut store,
+            [0x44; 32],
+            8,
+            None,
+            None,
+            filter_bytes,
+            &lane_bloom_bytes(
+                filter_bytes,
+                DEFAULT_BLOOM_HASHES,
+                &[pack_exact_gram(b"ABC")],
+            ),
+            None,
+        )
+        .expect("insert");
+        let plan = compile_query_plan_with_gram_sizes_and_identity_source(
+            r#"
+rule q {
+  strings:
+    $a = "ABC"
+  condition:
+    $a
+}
+"#,
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
+                .expect("default gram sizes"),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            100_000,
+        )
+        .expect("plan");
+
+        let _ = store.query_candidates(&plan, 0, 64).expect("query");
+        assert_eq!(store.prepared_query_cache.len(), 1);
+        store.clear_search_caches();
+        assert_eq!(store.prepared_query_cache.len(), 0);
+    }
+
+    #[test]
+    fn import_document_batch_wrappers_roundtrip_live_documents() {
+        let tmp = tempdir().expect("tmp");
+        let src_root = tmp.path().join("src");
+        let mut src = CandidateStore::init(
+            CandidateConfig {
+                root: src_root,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init src");
+        let filter_bytes = src
+            .resolve_filter_bytes_for_file_size(8, None)
+            .expect("filter bytes");
+        let bloom = lane_bloom_bytes(
+            filter_bytes,
+            DEFAULT_BLOOM_HASHES,
+            &[pack_exact_gram(b"ABC")],
+        );
+        insert_primary(
+            &mut src,
+            [0x61; 32],
+            8,
+            None,
+            None,
+            filter_bytes,
+            &bloom,
+            Some("src-doc".to_owned()),
+        )
+        .expect("insert source");
+        let documents = src.export_live_documents().expect("export");
+        assert_eq!(documents.len(), 1);
+
+        let mut dst = CandidateStore::init(
+            CandidateConfig {
+                root: tmp.path().join("dst"),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init dst");
+        let inserted = dst.import_documents_batch(&documents).expect("import");
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].status, "inserted");
+        assert_eq!(dst.stats().doc_count, 1);
+
+        let mut dst_known_new = CandidateStore::init(
+            CandidateConfig {
+                root: tmp.path().join("dst-known-new"),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init dst known new");
+        let inserted_known_new = dst_known_new
+            .import_documents_batch_known_new(&documents)
+            .expect("import known new");
+        assert_eq!(inserted_known_new.len(), 1);
+        assert_eq!(inserted_known_new[0].status, "inserted");
+
+        let mut dst_quiet = CandidateStore::init(
+            CandidateConfig {
+                root: tmp.path().join("dst-quiet"),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init dst quiet");
+        dst_quiet
+            .import_documents_batch_quiet(&documents)
+            .expect("import quiet");
+        assert_eq!(dst_quiet.stats().doc_count, 1);
+
+        let mut dst_known_new_quiet = CandidateStore::init(
+            CandidateConfig {
+                root: tmp.path().join("dst-known-new-quiet"),
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init dst known new quiet");
+        dst_known_new_quiet
+            .import_documents_batch_known_new_quiet(&documents)
+            .expect("import known new quiet");
+        assert_eq!(dst_known_new_quiet.stats().doc_count, 1);
+    }
+
+    #[test]
+    fn query_tree_gate_profile_wrapper_reports_pass_when_superblock_gate_disabled() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let _guard = no_superblock_gate_override(true);
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let plan = compile_query_plan_with_gram_sizes_and_identity_source(
+            r#"
+rule q {
+  strings:
+    $a = "ABC"
+  condition:
+    $a
+}
+"#,
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
+                .expect("default gram sizes"),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            100_000,
+        )
+        .expect("plan");
+        let profile = store
+            .query_tree_gate_profile(&plan)
+            .expect("tree gate profile");
+        assert_eq!(profile.tree_gate_trees_considered, 1);
+        assert_eq!(profile.tree_gate_passed, 1);
+        assert_eq!(profile.tree_gate_tier1_pruned, 0);
+        assert_eq!(profile.tree_gate_tier2_pruned, 0);
+    }
+
+    #[test]
+    fn update_tier2_superblocks_for_doc_inner_populates_masks() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path().join("store");
+        let mut store = CandidateStore::init(
+            CandidateConfig {
+                root: root.clone(),
+                enable_tier2_superblocks: true,
+                ..CandidateConfig::default()
+            },
+            true,
+        )
+        .expect("init");
+        let file_size = 8u64;
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(2))
+            .expect("tier1 filter bytes");
+        let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, Some(2), None);
+        let mut primary_bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("tier1 bloom");
+        primary_bloom
+            .add(pack_exact_gram(b"ABC"))
+            .expect("add primary gram");
+        let tier2_filter_bytes = store
+            .resolve_filter_bytes_for_file_size(file_size, Some(2))
+            .expect("tier2 filter bytes");
+        let tier2_bloom_hashes =
+            store.resolve_bloom_hashes_for_document(tier2_filter_bytes, Some(2), None);
+        let mut tier2_bloom =
+            BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes).expect("tier2 bloom");
+        tier2_bloom
+            .add(pack_exact_gram(b"ABCD"))
+            .expect("add tier2 gram");
+        store
+            .insert_document(
+                [0x71; 32],
+                file_size,
+                Some(2),
+                Some(bloom_hashes),
+                Some(2),
+                Some(tier2_bloom_hashes),
+                filter_bytes,
+                &primary_bloom.into_bytes(),
+                tier2_filter_bytes,
+                &tier2_bloom.into_bytes(),
+                None,
+            )
+            .expect("insert");
+
+        store.tier2_superblocks =
+            Tier2SuperblockIndex::with_docs_per_block(store.config().tier1_superblock_docs);
+        store
+            .update_tier2_superblocks_for_doc_inner(0)
+            .expect("update tier2 superblocks");
+
+        let bucket_key = tier2_superblock_bucket_key(tier2_filter_bytes, tier2_bloom_hashes);
+        assert_eq!(
+            store
+                .tier2_superblocks
+                .bucket_for_key
+                .get(&(tier2_filter_bytes, tier2_bloom_hashes))
+                .copied(),
+            Some(bucket_key)
+        );
+        let masks = store
+            .tier2_superblocks
+            .masks_by_bucket
+            .get(&bucket_key)
+            .expect("tier2 masks");
+        assert_eq!(masks.len(), 1);
+        let positions = store
+            .tier2_superblocks
+            .positions_by_bucket
+            .get(&bucket_key)
+            .expect("tier2 positions");
+        assert_eq!(positions, &vec![vec![0]]);
     }
 
     #[test]

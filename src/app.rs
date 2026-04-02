@@ -2538,6 +2538,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
     match (|| -> Result<i32> {
         let (host, port) = parse_host_port(&args.addr)?;
         let candidate_shards = serve_candidate_shard_count(args);
+        let serve_workspace_mode = serve_uses_workspace_mode(Path::new(&args.root));
         let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
             adaptive_publish_prior_for_root(Path::new(&args.root));
         let signals = serve_signal_flags()?;
@@ -2554,7 +2555,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
                 auto_publish_initial_idle_ms,
                 auto_publish_storage_class,
-                workspace_mode: true,
+                workspace_mode: serve_workspace_mode,
             },
             signals.shutdown.clone(),
             Some(signals.status_dump.clone()),
@@ -2569,6 +2570,39 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
             1
         }
     }
+}
+
+fn serve_uses_workspace_mode(root: &Path) -> bool {
+    if root.join("current").is_dir() || root.join("work_a").is_dir() || root.join("work_b").is_dir()
+    {
+        return true;
+    }
+    if root.join("store_meta.json").exists()
+        || root.join("meta.json").exists()
+        || root.join("sha256_by_docid.dat").exists()
+        || root.join("doc_meta.bin").exists()
+        || root.join("shard_000").join("store_meta.json").exists()
+        || root.join("shard_000").join("meta.json").exists()
+        || root.join("shard_000").join("sha256_by_docid.dat").exists()
+        || root.join("shard_000").join("doc_meta.bin").exists()
+    {
+        return false;
+    }
+    fs::read_dir(root)
+        .ok()
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| name.starts_with("tree_"))
+                        .unwrap_or(false)
+                    && entry.path().join("current").is_dir()
+            })
+        })
+        .map(|has_forest_trees| !has_forest_trees)
+        .unwrap_or(true)
 }
 
 fn cmd_init(args: &InitArgs) -> i32 {
@@ -6625,5 +6659,472 @@ rule remote_q {
                     .expect("normalized sha256")
             )
         );
+    }
+
+    #[test]
+    fn batch_search_helper_functions_cover_local_forest_paths() {
+        let _guard = crate::perf::test_lock().lock().expect("perf lock");
+        crate::perf::configure(None, false);
+        let tmp = tempdir().expect("tmp");
+        let base = tmp.path();
+
+        assert!(default_ingest_workers() >= 1);
+        assert_eq!(
+            remote_index_session_document_limit(0, 64),
+            REMOTE_INDEX_SESSION_MAX_DOCUMENTS
+        );
+        assert_eq!(
+            remote_index_session_document_limit(640 * 1024 * 4 * 8, 64),
+            64
+        );
+        assert_eq!(
+            remote_index_session_document_limit(640 * 1024 * 4 * 4096, 1),
+            REMOTE_INDEX_SESSION_MAX_DOCUMENTS
+        );
+        assert_eq!(
+            remote_index_session_input_bytes_limit(0),
+            REMOTE_INDEX_SESSION_MAX_INPUT_BYTES
+        );
+        assert_eq!(
+            remote_index_session_input_bytes_limit(4 << 30),
+            REMOTE_INDEX_SESSION_MIN_INPUT_BYTES
+        );
+        assert_eq!(
+            remote_index_session_input_bytes_limit(40 << 30),
+            REMOTE_INDEX_SESSION_MAX_INPUT_BYTES
+        );
+        assert!(is_retryable_remote_index_rotation_error(&SspryError::from(
+            "server is publishing; retry later"
+        )));
+        assert!(is_retryable_remote_index_rotation_error(&SspryError::from(
+            "another index session is already active; retry later"
+        )));
+        assert!(is_retryable_remote_index_rotation_error(&SspryError::from(
+            "no active index session; cannot update progress"
+        )));
+        assert!(!is_retryable_remote_index_rotation_error(
+            &SspryError::from("fatal publish failure")
+        ));
+        assert_eq!(
+            append_path_suffix(Path::new("/tmp/out.json"), ".jsonl"),
+            PathBuf::from("/tmp/out.json.jsonl")
+        );
+        assert!(is_wide_word_unit(b"A\0"));
+        assert!(!is_wide_word_unit(b"A"));
+        assert!(!is_wide_word_unit(&[0xff, 0x00]));
+
+        let direct_root = base.join("direct");
+        fs::create_dir_all(direct_root.join("current")).expect("direct current");
+        assert_eq!(
+            forest_tree_roots(&direct_root).expect("direct tree roots"),
+            vec![direct_root.join("current")]
+        );
+
+        let empty_root = base.join("empty");
+        fs::create_dir_all(&empty_root).expect("empty root");
+        assert_eq!(
+            forest_tree_roots(&empty_root).expect("fallback tree roots"),
+            vec![empty_root.clone()]
+        );
+
+        let connection = start_tcp_test_server(base, 1);
+        let base_client = rpc_client(&connection);
+        let mut client = base_client.connect_persistent().expect("persistent client");
+        client.begin_index_session().expect("begin session");
+        let empty_payload_size = empty_remote_batch_payload_size().expect("empty payload");
+        let mut pending = RemotePendingBatch {
+            rows: Vec::new(),
+            payload_size: empty_payload_size,
+        };
+        let mut processed = 3usize;
+        let mut submit_time = Duration::ZERO;
+        let mut progress_rpc_time = Duration::ZERO;
+        let mut last_progress_reported = 0usize;
+        let mut last_progress_at = Instant::now();
+        rotate_remote_index_session(
+            &base_client,
+            &mut client,
+            &mut pending,
+            &mut processed,
+            &mut submit_time,
+            false,
+            10,
+            &mut last_progress_reported,
+            &mut last_progress_at,
+            empty_payload_size,
+            &mut progress_rpc_time,
+            false,
+        )
+        .expect("rotate remote index session");
+        assert!(progress_rpc_time > Duration::ZERO);
+        client.end_index_session().expect("end session");
+    }
+
+    #[test]
+    fn batch_search_record_stream_roundtrips_json_outputs() {
+        let tmp = tempdir().expect("tmp");
+        let json_out = tmp.path().join("batch").join("search_summary.json");
+        let partial_json_out = append_path_suffix(&json_out, ".partial.json");
+        let jsonl_out = append_path_suffix(&json_out, ".jsonl");
+        let mut stream = BatchSearchRecordStream::new(&json_out).expect("stream");
+        assert_eq!(stream.jsonl_out(), jsonl_out.as_path());
+
+        let record_a = BatchSearchRecord {
+            rule: "rule_a".to_owned(),
+            rule_path: "/tmp/rule_a.yar".to_owned(),
+            exit_code: 0,
+            elapsed_ms_wall: 12.5,
+            error: None,
+            candidates: Some(2),
+            tier_used: Some("tier1+tier2".to_owned()),
+            verified_checked: Some(0),
+            verified_matched: Some(0),
+            verified_skipped: Some(0),
+            verbose_search_total_ms: Some(12.5),
+            verbose_search_plan_ms: Some(1.0),
+            verbose_search_query_ms: Some(11.0),
+            verbose_search_verify_ms: Some(0.5),
+            verbose_search_tree_gate_trees_considered: Some(2),
+            verbose_search_tree_gate_passed: Some(2),
+            verbose_search_tree_gate_tier1_pruned: Some(0),
+            verbose_search_tree_gate_tier2_pruned: Some(0),
+            verbose_search_tree_gate_special_docs_bypass: Some(0),
+            verbose_search_docs_scanned: Some(2),
+            verbose_search_superblocks_skipped: Some(0),
+            verbose_search_tier1_superblock_loads: Some(0),
+            verbose_search_tier1_superblock_bytes: Some(0),
+            verbose_search_tier2_superblock_loads: Some(0),
+            verbose_search_tier2_superblock_bytes: Some(0),
+            verbose_search_metadata_loads: Some(0),
+            verbose_search_metadata_bytes: Some(0),
+            verbose_search_tier1_bloom_loads: Some(2),
+            verbose_search_tier1_bloom_bytes: Some(128),
+            verbose_search_tier2_bloom_loads: Some(1),
+            verbose_search_tier2_bloom_bytes: Some(64),
+            verbose_search_prepared_query_bytes: Some(32),
+            verbose_search_prepared_pattern_plan_bytes: Some(16),
+            verbose_search_prepared_mask_cache_bytes: Some(8),
+            verbose_search_prepared_pattern_count: Some(1),
+            verbose_search_prepared_mask_cache_entries: Some(1),
+            verbose_search_prepared_fixed_literal_count: Some(1),
+            verbose_search_prepared_tier1_alternatives: Some(1),
+            verbose_search_prepared_tier2_alternatives: Some(1),
+            verbose_search_prepared_tier1_shift_variants: Some(1),
+            verbose_search_prepared_tier2_shift_variants: Some(1),
+            verbose_search_prepared_tier1_any_lane_alternatives: Some(0),
+            verbose_search_prepared_tier2_any_lane_alternatives: Some(0),
+            verbose_search_prepared_tier1_compacted_any_lane_alternatives: Some(0),
+            verbose_search_prepared_tier2_compacted_any_lane_alternatives: Some(0),
+            verbose_search_prepared_any_lane_variant_sets: Some(0),
+            verbose_search_prepared_compacted_any_lane_grams: Some(0),
+            verbose_search_prepared_max_pattern_bytes: Some(4),
+            verbose_search_prepared_max_pattern_id: Some("$a".to_owned()),
+            verbose_search_prepared_impossible_query: Some(false),
+            verbose_search_max_candidates: Some(100),
+            verbose_search_max_anchors_per_pattern: Some(8),
+            verbose_search_candidates: Some(2),
+            verbose_search_verify_enabled: Some(false),
+            verbose_search_client_current_rss_kb: Some(1024),
+            verbose_search_client_peak_rss_kb: Some(2048),
+            verbose_search_client_smaps_rss_kb: Some(1024),
+            verbose_search_client_anonymous_kb: Some(512),
+            verbose_search_client_private_clean_kb: Some(64),
+            verbose_search_client_private_dirty_kb: Some(128),
+            verbose_search_client_shared_clean_kb: Some(256),
+            verbose_search_server_current_rss_kb: Some(4096),
+            verbose_search_server_peak_rss_kb: Some(8192),
+            verbose_search_tree_count: Some(2),
+            verbose_search_tree_search_workers: Some(2),
+        };
+        let record_b = BatchSearchRecord {
+            rule: "rule_b".to_owned(),
+            rule_path: "/tmp/rule_b.yar".to_owned(),
+            exit_code: 1,
+            elapsed_ms_wall: 3.5,
+            error: Some("boom".to_owned()),
+            candidates: None,
+            tier_used: None,
+            verified_checked: None,
+            verified_matched: None,
+            verified_skipped: None,
+            verbose_search_total_ms: None,
+            verbose_search_plan_ms: None,
+            verbose_search_query_ms: None,
+            verbose_search_verify_ms: None,
+            verbose_search_tree_gate_trees_considered: None,
+            verbose_search_tree_gate_passed: None,
+            verbose_search_tree_gate_tier1_pruned: None,
+            verbose_search_tree_gate_tier2_pruned: None,
+            verbose_search_tree_gate_special_docs_bypass: None,
+            verbose_search_docs_scanned: None,
+            verbose_search_superblocks_skipped: None,
+            verbose_search_tier1_superblock_loads: None,
+            verbose_search_tier1_superblock_bytes: None,
+            verbose_search_tier2_superblock_loads: None,
+            verbose_search_tier2_superblock_bytes: None,
+            verbose_search_metadata_loads: None,
+            verbose_search_metadata_bytes: None,
+            verbose_search_tier1_bloom_loads: None,
+            verbose_search_tier1_bloom_bytes: None,
+            verbose_search_tier2_bloom_loads: None,
+            verbose_search_tier2_bloom_bytes: None,
+            verbose_search_prepared_query_bytes: None,
+            verbose_search_prepared_pattern_plan_bytes: None,
+            verbose_search_prepared_mask_cache_bytes: None,
+            verbose_search_prepared_pattern_count: None,
+            verbose_search_prepared_mask_cache_entries: None,
+            verbose_search_prepared_fixed_literal_count: None,
+            verbose_search_prepared_tier1_alternatives: None,
+            verbose_search_prepared_tier2_alternatives: None,
+            verbose_search_prepared_tier1_shift_variants: None,
+            verbose_search_prepared_tier2_shift_variants: None,
+            verbose_search_prepared_tier1_any_lane_alternatives: None,
+            verbose_search_prepared_tier2_any_lane_alternatives: None,
+            verbose_search_prepared_tier1_compacted_any_lane_alternatives: None,
+            verbose_search_prepared_tier2_compacted_any_lane_alternatives: None,
+            verbose_search_prepared_any_lane_variant_sets: None,
+            verbose_search_prepared_compacted_any_lane_grams: None,
+            verbose_search_prepared_max_pattern_bytes: None,
+            verbose_search_prepared_max_pattern_id: None,
+            verbose_search_prepared_impossible_query: None,
+            verbose_search_max_candidates: None,
+            verbose_search_max_anchors_per_pattern: None,
+            verbose_search_candidates: None,
+            verbose_search_verify_enabled: None,
+            verbose_search_client_current_rss_kb: None,
+            verbose_search_client_peak_rss_kb: None,
+            verbose_search_client_smaps_rss_kb: None,
+            verbose_search_client_anonymous_kb: None,
+            verbose_search_client_private_clean_kb: None,
+            verbose_search_client_private_dirty_kb: None,
+            verbose_search_client_shared_clean_kb: None,
+            verbose_search_server_current_rss_kb: None,
+            verbose_search_server_peak_rss_kb: None,
+            verbose_search_tree_count: None,
+            verbose_search_tree_search_workers: None,
+        };
+
+        stream.push(&record_a).expect("push record a");
+        stream.push(&record_b).expect("push record b");
+        assert_eq!(stream.finish().expect("finish"), 2);
+
+        let json_rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&json_out).expect("json output")).expect("json rows");
+        assert_eq!(json_rows.len(), 2);
+
+        let jsonl_lines = fs::read_to_string(&jsonl_out)
+            .expect("jsonl output")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(jsonl_lines.len(), 2);
+        assert!(!partial_json_out.exists());
+    }
+
+    #[test]
+    fn local_forest_search_wrappers_and_cmd_search_batch_work() {
+        let _guard = crate::perf::test_lock().lock().expect("perf lock");
+        crate::perf::configure(None, false);
+        let tmp = tempdir().expect("tmp");
+        let base = tmp.path();
+        let forest_root = base.join("forest");
+        let rules_dir = base.join("rules");
+        fs::create_dir_all(&forest_root).expect("forest root");
+        fs::create_dir_all(&rules_dir).expect("rules dir");
+
+        for (tree_idx, files) in [
+            (
+                0usize,
+                vec![
+                    ("match_a.bin", b"tree zero ABCD hit one".as_slice()),
+                    ("miss_a.bin", b"tree zero miss".as_slice()),
+                ],
+            ),
+            (
+                1usize,
+                vec![
+                    ("match_b.bin", b"tree one prefix ABCD hit two".as_slice()),
+                    ("miss_b.bin", b"tree one miss".as_slice()),
+                ],
+            ),
+        ] {
+            let tree_root = forest_root
+                .join(format!("tree_{tree_idx:02}"))
+                .join("current");
+            let sample_dir = base.join(format!("tree_{tree_idx:02}_samples"));
+            fs::create_dir_all(&sample_dir).expect("sample dir");
+            for (name, bytes) in files {
+                fs::write(sample_dir.join(name), bytes).expect("sample file");
+            }
+            assert_eq!(
+                cmd_init(&default_internal_init_args(&tree_root, 1, true)),
+                0
+            );
+            assert_eq!(
+                cmd_internal_index_batch(&InternalIndexBatchArgs {
+                    connection: default_connection(),
+                    paths: vec![sample_dir.display().to_string()],
+                    path_list: false,
+                    root: Some(tree_root.display().to_string()),
+                    batch_size: 1,
+                    remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
+                    workers: 1,
+                    chunk_size: 1024,
+                    external_id_from_path: true,
+                    verbose: false,
+                    rotate_remote_sessions: false,
+                }),
+                0
+            );
+        }
+
+        let match_rule = rules_dir.join("0001_match.yar");
+        let miss_rule = rules_dir.join("0002_miss.yar");
+        fs::write(
+            &match_rule,
+            r#"
+rule match_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+        )
+        .expect("match rule");
+        fs::write(
+            &miss_rule,
+            r#"
+rule miss_rule {
+  strings:
+    $a = "WXYZ"
+  condition:
+    $a
+}
+"#,
+        )
+        .expect("miss rule");
+
+        let manifest = base.join("rules.txt");
+        fs::write(
+            &manifest,
+            format!("{}\n{}\n", miss_rule.display(), match_rule.display()),
+        )
+        .expect("manifest");
+        assert_eq!(
+            collect_rules_from_args(&Some(rules_dir.display().to_string()), &None)
+                .expect("rules dir"),
+            vec![match_rule.clone(), miss_rule.clone()]
+        );
+        assert_eq!(
+            collect_rules_from_args(&None, &Some(manifest.display().to_string()))
+                .expect("manifest rules"),
+            vec![match_rule.clone(), miss_rule.clone()]
+        );
+        assert!(collect_rules_from_args(&None, &None).is_err());
+
+        assert_eq!(
+            forest_tree_roots(&forest_root).expect("forest tree roots"),
+            vec![
+                forest_root.join("tree_00").join("current"),
+                forest_root.join("tree_01").join("current")
+            ]
+        );
+
+        let mut tree_groups = open_forest_tree_groups(&forest_root).expect("open forest");
+        assert_eq!(tree_groups.len(), 2);
+        let (gram_sizes, active_identity_source, summary_cap_bytes) =
+            validate_forest_search_policy(&tree_groups).expect("search policy");
+        assert_eq!(gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
+        assert_eq!(active_identity_source.as_deref(), Some("sha256"));
+        assert_eq!(
+            summary_cap_bytes,
+            crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES
+        );
+
+        let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+            &match_rule,
+            gram_sizes,
+            active_identity_source.as_deref(),
+            8,
+            false,
+            true,
+            100,
+        )
+        .expect("compile plan");
+        let prepared =
+            forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes).expect("profile");
+        assert!(prepared.pattern_count >= 1);
+
+        let tree_gate_profile =
+            query_store_group_tree_gates(&mut tree_groups[0].stores, &plan).expect("tree gates");
+        assert_eq!(tree_gate_profile.tree_gate_trees_considered, 1);
+
+        let local_tree = query_store_group_all_candidates(&mut tree_groups[0].stores, &plan, true)
+            .expect("local tree query");
+        assert_eq!(local_tree.hashes.len(), 1);
+        assert_eq!(local_tree.external_ids.len(), 1);
+
+        let forest_tree_gate_profile =
+            query_local_forest_tree_gates(&mut tree_groups, &plan, 2).expect("forest gates");
+        assert_eq!(forest_tree_gate_profile.tree_gate_trees_considered, 2);
+        assert_eq!(forest_tree_gate_profile.tree_gate_passed, 2);
+
+        let local_forest = query_local_forest_all_candidates(&mut tree_groups, &plan, true, 2)
+            .expect("forest query");
+        assert_eq!(local_forest.total_candidates, 2);
+        assert_eq!(local_forest.hashes.len(), 2);
+        assert_eq!(
+            local_forest
+                .external_ids
+                .as_ref()
+                .expect("external ids")
+                .len(),
+            2
+        );
+        assert!(local_forest.query_profile.docs_scanned >= 2);
+        assert!(!local_forest.tier_used.is_empty());
+
+        clear_local_forest_search_caches(&mut tree_groups);
+        let after_clear = query_local_forest_all_candidates(&mut tree_groups, &plan, false, 2)
+            .expect("forest query after clear");
+        assert_eq!(after_clear.total_candidates, 2);
+        assert!(after_clear.external_ids.is_none());
+
+        let json_out = base.join("batch_results.json");
+        assert_eq!(
+            cmd_search_batch(&SearchBatchArgs {
+                root: forest_root.display().to_string(),
+                rules_dir: Some(rules_dir.display().to_string()),
+                rule_manifest: None,
+                json_out: json_out.display().to_string(),
+                tree_search_workers: 2,
+                max_anchors_per_pattern: 8,
+                max_candidates: 100,
+                verify_yara_files: false,
+            }),
+            0
+        );
+
+        let batch_rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&json_out).expect("batch json")).expect("batch rows");
+        assert_eq!(batch_rows.len(), 2);
+        let candidates_by_rule = batch_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("rule")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("rule name")
+                        .to_owned(),
+                    row.get("candidates")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(candidates_by_rule.get("0001_match.yar"), Some(&2));
+        assert_eq!(candidates_by_rule.get("0002_miss.yar"), Some(&0));
+        assert!(append_path_suffix(&json_out, ".jsonl").exists());
     }
 }

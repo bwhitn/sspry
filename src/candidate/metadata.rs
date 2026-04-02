@@ -4,7 +4,8 @@ use std::path::Path;
 
 use crate::{Result, SspryError};
 
-const METADATA_VERSION: u8 = 2;
+const METADATA_VERSION: u8 = 3;
+const PREVIOUS_METADATA_VERSION: u8 = 2;
 const LEGACY_METADATA_VERSION: u8 = 1;
 const MAX_MACHO_ARCHES: usize = 32;
 const MAX_MACHO_COMMAND_BYTES: usize = 256 * 1024;
@@ -22,8 +23,10 @@ enum BoolField {
     LnkIsLnk = 8,
     ElfIsElf = 9,
     MachoIsMacho = 10,
-    ZipIsZip = 11,
-    MzIsMz = 12,
+    #[allow(dead_code)]
+    ReservedLegacyZipBit = 11,
+    #[allow(dead_code)]
+    ReservedLegacyMzBit = 12,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,9 +48,10 @@ enum IntField {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BytesField {
     PeEntryPointPrefix = 0,
+    FilePrefix8 = 1,
 }
 
-const BYTES_FIELD_COUNT: usize = 1;
+const BYTES_FIELD_COUNT: usize = 2;
 
 #[derive(Clone, Debug, Default)]
 struct MetadataBuilder {
@@ -147,7 +151,10 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
         return Err(SspryError::from("Invalid compact document metadata."));
     }
     let version = bytes[0];
-    if version != METADATA_VERSION && version != LEGACY_METADATA_VERSION {
+    if version != METADATA_VERSION
+        && version != PREVIOUS_METADATA_VERSION
+        && version != LEGACY_METADATA_VERSION
+    {
         return Err(SspryError::from(format!(
             "Unsupported compact document metadata version: {}",
             version
@@ -301,10 +308,6 @@ fn extract_crx_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     builder.set_bool(BoolField::CrxIsCrx, prefix.starts_with(b"Cr24"));
 }
 
-fn extract_zip_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
-    builder.set_bool(BoolField::ZipIsZip, prefix.starts_with(b"PK\x03\x04"));
-}
-
 fn extract_dex_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     let is_dex = prefix.len() >= 8
         && &prefix[..4] == b"dex\n"
@@ -371,10 +374,6 @@ fn extract_pe_metadata(
     prefix: &[u8],
     builder: &mut MetadataBuilder,
 ) -> Result<()> {
-    builder.set_bool(
-        BoolField::MzIsMz,
-        prefix.len() >= 2 && &prefix[..2] == b"MZ",
-    );
     builder.set_bool(BoolField::PeIsPe, false);
     builder.set_bool(BoolField::PeIs32Bit, false);
     builder.set_bool(BoolField::PeIs64Bit, false);
@@ -608,8 +607,8 @@ pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let prefix = read_prefix(&mut file, 4096)?;
     let mut builder = MetadataBuilder::default();
+    builder.set_bytes(BytesField::FilePrefix8, &prefix[..prefix.len().min(8)]);
     extract_crx_metadata(&prefix, &mut builder);
-    extract_zip_metadata(&prefix, &mut builder);
     extract_dex_metadata(&prefix, &mut builder);
     extract_lnk_metadata(&prefix, &mut builder);
     extract_elf_metadata(&prefix, &mut builder);
@@ -621,7 +620,6 @@ pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
 fn normalize_field(raw: &str) -> Option<&'static str> {
     match raw.to_ascii_lowercase().as_str() {
         "crx.is_crx" => Some("crx.is_crx"),
-        "_intern.is_mz" => Some("_intern.is_mz"),
         "pe.is_pe" => Some("pe.is_pe"),
         "pe.is_32bit" => Some("pe.is_32bit"),
         "pe.is_64bit" => Some("pe.is_64bit"),
@@ -640,7 +638,6 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
         "dex.is_dex" => Some("dex.is_dex"),
         "dex.version" => Some("dex.version"),
         "lnk.is_lnk" => Some("lnk.is_lnk"),
-        "_intern.is_zip" | "zip.is_zip" => Some("_intern.is_zip"),
         "lnk.creation_time" => Some("lnk.creation_time"),
         "lnk.access_time" => Some("lnk.access_time"),
         "lnk.write_time" => Some("lnk.write_time"),
@@ -658,7 +655,6 @@ pub fn metadata_field_is_boolean(raw: &str) -> bool {
         normalize_field(raw),
         Some(
             "crx.is_crx"
-                | "_intern.is_mz"
                 | "pe.is_pe"
                 | "pe.is_32bit"
                 | "pe.is_64bit"
@@ -668,7 +664,6 @@ pub fn metadata_field_is_boolean(raw: &str) -> bool {
                 | "dex.is_dex"
                 | "lnk.is_lnk"
                 | "elf.is_elf"
-                | "_intern.is_zip"
         )
     )
 }
@@ -697,7 +692,6 @@ pub fn metadata_field_is_integer(raw: &str) -> bool {
 fn bool_field_for_name(field: &str) -> Option<BoolField> {
     match field {
         "crx.is_crx" => Some(BoolField::CrxIsCrx),
-        "_intern.is_mz" => Some(BoolField::MzIsMz),
         "pe.is_pe" => Some(BoolField::PeIsPe),
         "pe.is_32bit" => Some(BoolField::PeIs32Bit),
         "pe.is_64bit" => Some(BoolField::PeIs64Bit),
@@ -707,7 +701,6 @@ fn bool_field_for_name(field: &str) -> Option<BoolField> {
         "dex.is_dex" => Some(BoolField::DexIsDex),
         "lnk.is_lnk" => Some(BoolField::LnkIsLnk),
         "elf.is_elf" => Some(BoolField::ElfIsElf),
-        "_intern.is_zip" => Some(BoolField::ZipIsZip),
         _ => None,
     }
 }
@@ -750,9 +743,64 @@ fn bool_value(decoded: &DecodedMetadata, field: BoolField) -> Option<bool> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+fn compare_u64(lhs: u64, rhs: u64, op: MetadataCompareOp) -> bool {
+    match op {
+        MetadataCompareOp::Eq => lhs == rhs,
+        MetadataCompareOp::Ne => lhs != rhs,
+        MetadataCompareOp::Lt => lhs < rhs,
+        MetadataCompareOp::Le => lhs <= rhs,
+        MetadataCompareOp::Gt => lhs > rhs,
+        MetadataCompareOp::Ge => lhs >= rhs,
+    }
+}
+
+fn decoded_field_values<'a>(
+    decoded: &'a DecodedMetadata,
+    field: &str,
+) -> Result<Option<&'a [u64]>> {
+    if field == "time.now" {
+        return Ok(None);
+    }
+    if let Some(module_guard) = module_guard_for_field(field)
+        && bool_value(decoded, module_guard) == Some(false)
+    {
+        return Ok(Some(&[]));
+    }
+    let Some(int_field) = int_field_for_name(field) else {
+        return Err(SspryError::from(format!(
+            "Unsupported metadata field: {field}"
+        )));
+    };
+    let values = &decoded.ints[int_field as usize];
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values.as_slice()))
+    }
+}
+
 pub fn metadata_field_matches_eq(
     bytes: &[u8],
     raw_field: &str,
+    expected: u64,
+) -> Result<Option<bool>> {
+    metadata_field_matches_compare(bytes, raw_field, MetadataCompareOp::Eq, expected)
+}
+
+pub fn metadata_field_matches_compare(
+    bytes: &[u8],
+    raw_field: &str,
+    op: MetadataCompareOp,
     expected: u64,
 ) -> Result<Option<bool>> {
     let Some(field) = normalize_field(raw_field) else {
@@ -760,34 +808,71 @@ pub fn metadata_field_matches_eq(
             "Unsupported metadata field: {raw_field}"
         )));
     };
-    if field == "time.now" {
-        return Ok(None);
-    }
     let decoded = decode(bytes)?;
     if let Some(bool_field) = bool_field_for_name(field) {
-        return Ok(bool_value(&decoded, bool_field).map(|value| value == (expected != 0)));
+        return match op {
+            MetadataCompareOp::Eq | MetadataCompareOp::Ne => Ok(bool_value(&decoded, bool_field)
+                .map(|value| compare_u64(u64::from(value), u64::from(expected != 0), op))),
+            _ => Err(SspryError::from(format!(
+                "Unsupported metadata comparison for boolean field: {raw_field}"
+            ))),
+        };
     }
-    if let Some(module_guard) = module_guard_for_field(field)
-        && bool_value(&decoded, module_guard) == Some(false)
-    {
-        return Ok(Some(false));
-    }
-    let Some(int_field) = int_field_for_name(field) else {
+    let Some(values) = decoded_field_values(&decoded, field)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        values
+            .iter()
+            .copied()
+            .any(|value| compare_u64(value, expected, op)),
+    ))
+}
+
+pub fn metadata_fields_compare(
+    bytes: &[u8],
+    raw_lhs_field: &str,
+    op: MetadataCompareOp,
+    raw_rhs_field: &str,
+) -> Result<Option<bool>> {
+    let Some(lhs_field) = normalize_field(raw_lhs_field) else {
         return Err(SspryError::from(format!(
-            "Unsupported metadata field: {raw_field}"
+            "Unsupported metadata field: {raw_lhs_field}"
         )));
     };
-    let values = &decoded.ints[int_field as usize];
-    if values.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(values.iter().any(|value| *value == expected)))
-    }
+    let Some(rhs_field) = normalize_field(raw_rhs_field) else {
+        return Err(SspryError::from(format!(
+            "Unsupported metadata field: {raw_rhs_field}"
+        )));
+    };
+    let decoded = decode(bytes)?;
+    let Some(lhs_values) = decoded_field_values(&decoded, lhs_field)? else {
+        return Ok(None);
+    };
+    let Some(rhs_values) = decoded_field_values(&decoded, rhs_field)? else {
+        return Ok(None);
+    };
+    Ok(Some(lhs_values.iter().copied().any(|lhs| {
+        rhs_values
+            .iter()
+            .copied()
+            .any(|rhs| compare_u64(lhs, rhs, op))
+    })))
 }
 
 pub fn metadata_pe_entry_point_prefix(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let decoded = decode(bytes)?;
     let value = &decoded.bytes[BytesField::PeEntryPointPrefix as usize];
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.clone()))
+    }
+}
+
+pub fn metadata_file_prefix_8(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let decoded = decode(bytes)?;
+    let value = &decoded.bytes[BytesField::FilePrefix8 as usize];
     if value.is_empty() {
         Ok(None)
     } else {
@@ -812,6 +897,7 @@ mod tests {
         builder.push_int(IntField::MachoCpuType, 7);
         builder.push_int(IntField::MachoCpuType, 7);
         builder.set_bytes(BytesField::PeEntryPointPrefix, b"ABCDEFGHIJKLMNOP");
+        builder.set_bytes(BytesField::FilePrefix8, b"MZprefix");
         let bytes = builder.encode();
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(bool_value(&decoded, BoolField::PeIsPe), Some(true));
@@ -822,27 +908,19 @@ mod tests {
             decoded.bytes[BytesField::PeEntryPointPrefix as usize],
             b"ABCDEFGHIJKLMNOP"
         );
+        assert_eq!(decoded.bytes[BytesField::FilePrefix8 as usize], b"MZprefix");
         assert_eq!(
             normalize_query_metadata_field("ELF.OSABI"),
             Some("elf.os_abi")
         );
-        assert_eq!(
-            normalize_query_metadata_field("zip.is_zip"),
-            Some("_intern.is_zip")
-        );
-        assert_eq!(
-            normalize_query_metadata_field("_intern.is_zip"),
-            Some("_intern.is_zip")
-        );
-        assert_eq!(
-            normalize_query_metadata_field("_intern.is_mz"),
-            Some("_intern.is_mz")
-        );
+        assert_eq!(normalize_query_metadata_field("zip.is_zip"), None);
+        assert_eq!(normalize_query_metadata_field("_intern.is_zip"), None);
+        assert_eq!(normalize_query_metadata_field("_intern.is_mz"), None);
         assert!(metadata_field_is_boolean("pe.is_dll"));
         assert!(metadata_field_is_boolean("elf.is_elf"));
-        assert!(metadata_field_is_boolean("zip.is_zip"));
-        assert!(metadata_field_is_boolean("_intern.is_zip"));
-        assert!(metadata_field_is_boolean("_intern.is_mz"));
+        assert!(!metadata_field_is_boolean("zip.is_zip"));
+        assert!(!metadata_field_is_boolean("_intern.is_zip"));
+        assert!(!metadata_field_is_boolean("_intern.is_mz"));
         assert!(metadata_field_is_integer("macho.device_type"));
     }
 
@@ -850,6 +928,8 @@ mod tests {
     fn metadata_field_matching_handles_unknown_and_guard_bools() {
         let mut builder = MetadataBuilder::default();
         builder.set_bool(BoolField::PeIsPe, false);
+        builder.push_int(IntField::LnkCreationTime, 10);
+        builder.push_int(IntField::LnkWriteTime, 20);
         let bytes = builder.encode();
         assert_eq!(
             metadata_field_matches_eq(&bytes, "pe.machine", 0x14c).expect("match"),
@@ -863,13 +943,17 @@ mod tests {
             metadata_field_matches_eq(&bytes, "pe.is_pe", 1).expect("match"),
             Some(false)
         );
-        assert_eq!(
-            metadata_field_matches_eq(&bytes, "zip.is_zip", 1).expect("match"),
-            None
+        assert!(
+            metadata_field_matches_eq(&bytes, "zip.is_zip", 1)
+                .expect_err("zip removed")
+                .to_string()
+                .contains("Unsupported metadata field")
         );
-        assert_eq!(
-            metadata_field_matches_eq(&bytes, "_intern.is_mz", 1).expect("match"),
-            None
+        assert!(
+            metadata_field_matches_eq(&bytes, "_intern.is_mz", 1)
+                .expect_err("mz removed")
+                .to_string()
+                .contains("Unsupported metadata field")
         );
         assert_eq!(
             metadata_field_matches_eq(&[], "pe.machine", 0x14c).expect("unknown"),
@@ -878,6 +962,26 @@ mod tests {
         assert_eq!(
             metadata_field_matches_eq(&bytes, "time.now", 1234).expect("time.now"),
             None
+        );
+        assert_eq!(
+            metadata_field_matches_compare(&bytes, "lnk.creation_time", MetadataCompareOp::Lt, 11)
+                .expect("lt"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_compare(&bytes, "lnk.creation_time", MetadataCompareOp::Ne, 10)
+                .expect("ne"),
+            Some(false)
+        );
+        assert_eq!(
+            metadata_fields_compare(
+                &bytes,
+                "lnk.creation_time",
+                MetadataCompareOp::Lt,
+                "lnk.write_time"
+            )
+            .expect("field compare"),
+            Some(true)
         );
         assert!(
             metadata_field_matches_eq(&bytes, "bogus.field", 1)
@@ -894,6 +998,22 @@ mod tests {
         assert!(
             decoded.bytes[BytesField::PeEntryPointPrefix as usize].is_empty(),
             "legacy metadata should not have byte fields"
+        );
+        assert!(
+            decoded.bytes[BytesField::FilePrefix8 as usize].is_empty(),
+            "legacy metadata should not have file prefix bytes"
+        );
+    }
+
+    #[test]
+    fn extracted_metadata_includes_first_eight_file_bytes() {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("prefix.bin");
+        fs::write(&path, b"ABCDEFGHijklmnop").expect("write prefix");
+        let metadata = extract_compact_document_metadata(&path).expect("metadata");
+        assert_eq!(
+            metadata_file_prefix_8(&metadata).expect("decode prefix"),
+            Some(b"ABCDEFGH".to_vec())
         );
     }
 
@@ -925,10 +1045,6 @@ mod tests {
         pe[0x200..0x210].copy_from_slice(b"ENTRYPOINT-PE!!!");
         fs::write(&pe_path, &pe).expect("write pe");
         let pe_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
-        assert_eq!(
-            metadata_field_matches_eq(&pe_bytes, "_intern.is_mz", 1).expect("mz"),
-            Some(true)
-        );
         assert_eq!(
             metadata_field_matches_eq(&pe_bytes, "pe.is_pe", 1).expect("pe"),
             Some(true)
@@ -986,18 +1102,6 @@ mod tests {
         let crx_bytes = extract_compact_document_metadata(&crx_path).expect("metadata");
         assert_eq!(
             metadata_field_matches_eq(&crx_bytes, "crx.is_crx", 1).expect("crx"),
-            Some(true)
-        );
-
-        let zip_path = tmp.path().join("sample.zip");
-        fs::write(&zip_path, b"PK\x03\x04payload").expect("write zip");
-        let zip_bytes = extract_compact_document_metadata(&zip_path).expect("metadata");
-        assert_eq!(
-            metadata_field_matches_eq(&zip_bytes, "zip.is_zip", 1).expect("zip"),
-            Some(true)
-        );
-        assert_eq!(
-            metadata_field_matches_eq(&zip_bytes, "_intern.is_zip", 1).expect("zip intern"),
             Some(true)
         );
 

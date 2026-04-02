@@ -193,30 +193,8 @@ fn serve_persists_candidate_shards() {
             .join("meta.json")
             .exists()
     );
-    assert!(
-        root.join("work_a")
-            .join("shard_000")
-            .join("meta.json")
-            .exists()
-    );
-    assert!(
-        root.join("work_a")
-            .join("shard_001")
-            .join("meta.json")
-            .exists()
-    );
-    assert!(
-        root.join("work_b")
-            .join("shard_000")
-            .join("meta.json")
-            .exists()
-    );
-    assert!(
-        root.join("work_b")
-            .join("shard_001")
-            .join("meta.json")
-            .exists()
-    );
+    assert!(!root.join("work_a").exists());
+    assert!(!root.join("work_b").exists());
 
     let _ = child.kill();
     let _ = child.wait();

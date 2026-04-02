@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::candidate::{
-    GramSizes, metadata_field_is_boolean, normalize_query_metadata_field, pack_exact_gram,
+    GramSizes, metadata_field_is_boolean, metadata_field_is_integer,
+    normalize_query_metadata_field, pack_exact_gram,
 };
 use crate::{Result, SspryError};
 
@@ -179,6 +180,7 @@ enum Token {
     Comma,
     DotDot,
     EqEq,
+    Ne,
     Gt,
     Ge,
     Lt,
@@ -201,6 +203,29 @@ enum Token {
     Quoted(String),
     Id(String),
     Name(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComparisonOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl ComparisonOp {
+    fn reverse(self) -> Self {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::Ne => Self::Ne,
+            Self::Gt => Self::Lt,
+            Self::Ge => Self::Le,
+            Self::Lt => Self::Gt,
+            Self::Le => Self::Ge,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,20 +287,34 @@ struct RulePlanFragment {
     root: Option<QueryNode>,
 }
 
-fn magic_numeric_eq_rewrite(name: &str, offset: usize, value: usize) -> Option<&'static str> {
-    match (name, offset, value) {
-        ("uint16", 0, 0x5a4d) | ("uint16be", 0, 0x4d5a) => Some("_intern.is_mz"),
-        ("uint16", 0, 0x457f)
-        | ("uint16be", 0, 0x7f45)
-        | ("uint32", 0, 0x464c457f)
-        | ("uint32be", 0, 0x7f454c46) => Some("elf.is_elf"),
-        ("uint32", 0, 0x04034b50) | ("uint32be", 0, 0x504b0304) => Some("_intern.is_zip"),
+fn normalize_rule_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn comparison_op_from_token(token: &Token) -> Option<ComparisonOp> {
+    match token {
+        Token::EqEq => Some(ComparisonOp::Eq),
+        Token::Ne => Some(ComparisonOp::Ne),
+        Token::Gt => Some(ComparisonOp::Gt),
+        Token::Ge => Some(ComparisonOp::Ge),
+        Token::Lt => Some(ComparisonOp::Lt),
+        Token::Le => Some(ComparisonOp::Le),
         _ => None,
     }
 }
 
-fn normalize_rule_name(name: &str) -> String {
-    name.trim().to_ascii_lowercase()
+fn comparison_kind(prefix: &str, op: ComparisonOp) -> String {
+    format!(
+        "{prefix}_{}",
+        match op {
+            ComparisonOp::Eq => "eq",
+            ComparisonOp::Ne => "ne",
+            ComparisonOp::Gt => "gt",
+            ComparisonOp::Ge => "ge",
+            ComparisonOp::Lt => "lt",
+            ComparisonOp::Le => "le",
+        }
+    )
 }
 
 fn pattern_has_searchable_anchor(
@@ -585,28 +624,13 @@ impl ConditionParser {
                     self.consume(Some(&Token::RParen))?;
                     self.consume(Some(&Token::EqEq))?;
                     let literal_token = self.consume(None)?;
-                    if let Token::Int(value) = literal_token
-                        && let Some(metadata_field) =
-                            magic_numeric_eq_rewrite(&field_name, offset, value)
-                    {
-                        return Ok(QueryNode {
-                            kind: "metadata_eq".to_owned(),
-                            pattern_id: Some(metadata_field.to_owned()),
-                            threshold: Some(1),
-                            children: Vec::new(),
-                        });
-                    }
                     if let Some(read_kind) = numeric_read_kind(&field_name) {
-                        let literal_text = match (read_kind, literal_token) {
-                            (NumericReadKind::Integer, Token::Int(value)) => value.to_string(),
-                            (NumericReadKind::Float, Token::Int(value)) => value.to_string(),
-                            (NumericReadKind::Float, Token::Float(value)) => value.to_string(),
-                            _ => {
-                                return Err(SspryError::from(format!(
-                                    "{field_name} requires equality against a literal constant."
-                                )));
-                            }
-                        };
+                        let literal_text = parse_numeric_read_literal(
+                            self,
+                            &field_name,
+                            read_kind,
+                            literal_token,
+                        )?;
                         return Ok(QueryNode {
                             kind: "verifier_only_eq".to_owned(),
                             pattern_id: Some(format!("{field_name}({offset})=={literal_text}")),
@@ -643,57 +667,102 @@ impl ConditionParser {
                             SspryError::from(format!("Unsupported condition field: {field_name}"))
                         }
                     })?;
-                if matches!(self.peek(), Some(Token::EqEq)) {
-                    self.consume(Some(&Token::EqEq))?;
-                    let threshold = match self.consume(None)? {
-                        Token::Int(value) => value,
-                        Token::Bool(value) if metadata_field_is_boolean(normalized) => {
-                            usize::from(value)
+                if let Some(op) = self.peek().and_then(comparison_op_from_token) {
+                    self.consume(None)?;
+                    let rhs = self.consume(None)?;
+                    match rhs {
+                        Token::Int(value) => {
+                            let kind = if normalized == "filesize" {
+                                comparison_kind("filesize", op)
+                            } else if normalized == "time.now" {
+                                comparison_kind("time_now", op)
+                            } else if metadata_field_is_boolean(normalized) {
+                                if !matches!(op, ComparisonOp::Eq | ComparisonOp::Ne) {
+                                    return Err(SspryError::from(format!(
+                                        "Boolean metadata field {field_name} only supports == and !=."
+                                    )));
+                                }
+                                comparison_kind("metadata", op)
+                            } else if metadata_field_is_integer(normalized) {
+                                comparison_kind("metadata", op)
+                            } else {
+                                return Err(SspryError::from(format!(
+                                    "Condition field {field_name} requires == <literal>."
+                                )));
+                            };
+                            Ok(QueryNode {
+                                kind,
+                                pattern_id: Some(normalized.to_owned()),
+                                threshold: Some(value),
+                                children: Vec::new(),
+                            })
                         }
-                        _ => {
-                            return Err(SspryError::from(format!(
-                                "Expected literal equality value after {field_name} ==."
-                            )));
+                        Token::Bool(value) => {
+                            if !metadata_field_is_boolean(normalized) {
+                                return Err(SspryError::from(format!(
+                                    "Expected integer literal after {field_name} comparison."
+                                )));
+                            }
+                            if !matches!(op, ComparisonOp::Eq | ComparisonOp::Ne) {
+                                return Err(SspryError::from(format!(
+                                    "Boolean metadata field {field_name} only supports == and !=."
+                                )));
+                            }
+                            Ok(QueryNode {
+                                kind: comparison_kind("metadata", op),
+                                pattern_id: Some(normalized.to_owned()),
+                                threshold: Some(usize::from(value)),
+                                children: Vec::new(),
+                            })
                         }
-                    };
-                    let kind = match normalized {
-                        "filesize" => "filesize_eq",
-                        "time.now" => "time_now_eq",
-                        _ => "metadata_eq",
-                    };
-                    Ok(QueryNode {
-                        kind: kind.to_owned(),
-                        pattern_id: Some(normalized.to_owned()),
-                        threshold: Some(threshold),
-                        children: Vec::new(),
-                    })
-                } else if normalized == "filesize"
-                    && matches!(
-                        self.peek(),
-                        Some(Token::Gt | Token::Ge | Token::Lt | Token::Le)
-                    )
-                {
-                    let kind = match self.consume(None)? {
-                        Token::Gt => "filesize_gt",
-                        Token::Ge => "filesize_ge",
-                        Token::Lt => "filesize_lt",
-                        Token::Le => "filesize_le",
-                        _ => unreachable!(),
-                    };
-                    let threshold = match self.consume(None)? {
-                        Token::Int(value) => value,
-                        _ => {
-                            return Err(SspryError::from(format!(
-                                "Expected literal size value after {field_name} comparison."
-                            )));
+                        Token::Name(rhs_name) => {
+                            let rhs_normalized = normalize_query_metadata_field(&rhs_name)
+                                .ok_or_else(|| {
+                                    SspryError::from(format!(
+                                        "Unsupported comparison target: {rhs_name}"
+                                    ))
+                                })?;
+                            if normalized == "time.now" && rhs_normalized == "time.now" {
+                                return Err(SspryError::from(
+                                    "time.now comparisons against time.now are redundant.",
+                                ));
+                            }
+                            if normalized == "time.now" && metadata_field_is_integer(rhs_normalized)
+                            {
+                                return Ok(QueryNode {
+                                    kind: comparison_kind("metadata_time", op.reverse()),
+                                    pattern_id: Some(rhs_normalized.to_owned()),
+                                    threshold: None,
+                                    children: Vec::new(),
+                                });
+                            }
+                            if metadata_field_is_integer(normalized) && rhs_normalized == "time.now"
+                            {
+                                return Ok(QueryNode {
+                                    kind: comparison_kind("metadata_time", op),
+                                    pattern_id: Some(normalized.to_owned()),
+                                    threshold: None,
+                                    children: Vec::new(),
+                                });
+                            }
+                            if metadata_field_is_integer(normalized)
+                                && metadata_field_is_integer(rhs_normalized)
+                            {
+                                return Ok(QueryNode {
+                                    kind: comparison_kind("metadata_field", op),
+                                    pattern_id: Some(format!("{normalized}|{rhs_normalized}")),
+                                    threshold: None,
+                                    children: Vec::new(),
+                                });
+                            }
+                            Err(SspryError::from(format!(
+                                "Unsupported comparison target: {rhs_name}"
+                            )))
                         }
-                    };
-                    Ok(QueryNode {
-                        kind: kind.to_owned(),
-                        pattern_id: Some("filesize".to_owned()),
-                        threshold: Some(threshold),
-                        children: Vec::new(),
-                    })
+                        _ => Err(SspryError::from(format!(
+                            "Expected literal or comparable field after {field_name} comparison."
+                        ))),
+                    }
                 } else if metadata_field_is_boolean(normalized) {
                     Ok(QueryNode {
                         kind: "metadata_eq".to_owned(),
@@ -1159,6 +1228,14 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
                     continue;
                 }
                 return Err(SspryError::from("Unsupported token in condition near: '='"));
+            }
+            '!' => {
+                if chars.get(index + 1) == Some(&'=') {
+                    tokens.push(Token::Ne);
+                    index += 2;
+                    continue;
+                }
+                return Err(SspryError::from("Unsupported token in condition near: '!'"));
             }
             '>' => {
                 if chars.get(index + 1) == Some(&'=') {
@@ -1992,12 +2069,35 @@ fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
         "ignored_module_predicate" => None,
         "pattern"
         | "metadata_eq"
+        | "metadata_ne"
+        | "metadata_lt"
+        | "metadata_le"
+        | "metadata_gt"
+        | "metadata_ge"
+        | "metadata_time_eq"
+        | "metadata_time_ne"
+        | "metadata_time_lt"
+        | "metadata_time_le"
+        | "metadata_time_gt"
+        | "metadata_time_ge"
+        | "metadata_field_eq"
+        | "metadata_field_ne"
+        | "metadata_field_lt"
+        | "metadata_field_le"
+        | "metadata_field_gt"
+        | "metadata_field_ge"
         | "filesize_eq"
+        | "filesize_ne"
         | "filesize_gt"
         | "filesize_ge"
         | "filesize_lt"
         | "filesize_le"
         | "time_now_eq"
+        | "time_now_ne"
+        | "time_now_lt"
+        | "time_now_le"
+        | "time_now_gt"
+        | "time_now_ge"
         | "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
@@ -3260,9 +3360,41 @@ fn dedupe_pattern_alternatives(
 
 fn numeric_read_kind(name: &str) -> Option<NumericReadKind> {
     match name {
-        "int32" | "uint32" | "int32be" | "uint32be" => Some(NumericReadKind::Integer),
+        "int16" | "uint16" | "int16be" | "uint16be" | "int32" | "uint32" | "int32be"
+        | "uint32be" | "int64" | "uint64" | "int64be" | "uint64be" => {
+            Some(NumericReadKind::Integer)
+        }
         "float32" | "float64" | "float32be" | "float64be" => Some(NumericReadKind::Float),
         _ => None,
+    }
+}
+
+fn parse_numeric_read_literal(
+    parser: &mut ConditionParser,
+    field_name: &str,
+    read_kind: NumericReadKind,
+    first_token: Token,
+) -> Result<String> {
+    match read_kind {
+        NumericReadKind::Float => match first_token {
+            Token::Int(value) => Ok(value.to_string()),
+            Token::Float(value) => Ok(value.to_string()),
+            _ => Err(SspryError::from(format!(
+                "{field_name} requires equality against a literal constant."
+            ))),
+        },
+        NumericReadKind::Integer => match first_token {
+            Token::Int(value) => Ok(value.to_string()),
+            Token::Minus if field_name.starts_with("int") => match parser.consume(None)? {
+                Token::Int(value) => Ok(format!("-{value}")),
+                _ => Err(SspryError::from(format!(
+                    "{field_name} requires equality against a literal constant."
+                ))),
+            },
+            _ => Err(SspryError::from(format!(
+                "{field_name} requires equality against a literal constant."
+            ))),
+        },
     }
 }
 
@@ -3285,7 +3417,47 @@ fn parse_numeric_read_expression(expr: &str) -> Result<(&str, usize, &str)> {
 
 fn numeric_read_anchor_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> {
     match name {
-        "int32" | "uint32" => {
+        "int16" => {
+            let value = literal_text.parse::<i16>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        "uint16" => {
+            let value = literal_text.parse::<u16>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        "int16be" => {
+            let value = literal_text.parse::<i16>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        "uint16be" => {
+            let value = literal_text.parse::<u16>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        "int32" => {
+            let value = literal_text.parse::<i32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        "uint32" => {
             let value = literal_text.parse::<u32>().map_err(|_| {
                 SspryError::from(format!(
                     "Numeric read literal is out of range for {name}: {literal_text}"
@@ -3293,8 +3465,48 @@ fn numeric_read_anchor_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> 
             })?;
             Ok(value.to_le_bytes().to_vec())
         }
-        "int32be" | "uint32be" => {
+        "int32be" => {
+            let value = literal_text.parse::<i32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        "uint32be" => {
             let value = literal_text.parse::<u32>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        "int64" => {
+            let value = literal_text.parse::<i64>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        "uint64" => {
+            let value = literal_text.parse::<u64>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        "int64be" => {
+            let value = literal_text.parse::<i64>().map_err(|_| {
+                SspryError::from(format!(
+                    "Numeric read literal is out of range for {name}: {literal_text}"
+                ))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        "uint64be" => {
+            let value = literal_text.parse::<u64>().map_err(|_| {
                 SspryError::from(format!(
                     "Numeric read literal is out of range for {name}: {literal_text}"
                 ))
@@ -3821,9 +4033,11 @@ pub fn evaluate_fixed_literal_match(
         "filesize_eq" => Err(SspryError::from(
             "filesize_eq requires file metadata and cannot use the fixed-literal fast path",
         )),
-        "filesize_lt" | "filesize_le" | "filesize_gt" | "filesize_ge" => Err(SspryError::from(
-            "filesize comparison requires file metadata and cannot use the fixed-literal fast path",
-        )),
+        "filesize_ne" | "filesize_lt" | "filesize_le" | "filesize_gt" | "filesize_ge" => {
+            Err(SspryError::from(
+                "filesize comparison requires file metadata and cannot use the fixed-literal fast path",
+            ))
+        }
         "verifier_only_eq" => Err(SspryError::from(
             "verifier_only_eq requires file verification and cannot use the fixed-literal fast path",
         )),
@@ -3842,11 +4056,16 @@ pub fn evaluate_fixed_literal_match(
         "identity_eq" => Err(SspryError::from(
             "identity_eq requires DB identity lookup and cannot use the fixed-literal fast path",
         )),
-        "metadata_eq" => Err(SspryError::from(
-            "metadata_eq requires stored metadata and cannot use the fixed-literal fast path",
+        "metadata_eq" | "metadata_ne" | "metadata_lt" | "metadata_le" | "metadata_gt"
+        | "metadata_ge" | "metadata_time_eq" | "metadata_time_ne" | "metadata_time_lt"
+        | "metadata_time_le" | "metadata_time_gt" | "metadata_time_ge" | "metadata_field_eq"
+        | "metadata_field_ne" | "metadata_field_lt" | "metadata_field_le" | "metadata_field_gt"
+        | "metadata_field_ge" => Err(SspryError::from(
+            "metadata comparison requires stored metadata and cannot use the fixed-literal fast path",
         )),
-        "time_now_eq" => Err(SspryError::from(
-            "time_now_eq requires runtime evaluation and cannot use the fixed-literal fast path",
+        "time_now_eq" | "time_now_ne" | "time_now_lt" | "time_now_le" | "time_now_gt"
+        | "time_now_ge" => Err(SspryError::from(
+            "time_now comparison requires runtime evaluation and cannot use the fixed-literal fast path",
         )),
         "and" => {
             for child in &node.children {
@@ -3900,13 +4119,36 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
             .unwrap_or(u128::MAX),
         "not" => u128::MAX / 2,
         "filesize_eq"
+        | "filesize_ne"
         | "filesize_lt"
         | "filesize_le"
         | "filesize_gt"
         | "filesize_ge"
         | "identity_eq"
         | "metadata_eq"
+        | "metadata_ne"
+        | "metadata_lt"
+        | "metadata_le"
+        | "metadata_gt"
+        | "metadata_ge"
+        | "metadata_time_eq"
+        | "metadata_time_ne"
+        | "metadata_time_lt"
+        | "metadata_time_le"
+        | "metadata_time_gt"
+        | "metadata_time_ge"
+        | "metadata_field_eq"
+        | "metadata_field_ne"
+        | "metadata_field_lt"
+        | "metadata_field_le"
+        | "metadata_field_gt"
+        | "metadata_field_ge"
         | "time_now_eq"
+        | "time_now_ne"
+        | "time_now_lt"
+        | "time_now_le"
+        | "time_now_gt"
+        | "time_now_ge"
         | "verifier_only_eq"
         | "verifier_only_at"
         | "verifier_only_count"
@@ -5144,7 +5386,47 @@ rule module_meta {
     }
 
     #[test]
-    fn compile_rule_rewrites_header_magic_numeric_reads_to_metadata() {
+    fn compile_rule_with_extended_metadata_and_time_comparisons() {
+        let rule = r#"
+rule metadata_cmp {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and lnk.creation_time < time.now and time.now >= 1700000000 and lnk.write_time != 5 and lnk.access_time <= lnk.write_time
+}
+"#;
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.root.kind, "and");
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_time_lt"
+                && child.pattern_id.as_deref() == Some("lnk.creation_time")
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "time_now_ge"
+                && child.pattern_id.as_deref() == Some("time.now")
+                && child.threshold == Some(1_700_000_000)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_ne"
+                && child.pattern_id.as_deref() == Some("lnk.write_time")
+                && child.threshold == Some(5)
+        }));
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_field_le"
+                && child.pattern_id.as_deref() == Some("lnk.access_time|lnk.write_time")
+        }));
+    }
+
+    #[test]
+    fn compile_rule_header_magic_numeric_reads_stay_as_numeric_checks() {
+        fn contains_verifier_eq(node: &QueryNode, expr: &str) -> bool {
+            (node.kind == "verifier_only_eq" && node.pattern_id.as_deref() == Some(expr))
+                || node
+                    .children
+                    .iter()
+                    .any(|child| contains_verifier_eq(child, expr))
+        }
+
         let rule = r#"
 rule header_magic {
   strings:
@@ -5155,28 +5437,17 @@ rule header_magic {
 "#;
         let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.root.kind, "and");
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("_intern.is_mz")
-                && child.threshold == Some(1)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("elf.is_elf")
-                && child.threshold == Some(1)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("_intern.is_zip")
-                && child.threshold == Some(1)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "and"
-                && child
-                    .children
-                    .iter()
-                    .any(|grandchild| grandchild.kind == "verifier_only_eq")
-        }));
+        assert!(contains_verifier_eq(&plan.root, "uint16(0)==23117"));
+        assert!(contains_verifier_eq(&plan.root, "uint32(4)==332"));
+        assert!(contains_verifier_eq(&plan.root, "uint32(0)==1179403647"));
+        assert!(contains_verifier_eq(&plan.root, "uint32(0)==67324752"));
+        assert!(
+            !plan
+                .root
+                .children
+                .iter()
+                .any(|child| child.kind == "metadata_eq")
+        );
     }
 
     #[test]
@@ -5225,6 +5496,39 @@ rule numeric_reads {
             }
         }
         assert_eq!(verifier_children, 2);
+    }
+
+    #[test]
+    fn compile_rule_with_extended_integer_read_verifier_nodes() {
+        fn contains_verifier_eq(node: &QueryNode, expr: &str) -> bool {
+            (node.kind == "verifier_only_eq" && node.pattern_id.as_deref() == Some(expr))
+                || node
+                    .children
+                    .iter()
+                    .any(|child| contains_verifier_eq(child, expr))
+        }
+
+        let rule = r#"
+rule numeric_reads_ext {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and int16be(0) == -2 and uint64(0) == 0x1122334455667788
+}
+"#;
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
+        assert!(plan.patterns.iter().any(|pattern| {
+            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
+                && pattern
+                    .fixed_literals
+                    .iter()
+                    .any(|literal| literal == &0x1122_3344_5566_7788u64.to_le_bytes())
+        }));
+        assert!(contains_verifier_eq(&plan.root, "int16be(0)==-2"));
+        assert!(contains_verifier_eq(
+            &plan.root,
+            "uint64(0)==1234605616436508552"
+        ));
     }
 
     #[test]
