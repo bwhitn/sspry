@@ -784,7 +784,7 @@ def main() -> int:
     parser.add_argument('--result-base', required=True)
     parser.add_argument('--db-base', required=True)
     parser.add_argument('--base-port', type=int, default=18920)
-    parser.add_argument('--chunk-size', type=int, default=10000)
+    parser.add_argument('--chunk-size', type=int, default=5000)
     parser.add_argument('--chunk-count', type=int)
     parser.add_argument('--balance-bytes', action='store_true')
     parser.add_argument('--summary-cap-kib', type=int, default=32)

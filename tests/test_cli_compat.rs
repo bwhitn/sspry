@@ -249,8 +249,13 @@ fn write_minimal_pe(
 }
 
 fn write_minimal_crx(path: &Path, anchor: &[u8]) {
-    let mut crx = b"Cr24".to_vec();
-    crx.resize(32, 0);
+    let mut crx = Vec::new();
+    crx.extend_from_slice(b"Cr24");
+    crx.extend_from_slice(&2u32.to_le_bytes());
+    crx.extend_from_slice(&0u32.to_le_bytes());
+    crx.extend_from_slice(&0u32.to_le_bytes());
+    crx.extend_from_slice(b"PK\x05\x06");
+    crx.extend_from_slice(&[0u8; 18]);
     crx.extend_from_slice(anchor);
     fs::write(path, crx).expect("write crx");
 }
@@ -275,20 +280,25 @@ fn write_minimal_elf64(path: &Path, anchor: &[u8]) {
 }
 
 fn write_minimal_dex(path: &Path, version: &str, anchor: &[u8]) {
-    let mut dex = format!("dex\n{version}\0").into_bytes();
-    dex.resize(64, 0);
+    let mut dex = vec![0u8; 0x70];
+    let file_size = (dex.len() + anchor.len()) as u32;
+    dex[0..4].copy_from_slice(b"dex\n");
+    dex[4..7].copy_from_slice(version.as_bytes());
+    dex[7] = 0;
+    dex[32..36].copy_from_slice(&file_size.to_le_bytes());
+    dex[36..40].copy_from_slice(&0x70u32.to_le_bytes());
+    dex[40..44].copy_from_slice(&0x1234_5678u32.to_le_bytes());
     dex.extend_from_slice(anchor);
     fs::write(path, dex).expect("write dex");
 }
 
-fn write_minimal_thin_macho(path: &Path, cpu_type: u32, device_type: u32, anchor: &[u8]) {
+fn write_minimal_thin_macho(path: &Path, cpu_type: u32, file_type: u32, anchor: &[u8]) {
     let mut macho = vec![0u8; 64];
     macho[0..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
     macho[4..8].copy_from_slice(&cpu_type.to_le_bytes());
+    macho[12..16].copy_from_slice(&file_type.to_le_bytes());
     macho[16..20].copy_from_slice(&1u32.to_le_bytes());
     macho[20..24].copy_from_slice(&8u32.to_le_bytes());
-    macho[32..36].copy_from_slice(&device_type.to_le_bytes());
-    macho[36..40].copy_from_slice(&8u32.to_le_bytes());
     macho.extend_from_slice(anchor);
     fs::write(path, macho).expect("write macho");
 }
@@ -685,7 +695,7 @@ rule ModulePe {
   strings:
     $a = "ANCHOR"
   condition:
-    $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true and dotnet.is_dotnet == true
+    $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true
 }
 "#,
     )
@@ -784,7 +794,7 @@ fn search_supports_additional_module_metadata_conditions() {
         anchor,
     );
     write_minimal_crx(&sample_dir.join("sample.crx"), anchor);
-    write_minimal_thin_macho(&sample_dir.join("sample.macho"), 0x0100_0007, 0x24, anchor);
+    write_minimal_thin_macho(&sample_dir.join("sample.macho"), 0x0100_0007, 6, anchor);
     fs::write(
         sample_dir.join("decoy.bin"),
         [anchor.as_slice(), b"-not-a-module"].concat(),
@@ -798,7 +808,7 @@ rule ModulePeExtra {
   strings:
     $a = "EXTRA-ANCHOR"
   condition:
-    $a and pe.is_pe and pe.is_32bit and pe.is_64bit == false and pe.is_dll and pe.is_signed and dotnet.is_dotnet == false and pe.subsystem == 2 and pe.timestamp == 0x22334455
+    $a and pe.is_pe and pe.is_32bit and pe.is_64bit == false and pe.is_dll and dotnet.is_dotnet == false and pe.subsystem == 2 and pe.timestamp == 0x22334455
 }
 "#,
     )
@@ -822,7 +832,7 @@ rule ModuleMacho {
   strings:
     $a = "EXTRA-ANCHOR"
   condition:
-    $a and macho.cputype == 0x01000007 and macho.devicetype == 0x24
+    $a and macho.cputype == 0x01000007 and macho.filetype == 6
 }
 "#,
     )

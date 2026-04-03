@@ -3,12 +3,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::{Result, SspryError};
+use yara_x::mods::{self, pe::OptionalMagic};
 
-const METADATA_VERSION: u8 = 3;
-const PREVIOUS_METADATA_VERSION: u8 = 2;
-const LEGACY_METADATA_VERSION: u8 = 1;
+const METADATA_VERSION: u8 = 1;
 const MAX_MACHO_ARCHES: usize = 32;
-const MAX_MACHO_COMMAND_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoolField {
@@ -34,15 +32,18 @@ enum IntField {
     PeMachine = 0,
     PeSubsystem = 1,
     PeTimestamp = 2,
-    ElfType = 3,
-    ElfOsAbi = 4,
-    ElfMachine = 5,
-    MachoCpuType = 6,
-    MachoDeviceType = 7,
-    DexVersion = 8,
-    LnkCreationTime = 9,
-    LnkAccessTime = 10,
-    LnkWriteTime = 11,
+    PeCharacteristics = 3,
+    ElfType = 4,
+    ElfOsAbi = 5,
+    ElfMachine = 6,
+    MachoCpuType = 7,
+    MachoFileType = 8,
+    DexVersion = 9,
+    LnkCreationTime = 10,
+    LnkAccessTime = 11,
+    LnkWriteTime = 12,
+    MachoCpuSubtype = 13,
+    MathEntropy = 14,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,12 +53,13 @@ enum BytesField {
 }
 
 const BYTES_FIELD_COUNT: usize = 2;
+const INT_FIELD_COUNT: usize = IntField::MathEntropy as usize + 1;
 
 #[derive(Clone, Debug, Default)]
 struct MetadataBuilder {
     bool_known: u16,
     bool_values: u16,
-    ints: [Vec<u64>; 12],
+    ints: [Vec<u64>; INT_FIELD_COUNT],
     bytes: [Vec<u8>; BYTES_FIELD_COUNT],
 }
 
@@ -65,7 +67,7 @@ struct MetadataBuilder {
 struct DecodedMetadata {
     bool_known: u16,
     bool_values: u16,
-    ints: [Vec<u64>; 12],
+    ints: [Vec<u64>; INT_FIELD_COUNT],
     bytes: [Vec<u8>; BYTES_FIELD_COUNT],
 }
 
@@ -73,12 +75,6 @@ struct DecodedMetadata {
 enum ByteOrder {
     Little,
     Big,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ThinMachOKind {
-    Bits32,
-    Bits64,
 }
 
 impl MetadataBuilder {
@@ -151,10 +147,7 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
         return Err(SspryError::from("Invalid compact document metadata."));
     }
     let version = bytes[0];
-    if version != METADATA_VERSION
-        && version != PREVIOUS_METADATA_VERSION
-        && version != LEGACY_METADATA_VERSION
-    {
+    if version != METADATA_VERSION {
         return Err(SspryError::from(format!(
             "Unsupported compact document metadata version: {}",
             version
@@ -164,8 +157,8 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
     let bool_values = u16::from_le_bytes(bytes[3..5].try_into().expect("bool_values"));
     let int_presence = u16::from_le_bytes(bytes[5..7].try_into().expect("int_presence"));
     let mut offset = 7usize;
-    let mut ints: [Vec<u64>; 12] = Default::default();
-    for idx in 0..ints.len() {
+    let mut ints: [Vec<u64>; INT_FIELD_COUNT] = Default::default();
+    for idx in 0..INT_FIELD_COUNT {
         if (int_presence & (1u16 << idx)) == 0 {
             continue;
         }
@@ -177,28 +170,26 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
         ints[idx] = values;
     }
     let mut byte_values: [Vec<u8>; BYTES_FIELD_COUNT] = Default::default();
-    if version >= METADATA_VERSION {
-        if offset + 2 > bytes.len() {
-            return Err(SspryError::from("Invalid compact document metadata."));
+    if offset + 2 > bytes.len() {
+        return Err(SspryError::from("Invalid compact document metadata."));
+    }
+    let bytes_presence = u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("bytes_presence"),
+    );
+    offset += 2;
+    for (idx, value) in byte_values.iter_mut().enumerate() {
+        if (bytes_presence & (1u16 << idx)) == 0 {
+            continue;
         }
-        let bytes_presence = u16::from_le_bytes(
-            bytes[offset..offset + 2]
-                .try_into()
-                .expect("bytes_presence"),
-        );
-        offset += 2;
-        for (idx, value) in byte_values.iter_mut().enumerate() {
-            if (bytes_presence & (1u16 << idx)) == 0 {
-                continue;
-            }
-            let count = decode_varint(bytes, &mut offset)? as usize;
-            let end = offset.saturating_add(count);
-            if end > bytes.len() {
-                return Err(SspryError::from("Truncated compact document metadata."));
-            }
-            *value = bytes[offset..end].to_vec();
-            offset = end;
+        let count = decode_varint(bytes, &mut offset)? as usize;
+        let end = offset.saturating_add(count);
+        if end > bytes.len() {
+            return Err(SspryError::from("Truncated compact document metadata."));
         }
+        *value = bytes[offset..end].to_vec();
+        offset = end;
     }
     if offset != bytes.len() {
         return Err(SspryError::from(
@@ -258,6 +249,145 @@ fn read_prefix(file: &mut File, len: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn initialize_known_bool_metadata(builder: &mut MetadataBuilder) {
+    builder.set_bool(BoolField::CrxIsCrx, false);
+    builder.set_bool(BoolField::PeIsPe, false);
+    builder.set_bool(BoolField::PeIs32Bit, false);
+    builder.set_bool(BoolField::PeIs64Bit, false);
+    builder.set_bool(BoolField::PeIsDll, false);
+    builder.set_bool(BoolField::PeIsSigned, false);
+    builder.set_bool(BoolField::DotnetIsDotnet, false);
+    builder.set_bool(BoolField::DexIsDex, false);
+    builder.set_bool(BoolField::LnkIsLnk, false);
+    builder.set_bool(BoolField::ElfIsElf, false);
+    builder.set_bool(BoolField::MachoIsMacho, false);
+}
+
+fn extract_yarax_module_metadata(bytes: &[u8], builder: &mut MetadataBuilder) {
+    initialize_known_bool_metadata(builder);
+
+    let modules = mods::invoke_all(bytes);
+
+    if let Some(crx) = modules.crx.as_ref() {
+        builder.set_bool(BoolField::CrxIsCrx, crx.is_crx());
+    }
+
+    if let Some(dex) = modules.dex.as_ref() {
+        builder.set_bool(BoolField::DexIsDex, dex.is_dex());
+        if let Some(header) = dex.header.as_ref() {
+            if header.has_version() {
+                builder.push_int(IntField::DexVersion, u64::from(header.version()));
+            }
+        }
+    }
+
+    if let Some(lnk) = modules.lnk.as_ref() {
+        builder.set_bool(BoolField::LnkIsLnk, lnk.is_lnk());
+        if lnk.has_creation_time() {
+            builder.push_int(IntField::LnkCreationTime, lnk.creation_time());
+        }
+        if lnk.has_access_time() {
+            builder.push_int(IntField::LnkAccessTime, lnk.access_time());
+        }
+        if lnk.has_write_time() {
+            builder.push_int(IntField::LnkWriteTime, lnk.write_time());
+        }
+    }
+
+    if let Some(elf) = modules.elf.as_ref() {
+        let is_elf = elf.has_type()
+            || elf.has_machine()
+            || elf.has_osabi()
+            || elf.has_entry_point()
+            || elf.has_number_of_sections()
+            || elf.has_number_of_segments();
+        builder.set_bool(BoolField::ElfIsElf, is_elf);
+        if elf.has_type() {
+            builder.push_int(IntField::ElfType, elf.type_() as u64);
+        }
+        if elf.has_osabi() {
+            builder.push_int(IntField::ElfOsAbi, elf.osabi() as u64);
+        }
+        if elf.has_machine() {
+            builder.push_int(IntField::ElfMachine, elf.machine() as u64);
+        }
+    }
+
+    if let Some(pe) = modules.pe.as_ref() {
+        builder.set_bool(BoolField::PeIsPe, pe.is_pe());
+        if pe.has_machine() {
+            builder.push_int(IntField::PeMachine, pe.machine() as u64);
+        }
+        if pe.has_subsystem() {
+            builder.push_int(IntField::PeSubsystem, pe.subsystem() as u64);
+        }
+        if pe.has_timestamp() {
+            builder.push_int(IntField::PeTimestamp, u64::from(pe.timestamp()));
+        }
+        if pe.has_characteristics() {
+            let characteristics = pe.characteristics();
+            builder.push_int(IntField::PeCharacteristics, u64::from(characteristics));
+            builder.set_bool(BoolField::PeIsDll, (characteristics & 0x2000) != 0);
+        }
+        if pe.has_opthdr_magic() {
+            match pe.opthdr_magic() {
+                OptionalMagic::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+                    builder.set_bool(BoolField::PeIs32Bit, true);
+                }
+                OptionalMagic::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+                    builder.set_bool(BoolField::PeIs64Bit, true);
+                }
+                OptionalMagic::IMAGE_ROM_OPTIONAL_HDR_MAGIC => {}
+            }
+        }
+        if pe.has_is_signed() {
+            builder.set_bool(BoolField::PeIsSigned, pe.is_signed());
+        }
+        if pe.has_entry_point() {
+            let entry_point = pe.entry_point() as usize;
+            let end = entry_point.saturating_add(16);
+            if end <= bytes.len() {
+                builder.set_bytes(BytesField::PeEntryPointPrefix, &bytes[entry_point..end]);
+            }
+        }
+    }
+
+    if let Some(dotnet) = modules.dotnet.as_ref() {
+        builder.set_bool(BoolField::DotnetIsDotnet, dotnet.is_dotnet());
+    }
+
+    if let Some(macho) = modules.macho.as_ref() {
+        if macho.has_cputype() {
+            builder.push_int(IntField::MachoCpuType, u64::from(macho.cputype()));
+        }
+        if macho.has_cpusubtype() {
+            builder.push_int(IntField::MachoCpuSubtype, u64::from(macho.cpusubtype()));
+        }
+        if macho.has_filetype() {
+            builder.push_int(IntField::MachoFileType, u64::from(macho.filetype()));
+        }
+        for file in &macho.file {
+            if file.has_cputype() {
+                builder.push_int(IntField::MachoCpuType, u64::from(file.cputype()));
+            }
+            if file.has_cpusubtype() {
+                builder.push_int(IntField::MachoCpuSubtype, u64::from(file.cpusubtype()));
+            }
+            if file.has_filetype() {
+                builder.push_int(IntField::MachoFileType, u64::from(file.filetype()));
+            }
+        }
+        for arch in &macho.fat_arch {
+            if arch.has_cputype() {
+                builder.push_int(IntField::MachoCpuType, u64::from(arch.cputype()));
+            }
+            if arch.has_cpusubtype() {
+                builder.push_int(IntField::MachoCpuSubtype, u64::from(arch.cpusubtype()));
+            }
+        }
+    }
+}
+
 fn read_at(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
     let total_len = file.metadata()?.len();
     if offset > total_len || total_len - offset < len as u64 {
@@ -267,14 +397,6 @@ fn read_at(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> 
     let mut bytes = vec![0u8; len];
     file.read_exact(&mut bytes)?;
     Ok(Some(bytes))
-}
-
-fn le_u16(bytes: &[u8]) -> u16 {
-    u16::from_le_bytes(bytes.try_into().expect("u16"))
-}
-
-fn be_u16(bytes: &[u8]) -> u16 {
-    u16::from_be_bytes(bytes.try_into().expect("u16"))
 }
 
 fn le_u32(bytes: &[u8]) -> u32 {
@@ -300,198 +422,12 @@ fn read_u32(bytes: &[u8], order: ByteOrder) -> u32 {
     }
 }
 
-fn filetime_to_unix_timestamp(filetime: u64) -> Option<u64> {
-    (filetime / 10_000_000).checked_sub(11_644_473_600)
-}
-
-fn extract_crx_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
-    builder.set_bool(BoolField::CrxIsCrx, prefix.starts_with(b"Cr24"));
-}
-
-fn extract_dex_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
-    let is_dex = prefix.len() >= 8
-        && &prefix[..4] == b"dex\n"
-        && prefix[4].is_ascii_digit()
-        && prefix[5].is_ascii_digit()
-        && prefix[6].is_ascii_digit()
-        && prefix[7] == 0;
-    builder.set_bool(BoolField::DexIsDex, is_dex);
-    if is_dex {
-        let version = std::str::from_utf8(&prefix[4..7])
-            .ok()
-            .and_then(|text| text.parse::<u64>().ok())
-            .unwrap_or(0);
-        builder.push_int(IntField::DexVersion, version);
-    }
-}
-
-fn extract_lnk_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
-    let is_lnk = prefix.len() >= 76
-        && le_u32(&prefix[0..4]) == 0x4c
-        && le_u64(&prefix[4..12]) == 0x0000_0000_0002_1401
-        && le_u64(&prefix[12..20]) == 0x4600_0000_0000_00c0;
-    builder.set_bool(BoolField::LnkIsLnk, is_lnk);
-    if !is_lnk {
-        return;
-    }
-    if let Some(value) = filetime_to_unix_timestamp(le_u64(&prefix[28..36])) {
-        builder.push_int(IntField::LnkCreationTime, value);
-    }
-    if let Some(value) = filetime_to_unix_timestamp(le_u64(&prefix[36..44])) {
-        builder.push_int(IntField::LnkAccessTime, value);
-    }
-    if let Some(value) = filetime_to_unix_timestamp(le_u64(&prefix[44..52])) {
-        builder.push_int(IntField::LnkWriteTime, value);
-    }
-}
-
-fn extract_elf_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
-    let is_elf = prefix.len() >= 20 && &prefix[..4] == b"\x7fELF";
-    builder.set_bool(BoolField::ElfIsElf, is_elf);
-    if !is_elf {
-        return;
-    }
-    let order = match prefix.get(5).copied() {
-        Some(1) => ByteOrder::Little,
-        Some(2) => ByteOrder::Big,
-        _ => return,
-    };
-    builder.push_int(IntField::ElfOsAbi, u64::from(prefix[7]));
-    let elf_type = match order {
-        ByteOrder::Little => le_u16(&prefix[16..18]),
-        ByteOrder::Big => be_u16(&prefix[16..18]),
-    };
-    let machine = match order {
-        ByteOrder::Little => le_u16(&prefix[18..20]),
-        ByteOrder::Big => be_u16(&prefix[18..20]),
-    };
-    builder.push_int(IntField::ElfType, u64::from(elf_type));
-    builder.push_int(IntField::ElfMachine, u64::from(machine));
-}
-
-fn extract_pe_metadata(
-    file: &mut File,
-    prefix: &[u8],
-    builder: &mut MetadataBuilder,
-) -> Result<()> {
-    builder.set_bool(BoolField::PeIsPe, false);
-    builder.set_bool(BoolField::PeIs32Bit, false);
-    builder.set_bool(BoolField::PeIs64Bit, false);
-    builder.set_bool(BoolField::PeIsDll, false);
-    builder.set_bool(BoolField::PeIsSigned, false);
-    builder.set_bool(BoolField::DotnetIsDotnet, false);
-    if prefix.len() < 64 || &prefix[..2] != b"MZ" {
-        return Ok(());
-    }
-    let pe_offset = u64::from(le_u32(&prefix[0x3c..0x40]));
-    let Some(file_header) = read_at(file, pe_offset, 24)? else {
-        return Ok(());
-    };
-    if &file_header[..4] != b"PE\0\0" {
-        return Ok(());
-    }
-    let machine = le_u16(&file_header[4..6]);
-    let timestamp = le_u32(&file_header[8..12]);
-    let size_of_optional_header = usize::from(le_u16(&file_header[20..22]));
-    let characteristics = le_u16(&file_header[22..24]);
-    let Some(optional) = read_at(file, pe_offset + 24, size_of_optional_header)? else {
-        return Ok(());
-    };
-    if optional.len() < 72 {
-        return Ok(());
-    }
-    let magic = le_u16(&optional[0..2]);
-    let (is_32bit, is_64bit, data_dir_base) = match magic {
-        0x10b => (true, false, 96usize),
-        0x20b => (false, true, 112usize),
-        _ => return Ok(()),
-    };
-    let number_of_sections = usize::from(le_u16(&file_header[6..8]));
-    let address_of_entry_point = le_u32(&optional[16..20]);
-    let size_of_headers = if optional.len() >= 64 {
-        le_u32(&optional[60..64])
-    } else {
-        0
-    };
-    builder.set_bool(BoolField::PeIsPe, true);
-    builder.set_bool(BoolField::PeIs32Bit, is_32bit);
-    builder.set_bool(BoolField::PeIs64Bit, is_64bit);
-    builder.set_bool(BoolField::PeIsDll, (characteristics & 0x2000) != 0);
-    builder.push_int(IntField::PeMachine, u64::from(machine));
-    builder.push_int(IntField::PeTimestamp, u64::from(timestamp));
-    if optional.len() >= 70 {
-        builder.push_int(IntField::PeSubsystem, u64::from(le_u16(&optional[68..70])));
-    }
-    if optional.len() >= data_dir_base + (15 * 8) {
-        let security_offset = data_dir_base + (4 * 8);
-        let security_dir = le_u32(&optional[security_offset..security_offset + 4]);
-        let security_size = le_u32(&optional[security_offset + 4..security_offset + 8]);
-        builder.set_bool(
-            BoolField::PeIsSigned,
-            security_dir != 0 && security_size != 0,
-        );
-        let com_offset = data_dir_base + (14 * 8);
-        let com_rva = le_u32(&optional[com_offset..com_offset + 4]);
-        let com_size = le_u32(&optional[com_offset + 4..com_offset + 8]);
-        builder.set_bool(BoolField::DotnetIsDotnet, com_rva != 0 && com_size != 0);
-    }
-    if let Some(entry_offset) = pe_rva_to_file_offset(
-        file,
-        pe_offset,
-        number_of_sections,
-        size_of_optional_header,
-        address_of_entry_point,
-        size_of_headers,
-    )? {
-        if let Some(entry_prefix) = read_at(file, entry_offset, 16)? {
-            builder.set_bytes(BytesField::PeEntryPointPrefix, &entry_prefix);
-        }
-    }
-    Ok(())
-}
-
-fn pe_rva_to_file_offset(
-    file: &mut File,
-    pe_offset: u64,
-    number_of_sections: usize,
-    size_of_optional_header: usize,
-    rva: u32,
-    size_of_headers: u32,
-) -> Result<Option<u64>> {
-    if rva == 0 {
-        return Ok(None);
-    }
-    if size_of_headers != 0 && rva < size_of_headers {
-        return Ok(Some(u64::from(rva)));
-    }
-    let table_offset = pe_offset + 24 + size_of_optional_header as u64;
-    let table_len = number_of_sections.saturating_mul(40);
-    let Some(section_table) = read_at(file, table_offset, table_len)? else {
-        return Ok(None);
-    };
-    for entry in section_table.chunks_exact(40) {
-        let virtual_size = le_u32(&entry[8..12]);
-        let virtual_address = le_u32(&entry[12..16]);
-        let size_of_raw_data = le_u32(&entry[16..20]);
-        let pointer_to_raw_data = le_u32(&entry[20..24]);
-        let mapped_size = virtual_size.max(size_of_raw_data);
-        if mapped_size == 0 {
-            continue;
-        }
-        if rva >= virtual_address && rva < virtual_address.saturating_add(mapped_size) {
-            let delta = rva - virtual_address;
-            return Ok(Some(u64::from(pointer_to_raw_data) + u64::from(delta)));
-        }
-    }
-    Ok(None)
-}
-
-fn thin_macho_kind_and_order(magic: [u8; 4]) -> Option<(ThinMachOKind, ByteOrder)> {
+fn thin_macho_order(magic: [u8; 4]) -> Option<ByteOrder> {
     match magic {
-        [0xfe, 0xed, 0xfa, 0xce] => Some((ThinMachOKind::Bits32, ByteOrder::Big)),
-        [0xce, 0xfa, 0xed, 0xfe] => Some((ThinMachOKind::Bits32, ByteOrder::Little)),
-        [0xfe, 0xed, 0xfa, 0xcf] => Some((ThinMachOKind::Bits64, ByteOrder::Big)),
-        [0xcf, 0xfa, 0xed, 0xfe] => Some((ThinMachOKind::Bits64, ByteOrder::Little)),
+        [0xfe, 0xed, 0xfa, 0xce] => Some(ByteOrder::Big),
+        [0xce, 0xfa, 0xed, 0xfe] => Some(ByteOrder::Little),
+        [0xfe, 0xed, 0xfa, 0xcf] => Some(ByteOrder::Big),
+        [0xcf, 0xfa, 0xed, 0xfe] => Some(ByteOrder::Little),
         _ => None,
     }
 }
@@ -514,41 +450,21 @@ fn extract_thin_macho_metadata(
     let Some(header) = read_at(file, offset, 32)? else {
         return Ok(false);
     };
-    let Some((kind, order)) = thin_macho_kind_and_order(header[0..4].try_into().expect("magic"))
-    else {
+    let Some(order) = thin_macho_order(header[0..4].try_into().expect("magic")) else {
         return Ok(false);
     };
     builder.push_int(
         IntField::MachoCpuType,
         u64::from(read_u32(&header[4..8], order)),
     );
-    let ncmds = read_u32(&header[16..20], order) as usize;
-    let sizeofcmds = read_u32(&header[20..24], order) as usize;
-    let header_size = match kind {
-        ThinMachOKind::Bits32 => 28usize,
-        ThinMachOKind::Bits64 => 32usize,
-    };
-    if sizeofcmds == 0 || sizeofcmds > MAX_MACHO_COMMAND_BYTES {
-        return Ok(true);
-    }
-    let Some(full) = read_at(file, offset, header_size + sizeofcmds)? else {
-        return Ok(true);
-    };
-    let mut cursor = header_size;
-    for _ in 0..ncmds {
-        if cursor + 8 > full.len() {
-            break;
-        }
-        let command = read_u32(&full[cursor..cursor + 4], order);
-        let command_size = read_u32(&full[cursor + 4..cursor + 8], order) as usize;
-        if command_size < 8 || cursor + command_size > full.len() {
-            break;
-        }
-        if matches!(command, 0x24 | 0x25 | 0x2f | 0x30) {
-            builder.push_int(IntField::MachoDeviceType, u64::from(command));
-        }
-        cursor += command_size;
-    }
+    builder.push_int(
+        IntField::MachoCpuSubtype,
+        u64::from(read_u32(&header[8..12], order)),
+    );
+    builder.push_int(
+        IntField::MachoFileType,
+        u64::from(read_u32(&header[12..16], order)),
+    );
     Ok(true)
 }
 
@@ -562,7 +478,7 @@ fn extract_macho_metadata(
         return Ok(());
     }
     let magic: [u8; 4] = prefix[0..4].try_into().expect("magic");
-    if thin_macho_kind_and_order(magic).is_some() {
+    if thin_macho_order(magic).is_some() {
         if extract_thin_macho_metadata(file, 0, builder)? {
             builder.set_bool(BoolField::MachoIsMacho, true);
         }
@@ -586,6 +502,10 @@ fn extract_macho_metadata(
             IntField::MachoCpuType,
             u64::from(read_u32(&entry[0..4], order)),
         );
+        builder.push_int(
+            IntField::MachoCpuSubtype,
+            u64::from(read_u32(&entry[4..8], order)),
+        );
         let thin_offset = if is_64 {
             read_u64(&entry[8..16], order)
         } else {
@@ -603,16 +523,42 @@ fn read_u64(bytes: &[u8], order: ByteOrder) -> u64 {
     }
 }
 
+fn entropy_bits_per_byte(bytes: &[u8]) -> f32 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for byte in bytes {
+        counts[*byte as usize] += 1;
+    }
+    let total = bytes.len() as f64;
+    let mut entropy = 0.0f64;
+    for count in counts {
+        if count == 0 {
+            continue;
+        }
+        let probability = count as f64 / total;
+        entropy -= probability * probability.log2();
+    }
+    entropy as f32
+}
+
 pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let prefix = read_prefix(&mut file, 4096)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes)?;
     let mut builder = MetadataBuilder::default();
-    builder.set_bytes(BytesField::FilePrefix8, &prefix[..prefix.len().min(8)]);
-    extract_crx_metadata(&prefix, &mut builder);
-    extract_dex_metadata(&prefix, &mut builder);
-    extract_lnk_metadata(&prefix, &mut builder);
-    extract_elf_metadata(&prefix, &mut builder);
-    extract_pe_metadata(&mut file, &prefix, &mut builder)?;
+    builder.set_bytes(
+        BytesField::FilePrefix8,
+        &file_bytes[..file_bytes.len().min(8)],
+    );
+    builder.push_int(
+        IntField::MathEntropy,
+        u64::from(entropy_bits_per_byte(&file_bytes).to_bits()),
+    );
+    extract_yarax_module_metadata(&file_bytes, &mut builder);
     extract_macho_metadata(&mut file, &prefix, &mut builder)?;
     Ok(builder.encode())
 }
@@ -628,12 +574,14 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
         "pe.machine" => Some("pe.machine"),
         "pe.subsystem" => Some("pe.subsystem"),
         "pe.timestamp" => Some("pe.timestamp"),
+        "pe.characteristics" => Some("pe.characteristics"),
         "elf.is_elf" => Some("elf.is_elf"),
         "elf.type" => Some("elf.type"),
         "elf.os_abi" | "elf.osabi" => Some("elf.os_abi"),
         "elf.machine" => Some("elf.machine"),
         "macho.cpu_type" | "macho.cputype" => Some("macho.cpu_type"),
-        "macho.device_type" | "macho.devicetype" => Some("macho.device_type"),
+        "macho.cpu_subtype" | "macho.cpusubtype" => Some("macho.cpu_subtype"),
+        "macho.file_type" | "macho.filetype" => Some("macho.file_type"),
         "dotnet.is_dotnet" => Some("dotnet.is_dotnet"),
         "dex.is_dex" => Some("dex.is_dex"),
         "dex.version" => Some("dex.version"),
@@ -641,6 +589,7 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
         "lnk.creation_time" => Some("lnk.creation_time"),
         "lnk.access_time" => Some("lnk.access_time"),
         "lnk.write_time" => Some("lnk.write_time"),
+        "math.entropy" => Some("math.entropy"),
         "time.now" => Some("time.now"),
         _ => None,
     }
@@ -675,11 +624,13 @@ pub fn metadata_field_is_integer(raw: &str) -> bool {
             "pe.machine"
                 | "pe.subsystem"
                 | "pe.timestamp"
+                | "pe.characteristics"
                 | "elf.type"
                 | "elf.os_abi"
                 | "elf.machine"
                 | "macho.cpu_type"
-                | "macho.device_type"
+                | "macho.cpu_subtype"
+                | "macho.file_type"
                 | "dex.version"
                 | "lnk.creation_time"
                 | "lnk.access_time"
@@ -687,6 +638,10 @@ pub fn metadata_field_is_integer(raw: &str) -> bool {
                 | "time.now"
         )
     )
+}
+
+pub fn metadata_field_is_float(raw: &str) -> bool {
+    matches!(normalize_field(raw), Some("math.entropy"))
 }
 
 fn bool_field_for_name(field: &str) -> Option<BoolField> {
@@ -710,24 +665,29 @@ fn int_field_for_name(field: &str) -> Option<IntField> {
         "pe.machine" => Some(IntField::PeMachine),
         "pe.subsystem" => Some(IntField::PeSubsystem),
         "pe.timestamp" => Some(IntField::PeTimestamp),
+        "pe.characteristics" => Some(IntField::PeCharacteristics),
         "elf.type" => Some(IntField::ElfType),
         "elf.os_abi" => Some(IntField::ElfOsAbi),
         "elf.machine" => Some(IntField::ElfMachine),
         "macho.cpu_type" => Some(IntField::MachoCpuType),
-        "macho.device_type" => Some(IntField::MachoDeviceType),
+        "macho.cpu_subtype" => Some(IntField::MachoCpuSubtype),
+        "macho.file_type" => Some(IntField::MachoFileType),
         "dex.version" => Some(IntField::DexVersion),
         "lnk.creation_time" => Some(IntField::LnkCreationTime),
         "lnk.access_time" => Some(IntField::LnkAccessTime),
         "lnk.write_time" => Some(IntField::LnkWriteTime),
+        "math.entropy" => Some(IntField::MathEntropy),
         _ => None,
     }
 }
 
 fn module_guard_for_field(field: &str) -> Option<BoolField> {
     match field {
-        "pe.machine" | "pe.subsystem" | "pe.timestamp" => Some(BoolField::PeIsPe),
+        "pe.machine" | "pe.subsystem" | "pe.timestamp" | "pe.characteristics" => {
+            Some(BoolField::PeIsPe)
+        }
         "elf.type" | "elf.os_abi" | "elf.machine" => Some(BoolField::ElfIsElf),
-        "macho.cpu_type" | "macho.device_type" => Some(BoolField::MachoIsMacho),
+        "macho.cpu_type" | "macho.cpu_subtype" | "macho.file_type" => Some(BoolField::MachoIsMacho),
         "dex.version" => Some(BoolField::DexIsDex),
         "lnk.creation_time" | "lnk.access_time" | "lnk.write_time" => Some(BoolField::LnkIsLnk),
         _ => None,
@@ -754,6 +714,17 @@ pub enum MetadataCompareOp {
 }
 
 fn compare_u64(lhs: u64, rhs: u64, op: MetadataCompareOp) -> bool {
+    match op {
+        MetadataCompareOp::Eq => lhs == rhs,
+        MetadataCompareOp::Ne => lhs != rhs,
+        MetadataCompareOp::Lt => lhs < rhs,
+        MetadataCompareOp::Le => lhs <= rhs,
+        MetadataCompareOp::Gt => lhs > rhs,
+        MetadataCompareOp::Ge => lhs >= rhs,
+    }
+}
+
+fn compare_f32(lhs: f32, rhs: f32, op: MetadataCompareOp) -> bool {
     match op {
         MetadataCompareOp::Eq => lhs == rhs,
         MetadataCompareOp::Ne => lhs != rhs,
@@ -829,6 +800,31 @@ pub fn metadata_field_matches_compare(
     ))
 }
 
+pub fn metadata_field_matches_compare_f32(
+    bytes: &[u8],
+    raw_field: &str,
+    op: MetadataCompareOp,
+    expected: f32,
+) -> Result<Option<bool>> {
+    let Some(field) = normalize_field(raw_field) else {
+        return Err(SspryError::from(format!(
+            "Unsupported metadata field: {raw_field}"
+        )));
+    };
+    if !metadata_field_is_float(field) {
+        return Err(SspryError::from(format!(
+            "Unsupported float metadata field: {raw_field}"
+        )));
+    }
+    let decoded = decode(bytes)?;
+    let Some(values) = decoded_field_values(&decoded, field)? else {
+        return Ok(None);
+    };
+    Ok(Some(values.iter().copied().any(|value| {
+        compare_f32(f32::from_bits(value as u32), expected, op)
+    })))
+}
+
 pub fn metadata_fields_compare(
     bytes: &[u8],
     raw_lhs_field: &str,
@@ -883,10 +879,43 @@ pub fn metadata_file_prefix_8(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use tempfile::tempdir;
+    use yara_x::{Compiler as YaraCompiler, Scanner as YaraScanner};
 
     use super::*;
+
+    fn yara_condition_matches_file(imports: &[&str], condition: &str, path: &Path) -> bool {
+        let mut source = String::new();
+        for module in imports {
+            source.push_str("import \"");
+            source.push_str(module);
+            source.push_str("\"\n");
+        }
+        source.push_str("rule test {\ncondition:\n  ");
+        source.push_str(condition);
+        source.push_str("\n}\n");
+        let mut compiler = YaraCompiler::new();
+        compiler
+            .add_source(source.as_str())
+            .expect("compile yara-x probe");
+        let rules = compiler.build();
+        let mut scanner = YaraScanner::new(&rules);
+        scanner
+            .scan_file(path)
+            .expect("scan yara-x probe")
+            .matching_rules()
+            .next()
+            .is_some()
+    }
+
+    fn assert_no_false_negative(label: &str, oracle: bool, ours: bool) {
+        assert!(
+            !oracle || ours,
+            "{label}: YARA-X matched but compact metadata fast path rejected"
+        );
+    }
 
     #[test]
     fn compact_metadata_roundtrip_and_normalization() {
@@ -894,7 +923,10 @@ mod tests {
         builder.set_bool(BoolField::PeIsPe, true);
         builder.set_bool(BoolField::PeIsDll, false);
         builder.push_int(IntField::PeMachine, 0x14c);
+        builder.push_int(IntField::PeCharacteristics, 0x2000);
         builder.push_int(IntField::MachoCpuType, 7);
+        builder.push_int(IntField::MachoCpuSubtype, 3);
+        builder.push_int(IntField::MachoFileType, 6);
         builder.push_int(IntField::MachoCpuType, 7);
         builder.set_bytes(BytesField::PeEntryPointPrefix, b"ABCDEFGHIJKLMNOP");
         builder.set_bytes(BytesField::FilePrefix8, b"MZprefix");
@@ -903,7 +935,13 @@ mod tests {
         assert_eq!(bool_value(&decoded, BoolField::PeIsPe), Some(true));
         assert_eq!(bool_value(&decoded, BoolField::PeIsDll), Some(false));
         assert_eq!(decoded.ints[IntField::PeMachine as usize], vec![0x14c]);
+        assert_eq!(
+            decoded.ints[IntField::PeCharacteristics as usize],
+            vec![0x2000]
+        );
         assert_eq!(decoded.ints[IntField::MachoCpuType as usize], vec![7]);
+        assert_eq!(decoded.ints[IntField::MachoCpuSubtype as usize], vec![3]);
+        assert_eq!(decoded.ints[IntField::MachoFileType as usize], vec![6]);
         assert_eq!(
             decoded.bytes[BytesField::PeEntryPointPrefix as usize],
             b"ABCDEFGHIJKLMNOP"
@@ -921,7 +959,10 @@ mod tests {
         assert!(!metadata_field_is_boolean("zip.is_zip"));
         assert!(!metadata_field_is_boolean("_intern.is_zip"));
         assert!(!metadata_field_is_boolean("_intern.is_mz"));
-        assert!(metadata_field_is_integer("macho.device_type"));
+        assert!(metadata_field_is_integer("pe.characteristics"));
+        assert!(metadata_field_is_integer("macho.cpu_subtype"));
+        assert!(metadata_field_is_integer("macho.file_type"));
+        assert!(metadata_field_is_float("math.entropy"));
     }
 
     #[test]
@@ -992,20 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_legacy_v1_metadata_without_byte_fields() {
-        let legacy = vec![LEGACY_METADATA_VERSION, 0, 0, 0, 0, 0, 0];
-        let decoded = decode(&legacy).expect("decode legacy");
-        assert!(
-            decoded.bytes[BytesField::PeEntryPointPrefix as usize].is_empty(),
-            "legacy metadata should not have byte fields"
-        );
-        assert!(
-            decoded.bytes[BytesField::FilePrefix8 as usize].is_empty(),
-            "legacy metadata should not have file prefix bytes"
-        );
-    }
-
-    #[test]
     fn extracted_metadata_includes_first_eight_file_bytes() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("prefix.bin");
@@ -1014,6 +1041,36 @@ mod tests {
         assert_eq!(
             metadata_file_prefix_8(&metadata).expect("decode prefix"),
             Some(b"ABCDEFGH".to_vec())
+        );
+    }
+
+    #[test]
+    fn extracted_metadata_includes_math_entropy() {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("entropy.bin");
+        fs::write(&path, [0u8; 64]).expect("write entropy");
+        let metadata = extract_compact_document_metadata(&path).expect("metadata");
+        assert_eq!(
+            metadata_field_matches_compare_f32(
+                &metadata,
+                "math.entropy",
+                MetadataCompareOp::Eq,
+                0.0
+            )
+            .expect("entropy compare"),
+            Some(true)
+        );
+        assert_no_false_negative(
+            "math entropy",
+            yara_condition_matches_file(&["math"], "math.entropy(0, filesize) <= 0.0", &path),
+            metadata_field_matches_compare_f32(
+                &metadata,
+                "math.entropy",
+                MetadataCompareOp::Le,
+                0.0,
+            )
+            .expect("entropy oracle compare")
+            .expect("known entropy"),
         );
     }
 
@@ -1055,19 +1112,64 @@ mod tests {
         );
         assert_eq!(
             metadata_field_matches_eq(&pe_bytes, "pe.is_signed", 1).expect("signed"),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             metadata_field_matches_eq(&pe_bytes, "pe.machine", 0x14c).expect("machine"),
             Some(true)
         );
         assert_eq!(
-            metadata_field_matches_eq(&pe_bytes, "dotnet.is_dotnet", 1).expect("dotnet"),
+            metadata_field_matches_eq(&pe_bytes, "pe.characteristics", 0x0200)
+                .expect("characteristics"),
             Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&pe_bytes, "dotnet.is_dotnet", 1).expect("dotnet"),
+            Some(false)
         );
         assert_eq!(
             metadata_pe_entry_point_prefix(&pe_bytes).expect("entry point prefix"),
             Some(b"ENTRYPOINT-PE!!!".to_vec())
+        );
+        assert_no_false_negative(
+            "pe.is_pe",
+            yara_condition_matches_file(&["pe"], "pe.is_pe", &pe_path),
+            metadata_field_matches_eq(&pe_bytes, "pe.is_pe", 1)
+                .expect("pe is_pe")
+                .expect("known pe is_pe"),
+        );
+        assert_no_false_negative(
+            "pe.machine",
+            yara_condition_matches_file(&["pe"], "pe.machine == 0x14c", &pe_path),
+            metadata_field_matches_eq(&pe_bytes, "pe.machine", 0x14c)
+                .expect("pe machine")
+                .expect("known pe machine"),
+        );
+        assert_no_false_negative(
+            "pe.timestamp",
+            yara_condition_matches_file(
+                &["pe"],
+                "pe.timestamp == 0x12345678 and pe.timestamp < 0x20000000",
+                &pe_path,
+            ),
+            metadata_field_matches_eq(&pe_bytes, "pe.timestamp", 0x1234_5678)
+                .expect("pe timestamp")
+                .expect("known pe timestamp")
+                && metadata_field_matches_compare(
+                    &pe_bytes,
+                    "pe.timestamp",
+                    MetadataCompareOp::Lt,
+                    0x2000_0000,
+                )
+                .expect("pe timestamp lt")
+                .expect("known pe timestamp lt"),
+        );
+        assert_no_false_negative(
+            "pe.is_64bit",
+            yara_condition_matches_file(&["pe"], "pe.is_64bit()", &pe_path),
+            metadata_field_matches_eq(&pe_bytes, "pe.is_64bit", 1)
+                .expect("pe is_64bit")
+                .expect("known pe is_64bit"),
         );
 
         let elf_path = tmp.path().join("sample.elf");
@@ -1084,9 +1186,34 @@ mod tests {
             metadata_field_matches_eq(&elf_bytes, "elf.machine", 62).expect("elf machine"),
             Some(true)
         );
+        assert_no_false_negative(
+            "elf fields",
+            yara_condition_matches_file(
+                &["elf"],
+                "elf.type == 2 and elf.machine == 62 and elf.osabi == 3",
+                &elf_path,
+            ),
+            metadata_field_matches_eq(&elf_bytes, "elf.type", 2)
+                .expect("elf type")
+                .expect("known elf type")
+                && metadata_field_matches_eq(&elf_bytes, "elf.machine", 62)
+                    .expect("elf machine")
+                    .expect("known elf machine")
+                && metadata_field_matches_eq(&elf_bytes, "elf.os_abi", 3)
+                    .expect("elf osabi")
+                    .expect("known elf osabi"),
+        );
 
         let dex_path = tmp.path().join("sample.dex");
-        fs::write(&dex_path, b"dex\n035\0rest").expect("write dex");
+        let mut dex = vec![0u8; 0x70];
+        let dex_file_size = dex.len() as u32;
+        dex[0..4].copy_from_slice(b"dex\n");
+        dex[4..7].copy_from_slice(b"035");
+        dex[7] = 0;
+        dex[32..36].copy_from_slice(&dex_file_size.to_le_bytes());
+        dex[36..40].copy_from_slice(&0x70u32.to_le_bytes());
+        dex[40..44].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        fs::write(&dex_path, &dex).expect("write dex");
         let dex_bytes = extract_compact_document_metadata(&dex_path).expect("metadata");
         assert_eq!(
             metadata_field_matches_eq(&dex_bytes, "dex.is_dex", 1).expect("dex"),
@@ -1096,13 +1223,41 @@ mod tests {
             metadata_field_matches_eq(&dex_bytes, "dex.version", 35).expect("dex version"),
             Some(true)
         );
+        assert_no_false_negative(
+            "dex fields",
+            yara_condition_matches_file(
+                &["dex"],
+                "dex.is_dex and dex.header.version == 35",
+                &dex_path,
+            ),
+            metadata_field_matches_eq(&dex_bytes, "dex.is_dex", 1)
+                .expect("dex is_dex")
+                .expect("known dex is_dex")
+                && metadata_field_matches_eq(&dex_bytes, "dex.version", 35)
+                    .expect("dex version")
+                    .expect("known dex version"),
+        );
 
         let crx_path = tmp.path().join("sample.crx");
-        fs::write(&crx_path, b"Cr24payload").expect("write crx");
+        let mut crx = Vec::new();
+        crx.extend_from_slice(b"Cr24");
+        crx.extend_from_slice(&2u32.to_le_bytes());
+        crx.extend_from_slice(&0u32.to_le_bytes());
+        crx.extend_from_slice(&0u32.to_le_bytes());
+        crx.extend_from_slice(b"PK\x05\x06");
+        crx.extend_from_slice(&[0u8; 18]);
+        fs::write(&crx_path, &crx).expect("write crx");
         let crx_bytes = extract_compact_document_metadata(&crx_path).expect("metadata");
         assert_eq!(
             metadata_field_matches_eq(&crx_bytes, "crx.is_crx", 1).expect("crx"),
             Some(true)
+        );
+        assert_no_false_negative(
+            "crx.is_crx",
+            yara_condition_matches_file(&["crx"], "crx.is_crx", &crx_path),
+            metadata_field_matches_eq(&crx_bytes, "crx.is_crx", 1)
+                .expect("crx is_crx")
+                .expect("known crx is_crx"),
         );
 
         let lnk_path = tmp.path().join("sample.lnk");
@@ -1125,6 +1280,34 @@ mod tests {
         assert_eq!(
             metadata_field_matches_eq(&lnk_bytes, "lnk.creation_time", 60).expect("lnk ts"),
             Some(true)
+        );
+        assert_no_false_negative(
+            "lnk fields",
+            yara_condition_matches_file(
+                &["lnk"],
+                "lnk.is_lnk and lnk.creation_time == 60 and lnk.access_time == 60 and lnk.write_time == 60 and lnk.creation_time < 61",
+                &lnk_path,
+            ),
+            metadata_field_matches_eq(&lnk_bytes, "lnk.is_lnk", 1)
+                .expect("lnk is_lnk")
+                .expect("known lnk is_lnk")
+                && metadata_field_matches_eq(&lnk_bytes, "lnk.creation_time", 60)
+                    .expect("lnk creation")
+                    .expect("known lnk creation")
+                && metadata_field_matches_eq(&lnk_bytes, "lnk.access_time", 60)
+                    .expect("lnk access")
+                    .expect("known lnk access")
+                && metadata_field_matches_eq(&lnk_bytes, "lnk.write_time", 60)
+                    .expect("lnk write")
+                    .expect("known lnk write")
+                && metadata_field_matches_compare(
+                    &lnk_bytes,
+                    "lnk.creation_time",
+                    MetadataCompareOp::Lt,
+                    61,
+                )
+                .expect("lnk lt")
+                .expect("known lnk lt"),
         );
     }
 
@@ -1169,7 +1352,7 @@ mod tests {
         elf[5] = 2;
         elf[7] = 9;
         elf[16..18].copy_from_slice(&3u16.to_be_bytes());
-        elf[18..20].copy_from_slice(&22u16.to_be_bytes());
+        elf[18..20].copy_from_slice(&21u16.to_be_bytes());
         fs::write(&elf_path, &elf).expect("write elf");
         let elf_bytes = extract_compact_document_metadata(&elf_path).expect("metadata");
         assert_eq!(
@@ -1177,7 +1360,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            metadata_field_matches_eq(&elf_bytes, "elf.machine", 22).expect("elf machine"),
+            metadata_field_matches_eq(&elf_bytes, "elf.machine", 21).expect("elf machine"),
             Some(true)
         );
         assert_eq!(
@@ -1189,10 +1372,10 @@ mod tests {
         let mut macho = vec![0u8; 40];
         macho[0..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         macho[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        macho[8..12].copy_from_slice(&3u32.to_le_bytes());
+        macho[12..16].copy_from_slice(&6u32.to_le_bytes());
         macho[16..20].copy_from_slice(&1u32.to_le_bytes());
         macho[20..24].copy_from_slice(&8u32.to_le_bytes());
-        macho[32..36].copy_from_slice(&0x24u32.to_le_bytes());
-        macho[36..40].copy_from_slice(&8u32.to_le_bytes());
         fs::write(&macho_path, &macho).expect("write macho");
         let macho_bytes = extract_compact_document_metadata(&macho_path).expect("metadata");
         assert_eq!(
@@ -1201,17 +1384,39 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            metadata_field_matches_eq(&macho_bytes, "macho.device_type", 0x24)
-                .expect("macho device"),
+            metadata_field_matches_eq(&macho_bytes, "macho.cpu_subtype", 3)
+                .expect("macho cpu subtype"),
             Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "macho.file_type", 6).expect("macho filetype"),
+            Some(true)
+        );
+        assert_no_false_negative(
+            "macho fields",
+            yara_condition_matches_file(
+                &["macho"],
+                "macho.cputype == 0x01000007 and macho.filetype == 6",
+                &macho_path,
+            ),
+            metadata_field_matches_eq(&macho_bytes, "macho.cpu_type", 0x0100_0007)
+                .expect("macho cpu")
+                .expect("known macho cpu")
+                && metadata_field_matches_eq(&macho_bytes, "macho.file_type", 6)
+                    .expect("macho filetype")
+                    .expect("known macho filetype"),
         );
         assert_eq!(
             normalize_query_metadata_field("macho.cputype"),
             Some("macho.cpu_type")
         );
         assert_eq!(
-            normalize_query_metadata_field("macho.devicetype"),
-            Some("macho.device_type")
+            normalize_query_metadata_field("macho.cpusubtype"),
+            Some("macho.cpu_subtype")
+        );
+        assert_eq!(
+            normalize_query_metadata_field("macho.filetype"),
+            Some("macho.file_type")
         );
     }
 
@@ -1223,18 +1428,24 @@ mod tests {
         macho[0..4].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
         macho[4..8].copy_from_slice(&1u32.to_be_bytes());
         macho[8..12].copy_from_slice(&7u32.to_be_bytes());
+        macho[12..16].copy_from_slice(&8u32.to_be_bytes());
         macho[16..20].copy_from_slice(&0x100u32.to_be_bytes());
         macho[20..24].copy_from_slice(&40u32.to_be_bytes());
         macho[0x100..0x104].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         macho[0x104..0x108].copy_from_slice(&0x0100_000cu32.to_le_bytes());
+        macho[0x108..0x10c].copy_from_slice(&9u32.to_le_bytes());
+        macho[0x10c..0x110].copy_from_slice(&7u32.to_le_bytes());
         macho[0x110..0x114].copy_from_slice(&1u32.to_le_bytes());
         macho[0x114..0x118].copy_from_slice(&8u32.to_le_bytes());
-        macho[0x120..0x124].copy_from_slice(&0x25u32.to_le_bytes());
-        macho[0x124..0x128].copy_from_slice(&8u32.to_le_bytes());
         fs::write(&macho_path, &macho).expect("write fat macho");
         let macho_bytes = extract_compact_document_metadata(&macho_path).expect("metadata");
         assert_eq!(
             metadata_field_matches_eq(&macho_bytes, "macho.cputype", 7).expect("fat cpu type"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "macho.cpu_subtype", 8)
+                .expect("fat cpu subtype"),
             Some(true)
         );
         assert_eq!(
@@ -1243,7 +1454,12 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            metadata_field_matches_eq(&macho_bytes, "macho.devicetype", 0x25).expect("device type"),
+            metadata_field_matches_eq(&macho_bytes, "macho.cpusubtype", 9)
+                .expect("thin cpu subtype"),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_field_matches_eq(&macho_bytes, "macho.filetype", 7).expect("file type"),
             Some(true)
         );
         assert_eq!(

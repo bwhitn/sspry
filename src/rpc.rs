@@ -29,9 +29,9 @@ use crate::candidate::store::{
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
     CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode, candidate_shard_index,
-    candidate_shard_root, metadata_field_is_boolean, metadata_field_is_integer,
-    normalize_max_candidates, normalize_query_metadata_field, read_candidate_shard_count,
-    write_candidate_shard_count,
+    candidate_shard_root, metadata_field_is_boolean, metadata_field_is_float,
+    metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
+    read_candidate_shard_count, write_candidate_shard_count,
 };
 use crate::perf::{record_counter, scope};
 use crate::{Result, SspryError};
@@ -6866,33 +6866,41 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
                 )));
             }
         }
-        "metadata_eq" => {
+        "metadata_eq" | "metadata_ne" | "metadata_lt" | "metadata_le" | "metadata_gt"
+        | "metadata_ge" | "metadata_float_eq" | "metadata_float_ne" | "metadata_float_lt"
+        | "metadata_float_le" | "metadata_float_gt" | "metadata_float_ge" => {
             let field = pattern_id
                 .as_deref()
-                .ok_or_else(|| SspryError::from("metadata_eq node requires a pattern_id"))?;
-            let normalized = normalize_query_metadata_field(field).ok_or_else(|| {
-                SspryError::from(format!("Unsupported metadata_eq field: {field}"))
-            })?;
+                .ok_or_else(|| SspryError::from(format!("{kind} node requires a pattern_id")))?;
+            let normalized = normalize_query_metadata_field(field)
+                .ok_or_else(|| SspryError::from(format!("Unsupported {kind} field: {field}")))?;
             if threshold.is_none() {
-                return Err(SspryError::from("metadata_eq node requires a threshold"));
+                return Err(SspryError::from(format!(
+                    "{kind} node requires a threshold"
+                )));
             }
             if !children.is_empty() {
-                return Err(SspryError::from("metadata_eq node must not have children"));
+                return Err(SspryError::from(format!(
+                    "{kind} node must not have children"
+                )));
             }
             if normalized == "time.now" {
-                return Err(SspryError::from(
-                    "time.now must use a time_now_eq node, not metadata_eq",
-                ));
+                return Err(SspryError::from(format!(
+                    "time.now must use a time_now_* node, not {kind}"
+                )));
             }
             let expected = threshold.expect("threshold");
             if metadata_field_is_boolean(normalized) && expected > 1 {
-                return Err(SspryError::from(
-                    "metadata_eq boolean fields require threshold 0 or 1",
-                ));
-            }
-            if !metadata_field_is_boolean(normalized) && !metadata_field_is_integer(normalized) {
                 return Err(SspryError::from(format!(
-                    "Unsupported metadata_eq field: {field}"
+                    "{kind} boolean fields require threshold 0 or 1"
+                )));
+            }
+            let is_supported = metadata_field_is_boolean(normalized)
+                || metadata_field_is_integer(normalized)
+                || metadata_field_is_float(normalized);
+            if !is_supported {
+                return Err(SspryError::from(format!(
+                    "Unsupported {kind} field: {field}"
                 )));
             }
         }
@@ -6951,7 +6959,9 @@ fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
     }
 
     let pattern_id = match kind.as_str() {
-        "metadata_eq" => pattern_id
+        "metadata_eq" | "metadata_ne" | "metadata_lt" | "metadata_le" | "metadata_gt"
+        | "metadata_ge" | "metadata_float_eq" | "metadata_float_ne" | "metadata_float_lt"
+        | "metadata_float_le" | "metadata_float_gt" | "metadata_float_ge" => pattern_id
             .as_deref()
             .and_then(normalize_query_metadata_field)
             .map(str::to_owned),

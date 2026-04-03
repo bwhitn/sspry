@@ -28,8 +28,8 @@ use crate::candidate::grams::{
 };
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::candidate::{
-    MetadataCompareOp, metadata_field_matches_compare, metadata_fields_compare,
-    metadata_file_prefix_8,
+    MetadataCompareOp, metadata_field_matches_compare, metadata_field_matches_compare_f32,
+    metadata_fields_compare, metadata_file_prefix_8,
 };
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
@@ -6225,6 +6225,12 @@ fn node_structurally_impossible(node: &QueryNode) -> bool {
         "metadata_le" => false,
         "metadata_gt" => false,
         "metadata_ge" => false,
+        "metadata_float_eq" => false,
+        "metadata_float_ne" => false,
+        "metadata_float_lt" => false,
+        "metadata_float_le" => false,
+        "metadata_float_gt" => false,
+        "metadata_float_ge" => false,
         "metadata_time_eq" => false,
         "metadata_time_ne" => false,
         "metadata_time_lt" => false,
@@ -6707,6 +6713,12 @@ fn tree_maybe_matches_node(
         | "metadata_le"
         | "metadata_gt"
         | "metadata_ge"
+        | "metadata_float_eq"
+        | "metadata_float_ne"
+        | "metadata_float_lt"
+        | "metadata_float_le"
+        | "metadata_float_gt"
+        | "metadata_float_ge"
         | "metadata_time_eq"
         | "metadata_time_ne"
         | "metadata_time_lt"
@@ -6936,6 +6948,12 @@ fn block_maybe_matches_node(
         "metadata_le" => Ok(true),
         "metadata_gt" => Ok(true),
         "metadata_ge" => Ok(true),
+        "metadata_float_eq" => Ok(true),
+        "metadata_float_ne" => Ok(true),
+        "metadata_float_lt" => Ok(true),
+        "metadata_float_le" => Ok(true),
+        "metadata_float_gt" => Ok(true),
+        "metadata_float_ge" => Ok(true),
         "metadata_time_eq" => Ok(true),
         "metadata_time_ne" => Ok(true),
         "metadata_time_lt" => Ok(true),
@@ -7651,6 +7669,31 @@ where
                 tiers: TierFlags::default(),
             })
         }
+        "metadata_float_eq" | "metadata_float_ne" | "metadata_float_lt" | "metadata_float_le"
+        | "metadata_float_gt" | "metadata_float_ge" => {
+            let field = node.pattern_id.as_deref().ok_or_else(|| {
+                SspryError::from(format!("{} node requires pattern_id", node.kind))
+            })?;
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u32;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata-float node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched = metadata_field_matches_compare_f32(
+                metadata_bytes,
+                field,
+                op,
+                f32::from_bits(expected),
+            )?
+            .unwrap_or(true);
+            Ok(MatchOutcome {
+                matched,
+                tiers: TierFlags::default(),
+            })
+        }
         "metadata_time_eq" | "metadata_time_ne" | "metadata_time_lt" | "metadata_time_le"
         | "metadata_time_gt" | "metadata_time_ge" => {
             let field = node.pattern_id.as_deref().ok_or_else(|| {
@@ -7789,6 +7832,7 @@ where
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
+    use yara_x::{Compiler as YaraCompiler, Scanner as YaraScanner};
 
     use crate::candidate::BloomFilter;
     use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
@@ -7807,6 +7851,19 @@ mod tests {
 
     fn borrowed_bytes<'a>(bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         Ok(Cow::Borrowed(bytes))
+    }
+
+    fn yara_rule_matches_bytes(source: &str, bytes: &[u8]) -> bool {
+        let mut compiler = YaraCompiler::new();
+        compiler.add_source(source).expect("compile yara-x probe");
+        let rules = compiler.build();
+        let mut scanner = YaraScanner::new(&rules);
+        scanner
+            .scan(bytes)
+            .expect("scan yara-x probe")
+            .matching_rules()
+            .next()
+            .is_some()
     }
 
     struct Tier2AndMetadataOnlyOverrideGuard {
@@ -10267,7 +10324,7 @@ rule q {
         pe[0x96..0x98].copy_from_slice(&0x2000u16.to_le_bytes());
         pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
         pe[0x98 + 68..0x98 + 70].copy_from_slice(&3u16.to_le_bytes());
-        fs::write(&pe_path, pe).expect("write pe");
+        fs::write(&pe_path, &pe).expect("write pe");
         let metadata_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
 
         let doc = CandidateDoc {
@@ -10404,7 +10461,8 @@ rule q {
         assert!(verifier_outcome.matched);
 
         let numeric_path = tmp.path().join("numeric.bin");
-        fs::write(&numeric_path, 0x1122_3344_5566_7788u64.to_le_bytes()).expect("write numeric");
+        let numeric_bytes = 0x1122_3344_5566_7788u64.to_le_bytes();
+        fs::write(&numeric_path, numeric_bytes).expect("write numeric");
         let numeric_metadata = extract_compact_document_metadata(&numeric_path).expect("metadata");
         let numeric_doc = CandidateDoc {
             file_size: 8,
@@ -10431,6 +10489,39 @@ rule q {
         )
         .expect("uint64 prefix eq");
         assert!(numeric_true.matched);
+        assert_eq!(
+            true, numeric_true.matched,
+            "uint64(0) prefix shortcut should match the expected decoded value"
+        );
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
+        let numeric_u32 = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_eq".to_owned(),
+                pattern_id: Some("uint32(0)==1432778632".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("uint32 prefix eq");
+        assert_eq!(
+            numeric_u32.matched,
+            yara_rule_matches_bytes(
+                "rule test { condition: uint32(0) == 1432778632 }",
+                &numeric_bytes,
+            ),
+            "uint32(0) prefix shortcut must match YARA-X semantics"
+        );
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
@@ -10453,6 +10544,45 @@ rule q {
         )
         .expect("int16be prefix eq");
         assert!(!numeric_false.matched);
+        assert_eq!(
+            numeric_false.matched,
+            yara_rule_matches_bytes("rule test { condition: int16be(0) == -2 }", &numeric_bytes,),
+            "int16be(0) prefix shortcut must match YARA-X semantics"
+        );
+
+        let short_path = tmp.path().join("short.bin");
+        let short_bytes = *b"AB";
+        fs::write(&short_path, short_bytes).expect("write short");
+        let short_metadata = extract_compact_document_metadata(&short_path).expect("metadata");
+        let short_doc = CandidateDoc {
+            file_size: 2,
+            ..doc.clone()
+        };
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&short_doc, &short_metadata, &[], &[]);
+        let short_numeric = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_eq".to_owned(),
+                pattern_id: Some("uint32(0)==0".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("short uint64 prefix eq");
+        assert_eq!(
+            short_numeric.matched,
+            yara_rule_matches_bytes("rule test { condition: uint32(0) == 0 }", &short_bytes),
+            "short-file integer prefix shortcut must match YARA-X semantics"
+        );
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
             prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
@@ -10553,6 +10683,14 @@ rule q {
         )
         .expect("at zero prefix true");
         assert!(at_zero_true.matched);
+        assert_eq!(
+            at_zero_true.matched,
+            yara_rule_matches_bytes(
+                "rule test { strings: $mz = \"MZ\" condition: $mz at 0 }",
+                &pe,
+            ),
+            "$str at 0 prefix shortcut must match YARA-X semantics"
+        );
 
         let at_zero_patterns = HashMap::from([(
             "$pk".to_owned(),
@@ -10587,6 +10725,14 @@ rule q {
         )
         .expect("at zero prefix false");
         assert!(!at_zero_false.matched);
+        assert_eq!(
+            at_zero_false.matched,
+            yara_rule_matches_bytes(
+                "rule test { strings: $pk = \"PK\" condition: $pk at 0 }",
+                &pe,
+            ),
+            "negative $str at 0 prefix shortcut must match YARA-X semantics"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::candidate::{
-    GramSizes, metadata_field_is_boolean, metadata_field_is_integer,
+    GramSizes, metadata_field_is_boolean, metadata_field_is_float, metadata_field_is_integer,
     normalize_query_metadata_field, pack_exact_gram,
 };
 use crate::{Result, SspryError};
@@ -616,6 +616,9 @@ impl ConditionParser {
                     if field_name.starts_with("hash.") {
                         return self.parse_hash_identity_equality(&field_name);
                     }
+                    if field_name == "math.entropy" {
+                        return self.parse_math_entropy_comparison(&field_name);
+                    }
                     let Token::Int(offset) = self.consume(None)? else {
                         return Err(SspryError::from(format!(
                             "{field_name} requires an integer byte offset."
@@ -676,6 +679,8 @@ impl ConditionParser {
                                 comparison_kind("filesize", op)
                             } else if normalized == "time.now" {
                                 comparison_kind("time_now", op)
+                            } else if metadata_field_is_float(normalized) {
+                                comparison_kind("metadata_float", op)
                             } else if metadata_field_is_boolean(normalized) {
                                 if !matches!(op, ComparisonOp::Eq | ComparisonOp::Ne) {
                                     return Err(SspryError::from(format!(
@@ -694,6 +699,19 @@ impl ConditionParser {
                                 kind,
                                 pattern_id: Some(normalized.to_owned()),
                                 threshold: Some(value),
+                                children: Vec::new(),
+                            })
+                        }
+                        Token::Float(value) => {
+                            if !metadata_field_is_float(normalized) {
+                                return Err(SspryError::from(format!(
+                                    "Expected integer literal after {field_name} comparison."
+                                )));
+                            }
+                            Ok(QueryNode {
+                                kind: comparison_kind("metadata_float", op),
+                                pattern_id: Some(normalized.to_owned()),
+                                threshold: Some((value as f32).to_bits() as usize),
                                 children: Vec::new(),
                             })
                         }
@@ -1070,6 +1088,56 @@ impl ConditionParser {
             kind: "identity_eq".to_owned(),
             pattern_id: Some(normalize_identity_literal(hash_kind, &literal)?),
             threshold: None,
+            children: Vec::new(),
+        })
+    }
+
+    fn parse_math_entropy_comparison(&mut self, field_name: &str) -> Result<QueryNode> {
+        let Token::Int(offset) = self.consume(None)? else {
+            return Err(SspryError::from(format!(
+                "{field_name} requires a literal start offset."
+            )));
+        };
+        self.consume(Some(&Token::Comma))?;
+        match self.consume(None)? {
+            Token::Name(name) if name == "filesize" => {}
+            _ => {
+                return Err(SspryError::from(format!(
+                    "Only whole-file {field_name}(0, filesize) comparisons are searchable.",
+                )));
+            }
+        }
+        self.consume(Some(&Token::RParen))?;
+        if offset != 0 {
+            return Err(SspryError::from(format!(
+                "Only whole-file {field_name}(0, filesize) comparisons are searchable.",
+            )));
+        }
+        let Some(op) = self.peek().and_then(comparison_op_from_token) else {
+            return Err(SspryError::from(format!(
+                "{field_name}(0, filesize) requires a comparison operator.",
+            )));
+        };
+        self.consume(None)?;
+        let rhs = self.consume(None)?;
+        let value = match rhs {
+            Token::Int(value) => value as f32,
+            Token::Float(value) => value as f32,
+            _ => {
+                return Err(SspryError::from(format!(
+                    "{field_name}(0, filesize) requires an integer or float literal.",
+                )));
+            }
+        };
+        if !value.is_finite() {
+            return Err(SspryError::from(format!(
+                "{field_name}(0, filesize) requires a finite numeric literal.",
+            )));
+        }
+        Ok(QueryNode {
+            kind: comparison_kind("metadata_float", op),
+            pattern_id: Some("math.entropy".to_owned()),
+            threshold: Some(value.to_bits() as usize),
             children: Vec::new(),
         })
     }
@@ -2074,6 +2142,12 @@ fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
         | "metadata_le"
         | "metadata_gt"
         | "metadata_ge"
+        | "metadata_float_eq"
+        | "metadata_float_ne"
+        | "metadata_float_lt"
+        | "metadata_float_le"
+        | "metadata_float_gt"
+        | "metadata_float_ge"
         | "metadata_time_eq"
         | "metadata_time_ne"
         | "metadata_time_lt"
@@ -4057,10 +4131,11 @@ pub fn evaluate_fixed_literal_match(
             "identity_eq requires DB identity lookup and cannot use the fixed-literal fast path",
         )),
         "metadata_eq" | "metadata_ne" | "metadata_lt" | "metadata_le" | "metadata_gt"
-        | "metadata_ge" | "metadata_time_eq" | "metadata_time_ne" | "metadata_time_lt"
-        | "metadata_time_le" | "metadata_time_gt" | "metadata_time_ge" | "metadata_field_eq"
-        | "metadata_field_ne" | "metadata_field_lt" | "metadata_field_le" | "metadata_field_gt"
-        | "metadata_field_ge" => Err(SspryError::from(
+        | "metadata_ge" | "metadata_float_eq" | "metadata_float_ne" | "metadata_float_lt"
+        | "metadata_float_le" | "metadata_float_gt" | "metadata_float_ge" | "metadata_time_eq"
+        | "metadata_time_ne" | "metadata_time_lt" | "metadata_time_le" | "metadata_time_gt"
+        | "metadata_time_ge" | "metadata_field_eq" | "metadata_field_ne" | "metadata_field_lt"
+        | "metadata_field_le" | "metadata_field_gt" | "metadata_field_ge" => Err(SspryError::from(
             "metadata comparison requires stored metadata and cannot use the fixed-literal fast path",
         )),
         "time_now_eq" | "time_now_ne" | "time_now_lt" | "time_now_le" | "time_now_gt"
@@ -4131,6 +4206,12 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
         | "metadata_le"
         | "metadata_gt"
         | "metadata_ge"
+        | "metadata_float_eq"
+        | "metadata_float_ne"
+        | "metadata_float_lt"
+        | "metadata_float_le"
+        | "metadata_float_gt"
+        | "metadata_float_ge"
         | "metadata_time_eq"
         | "metadata_time_ne"
         | "metadata_time_lt"
@@ -5414,6 +5495,24 @@ rule metadata_cmp {
         assert!(plan.root.children.iter().any(|child| {
             child.kind == "metadata_field_le"
                 && child.pattern_id.as_deref() == Some("lnk.access_time|lnk.write_time")
+        }));
+    }
+
+    #[test]
+    fn compile_rule_with_math_entropy_whole_file_comparison() {
+        let rule = r#"
+rule entropy_cmp {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and math.entropy(0, filesize) > 7.2
+}
+"#;
+        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
+        assert_eq!(plan.root.kind, "and");
+        assert!(plan.root.children.iter().any(|child| {
+            child.kind == "metadata_float_gt"
+                && child.pattern_id.as_deref() == Some("math.entropy")
         }));
     }
 
