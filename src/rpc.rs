@@ -79,6 +79,10 @@ const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
 pub const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
 const DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP: usize = 0;
 
+fn resolve_tree_query_workers(configured_workers: usize, tree_count: usize) -> usize {
+    configured_workers.max(1).min(tree_count.max(1))
+}
+
 fn lock_candidate_store_with_timeout<'a>(
     store_lock: &'a Mutex<CandidateStore>,
     shard_idx: usize,
@@ -4649,6 +4653,25 @@ impl ServerState {
         Ok((hits, tier_used, query_profile))
     }
 
+    fn collect_query_matches_store_set(
+        stores: &Arc<StoreSet>,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+    ) -> Result<(HashSet<String>, Vec<String>, CandidateQueryProfile)> {
+        let mut hits = HashSet::<String>::new();
+        let mut tier_used = Vec::<String>::new();
+        let mut query_profile = CandidateQueryProfile::default();
+        for store_lock in &stores.stores {
+            let mut store = lock_candidate_store_blocking(store_lock)?;
+            let (local_hits, local_tiers, local_profile) =
+                Self::collect_query_matches_single_store(&mut store, plan, prepared)?;
+            hits.extend(local_hits);
+            tier_used.extend(local_tiers);
+            query_profile.merge_from(&local_profile);
+        }
+        Ok((hits, tier_used, query_profile))
+    }
+
     fn collect_query_matches_all_shards(
         &self,
         plan: &CompiledQueryPlan,
@@ -4686,29 +4709,15 @@ impl ServerState {
             });
         }
 
-        let worker_count = self.config.search_workers.max(1).min(
-            store_sets
-                .iter()
-                .map(|stores| stores.stores.len())
-                .sum::<usize>()
-                .max(1),
-        );
-
-        let store_units = store_sets
-            .iter()
-            .flat_map(|stores| {
-                (0..stores.stores.len()).map(move |shard_idx| (stores.clone(), shard_idx))
-            })
-            .collect::<Vec<_>>();
+        let worker_count = resolve_tree_query_workers(self.config.search_workers, store_sets.len());
 
         if worker_count <= 1 {
             let mut hits = HashSet::<String>::new();
             let mut tier_used = Vec::<String>::new();
             let mut query_profile = CandidateQueryProfile::default();
-            for (stores, shard_idx) in &store_units {
-                let mut store = lock_candidate_store_blocking(&stores.stores[*shard_idx])?;
+            for stores in &store_sets {
                 let (local_hits, local_tiers, local_profile) =
-                    Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
+                    Self::collect_query_matches_store_set(stores, plan, &prepared)?;
                 hits.extend(local_hits);
                 tier_used.extend(local_tiers);
                 query_profile.merge_from(&local_profile);
@@ -4728,30 +4737,27 @@ impl ServerState {
             });
         }
 
-        let next_shard = AtomicUsize::new(0);
+        let next_tree = AtomicUsize::new(0);
         let partials = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
-                let store_units = &store_units;
+                let store_sets = &store_sets;
                 let plan = plan;
                 let prepared = prepared.clone();
-                let next_shard = &next_shard;
+                let next_tree = &next_tree;
                 handles.push(scope.spawn(
                     move || -> Result<(HashSet<String>, Vec<String>, CandidateQueryProfile)> {
                         let mut local_hits = HashSet::<String>::new();
                         let mut local_tiers = Vec::<String>::new();
                         let mut local_profile = CandidateQueryProfile::default();
                         loop {
-                            let shard_idx = next_shard.fetch_add(1, Ordering::Relaxed);
-                            if shard_idx >= store_units.len() {
+                            let tree_idx = next_tree.fetch_add(1, Ordering::Relaxed);
+                            if tree_idx >= store_sets.len() {
                                 break;
                             }
-                            let (stores, store_shard_idx) = &store_units[shard_idx];
-                            let mut store =
-                                lock_candidate_store_blocking(&stores.stores[*store_shard_idx])?;
-                            let (hits, tiers, profile) = Self::collect_query_matches_single_store(
-                                &mut store, plan, &prepared,
-                            )?;
+                            let stores = &store_sets[tree_idx];
+                            let (hits, tiers, profile) =
+                                Self::collect_query_matches_store_set(stores, plan, &prepared)?;
                             local_hits.extend(hits);
                             local_tiers.extend(tiers);
                             local_profile.merge_from(&profile);
@@ -7419,6 +7425,15 @@ mod tests {
     use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, pack_exact_gram};
     use base64::Engine;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_tree_query_workers_caps_to_tree_count() {
+        assert_eq!(resolve_tree_query_workers(0, 0), 1);
+        assert_eq!(resolve_tree_query_workers(1, 0), 1);
+        assert_eq!(resolve_tree_query_workers(1, 1), 1);
+        assert_eq!(resolve_tree_query_workers(5, 3), 3);
+        assert_eq!(resolve_tree_query_workers(3, 5), 3);
+    }
 
     fn lane_bloom_bytes(filter_bytes: usize, bloom_hashes: usize, grams: &[u64]) -> Vec<u8> {
         let mut bloom = BloomFilter::new(filter_bytes, bloom_hashes).expect("bloom");

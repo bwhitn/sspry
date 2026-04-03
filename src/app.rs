@@ -4938,7 +4938,7 @@ struct ServeArgs {
     #[arg(
         long = "search-workers",
         default_value_t = default_search_workers(),
-        help = "Server-side shard query workers. Default is max(1, cpus/4)."
+        help = "Server-side tree query workers per search. Forest searches run across at most this many trees at once. Default is max(1, cpus/4)."
     )]
     search_workers: usize,
     #[arg(
