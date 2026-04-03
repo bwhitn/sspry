@@ -1,52 +1,56 @@
-# Scalable Screening and Prefiltering of Rules for YARA
+# Scalable Screening and Prefiltering of Rules for YARA (SSPRY)
 
 `sspry` is the command-line binary and crate name.
 
 A mutable file search database with fast candidate retrieval and optional YARA verification.
 
-## What It Is
+## Overview
 
-`sspry` runs as a TCP server, indexes files into a mutable search store, and answers YARA-style searches by combining:
+SSPRY is a scalable way to reduce the set of files that need to be scanned based on the YARA rule you intend to use. This isn’t meant for many rules to scan at one time, but rather for one-off scanning of a corpus of files. It is intended to avoid false negatives and have limited false positives. Other projects have done similar things, but the goal of this one is to do so in a scalable way that trades upfront processing for reduced memory and search processing, while keeping the overall database (Forest) size smaller than the sum of the files; however, it has a fair amount of disk I/O during searches. In addition to those, the database needs to support the insertion and deletion of items.
 
-- per-document Tier1 bloom filters
-- per-document Tier2 bloom filters
-- optional per-superblock Tier2 summaries for block gating
-- optional local YARA verification over stored file paths
-- shard-local background compaction with deferred physical reclaim
+## Terms
+Branch - A partition inside a Tree.
+Candidate - An individual document that is returned as a possible match.
+Document - An individual file.
+Document ID - The hash used to uniquely identify the file in the forest. (MD5, SHA1, SHA256, SHA512)
+Forest - A collection of Trees.
+Metadata sidecar - The metadata contains the subset of YARA-relevant values that can be checked during search.
+Tier 1 bloom filter - A broader filter used first to gate some Tier 2 reads and help improve the accuracy.
+Tier 2 bloom filter - A more precise filter used to further narrow candidate sets.
+Tree - A single logical storage unit that contains a number of Branches.
 
-The current search planner is intentionally conservative about recall:
+## General Methodology
+The general methodology involves a Forest that operates similarly to a Log-Structured Merge Tree (LSM Tree). The general idea is to append new items via a publish routine and perform deletions lazily via a compaction routine. The overall format isn’t really a Tree, but a physically split set of long data streams (a forest). Each file consists of a Tier 1 (T1) and a Tier 2 (T2) bloom filter, which, by default, are 3-gram and 4-gram bloom filters, respectively, along with an optional metadata sidecar containing YARA-specific information (pe.is_pe, file entropy for math.entropy(0, filesize), etc.). T1 is a lighter bloom filter that will gate some required T2 bloom filter reads and slightly reduce false positives. T2 is a more precise bloom filter with a much lower false-positive rate. The blooms are sized based on the false-positive (fp) value p and the approximate number of ngrams, computed by applying the HyperLogLog function to all grams, yielding results typically within 1% accuracy.
 
-- if a rule has a safe searchable anchor, `sspry` uses it and verifies the rest later
-- if a rule is structurally too broad to search safely at scale, `sspry` now returns an explicit planner error instead of pretending it is scaling-safe
+These forests are broken into Trees of fixed-sized documents, and each Tree is further split into Branches. Each of these Branches contains the data needed for the search to include T1 and T2 blooms, along with the metadata sidecar. These are broken down to prevent excessively large files. When a file is removed, it is annotated immediately, but won’t be physically removed until compaction is completed. Compaction rebuilds a Branch, which is then swapped out for the previous one. Indexing, on the other hand, is done via publishing, which appends to the Branch(es).
 
-The current public CLI is intentionally small:
+Duplicate detection is prevented on insert into the same Branch. This does mean there could be duplicates inserted into the Forest in other Trees. In the future, maintenance runs will mark duplicates for deletion within the same forest, but this doesn’t currently happen. This won’t affect searches, as they are inserted into a hash set that automatically deduplicates them.
 
-- `serve`
-- `index`
-- `delete`
-- `search`
-- `info`
-- `shutdown`
-- `yara`
+Most bloom-backed searches read the T1 blooms across the Trees being searched. Possible T1 matches may then require T2 reads and metadata checks. If a rule has no searchable string anchors, it may fall back to metadata checks, direct identity lookups, or later verification depending on the rule structure. An example of this could be a condition like “filesize < 4kb and pe.is_pe and pe.timestamp > time.now”, which could find a PE file smaller than 4kb and with a timestamp greater than the time of the search start.
 
-`search` now supports two execution paths:
+## Program Architecture
+The program's architecture is client-server, with the client performing bloom creation and sending requests to the server, while the server handles the disk I/O for storage, search, and responses. The exception to this is the batch functions, which are mainly used in testing and allow batching searches (a list of YARA rules) and indexing (a list of paths to files to index). A quick note: these are clients and servers and do not have any built-in security, so it is recommended that they be on a closed network.
 
-- RPC search against a running `serve` process via `--addr`
-- in-process forest search via `--root`, which opens `tree_*/current` stores directly and can search trees concurrently with `--tree-search-workers`
+Additionally, if you opt to store path information when creating the Forest, you can automatically verify search results using it.
 
-`search-batch` is the long-lived in-process forest runner for repeated rule sweeps:
+The client can also distribute files across multiple servers in a round-robin fashion. This can improve indexing throughput and spread search work across machines, but it also splits the corpus across those servers. As a result, built-in verification becomes more difficult unless the original files are still available to the system performing the verification.
 
-- it opens the forest once
-- runs many rules against that same live forest
-- writes JSON results for benchmarking/profiling
+## General Operation Complexity
+* Search is generally linear in the amount of data the server has to examine.
+* Server-side indexing is append-oriented and mostly sequential, so for normal batch sizes it behaves close to constant in practice, even though it still grows with the amount of data written. Client-side indexing scales with file size, the number of unique n-grams, and the amount of metadata extraction work.
+*  Removals are usually cheap up front, while heavier cleanup work is deferred to compaction.
+* All of this is with respect to the configured bloom sizing and the general occasional overhead from publishing and compaction.
 
-`serve --root` auto-detects three root shapes:
+## General Notes
+* There are many trade-offs with this pre-Yara search screening method. With T1, if the p (fp) rate is too low, the blooms are larger, so the minimum amount of disk IO required to search will increase. The same goes for T2, but to an even greater degree: the larger the ngram size, the more unique ngrams there will be. While some YARA modules and common condition evaluations are stored in metadata, storing all metadata would drastically increase the Forest size.
+* This is still in early development, and many refinements are needed. These refinements could break some items, rendering the current Forest unusable and requiring it to be deleted and recreated.
+* Trying to compare this to similar projects isn’t easy. It would probably be easier to do a feature comparison chart.
+* When using “time.now” in a YARA rule, there is a chance of a false negative because the search evaluates it at the time it starts, whereas verification happens later, and it will be evaluated again during that time.
 
-- mutable workspace roots with `current/`, `work_a/`, and `work_b/`
-- direct published store roots
-- forest roots containing `tree_*/current`
-
-Forest-root servers are read-only search/info endpoints over the published trees.
+## Current Issues
+* Identifying search memory expansion: Currently, memory usage during search tends to grow rapidly for some rules. While it may be related to the candidate count, it doesn’t appear to be the main driver. Rule shape, scan breadth, prepared-query artifacts, and file-backed residency appear to matter more.
+* Configuration state files are duplicated among many trees when most of the information is forest-specific.
+* Deduplication across forest.
 
 ## Quick Links
 
@@ -74,19 +78,3 @@ If `cargo-llvm-cov` is installed:
 ```bash
 ./scripts/coverage.sh
 ```
-
-## Notes
-
-- The workspace layout is `current/`, `work_a/`, `work_b/`, and `retired/`.
-- The default ingest/search path is bloom-only; the retired exact-gram / DF path has been removed from the normal runtime.
-- Pattern superblocks are optional and disabled by default; enable them explicitly with `--enable-pattern-superblocks` when you want the extra block-gating layer.
-- Search returns candidate digests as an unordered candidate set and can optionally verify matches locally with `yara-x` when stored paths are available.
-- `search --root <forest_root>` is the direct forest path for tree-level threaded search experiments and one-off local queries.
-- For large repeated tuning sweeps, use `search-batch` or a persistent server path.
-- A bare `search --root` per rule is intentionally still a one-shot path and will reopen the forest each time.
-- For smaller alpha-scale trees such as the current `5k`-docs-per-tree runs, start with a lower shard count than `256` and scale up only if ingest contention justifies it.
-- Current caveat: on the preserved `50k` tree, `search-batch` is functionally correct but still too resident-memory-heavy to replace the persistent server path as the default tuning loop.
-- Search now rejects two important non-scaling-safe rule shapes:
-  - high-fanout unions with no mandatory anchorable pattern
-  - low-information `at pe.entry_point` style stub rules that only contribute tiny generic gram anchors
-  - short suffix/range rules where only tiny literals gate `in (filesize-N..filesize)` checks
