@@ -1600,11 +1600,6 @@ struct BatchSearchRecord {
     verbose_search_plan_ms: Option<f64>,
     verbose_search_query_ms: Option<f64>,
     verbose_search_verify_ms: Option<f64>,
-    verbose_search_tree_gate_trees_considered: Option<u64>,
-    verbose_search_tree_gate_passed: Option<u64>,
-    verbose_search_tree_gate_tier1_pruned: Option<u64>,
-    verbose_search_tree_gate_tier2_pruned: Option<u64>,
-    verbose_search_tree_gate_special_docs_bypass: Option<u64>,
     verbose_search_docs_scanned: Option<u64>,
     verbose_search_metadata_loads: Option<u64>,
     verbose_search_metadata_bytes: Option<u64>,
@@ -1956,65 +1951,6 @@ fn query_local_forest_all_candidates(
         external_ids,
         hashes,
     })
-}
-
-fn query_store_group_tree_gates(
-    stores: &mut [CandidateStore],
-    plan: &crate::candidate::CompiledQueryPlan,
-) -> Result<crate::candidate::CandidateQueryProfile> {
-    let mut out = crate::candidate::CandidateQueryProfile::default();
-    for store in stores {
-        out.merge_from(&store.query_tree_gate_profile(plan)?);
-    }
-    Ok(out)
-}
-
-fn query_local_forest_tree_gates(
-    tree_groups: &mut Vec<TreeStoreGroup>,
-    plan: &crate::candidate::CompiledQueryPlan,
-    tree_search_workers: usize,
-) -> Result<crate::candidate::CandidateQueryProfile> {
-    let worker_count = tree_search_workers.max(1).min(tree_groups.len().max(1));
-    let mut partials = Vec::<crate::candidate::CandidateQueryProfile>::new();
-    if tree_groups.len() <= 1 || worker_count <= 1 {
-        for group in tree_groups {
-            partials.push(query_store_group_tree_gates(&mut group.stores, plan)?);
-        }
-    } else {
-        let chunk_size = tree_groups.len().div_ceil(worker_count);
-        let scoped = thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk in tree_groups.chunks_mut(chunk_size) {
-                handles.push(scope.spawn(
-                    move || -> Result<crate::candidate::CandidateQueryProfile> {
-                        let mut merged = crate::candidate::CandidateQueryProfile::default();
-                        for group in chunk {
-                            merged.merge_from(&query_store_group_tree_gates(
-                                &mut group.stores,
-                                plan,
-                            )?);
-                        }
-                        Ok(merged)
-                    },
-                ));
-            }
-            let mut merged = Vec::with_capacity(handles.len());
-            for handle in handles {
-                merged.push(
-                    handle
-                        .join()
-                        .map_err(|_| SspryError::from("Forest tree-gate worker panicked."))??,
-                );
-            }
-            Ok::<Vec<crate::candidate::CandidateQueryProfile>, SspryError>(merged)
-        })?;
-        partials = scoped;
-    }
-    let mut query_profile = crate::candidate::CandidateQueryProfile::default();
-    for partial in partials {
-        query_profile.merge_from(&partial);
-    }
-    Ok(query_profile)
 }
 
 fn clear_local_forest_search_caches(tree_groups: &mut [TreeStoreGroup]) {
@@ -3375,17 +3311,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     .get("work")
                     .and_then(serde_json::Value::as_object)
                     .unwrap_or(&stats);
-                for (key, label) in [
-                    ("disk_usage_bytes", "verbose.index.server_disk_usage_bytes"),
-                    (
-                        "tree_tier1_gate_bytes",
-                        "verbose.index.server_tree_tier1_gate_bytes",
-                    ),
-                    (
-                        "tree_tier2_gate_bytes",
-                        "verbose.index.server_tree_tier2_gate_bytes",
-                    ),
-                ] {
+                for (key, label) in [("disk_usage_bytes", "verbose.index.server_disk_usage_bytes")]
+                {
                     if let Some(value) = stats_scope.get(key).and_then(|value| value.as_u64()) {
                         eprintln!("{label}: {value}");
                     }
@@ -4128,12 +4055,7 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut query_time = Duration::ZERO;
         let mut verify_time = Duration::ZERO;
         let mut server_rss_kb = None::<(u64, u64)>;
-        if args.gate_only && args.root.is_none() {
-            return Err(SspryError::from(
-                "--gate-only currently requires --root local search mode.",
-            ));
-        }
-        let verify_yara_files = args.verify_yara_files && !args.gate_only;
+        let verify_yara_files = args.verify_yara_files;
         let mut tree_count = None::<usize>;
         let mut tree_search_workers = None::<usize>;
 
@@ -4169,43 +4091,26 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             )?;
             plan_time += started_plan.elapsed();
             let started_query = Instant::now();
-            if args.gate_only {
-                let query_profile =
-                    query_local_forest_tree_gates(&mut tree_groups, &plan, worker_count)?;
-                query_time += started_query.elapsed();
-                (
-                    plan,
-                    0usize,
-                    "gate-only".to_owned(),
-                    false,
-                    None,
-                    Vec::new(),
-                    query_profile,
-                    crate::candidate::CandidatePreparedQueryProfile::default(),
-                    Vec::new(),
-                )
-            } else {
-                let prepared_query_profile =
-                    forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
-                let local = query_local_forest_all_candidates(
-                    &mut tree_groups,
-                    &plan,
-                    verify_yara_files,
-                    worker_count,
-                )?;
-                query_time += started_query.elapsed();
-                (
-                    plan,
-                    local.total_candidates,
-                    local.tier_used,
-                    local.truncated,
-                    local.truncated_limit,
-                    local.hashes,
-                    local.query_profile,
-                    prepared_query_profile,
-                    local.external_ids.unwrap_or_default(),
-                )
-            }
+            let prepared_query_profile =
+                forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
+            let local = query_local_forest_all_candidates(
+                &mut tree_groups,
+                &plan,
+                verify_yara_files,
+                worker_count,
+            )?;
+            query_time += started_query.elapsed();
+            (
+                plan,
+                local.total_candidates,
+                local.tier_used,
+                local.truncated,
+                local.truncated_limit,
+                local.hashes,
+                local.query_profile,
+                prepared_query_profile,
+                local.external_ids.unwrap_or_default(),
+            )
         } else {
             let client = search_rpc_client(&args.connection);
             let server_policy = server_scan_policy(&args.connection)?;
@@ -4451,27 +4356,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
             );
             eprintln!("verbose.search.candidates: {total}");
             eprintln!("verbose.search.verify_enabled: {}", verify_yara_files);
-            eprintln!(
-                "verbose.search.tree_gate_trees_considered: {}",
-                query_profile.tree_gate_trees_considered
-            );
-            eprintln!(
-                "verbose.search.tree_gate_passed: {}",
-                query_profile.tree_gate_passed
-            );
-            eprintln!(
-                "verbose.search.tree_gate_tier1_pruned: {}",
-                query_profile.tree_gate_tier1_pruned
-            );
-            eprintln!(
-                "verbose.search.tree_gate_tier2_pruned: {}",
-                query_profile.tree_gate_tier2_pruned
-            );
-            eprintln!(
-                "verbose.search.tree_gate_special_docs_bypass: {}",
-                query_profile.tree_gate_special_docs_bypass
-            );
-            eprintln!("verbose.search.gate_only: {}", args.gate_only);
             let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
             let smaps_rollup = current_process_smaps_rollup_kb();
             eprintln!("verbose.search.client_current_rss_kb: {client_current_rss_kb}");
@@ -4634,19 +4518,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_plan_ms: Some(plan_ms),
                     verbose_search_query_ms: Some(query_ms),
                     verbose_search_verify_ms: Some(verify_ms),
-                    verbose_search_tree_gate_trees_considered: Some(
-                        local.query_profile.tree_gate_trees_considered,
-                    ),
-                    verbose_search_tree_gate_passed: Some(local.query_profile.tree_gate_passed),
-                    verbose_search_tree_gate_tier1_pruned: Some(
-                        local.query_profile.tree_gate_tier1_pruned,
-                    ),
-                    verbose_search_tree_gate_tier2_pruned: Some(
-                        local.query_profile.tree_gate_tier2_pruned,
-                    ),
-                    verbose_search_tree_gate_special_docs_bypass: Some(
-                        local.query_profile.tree_gate_special_docs_bypass,
-                    ),
                     verbose_search_docs_scanned: Some(local.query_profile.docs_scanned),
                     verbose_search_metadata_loads: Some(local.query_profile.metadata_loads),
                     verbose_search_metadata_bytes: Some(local.query_profile.metadata_bytes),
@@ -4744,11 +4615,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_plan_ms: None,
                     verbose_search_query_ms: None,
                     verbose_search_verify_ms: None,
-                    verbose_search_tree_gate_trees_considered: None,
-                    verbose_search_tree_gate_passed: None,
-                    verbose_search_tree_gate_tier1_pruned: None,
-                    verbose_search_tree_gate_tier2_pruned: None,
-                    verbose_search_tree_gate_special_docs_bypass: None,
                     verbose_search_docs_scanned: None,
                     verbose_search_metadata_loads: None,
                     verbose_search_metadata_bytes: None,
@@ -4956,13 +4822,6 @@ struct SearchCommandArgs {
         help = "Server-side candidate cap as a percentage of searchable documents; 0 means unlimited."
     )]
     max_candidates: f64,
-    #[arg(
-        long = "gate-only",
-        action = ArgAction::SetTrue,
-        default_value_t = false,
-        help = "In --root mode, evaluate only the tree-gate layer and skip candidate/doc scanning."
-    )]
-    gate_only: bool,
     #[arg(
         long = "verify",
         action = ArgAction::SetTrue,
@@ -6246,7 +6105,6 @@ rule remote_q {
                 tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
                 max_candidates: 8.0,
-                gate_only: false,
                 verify_yara_files: false,
                 verbose: false,
             }),
@@ -6260,7 +6118,6 @@ rule remote_q {
                 tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
                 max_candidates: 8.0,
-                gate_only: false,
                 verify_yara_files: true,
                 verbose: false,
             }),
@@ -6716,11 +6573,6 @@ rule remote_q {
             verbose_search_plan_ms: Some(1.0),
             verbose_search_query_ms: Some(11.0),
             verbose_search_verify_ms: Some(0.5),
-            verbose_search_tree_gate_trees_considered: Some(2),
-            verbose_search_tree_gate_passed: Some(2),
-            verbose_search_tree_gate_tier1_pruned: Some(0),
-            verbose_search_tree_gate_tier2_pruned: Some(0),
-            verbose_search_tree_gate_special_docs_bypass: Some(0),
             verbose_search_docs_scanned: Some(2),
             verbose_search_metadata_loads: Some(0),
             verbose_search_metadata_bytes: Some(0),
@@ -6780,11 +6632,6 @@ rule remote_q {
             verbose_search_plan_ms: None,
             verbose_search_query_ms: None,
             verbose_search_verify_ms: None,
-            verbose_search_tree_gate_trees_considered: None,
-            verbose_search_tree_gate_passed: None,
-            verbose_search_tree_gate_tier1_pruned: None,
-            verbose_search_tree_gate_tier2_pruned: None,
-            verbose_search_tree_gate_special_docs_bypass: None,
             verbose_search_docs_scanned: None,
             verbose_search_metadata_loads: None,
             verbose_search_metadata_bytes: None,
@@ -6977,19 +6824,10 @@ rule miss_rule {
             forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes).expect("profile");
         assert!(prepared.pattern_count >= 1);
 
-        let tree_gate_profile =
-            query_store_group_tree_gates(&mut tree_groups[0].stores, &plan).expect("tree gates");
-        assert_eq!(tree_gate_profile.tree_gate_trees_considered, 1);
-
         let local_tree = query_store_group_all_candidates(&mut tree_groups[0].stores, &plan, true)
             .expect("local tree query");
         assert_eq!(local_tree.hashes.len(), 1);
         assert_eq!(local_tree.external_ids.len(), 1);
-
-        let forest_tree_gate_profile =
-            query_local_forest_tree_gates(&mut tree_groups, &plan, 2).expect("forest gates");
-        assert_eq!(forest_tree_gate_profile.tree_gate_trees_considered, 2);
-        assert_eq!(forest_tree_gate_profile.tree_gate_passed, 2);
 
         let local_forest = query_local_forest_all_candidates(&mut tree_groups, &plan, true, 2)
             .expect("forest query");

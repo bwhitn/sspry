@@ -19,7 +19,7 @@ use crate::candidate::bloom::{
 };
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
-    align_filter_bytes, choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
+    choose_filter_bytes_for_file_size, derive_document_bloom_hash_count,
 };
 use crate::candidate::grams::{
     DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram,
@@ -215,11 +215,6 @@ pub struct CandidatePreparedQueryProfile {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CandidateQueryProfile {
-    pub tree_gate_trees_considered: u64,
-    pub tree_gate_passed: u64,
-    pub tree_gate_tier1_pruned: u64,
-    pub tree_gate_tier2_pruned: u64,
-    pub tree_gate_special_docs_bypass: u64,
     pub docs_scanned: u64,
     pub metadata_loads: u64,
     pub metadata_bytes: u64,
@@ -231,19 +226,6 @@ pub struct CandidateQueryProfile {
 
 impl CandidateQueryProfile {
     pub(crate) fn merge_from(&mut self, other: &Self) {
-        self.tree_gate_trees_considered = self
-            .tree_gate_trees_considered
-            .saturating_add(other.tree_gate_trees_considered);
-        self.tree_gate_passed = self.tree_gate_passed.saturating_add(other.tree_gate_passed);
-        self.tree_gate_tier1_pruned = self
-            .tree_gate_tier1_pruned
-            .saturating_add(other.tree_gate_tier1_pruned);
-        self.tree_gate_tier2_pruned = self
-            .tree_gate_tier2_pruned
-            .saturating_add(other.tree_gate_tier2_pruned);
-        self.tree_gate_special_docs_bypass = self
-            .tree_gate_special_docs_bypass
-            .saturating_add(other.tree_gate_special_docs_bypass);
         self.docs_scanned = self.docs_scanned.saturating_add(other.docs_scanned);
         self.metadata_loads = self.metadata_loads.saturating_add(other.metadata_loads);
         self.metadata_bytes = self.metadata_bytes.saturating_add(other.metadata_bytes);
@@ -316,8 +298,6 @@ pub struct CandidateStats {
     pub tier2_scanned_docs_total: u64,
     pub tier2_docs_matched_total: u64,
     pub tier2_match_ratio: f64,
-    pub tree_tier1_gate_bytes: u64,
-    pub tree_tier2_gate_bytes: u64,
     pub docs_vector_bytes: u64,
     pub doc_rows_bytes: u64,
     pub tier2_doc_rows_bytes: u64,
@@ -520,21 +500,6 @@ fn experiment_tier2_and_metadata_only_enabled() -> bool {
 #[cfg(test)]
 thread_local! {
     static EXPERIMENT_TIER2_AND_METADATA_ONLY_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
-fn experiment_disable_tree_gates_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SSPRY_EXPERIMENT_DISABLE_TREE_GATES")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -978,23 +943,6 @@ impl StoreAppendWriters {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct TreeBloomGateIndex {
-    bucket_for_key: FxHashMap<(usize, usize), (usize, usize)>,
-    summary_bytes_by_bucket: FxHashMap<(usize, usize), usize>,
-    masks_by_bucket: FxHashMap<(usize, usize), Vec<u8>>,
-    summary_memory_bytes: u64,
-}
-
-impl TreeBloomGateIndex {
-    fn memory_bytes(&self) -> u64 {
-        self.masks_by_bucket
-            .values()
-            .map(|mask| mask.len() as u64)
-            .sum()
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct CandidateCompactionSnapshot {
     root: PathBuf,
@@ -1031,78 +979,6 @@ pub(crate) struct PreparedQueryArtifacts {
     impossible_query: bool,
 }
 
-fn bloom_bucket_key(filter_bytes: usize, bloom_hashes: usize) -> (usize, usize) {
-    (align_filter_bytes(filter_bytes.max(1)), bloom_hashes)
-}
-
-fn merge_bloom_bytes_into_tree_gate(gate: &mut [u8], bloom_bytes: &[u8]) {
-    let shared_len = gate.len().min(bloom_bytes.len());
-    let word_len = shared_len / 8;
-    for word_idx in 0..word_len {
-        let start = word_idx * 8;
-        let end = start + 8;
-        let merged = u64::from_le_bytes(
-            gate[start..end]
-                .try_into()
-                .expect("word-sized tree gate chunk"),
-        ) | u64::from_le_bytes(
-            bloom_bytes[start..end]
-                .try_into()
-                .expect("word-sized bloom chunk"),
-        );
-        gate[start..end].copy_from_slice(&merged.to_le_bytes());
-    }
-    for idx in (word_len * 8)..shared_len {
-        gate[idx] |= bloom_bytes[idx];
-    }
-}
-
-fn ensure_tree_gate_capacity_for(
-    index: &mut TreeBloomGateIndex,
-    filter_bytes: usize,
-    bloom_hashes: usize,
-) {
-    let filter_key = (filter_bytes, bloom_hashes);
-    let bucket_key = bloom_bucket_key(filter_bytes, bloom_hashes);
-    let summary_bytes = align_filter_bytes(bucket_key.0.max(1));
-    index.bucket_for_key.insert(filter_key, bucket_key);
-    if index
-        .summary_bytes_by_bucket
-        .insert(bucket_key, summary_bytes)
-        .is_none()
-    {
-        index.summary_memory_bytes = index
-            .summary_memory_bytes
-            .saturating_add(summary_bytes as u64);
-    }
-    index
-        .masks_by_bucket
-        .entry(bucket_key)
-        .or_insert_with(|| vec![0u8; summary_bytes]);
-}
-
-fn update_tree_gate_for_doc_bytes_inner(
-    index: &mut TreeBloomGateIndex,
-    filter_bytes: usize,
-    bloom_hashes: usize,
-    bloom_bytes: &[u8],
-) {
-    ensure_tree_gate_capacity_for(index, filter_bytes, bloom_hashes);
-    let bucket_key = bloom_bucket_key(filter_bytes, bloom_hashes);
-    if let Some(mask) = index.masks_by_bucket.get_mut(&bucket_key) {
-        merge_bloom_bytes_into_tree_gate(mask, bloom_bytes);
-    }
-}
-
-fn update_tree_gate_for_doc_bytes_batch<'a>(
-    index: &mut TreeBloomGateIndex,
-    updates: &[(usize, usize, usize, &'a [u8])],
-) {
-    for (_, filter_bytes, bloom_hashes, bloom_bytes) in updates {
-        update_tree_gate_for_doc_bytes_inner(index, *filter_bytes, *bloom_hashes, bloom_bytes);
-    }
-}
-
 #[derive(Debug)]
 pub struct CandidateStore {
     root: PathBuf,
@@ -1119,8 +995,6 @@ pub struct CandidateStore {
     compaction_generation: u64,
     retired_generation_roots: Vec<String>,
     last_write_activity_monotonic: Option<Instant>,
-    tree_tier1_gates: TreeBloomGateIndex,
-    tree_tier2_gates: TreeBloomGateIndex,
     tier2_telemetry: Tier2Telemetry,
     prepared_query_cache: BoundedCache<String, Arc<PreparedQueryArtifacts>>,
     memory_budget_bytes: u64,
@@ -1395,8 +1269,6 @@ impl CandidateStore {
             let _ = fs::remove_file(&blooms_path);
             let _ = fs::remove_file(&tier2_blooms_path);
             let _ = fs::remove_file(&external_ids_path);
-            let _ = fs::remove_file(&tree_tier1_gates_path(&config.root));
-            let _ = fs::remove_file(&tree_tier2_gates_path(&config.root));
         }
 
         let mut store = Self {
@@ -1423,8 +1295,6 @@ impl CandidateStore {
             compaction_generation: 1,
             retired_generation_roots: Vec::new(),
             last_write_activity_monotonic: None,
-            tree_tier1_gates: TreeBloomGateIndex::default(),
-            tree_tier2_gates: TreeBloomGateIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
@@ -1483,8 +1353,6 @@ impl CandidateStore {
             compaction_generation: compaction_manifest.current_generation,
             retired_generation_roots: compaction_manifest.retired_roots,
             last_write_activity_monotonic: None,
-            tree_tier1_gates: TreeBloomGateIndex::default(),
-            tree_tier2_gates: TreeBloomGateIndex::default(),
             tier2_telemetry: Tier2Telemetry::default(),
             prepared_query_cache: BoundedCache::new(PREPARED_QUERY_CACHE_CAPACITY),
             memory_budget_bytes: 0,
@@ -1577,6 +1445,12 @@ impl CandidateStore {
                 .map(|doc| doc.special_population && !doc.deleted)
                 .unwrap_or(false)
         })
+    }
+
+    fn has_live_regular_docs(&self) -> bool {
+        self.docs
+            .iter()
+            .any(|doc| !doc.deleted && !doc.special_population)
     }
 
     pub fn deleted_storage_bytes(&self) -> u64 {
@@ -1948,8 +1822,6 @@ impl CandidateStore {
             if snapshot.special_population {
                 self.remember_special_doc_position(existing_pos);
             }
-            self.update_tree_tier1_gates_for_doc_bytes_inner(existing_pos, bloom_filter)?;
-            self.update_tree_tier2_gates_for_doc_bytes_inner(existing_pos, tier2_bloom_filter)?;
         } else {
             doc_id = self.local_meta.next_doc_id;
             self.local_meta.next_doc_id += 1;
@@ -1996,8 +1868,6 @@ impl CandidateStore {
             if doc.special_population {
                 self.remember_special_doc_position(new_pos);
             }
-            self.update_tree_tier1_gates_for_doc_bytes_inner(new_pos, bloom_filter)?;
-            self.update_tree_tier2_gates_for_doc_bytes_inner(new_pos, tier2_bloom_filter)?;
             status = "inserted".to_owned();
         }
 
@@ -2398,8 +2268,6 @@ impl CandidateStore {
 
         if modified {
             let tier2_update_started = Instant::now();
-            self.update_tree_tier1_gates_for_doc_bytes_batch(&tier2_updates)?;
-            self.update_tree_tier2_gates_for_doc_bytes_batch(&tier2_pattern_updates)?;
             insert_profile.tier2_update_us = insert_profile
                 .tier2_update_us
                 .saturating_add(elapsed_us(tier2_update_started));
@@ -2438,7 +2306,6 @@ impl CandidateStore {
             row.flags |= DOC_FLAG_DELETED;
             self.doc_rows[pos] = row;
             self.write_doc_row(snapshot.doc_id, row)?;
-            self.rebuild_tree_gates()?;
             self.mark_write_activity();
             record_counter("candidate.delete_document_deleted_total", 1);
             return Ok(result);
@@ -2817,8 +2684,6 @@ impl CandidateStore {
                 .try_into()
                 .unwrap_or(u64::MAX);
             let tier2_update_started = Instant::now();
-            self.update_tree_tier1_gates_for_doc_bytes_batch(&tier2_updates)?;
-            self.update_tree_tier2_gates_for_doc_bytes_batch(&tier2_pattern_updates)?;
             import_profile.tier2_update_ms = tier2_update_started
                 .elapsed()
                 .as_millis()
@@ -2952,15 +2817,6 @@ impl CandidateStore {
         )
     }
 
-    pub fn query_tree_gate_profile(
-        &mut self,
-        plan: &CompiledQueryPlan,
-    ) -> Result<CandidateQueryProfile> {
-        let prepared = self.prepare_query_artifacts(plan)?;
-        let (_, _, query_profile) = self.tree_gate_profile(plan, &prepared)?;
-        Ok(query_profile)
-    }
-
     pub(crate) fn query_candidates_with_prepared(
         &mut self,
         plan: &CompiledQueryPlan,
@@ -3013,26 +2869,6 @@ impl CandidateStore {
         record_counter(
             "candidate.query_candidates_matches_total",
             matched_hits.len() as u64,
-        );
-        record_counter(
-            "candidate.query_candidates_tree_gate_trees_considered_total",
-            query_profile.tree_gate_trees_considered,
-        );
-        record_counter(
-            "candidate.query_candidates_tree_gate_passed_total",
-            query_profile.tree_gate_passed,
-        );
-        record_counter(
-            "candidate.query_candidates_tree_gate_tier1_pruned_total",
-            query_profile.tree_gate_tier1_pruned,
-        );
-        record_counter(
-            "candidate.query_candidates_tree_gate_tier2_pruned_total",
-            query_profile.tree_gate_tier2_pruned,
-        );
-        record_counter(
-            "candidate.query_candidates_tree_gate_special_docs_bypass_total",
-            query_profile.tree_gate_special_docs_bypass,
         );
         record_counter(
             "candidate.query_candidates_metadata_loads_total",
@@ -3088,78 +2924,15 @@ impl CandidateStore {
         })
     }
 
-    fn tree_gate_profile(
-        &self,
-        plan: &CompiledQueryPlan,
-        prepared: &PreparedQueryArtifacts,
-    ) -> Result<(bool, bool, CandidateQueryProfile)> {
-        if experiment_tier2_and_metadata_only_enabled() {
-            let mut query_profile = CandidateQueryProfile::default();
-            query_profile.tree_gate_trees_considered = 1;
-            query_profile.tree_gate_passed = 1;
-            return Ok((true, self.has_live_special_docs(), query_profile));
-        }
-        let tier2_only = experiment_tier2_only_enabled();
-        let mut query_profile = CandidateQueryProfile::default();
-        query_profile.tree_gate_trees_considered = 1;
-        if tier2_only {
-            let normal_tree_match = tree_maybe_matches_node(
-                &plan.root,
-                &prepared.mask_cache,
-                &self.tree_tier1_gates,
-                &self.tree_tier2_gates,
-                true,
-            )?;
-            let has_special_docs = self.has_live_special_docs();
-            if normal_tree_match {
-                query_profile.tree_gate_passed = 1;
-            } else if has_special_docs {
-                query_profile.tree_gate_special_docs_bypass = 1;
-            } else {
-                query_profile.tree_gate_tier2_pruned = 1;
-            }
-            return Ok((normal_tree_match, has_special_docs, query_profile));
-        }
-        let tier1_tree_match = tree_maybe_matches_node(
-            &plan.root,
-            &prepared.mask_cache,
-            &self.tree_tier1_gates,
-            &self.tree_tier2_gates,
-            false,
-        )?;
-        let normal_tree_match =
-            if !plan.force_tier1_only && plan.allow_tier2_fallback && tier1_tree_match {
-                tree_maybe_matches_node(
-                    &plan.root,
-                    &prepared.mask_cache,
-                    &self.tree_tier1_gates,
-                    &self.tree_tier2_gates,
-                    true,
-                )?
-            } else {
-                tier1_tree_match
-            };
-        let has_special_docs = self.has_live_special_docs();
-        if normal_tree_match {
-            query_profile.tree_gate_passed = 1;
-        } else if has_special_docs {
-            query_profile.tree_gate_special_docs_bypass = 1;
-        } else if !tier1_tree_match {
-            query_profile.tree_gate_tier1_pruned = 1;
-        } else {
-            query_profile.tree_gate_tier2_pruned = 1;
-        }
-        Ok((normal_tree_match, has_special_docs, query_profile))
-    }
-
     fn scan_query_hits(
         &self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
-        let (normal_tree_match, has_special_docs, mut query_profile) =
-            self.tree_gate_profile(plan, prepared)?;
-        if !normal_tree_match && !has_special_docs {
+        let has_regular_docs = self.has_live_regular_docs();
+        let has_special_docs = self.has_live_special_docs();
+        let mut query_profile = CandidateQueryProfile::default();
+        if !has_regular_docs && !has_special_docs {
             return Ok((Vec::new(), TierFlags::default(), query_profile));
         }
         let query_now_unix = SystemTime::now()
@@ -3169,7 +2942,7 @@ impl CandidateStore {
         let mut matched_hits = Vec::<String>::new();
         let mut used_tiers = TierFlags::default();
 
-        if normal_tree_match {
+        if has_regular_docs {
             let (hits, tiers, profile) =
                 self.scan_query_hits_all_docs(plan, prepared, query_now_unix)?;
             matched_hits.extend(hits);
@@ -3347,8 +3120,6 @@ impl CandidateStore {
             tier2_scanned_docs_total: self.tier2_telemetry.tier2_scanned_docs_total,
             tier2_docs_matched_total: self.tier2_telemetry.tier2_docs_matched_total,
             tier2_match_ratio,
-            tree_tier1_gate_bytes: self.tree_tier1_gates.memory_bytes(),
-            tree_tier2_gate_bytes: self.tree_tier2_gates.memory_bytes(),
             docs_vector_bytes: self.docs_vector_memory_bytes(),
             doc_rows_bytes: (self.doc_rows.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<DocMetaRow>() as u64),
@@ -3715,123 +3486,6 @@ impl CandidateStore {
         )
     }
 
-    fn update_tree_tier1_gates_for_doc_bytes_inner(
-        &mut self,
-        pos: usize,
-        bloom_bytes: &[u8],
-    ) -> Result<()> {
-        if experiment_disable_tree_gates_enabled() {
-            return Ok(());
-        }
-        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
-            return Ok(());
-        }
-        let filter_bytes = self.docs[pos].filter_bytes;
-        let bloom_hashes = self.docs[pos].bloom_hashes;
-        update_tree_gate_for_doc_bytes_inner(
-            &mut self.tree_tier1_gates,
-            filter_bytes,
-            bloom_hashes,
-            bloom_bytes,
-        );
-        Ok(())
-    }
-
-    fn update_tree_tier1_gates_for_doc_bytes_batch(
-        &mut self,
-        updates: &[(usize, usize, usize, &[u8])],
-    ) -> Result<()> {
-        if experiment_disable_tree_gates_enabled() {
-            return Ok(());
-        }
-        update_tree_gate_for_doc_bytes_batch(&mut self.tree_tier1_gates, updates);
-        Ok(())
-    }
-
-    fn update_tree_tier2_gates_for_doc_bytes_inner(
-        &mut self,
-        pos: usize,
-        bloom_bytes: &[u8],
-    ) -> Result<()> {
-        if experiment_disable_tree_gates_enabled() {
-            return Ok(());
-        }
-        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
-            return Ok(());
-        }
-        let filter_bytes = self.docs[pos].tier2_filter_bytes;
-        let bloom_hashes = self.docs[pos].tier2_bloom_hashes;
-        if filter_bytes == 0 || bloom_hashes == 0 || bloom_bytes.is_empty() {
-            return Ok(());
-        }
-        update_tree_gate_for_doc_bytes_inner(
-            &mut self.tree_tier2_gates,
-            filter_bytes,
-            bloom_hashes,
-            bloom_bytes,
-        );
-        Ok(())
-    }
-
-    fn update_tree_tier2_gates_for_doc_bytes_batch(
-        &mut self,
-        updates: &[(usize, usize, usize, &[u8])],
-    ) -> Result<()> {
-        if experiment_disable_tree_gates_enabled() {
-            return Ok(());
-        }
-        update_tree_gate_for_doc_bytes_batch(&mut self.tree_tier2_gates, updates);
-        Ok(())
-    }
-
-    fn update_tree_tier1_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
-            return Ok(());
-        }
-        let doc_id = self.docs[pos].doc_id;
-        let row = self.doc_rows[pos];
-        let bloom_bytes = self.sidecars.blooms.read_bytes(
-            row.bloom_offset,
-            row.bloom_len as usize,
-            "bloom",
-            doc_id,
-        )?;
-        let owned_bloom_bytes = bloom_bytes.into_owned();
-        self.update_tree_tier1_gates_for_doc_bytes_inner(pos, &owned_bloom_bytes)
-    }
-
-    fn update_tree_tier2_gates_for_doc_inner(&mut self, pos: usize) -> Result<()> {
-        if pos >= self.docs.len() || self.docs[pos].deleted || self.docs[pos].special_population {
-            return Ok(());
-        }
-        let doc_id = self.docs[pos].doc_id;
-        let row = self.tier2_doc_rows[pos];
-        if row.bloom_len == 0 {
-            return Ok(());
-        }
-        let bloom_bytes = self.sidecars.tier2_blooms.read_bytes(
-            row.bloom_offset,
-            row.bloom_len as usize,
-            "tier2_bloom",
-            doc_id,
-        )?;
-        let owned_bloom_bytes = bloom_bytes.into_owned();
-        self.update_tree_tier2_gates_for_doc_bytes_inner(pos, &owned_bloom_bytes)
-    }
-
-    fn rebuild_tree_gates(&mut self) -> Result<()> {
-        self.tree_tier1_gates = TreeBloomGateIndex::default();
-        self.tree_tier2_gates = TreeBloomGateIndex::default();
-        if experiment_disable_tree_gates_enabled() {
-            return Ok(());
-        }
-        for pos in 0..self.docs.len() {
-            self.update_tree_tier1_gates_for_doc_inner(pos)?;
-            self.update_tree_tier2_gates_for_doc_inner(pos)?;
-        }
-        Ok(())
-    }
-
     fn record_query_metrics(&mut self, tier2_scanned_docs: u64, tier2_docs_matched: u64) {
         self.tier2_telemetry.query_count = self.tier2_telemetry.query_count.saturating_add(1);
         self.tier2_telemetry.tier2_scanned_docs_total = self
@@ -3866,9 +3520,6 @@ impl CandidateStore {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        self.tree_tier1_gates = TreeBloomGateIndex::default();
-        self.tree_tier2_gates = TreeBloomGateIndex::default();
-        self.rebuild_tree_gates()?;
         Ok(CandidateStoreRebuildProfile {
             sha_index_ms,
             total_ms: started_total
@@ -3877,20 +3528,6 @@ impl CandidateStore {
                 .try_into()
                 .unwrap_or(u64::MAX),
         })
-    }
-
-    pub(crate) fn remove_tree_gate_snapshots(&self) -> Result<()> {
-        for path in [
-            tree_tier1_gates_path(&self.root),
-            tree_tier2_gates_path(&self.root),
-        ] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-        Ok(())
     }
 
     fn prepared_query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
@@ -4113,14 +3750,6 @@ fn tier2_blooms_path(root: &Path) -> PathBuf {
 
 fn external_ids_path(root: &Path) -> PathBuf {
     root.join("external_ids.dat")
-}
-
-fn tree_tier1_gates_path(root: &Path) -> PathBuf {
-    root.join("tree_tier1_gates.bin")
-}
-
-fn tree_tier2_gates_path(root: &Path) -> PathBuf {
-    root.join("tree_tier2_gates.bin")
 }
 
 pub fn candidate_shard_manifest_path(root: &Path) -> PathBuf {
@@ -4481,17 +4110,6 @@ struct ShiftedRequiredMasks {
     shifts: Vec<RequiredMasksByKey>,
     any_lane_values: Vec<Vec<RequiredMasksByKey>>,
     any_lane_grams: Vec<u64>,
-}
-
-impl ShiftedRequiredMasks {
-    fn is_empty(&self) -> bool {
-        self.shifts.iter().all(RequiredMasksByKey::is_empty)
-            && self
-                .any_lane_values
-                .iter()
-                .all(|lanes| lanes.iter().all(RequiredMasksByKey::is_empty))
-            && self.any_lane_grams.is_empty()
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5156,226 +4774,6 @@ pub(crate) fn build_prepared_query_artifacts(
         mask_cache,
         impossible_query: node_structurally_impossible(&plan.root),
     }))
-}
-
-fn tree_gate_matches_required_masks(
-    by_key: &RequiredMasksByKey,
-    gates: &TreeBloomGateIndex,
-) -> bool {
-    if by_key.is_empty() {
-        return true;
-    }
-    if gates.masks_by_bucket.is_empty() {
-        return true;
-    }
-    by_key.iter().any(|(filter_key, required)| {
-        let Some(bucket_key) = gates.bucket_for_key.get(filter_key) else {
-            return false;
-        };
-        let Some(mask) = gates.masks_by_bucket.get(bucket_key) else {
-            return false;
-        };
-        raw_filter_matches_word_masks(mask, required)
-    })
-}
-
-fn tree_gate_matches_shifted_required_masks(
-    shifted: &ShiftedRequiredMasks,
-    gates: &TreeBloomGateIndex,
-) -> bool {
-    if shifted.is_empty() {
-        return true;
-    }
-    if !shifted.any_lane_grams.is_empty() {
-        if gates.masks_by_bucket.is_empty() {
-            return true;
-        }
-        return shifted.any_lane_grams.iter().all(|value| {
-            gates
-                .bucket_for_key
-                .iter()
-                .any(|((filter_bytes, bloom_hashes), bucket_key)| {
-                    let Some(mask) = gates.masks_by_bucket.get(bucket_key) else {
-                        return false;
-                    };
-                    (0..DEFAULT_BLOOM_POSITION_LANES).any(|lane| {
-                        bloom_word_masks_in_lane(
-                            &[*value],
-                            *filter_bytes,
-                            *bloom_hashes,
-                            lane,
-                            DEFAULT_BLOOM_POSITION_LANES,
-                        )
-                        .ok()
-                        .is_some_and(|required| raw_filter_matches_word_masks(mask, &required))
-                    })
-                })
-        });
-    }
-    if !shifted.any_lane_values.is_empty() {
-        return shifted.any_lane_values.iter().all(|lanes| {
-            lanes
-                .iter()
-                .any(|by_key| tree_gate_matches_required_masks(by_key, gates))
-        });
-    }
-    shifted
-        .shifts
-        .iter()
-        .any(|by_key| tree_gate_matches_required_masks(by_key, gates))
-}
-
-fn tree_gate_matches_pattern(
-    pattern_id: &str,
-    mask_cache: &PatternMaskCache,
-    tier1_gates: &TreeBloomGateIndex,
-    tier2_gates: &TreeBloomGateIndex,
-    allow_tier2: bool,
-) -> bool {
-    let Some(pattern_masks) = mask_cache.get(pattern_id) else {
-        return false;
-    };
-    let tier2_only = experiment_tier2_only_enabled();
-    pattern_masks
-        .tier1
-        .iter()
-        .enumerate()
-        .any(|(alt_index, tier1_by_key)| {
-            if tier2_only {
-                let Some(tier2_by_key) = pattern_masks.tier2.get(alt_index) else {
-                    return true;
-                };
-                if tier2_by_key.is_empty() {
-                    return true;
-                }
-                return tree_gate_matches_shifted_required_masks(tier2_by_key, tier2_gates);
-            }
-            if !tree_gate_matches_shifted_required_masks(tier1_by_key, tier1_gates) {
-                return false;
-            }
-            let Some(tier2_by_key) = pattern_masks.tier2.get(alt_index) else {
-                return true;
-            };
-            if !allow_tier2 || tier2_by_key.is_empty() {
-                return true;
-            }
-            tree_gate_matches_shifted_required_masks(tier2_by_key, tier2_gates)
-        })
-}
-
-fn tree_maybe_matches_node(
-    node: &QueryNode,
-    mask_cache: &PatternMaskCache,
-    tier1_gates: &TreeBloomGateIndex,
-    tier2_gates: &TreeBloomGateIndex,
-    allow_tier2: bool,
-) -> Result<bool> {
-    match node.kind.as_str() {
-        "pattern" => {
-            let pattern_id = node
-                .pattern_id
-                .as_ref()
-                .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
-            Ok(tree_gate_matches_pattern(
-                pattern_id,
-                mask_cache,
-                tier1_gates,
-                tier2_gates,
-                allow_tier2,
-            ))
-        }
-        "not" => Ok(true),
-        "identity_eq" => Ok(true),
-        "verifier_only_eq"
-        | "verifier_only_at"
-        | "verifier_only_count"
-        | "verifier_only_in_range"
-        | "verifier_only_loop"
-        | "filesize_eq"
-        | "filesize_ne"
-        | "filesize_lt"
-        | "filesize_le"
-        | "filesize_gt"
-        | "filesize_ge"
-        | "metadata_eq"
-        | "metadata_ne"
-        | "metadata_lt"
-        | "metadata_le"
-        | "metadata_gt"
-        | "metadata_ge"
-        | "metadata_float_eq"
-        | "metadata_float_ne"
-        | "metadata_float_lt"
-        | "metadata_float_le"
-        | "metadata_float_gt"
-        | "metadata_float_ge"
-        | "metadata_time_eq"
-        | "metadata_time_ne"
-        | "metadata_time_lt"
-        | "metadata_time_le"
-        | "metadata_time_gt"
-        | "metadata_time_ge"
-        | "metadata_field_eq"
-        | "metadata_field_ne"
-        | "metadata_field_lt"
-        | "metadata_field_le"
-        | "metadata_field_gt"
-        | "metadata_field_ge"
-        | "time_now_eq" => Ok(true),
-        "time_now_ne" | "time_now_lt" | "time_now_le" | "time_now_gt" | "time_now_ge" => Ok(true),
-        "and" => {
-            for child in &node.children {
-                if !tree_maybe_matches_node(
-                    child,
-                    mask_cache,
-                    tier1_gates,
-                    tier2_gates,
-                    allow_tier2,
-                )? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        "or" => {
-            for child in &node.children {
-                if tree_maybe_matches_node(
-                    child,
-                    mask_cache,
-                    tier1_gates,
-                    tier2_gates,
-                    allow_tier2,
-                )? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        "n_of" => {
-            let threshold = node
-                .threshold
-                .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
-            let mut matched = 0usize;
-            for child in &node.children {
-                if tree_maybe_matches_node(
-                    child,
-                    mask_cache,
-                    tier1_gates,
-                    tier2_gates,
-                    allow_tier2,
-                )? {
-                    matched += 1;
-                    if matched >= threshold {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
-        }
-        other => Err(SspryError::from(format!(
-            "Unsupported ast node kind: {other}"
-        ))),
-    }
 }
 
 fn numeric_read_literal_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> {
@@ -6405,42 +5803,6 @@ mod tests {
         .expect("evaluate hit");
         assert!(hit.matched);
         assert_eq!(hit.tiers.as_label(), "tier2");
-    }
-
-    #[test]
-    fn tier2_only_patterns_match_from_tier2_tree_gates() {
-        let pattern = PatternPlan {
-            pattern_id: "$a".to_owned(),
-            alternatives: vec![Vec::new()],
-            tier2_alternatives: vec![vec![pack_exact_gram(b"To:!")]],
-            anchor_literals: vec![b"To:!".to_vec()],
-            fixed_literals: vec![b"To:!".to_vec()],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
-        };
-        let cache = build_pattern_mask_cache(
-            &[pattern.clone()],
-            &[(64, 3)],
-            &[(64, 3)],
-            DEFAULT_TIER1_GRAM_SIZE,
-            DEFAULT_TIER2_GRAM_SIZE,
-        )
-        .expect("mask cache");
-        let pattern_masks = cache.get("$a").expect("pattern masks");
-        assert!(!pattern_masks.tier1[0].is_empty());
-        assert!(!pattern_masks.tier2[0].is_empty());
-
-        let mut tier2_gates = TreeBloomGateIndex::default();
-        let tier2_bloom = lane_bloom_bytes(64, 3, &[pack_exact_gram(b"To:!")]);
-        update_tree_gate_for_doc_bytes_inner(&mut tier2_gates, 64, 3, &tier2_bloom);
-
-        assert!(tree_gate_matches_pattern(
-            "$a",
-            &cache,
-            &TreeBloomGateIndex::default(),
-            &tier2_gates,
-            true,
-        ));
     }
 
     fn prefetched_query_inputs<'a>(
@@ -7618,9 +6980,34 @@ rule q {
             serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad bloom meta"),
         )
         .expect("write bad bloom meta");
+        let mut reopened_invalid_bloom =
+            CandidateStore::open(&invalid_bloom_root).expect("open invalid bloom root");
+        let invalid_bloom_plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "bad".to_owned(),
+                alternatives: vec![vec![30_u64]],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("bad".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: true,
+            allow_tier2_fallback: false,
+            max_candidates: 8.0,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
         assert!(
-            CandidateStore::open(&invalid_bloom_root)
-                .expect_err("invalid bloom offset")
+            reopened_invalid_bloom
+                .query_candidates(&invalid_bloom_plan, 0, 8)
+                .expect_err("invalid bloom offset on direct scan")
                 .to_string()
                 .contains("Invalid bloom payload stored")
         );
@@ -9203,7 +8590,7 @@ rule q {
     }
 
     #[test]
-    fn query_candidates_scans_special_population_when_normal_tree_gate_is_empty() {
+    fn query_candidates_scans_special_population_when_no_regular_docs_exist() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("store");
         let mut store = CandidateStore::init(
@@ -9242,7 +8629,6 @@ rule q {
             )
             .expect("insert special doc");
 
-        assert!(store.tree_tier1_gates.bucket_for_key.is_empty());
         assert_eq!(store.special_doc_positions, vec![0]);
 
         let plan = CompiledQueryPlan {
@@ -9352,7 +8738,6 @@ rule q {
         assert_eq!(result.total_candidates, 1);
         assert_eq!(result.returned_count, 1);
         assert_eq!(result.query_profile.docs_scanned, 2);
-        assert_eq!(result.query_profile.tree_gate_passed, 1);
         assert_eq!(result.query_profile.tier1_bloom_loads, 0);
         assert_eq!(result.query_profile.tier2_bloom_loads, 2);
         assert_eq!(result.tier_used, "tier2");

@@ -1526,14 +1526,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.retired_generation_count)
         .sum::<usize>();
-    let tree_tier1_gate_bytes = stats_rows
-        .iter()
-        .map(|item| item.tree_tier1_gate_bytes)
-        .sum::<u64>();
-    let tree_tier2_gate_bytes = stats_rows
-        .iter()
-        .map(|item| item.tree_tier2_gate_bytes)
-        .sum::<u64>();
     let mapped_bloom_bytes = stats_rows
         .iter()
         .map(|item| item.mapped_bloom_bytes)
@@ -1587,14 +1579,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert("id_source".to_owned(), json!(stats.id_source));
     out.insert("store_path".to_owned(), json!(stats.store_path));
     out.insert("deleted_doc_count".to_owned(), json!(deleted_doc_count));
-    out.insert(
-        "tree_tier1_gate_bytes".to_owned(),
-        json!(tree_tier1_gate_bytes),
-    );
-    out.insert(
-        "tree_tier2_gate_bytes".to_owned(),
-        json!(tree_tier2_gate_bytes),
-    );
     out.insert("mapped_bloom_bytes".to_owned(), json!(mapped_bloom_bytes));
     out.insert(
         "mapped_tier2_bloom_bytes".to_owned(),
@@ -1703,8 +1687,6 @@ fn empty_candidate_stats_json_for_config(
         tier2_scanned_docs_total: 0,
         tier2_docs_matched_total: 0,
         tier2_match_ratio: 0.0,
-        tree_tier1_gate_bytes: 0,
-        tree_tier2_gate_bytes: 0,
         docs_vector_bytes: 0,
         doc_rows_bytes: 0,
         tier2_doc_rows_bytes: 0,
@@ -2494,10 +2476,7 @@ impl ServerState {
                 return Ok((0, 0));
             };
             match store_lock.try_lock() {
-                Ok(store) => {
-                    store.remove_tree_gate_snapshots()?;
-                    Ok((1, 0))
-                }
+                Ok(_store) => Ok((1, 0)),
                 Err(TryLockError::WouldBlock) => {
                     self.enqueue_published_tier2_snapshot_shards([shard_idx])?;
                     Ok((0, 0))
@@ -6799,7 +6778,7 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
     let max_candidates = flags
         .get("max_candidates")
         .and_then(Value::as_f64)
-        .unwrap_or(7.5);
+        .unwrap_or(10.0);
     let max_candidates = normalize_max_candidates(max_candidates);
     Ok(CompiledQueryPlan {
         patterns,
