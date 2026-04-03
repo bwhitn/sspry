@@ -147,7 +147,6 @@ pub struct ServerConfig {
     pub candidate_shards: usize,
     pub search_workers: usize,
     pub memory_budget_bytes: u64,
-    pub tier2_superblock_budget_divisor: u64,
     pub auto_publish_initial_idle_ms: u64,
     pub auto_publish_storage_class: String,
     pub workspace_mode: bool,
@@ -490,7 +489,6 @@ struct ServerState {
     last_publish_promote_work_imported_docs: AtomicU64,
     last_publish_promote_work_imported_shards: AtomicU64,
     last_publish_init_work_ms: AtomicU64,
-    last_publish_persist_superblocks_ms: AtomicU64,
     last_publish_tier2_snapshot_persist_failures: AtomicU64,
     last_publish_persisted_snapshot_shards: AtomicU64,
     last_publish_reused_work_stores: AtomicBool,
@@ -569,9 +567,6 @@ struct StoreRootStartupProfile {
     store_open_sidecars_ms: u64,
     store_open_rebuild_indexes_ms: u64,
     store_open_rebuild_sha_index_ms: u64,
-    store_open_load_superblock_snapshots_ms: u64,
-    store_open_loaded_superblocks_from_snapshot_shards: u64,
-    store_open_rebuild_superblocks_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1454,22 +1449,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.retired_generation_count)
         .sum::<usize>();
-    let tier1_superblock_summary_bytes = stats_rows
-        .iter()
-        .map(|item| item.tier1_superblock_summary_bytes)
-        .sum::<u64>();
-    let tier2_superblock_summary_bytes = stats_rows
-        .iter()
-        .map(|item| item.tier2_superblock_summary_bytes)
-        .sum::<u64>();
-    let tier1_superblock_positions_bytes = stats_rows
-        .iter()
-        .map(|item| item.tier1_superblock_positions_bytes)
-        .sum::<u64>();
-    let tier2_superblock_positions_bytes = stats_rows
-        .iter()
-        .map(|item| item.tier2_superblock_positions_bytes)
-        .sum::<u64>();
     let tree_tier1_gate_bytes = stats_rows
         .iter()
         .map(|item| item.tree_tier1_gate_bytes)
@@ -1493,30 +1472,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     let mapped_external_id_bytes = stats_rows
         .iter()
         .map(|item| item.mapped_external_id_bytes)
-        .sum::<u64>();
-    let superblock_memory_budget_bytes = stats_rows
-        .iter()
-        .map(|item| item.superblock_memory_budget_bytes)
-        .sum::<u64>();
-    let superblock_summary_bytes_total = stats_rows
-        .iter()
-        .map(|item| item.superblock_summary_bytes_total)
-        .sum::<u64>();
-    let superblock_positions_bytes_total = stats_rows
-        .iter()
-        .map(|item| item.superblock_positions_bytes_total)
-        .sum::<u64>();
-    let mapped_superblock_snapshot_bytes_total = stats_rows
-        .iter()
-        .map(|item| item.mapped_superblock_snapshot_bytes_total)
-        .sum::<u64>();
-    let mapped_tier1_superblock_snapshot_bytes = stats_rows
-        .iter()
-        .map(|item| item.mapped_tier1_superblock_snapshot_bytes)
-        .sum::<u64>();
-    let mapped_tier2_superblock_snapshot_bytes = stats_rows
-        .iter()
-        .map(|item| item.mapped_tier2_superblock_snapshot_bytes)
         .sum::<u64>();
     let docs_vector_bytes = stats_rows
         .iter()
@@ -1556,22 +1511,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert("store_path".to_owned(), json!(stats.store_path));
     out.insert("deleted_doc_count".to_owned(), json!(deleted_doc_count));
     out.insert(
-        "tier1_superblock_summary_bytes".to_owned(),
-        json!(tier1_superblock_summary_bytes),
-    );
-    out.insert(
-        "tier2_superblock_summary_bytes".to_owned(),
-        json!(tier2_superblock_summary_bytes),
-    );
-    out.insert(
-        "tier1_superblock_positions_bytes".to_owned(),
-        json!(tier1_superblock_positions_bytes),
-    );
-    out.insert(
-        "tier2_superblock_positions_bytes".to_owned(),
-        json!(tier2_superblock_positions_bytes),
-    );
-    out.insert(
         "tree_tier1_gate_bytes".to_owned(),
         json!(tree_tier1_gate_bytes),
     );
@@ -1591,30 +1530,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "mapped_external_id_bytes".to_owned(),
         json!(mapped_external_id_bytes),
-    );
-    out.insert(
-        "superblock_memory_budget_bytes".to_owned(),
-        json!(superblock_memory_budget_bytes),
-    );
-    out.insert(
-        "superblock_summary_bytes_total".to_owned(),
-        json!(superblock_summary_bytes_total),
-    );
-    out.insert(
-        "superblock_positions_bytes_total".to_owned(),
-        json!(superblock_positions_bytes_total),
-    );
-    out.insert(
-        "mapped_superblock_snapshot_bytes_total".to_owned(),
-        json!(mapped_superblock_snapshot_bytes_total),
-    );
-    out.insert(
-        "mapped_tier1_superblock_snapshot_bytes".to_owned(),
-        json!(mapped_tier1_superblock_snapshot_bytes),
-    );
-    out.insert(
-        "mapped_tier2_superblock_snapshot_bytes".to_owned(),
-        json!(mapped_tier2_superblock_snapshot_bytes),
     );
     out.insert("docs_vector_bytes".to_owned(), json!(docs_vector_bytes));
     out.insert("doc_rows_bytes".to_owned(), json!(doc_rows_bytes));
@@ -1677,20 +1592,6 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         "tier2_scanned_docs_total".to_owned(),
         json!(stats.tier2_scanned_docs_total),
     );
-    out.insert("tier2_superblock_adaptive".to_owned(), json!(false));
-    out.insert("tier2_superblock_adapt_interval_scans".to_owned(), json!(0));
-    out.insert(
-        "tier1_superblock_count".to_owned(),
-        json!(stats.tier1_superblock_count),
-    );
-    out.insert(
-        "tier1_superblock_docs".to_owned(),
-        json!(stats.tier1_superblock_docs),
-    );
-    out.insert(
-        "superblocks_skipped_total".to_owned(),
-        json!(stats.superblocks_skipped_total),
-    );
     out.insert("version".to_owned(), json!(1));
     out
 }
@@ -1724,21 +1625,9 @@ fn empty_candidate_stats_json_for_config(
         query_count: 0,
         tier2_scanned_docs_total: 0,
         tier2_docs_matched_total: 0,
-        superblocks_skipped_total: 0,
         tier2_match_ratio: 0.0,
-        tier1_superblock_count: 0,
-        tier1_superblock_docs: config.candidate_config.tier1_superblock_docs,
-        tier1_superblock_summary_bytes: 0,
-        tier2_superblock_summary_bytes: 0,
-        tier1_superblock_positions_bytes: 0,
-        tier2_superblock_positions_bytes: 0,
         tree_tier1_gate_bytes: 0,
         tree_tier2_gate_bytes: 0,
-        superblock_summary_bytes_total: 0,
-        superblock_positions_bytes_total: 0,
-        mapped_superblock_snapshot_bytes_total: 0,
-        mapped_tier1_superblock_snapshot_bytes: 0,
-        mapped_tier2_superblock_snapshot_bytes: 0,
         docs_vector_bytes: 0,
         doc_rows_bytes: 0,
         tier2_doc_rows_bytes: 0,
@@ -1750,7 +1639,6 @@ fn empty_candidate_stats_json_for_config(
         mapped_tier2_bloom_bytes: 0,
         mapped_metadata_bytes: 0,
         mapped_external_id_bytes: 0,
-        superblock_memory_budget_bytes: 0,
     };
     let mut out = candidate_stats_json_from_parts_with_disk_usage(
         &[stats],
@@ -2001,7 +1889,6 @@ impl ServerState {
             last_publish_promote_work_imported_docs: AtomicU64::new(0),
             last_publish_promote_work_imported_shards: AtomicU64::new(0),
             last_publish_init_work_ms: AtomicU64::new(0),
-            last_publish_persist_superblocks_ms: AtomicU64::new(0),
             last_publish_tier2_snapshot_persist_failures: AtomicU64::new(0),
             last_publish_persisted_snapshot_shards: AtomicU64::new(0),
             last_publish_reused_work_stores: AtomicBool::new(false),
@@ -2532,7 +2419,6 @@ impl ServerState {
             match store_lock.try_lock() {
                 Ok(store) => {
                     store.remove_tree_gate_snapshots()?;
-                    store.persist_superblock_snapshots()?;
                     Ok((1, 0))
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -3423,10 +3309,6 @@ impl ServerState {
             "memory_budget_bytes".to_owned(),
             json!(self.config.memory_budget_bytes),
         );
-        stats.insert(
-            "tier2_superblock_budget_divisor".to_owned(),
-            json!(self.config.tier2_superblock_budget_divisor),
-        );
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
         let (normalized_plan_cache_entries, normalized_plan_cache_bytes) =
             self.normalized_plan_cache_stats();
@@ -3568,9 +3450,6 @@ impl ServerState {
                 "store_open_sidecars_ms": profile.store_open_sidecars_ms,
                 "store_open_rebuild_indexes_ms": profile.store_open_rebuild_indexes_ms,
                 "store_open_rebuild_sha_index_ms": profile.store_open_rebuild_sha_index_ms,
-                "store_open_load_superblock_snapshots_ms": profile.store_open_load_superblock_snapshots_ms,
-                "store_open_loaded_superblocks_from_snapshot_shards": profile.store_open_loaded_superblocks_from_snapshot_shards,
-                "store_open_rebuild_superblocks_ms": profile.store_open_rebuild_superblocks_ms,
             })
         };
         stats.insert(
@@ -3938,13 +3817,6 @@ impl ServerState {
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
             );
             publish.insert(
-                "last_publish_persist_superblocks_ms".to_owned(),
-                json!(
-                    self.last_publish_persist_superblocks_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
                 json!(
                     self.last_publish_tier2_snapshot_persist_failures
@@ -4067,10 +3939,6 @@ impl ServerState {
         stats.insert(
             "memory_budget_bytes".to_owned(),
             json!(self.config.memory_budget_bytes),
-        );
-        stats.insert(
-            "tier2_superblock_budget_divisor".to_owned(),
-            json!(self.config.tier2_superblock_budget_divisor),
         );
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
         let (normalized_plan_cache_entries, normalized_plan_cache_bytes) =
@@ -4411,13 +4279,6 @@ impl ServerState {
                 json!(self.last_publish_init_work_ms.load(Ordering::Acquire)),
             );
             publish.insert(
-                "last_publish_persist_superblocks_ms".to_owned(),
-                json!(
-                    self.last_publish_persist_superblocks_ms
-                        .load(Ordering::Acquire)
-                ),
-            );
-            publish.insert(
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
                 json!(
                     self.last_publish_tier2_snapshot_persist_failures
@@ -4668,21 +4529,10 @@ impl ServerState {
         record_counter("rpc.handle_candidate_query_prepared_cache_misses_total", 1);
         let mut filter_keys = HashSet::<(usize, usize)>::new();
         let mut tier2_doc_filter_keys = HashSet::<(usize, usize)>::new();
-        let mut summary_cap_bytes = None::<usize>;
         for store_set in self.published_query_store_sets()? {
             for store_lock in &store_set.stores {
                 let store = lock_candidate_store_blocking(store_lock)?;
-                let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
-                if let Some(existing) = summary_cap_bytes {
-                    if existing != shard_summary_cap {
-                        return Err(SspryError::from(
-                            "query stores use mixed tier2 superblock summary caps",
-                        ));
-                    }
-                } else {
-                    summary_cap_bytes = Some(shard_summary_cap);
-                }
-                filter_keys.extend(store.tier1_superblock_filter_keys());
+                filter_keys.extend(store.tier1_doc_filter_keys());
                 tier2_doc_filter_keys.extend(store.tier2_doc_filter_keys());
             }
         }
@@ -4695,8 +4545,6 @@ impl ServerState {
             plan,
             &ordered_filter_keys,
             &ordered_tier2_doc_filter_keys,
-            summary_cap_bytes
-                .unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
         )?;
         let entry_bytes = prepared_query_artifacts_memory_bytes(entry.as_ref());
         if entry_bytes > PREPARED_PLAN_CACHE_MAX_ENTRY_BYTES {
@@ -5652,8 +5500,6 @@ impl ServerState {
                 .store(0, Ordering::SeqCst);
             self.last_publish_promote_work_imported_shards
                 .store(0, Ordering::SeqCst);
-            self.last_publish_persist_superblocks_ms
-                .store(0, Ordering::SeqCst);
             self.last_publish_tier2_snapshot_persist_failures
                 .store(0, Ordering::SeqCst);
             self.last_publish_persisted_snapshot_shards
@@ -5954,14 +5800,7 @@ impl ServerState {
                     .enumerate()
                     .filter_map(|(shard_idx, changed)| changed.then_some(shard_idx)),
             )?;
-            self.last_publish_persist_superblocks_ms.store(
-                persist_tier2_started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                Ordering::SeqCst,
-            );
+            let _persist_tier2_elapsed = persist_tier2_started.elapsed();
             self.last_publish_tier2_snapshot_persist_failures
                 .store(0, Ordering::SeqCst);
 
@@ -7001,17 +6840,6 @@ fn apply_store_open_profile(
     aggregate.store_open_rebuild_sha_index_ms = aggregate
         .store_open_rebuild_sha_index_ms
         .saturating_add(profile.rebuild_sha_index_ms);
-    aggregate.store_open_load_superblock_snapshots_ms = aggregate
-        .store_open_load_superblock_snapshots_ms
-        .saturating_add(profile.load_superblock_snapshots_ms);
-    if profile.loaded_superblocks_from_snapshot {
-        aggregate.store_open_loaded_superblocks_from_snapshot_shards = aggregate
-            .store_open_loaded_superblocks_from_snapshot_shards
-            .saturating_add(1);
-    }
-    aggregate.store_open_rebuild_superblocks_ms = aggregate
-        .store_open_rebuild_superblocks_ms
-        .saturating_add(profile.rebuild_superblocks_ms);
 }
 
 fn ensure_candidate_store_profiled(
@@ -7157,15 +6985,6 @@ fn merge_store_root_startup_profile(
     dst.store_open_rebuild_sha_index_ms = dst
         .store_open_rebuild_sha_index_ms
         .saturating_add(src.store_open_rebuild_sha_index_ms);
-    dst.store_open_load_superblock_snapshots_ms = dst
-        .store_open_load_superblock_snapshots_ms
-        .saturating_add(src.store_open_load_superblock_snapshots_ms);
-    dst.store_open_loaded_superblocks_from_snapshot_shards = dst
-        .store_open_loaded_superblocks_from_snapshot_shards
-        .saturating_add(src.store_open_loaded_superblocks_from_snapshot_shards);
-    dst.store_open_rebuild_superblocks_ms = dst
-        .store_open_rebuild_superblocks_ms
-        .saturating_add(src.store_open_rebuild_superblocks_ms);
 }
 
 fn next_workspace_retired_root_path(root: &Path) -> PathBuf {
@@ -7248,11 +7067,7 @@ fn ensure_candidate_stores_at_root(
                 startup_profile.opened_existing_shards.saturating_add(1);
         }
         apply_store_open_profile(&mut startup_profile, &open_profile);
-        store.apply_runtime_limits(
-            config.memory_budget_bytes,
-            shard_count,
-            config.tier2_superblock_budget_divisor,
-        )?;
+        store.apply_runtime_limits(config.memory_budget_bytes, shard_count)?;
         stores.push(store);
     }
     write_candidate_shard_count(root, shard_count)?;
@@ -7305,7 +7120,12 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
         ));
     }
 
-    if root.join("meta.json").exists() || root.join("shard_000").join("meta.json").exists() {
+    let has_workspace_layout = root.join("current").is_dir()
+        || root.join("work_a").is_dir()
+        || root.join("work_b").is_dir();
+    if !has_workspace_layout
+        && (root.join("meta.json").exists() || root.join("shard_000").join("meta.json").exists())
+    {
         return Err(SspryError::from(format!(
             "{} contains a direct store; move it under {}/current or use a fresh workspace root.",
             root.display(),
@@ -7419,8 +7239,6 @@ mod tests {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -7442,8 +7260,6 @@ mod tests {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -7464,7 +7280,6 @@ mod tests {
             candidate_shards,
             search_workers: 2,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
             auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
@@ -7535,8 +7350,6 @@ mod tests {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: true,
@@ -7663,7 +7476,6 @@ mod tests {
     #[test]
     fn forest_root_server_queries_across_all_trees() {
         let tmp = tempdir().expect("tmp");
-        let _guard = crate::candidate::store::no_superblock_gate_override_for_tests(true);
         let state = sample_forest_server_state(tmp.path(), 1);
         let stores = state
             .published_query_store_sets()
@@ -7806,7 +7618,6 @@ mod tests {
     #[test]
     fn direct_server_query_caches_results_and_external_ids() {
         let tmp = tempdir().expect("tmp");
-        let _guard = crate::candidate::store::no_superblock_gate_override_for_tests(true);
         let state = sample_server_state(tmp.path());
         let sample = tmp.path().join("direct-cache.bin");
         fs::write(&sample, b"xxABCyy").expect("sample");
@@ -8577,7 +8388,6 @@ rule overflow_rule {
             candidate_shards: 1,
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 0,
             auto_publish_storage_class: "solid-state".to_owned(),
             workspace_mode: true,
@@ -8776,8 +8586,6 @@ rule overflow_rule {
                 candidate_shards: 1,
                 search_workers: 1,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
                 auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: true,
@@ -8799,8 +8607,6 @@ rule overflow_rule {
                 candidate_shards: 1,
                 search_workers: 1,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
                 auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: true,
@@ -9262,8 +9068,6 @@ rule overflow_rule {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -9327,8 +9131,6 @@ rule overflow_rule {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -9386,8 +9188,6 @@ rule overflow_rule {
                     candidate_shards,
                     search_workers: 1,
                     memory_budget_bytes,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: true,
@@ -9438,8 +9238,6 @@ rule overflow_rule {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -11134,8 +10932,6 @@ rule q {
                 candidate_shards: 1,
                 search_workers: 1,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
                 auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
@@ -11381,8 +11177,6 @@ rule q {
                 candidate_shards: 2,
                 search_workers: 1,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
                 auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
@@ -11401,24 +11195,26 @@ rule q {
             true,
         )
         .expect("init orphaned shard");
-        assert!(
-            ensure_candidate_stores(&ServerConfig {
-                candidate_config: CandidateConfig {
-                    root: sharded_root.clone(),
-                    ..CandidateConfig::default()
-                },
-                candidate_shards: 1,
-                search_workers: 1,
-                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-                auto_publish_initial_idle_ms: 500,
-                auto_publish_storage_class: "unknown".to_owned(),
-                workspace_mode: false,
-            })
-            .expect_err("sharded mismatch")
-            .to_string()
-            .contains("sharded store")
+        let (stores, _, _) = ensure_candidate_stores(&ServerConfig {
+            candidate_config: CandidateConfig {
+                root: sharded_root.clone(),
+                ..CandidateConfig::default()
+            },
+            candidate_shards: 1,
+            search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            auto_publish_initial_idle_ms: 500,
+            auto_publish_storage_class: "unknown".to_owned(),
+            workspace_mode: false,
+        })
+        .expect("direct root should normalize to single-store layout");
+        assert_eq!(
+            match stores {
+                StoreMode::Direct { stores } => stores.stores.len(),
+                StoreMode::Forest { .. } => 0,
+                StoreMode::Workspace { .. } => 0,
+            },
+            1
         );
 
         let manifest_root = tmp.path().join("manifest");
@@ -11430,7 +11226,6 @@ rule q {
             candidate_shards: 2,
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
             auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
@@ -11453,8 +11248,6 @@ rule q {
                 candidate_shards: 1,
                 search_workers: 1,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
                 auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
@@ -11563,8 +11356,6 @@ rule q {
                 candidate_shards: 2,
                 search_workers: 2,
                 memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                tier2_superblock_budget_divisor:
-                    crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                 auto_publish_initial_idle_ms: 500,
                 auto_publish_storage_class: "unknown".to_owned(),
                 workspace_mode: false,
@@ -11664,7 +11455,6 @@ rule q {
             candidate_shards: 2,
             search_workers: 1,
             memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            tier2_superblock_budget_divisor: crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
             auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: false,
@@ -11699,8 +11489,6 @@ rule q {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -11821,8 +11609,6 @@ rule q {
                     candidate_shards: 4,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,
@@ -11903,8 +11689,6 @@ rule q {
                     candidate_shards: 1,
                     search_workers: 1,
                     memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-                    tier2_superblock_budget_divisor:
-                        crate::app::DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
                     auto_publish_initial_idle_ms: 500,
                     auto_publish_storage_class: "unknown".to_owned(),
                     workspace_mode: false,

@@ -181,16 +181,17 @@ fn serve_persists_candidate_shards() {
         parsed.get("workspace_mode").and_then(Value::as_bool),
         Some(true)
     );
+    assert!(root.join("meta.json").exists());
     assert!(
         root.join("current")
             .join("shard_000")
-            .join("meta.json")
+            .join("store_meta.json")
             .exists()
     );
     assert!(
         root.join("current")
             .join("shard_001")
-            .join("meta.json")
+            .join("store_meta.json")
             .exists()
     );
     assert!(!root.join("work_a").exists());

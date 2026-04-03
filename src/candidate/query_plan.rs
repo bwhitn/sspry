@@ -5511,8 +5511,7 @@ rule entropy_cmp {
         let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
         assert_eq!(plan.root.kind, "and");
         assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_float_gt"
-                && child.pattern_id.as_deref() == Some("math.entropy")
+            child.kind == "metadata_float_gt" && child.pattern_id.as_deref() == Some("math.entropy")
         }));
     }
 

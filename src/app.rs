@@ -24,9 +24,8 @@ use crate::candidate::query_plan::{
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER1_FILTER_TARGET_FP,
-    DEFAULT_TIER1_SUPERBLOCK_DOCS, DEFAULT_TIER2_FILTER_TARGET_FP,
-    DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES, GramSizes, HLL_DEFAULT_PRECISION,
-    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
+    DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index,
+    candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
@@ -51,9 +50,6 @@ pub const DEFAULT_SEARCH_RESULT_CHUNK_SIZE: usize = 1024;
 pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
-pub const DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR: u64 = 4;
-pub const DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB: usize =
-    DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES / 1024;
 pub const DEFAULT_STANDARD_SHARDS: usize = 256;
 pub const DEFAULT_INCREMENTAL_SHARDS: usize = 32;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
@@ -1430,9 +1426,6 @@ fn store_config_from_parts(
     tier2_filter_target_fp: f64,
     tier2_gram_size: usize,
     tier1_gram_size: usize,
-    tier1_superblock_docs: usize,
-    tier2_superblock_summary_cap_kib: usize,
-    enable_tier2_superblocks: bool,
     compaction_idle_cooldown_s: f64,
 ) -> CandidateConfig {
     CandidateConfig {
@@ -1441,11 +1434,6 @@ fn store_config_from_parts(
         store_path,
         tier2_gram_size,
         tier1_gram_size,
-        tier1_superblock_docs: tier1_superblock_docs.max(1),
-        tier2_superblock_summary_cap_bytes: tier2_superblock_summary_cap_kib
-            .max(1)
-            .saturating_mul(1024),
-        enable_tier2_superblocks,
         tier1_filter_target_fp: Some(tier1_filter_target_fp),
         tier2_filter_target_fp: Some(tier2_filter_target_fp),
         filter_target_fp: if (tier1_filter_target_fp - tier2_filter_target_fp).abs() < f64::EPSILON
@@ -1487,9 +1475,6 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
-        args.tier1_superblock_docs,
-        args.tier2_superblock_summary_cap_kib,
-        args.enable_pattern_superblocks,
         CandidateConfig::default().compaction_idle_cooldown_s,
     )
 }
@@ -1510,9 +1495,6 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         tier2_filter_target_fp,
         gram_sizes.tier2,
         gram_sizes.tier1,
-        args.tier1_superblock_docs,
-        args.tier2_superblock_summary_cap_kib,
-        args.enable_pattern_superblocks,
         args.compaction_idle_cooldown_s,
     )
 }
@@ -1609,11 +1591,6 @@ struct BatchSearchRecord {
     verbose_search_tree_gate_tier2_pruned: Option<u64>,
     verbose_search_tree_gate_special_docs_bypass: Option<u64>,
     verbose_search_docs_scanned: Option<u64>,
-    verbose_search_superblocks_skipped: Option<u64>,
-    verbose_search_tier1_superblock_loads: Option<u64>,
-    verbose_search_tier1_superblock_bytes: Option<u64>,
-    verbose_search_tier2_superblock_loads: Option<u64>,
-    verbose_search_tier2_superblock_bytes: Option<u64>,
     verbose_search_metadata_loads: Option<u64>,
     verbose_search_metadata_bytes: Option<u64>,
     verbose_search_tier1_bloom_loads: Option<u64>,
@@ -1780,7 +1757,6 @@ fn validate_forest_search_policy(
 ) -> Result<(GramSizes, Option<String>, usize)> {
     let mut gram_sizes = None::<GramSizes>;
     let mut id_source = None::<String>;
-    let mut summary_cap_bytes = None::<usize>;
     for group in tree_groups {
         for store in &group.stores {
             let config = store.config();
@@ -1804,34 +1780,21 @@ fn validate_forest_search_policy(
             } else {
                 id_source = Some(config.id_source.clone());
             }
-            if let Some(existing) = summary_cap_bytes {
-                if existing != config.tier2_superblock_summary_cap_bytes {
-                    return Err(SspryError::from(
-                        "candidate stores use mixed tier2 superblock summary caps across the forest",
-                    ));
-                }
-            } else {
-                summary_cap_bytes = Some(config.tier2_superblock_summary_cap_bytes);
-            }
         }
     }
-    Ok((
-        gram_sizes.unwrap_or(GramSizes::new(3, 4)?),
-        id_source,
-        summary_cap_bytes.unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
-    ))
+    Ok((gram_sizes.unwrap_or(GramSizes::new(3, 4)?), id_source, 0))
 }
 
 fn forest_prepared_query_profile(
     tree_groups: &[TreeStoreGroup],
     plan: &crate::candidate::CompiledQueryPlan,
-    summary_cap_bytes: usize,
+    _summary_cap_bytes: usize,
 ) -> Result<crate::candidate::CandidatePreparedQueryProfile> {
     let mut tier1_filter_keys = HashSet::<(usize, usize)>::new();
     let mut tier2_filter_keys = HashSet::<(usize, usize)>::new();
     for group in tree_groups {
         for store in &group.stores {
-            tier1_filter_keys.extend(store.tier1_superblock_filter_keys());
+            tier1_filter_keys.extend(store.tier1_doc_filter_keys());
             tier2_filter_keys.extend(store.tier2_doc_filter_keys());
         }
     }
@@ -1844,7 +1807,6 @@ fn forest_prepared_query_profile(
             plan,
             &ordered_tier1_filter_keys,
             &ordered_tier2_filter_keys,
-            summary_cap_bytes,
         )?
         .as_ref(),
     ))
@@ -2552,7 +2514,6 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 candidate_shards,
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
-                tier2_superblock_budget_divisor: args.tier2_superblock_budget_divisor.max(1),
                 auto_publish_initial_idle_ms,
                 auto_publish_storage_class,
                 workspace_mode: serve_workspace_mode,
@@ -2952,7 +2913,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             )?;
             for store in &mut stores {
                 let _ = store.persist_meta_if_dirty()?;
-                store.persist_superblock_snapshots()?;
             }
 
             if args.verbose {
@@ -3395,20 +3355,12 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 for (key, label) in [
                     ("disk_usage_bytes", "verbose.index.server_disk_usage_bytes"),
                     (
-                        "tier1_superblock_summary_bytes",
-                        "verbose.index.server_tier1_superblock_summary_bytes",
+                        "tree_tier1_gate_bytes",
+                        "verbose.index.server_tree_tier1_gate_bytes",
                     ),
                     (
-                        "tier2_superblock_summary_bytes",
-                        "verbose.index.server_tier2_superblock_summary_bytes",
-                    ),
-                    (
-                        "superblock_memory_budget_bytes",
-                        "verbose.index.server_tier2_superblock_budget_bytes",
-                    ),
-                    (
-                        "tier1_superblock_docs",
-                        "verbose.index.server_tier1_superblock_docs_per_block",
+                        "tree_tier2_gate_bytes",
+                        "verbose.index.server_tree_tier2_gate_bytes",
                     ),
                 ] {
                     if let Some(value) = stats_scope.get(key).and_then(|value| value.as_u64()) {
@@ -3559,10 +3511,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         (
                             "last_publish_init_work_ms",
                             "verbose.index.server_last_publish_init_work_ms",
-                        ),
-                        (
-                            "last_publish_persist_superblocks_ms",
-                            "verbose.index.server_last_publish_persist_superblocks_ms",
                         ),
                         (
                             "last_publish_tier2_snapshot_persist_failures",
@@ -3915,20 +3863,9 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             )?;
             let mut tier1_filter_keys = std::collections::HashSet::<(usize, usize)>::new();
             let mut tier2_filter_keys = std::collections::HashSet::<(usize, usize)>::new();
-            let mut summary_cap_bytes = None::<usize>;
             for store in &stores {
-                tier1_filter_keys.extend(store.tier1_superblock_filter_keys());
+                tier1_filter_keys.extend(store.tier1_doc_filter_keys());
                 tier2_filter_keys.extend(store.tier2_doc_filter_keys());
-                let shard_summary_cap = store.config().tier2_superblock_summary_cap_bytes;
-                if let Some(existing) = summary_cap_bytes {
-                    if existing != shard_summary_cap {
-                        return Err(SspryError::from(
-                            "candidate stores use mixed tier2 superblock summary caps",
-                        ));
-                    }
-                } else {
-                    summary_cap_bytes = Some(shard_summary_cap);
-                }
             }
             let mut ordered_tier1_filter_keys = tier1_filter_keys.into_iter().collect::<Vec<_>>();
             ordered_tier1_filter_keys.sort_unstable();
@@ -3939,8 +3876,6 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     &plan,
                     &ordered_tier1_filter_keys,
                     &ordered_tier2_filter_keys,
-                    summary_cap_bytes
-                        .unwrap_or(crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES),
                 )?
                 .as_ref(),
             );
@@ -4322,26 +4257,6 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
                 query_profile.docs_scanned
             );
             eprintln!(
-                "verbose.search.superblocks_skipped: {}",
-                query_profile.superblocks_skipped
-            );
-            eprintln!(
-                "verbose.search.tier1_superblock_loads: {}",
-                query_profile.tier1_superblock_loads
-            );
-            eprintln!(
-                "verbose.search.tier1_superblock_bytes: {}",
-                query_profile.tier1_superblock_bytes
-            );
-            eprintln!(
-                "verbose.search.tier2_superblock_loads: {}",
-                query_profile.tier2_superblock_loads
-            );
-            eprintln!(
-                "verbose.search.tier2_superblock_bytes: {}",
-                query_profile.tier2_superblock_bytes
-            );
-            eprintln!(
                 "verbose.search.metadata_loads: {}",
                 query_profile.metadata_loads
             );
@@ -4642,21 +4557,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                         local.query_profile.tree_gate_special_docs_bypass,
                     ),
                     verbose_search_docs_scanned: Some(local.query_profile.docs_scanned),
-                    verbose_search_superblocks_skipped: Some(
-                        local.query_profile.superblocks_skipped,
-                    ),
-                    verbose_search_tier1_superblock_loads: Some(
-                        local.query_profile.tier1_superblock_loads,
-                    ),
-                    verbose_search_tier1_superblock_bytes: Some(
-                        local.query_profile.tier1_superblock_bytes,
-                    ),
-                    verbose_search_tier2_superblock_loads: Some(
-                        local.query_profile.tier2_superblock_loads,
-                    ),
-                    verbose_search_tier2_superblock_bytes: Some(
-                        local.query_profile.tier2_superblock_bytes,
-                    ),
                     verbose_search_metadata_loads: Some(local.query_profile.metadata_loads),
                     verbose_search_metadata_bytes: Some(local.query_profile.metadata_bytes),
                     verbose_search_tier1_bloom_loads: Some(local.query_profile.tier1_bloom_loads),
@@ -4757,11 +4657,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_tree_gate_tier2_pruned: None,
                     verbose_search_tree_gate_special_docs_bypass: None,
                     verbose_search_docs_scanned: None,
-                    verbose_search_superblocks_skipped: None,
-                    verbose_search_tier1_superblock_loads: None,
-                    verbose_search_tier1_superblock_bytes: None,
-                    verbose_search_tier2_superblock_loads: None,
-                    verbose_search_tier2_superblock_bytes: None,
                     verbose_search_metadata_loads: None,
                     verbose_search_metadata_bytes: None,
                     verbose_search_tier1_bloom_loads: None,
@@ -5099,30 +4994,6 @@ struct ServeArgs {
     )]
     memory_budget_gb: u64,
     #[arg(
-        long = "tier2-superblock-budget-divisor",
-        default_value_t = DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-        help = "Divides the server memory budget to derive the per-shard Tier2 summary-memory budget. Lower values allow more RAM for Tier2 summaries."
-    )]
-    tier2_superblock_budget_divisor: u64,
-    #[arg(
-        long = "tier1-superblock-docs",
-        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS,
-        help = "Documents per tier1 superblock. Lower values make block gates finer-grained at higher index/storage cost."
-    )]
-    tier1_superblock_docs: usize,
-    #[arg(
-        long = "tier2-superblock-summary-cap-kib",
-        default_value_t = DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-        help = "Cap per-superblock summary bytes in KiB. Larger values spend more block-level bytes to reduce coarse-filter collisions."
-    )]
-    tier2_superblock_summary_cap_kib: usize,
-    #[arg(
-        long = "enable-pattern-superblocks",
-        action = ArgAction::SetTrue,
-        help = "Enable the tier2/pattern superblock summary layer for this DB. Disabled by default."
-    )]
-    enable_pattern_superblocks: bool,
-    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
@@ -5215,24 +5086,6 @@ struct InitArgs {
         help = "Minimum idle time after writes before compaction is allowed to run."
     )]
     compaction_idle_cooldown_s: f64,
-    #[arg(
-        long = "tier1-superblock-docs",
-        default_value_t = DEFAULT_TIER1_SUPERBLOCK_DOCS,
-        help = "Documents per tier1 superblock."
-    )]
-    tier1_superblock_docs: usize,
-    #[arg(
-        long = "tier2-superblock-summary-cap-kib",
-        default_value_t = DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-        help = "Cap per-superblock summary bytes in KiB."
-    )]
-    tier2_superblock_summary_cap_kib: usize,
-    #[arg(
-        long = "enable-pattern-superblocks",
-        action = ArgAction::SetTrue,
-        help = "Enable the tier2/pattern superblock summary layer for this DB. Disabled by default."
-    )]
-    enable_pattern_superblocks: bool,
 }
 
 #[cfg(test)]
@@ -5395,9 +5248,6 @@ mod tests {
             tier2_filter_target_fp: None,
             gram_sizes: "3,4".to_owned(),
             compaction_idle_cooldown_s: 5.0,
-            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
-            tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
-            enable_pattern_superblocks: false,
         }
     }
 
@@ -5410,7 +5260,6 @@ mod tests {
             candidate_shards: shard_count,
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
             auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: true,
@@ -5490,9 +5339,6 @@ mod tests {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             search_workers: default_search_workers_for(4),
             memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
-            tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
-            tier1_superblock_docs: DEFAULT_TIER1_SUPERBLOCK_DOCS,
-            tier2_superblock_summary_cap_kib: DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_KIB,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
@@ -5502,7 +5348,6 @@ mod tests {
             id_source: CandidateIdSource::Sha256,
             store_path: false,
             gram_sizes: "3,4".to_owned(),
-            enable_pattern_superblocks: false,
         }
     }
 
@@ -5614,9 +5459,6 @@ mod tests {
             0.002,
             3,
             4,
-            DEFAULT_TIER1_SUPERBLOCK_DOCS,
-            8,
-            true,
             33.5,
         );
         assert_eq!(fixed.root, PathBuf::from("root"));
@@ -5624,8 +5466,6 @@ mod tests {
         assert!(fixed.store_path);
         assert_eq!(fixed.tier2_gram_size, 3);
         assert_eq!(fixed.tier1_gram_size, 4);
-        assert_eq!(fixed.tier2_superblock_summary_cap_bytes, 8 * 1024);
-        assert!(fixed.enable_tier2_superblocks);
         assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
         assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
         assert_eq!(fixed.filter_target_fp, None);
@@ -5639,9 +5479,6 @@ mod tests {
             0.01,
             5,
             4,
-            DEFAULT_TIER1_SUPERBLOCK_DOCS,
-            16,
-            false,
             9.25,
         );
         assert_eq!(variable.root, PathBuf::from("root"));
@@ -5652,8 +5489,6 @@ mod tests {
         assert_eq!(variable.filter_target_fp, Some(0.01));
         assert_eq!(variable.tier2_gram_size, 5);
         assert_eq!(variable.tier1_gram_size, 4);
-        assert_eq!(variable.tier2_superblock_summary_cap_bytes, 16 * 1024);
-        assert!(!variable.enable_tier2_superblocks);
         assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
         let row = IndexBatchRow {
@@ -6480,7 +6315,6 @@ rule remote_q {
             candidate_shards: 1,
             search_workers: default_search_workers_for(4),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            tier2_superblock_budget_divisor: DEFAULT_TIER2_SUPERBLOCK_BUDGET_DIVISOR,
             auto_publish_initial_idle_ms: 500,
             auto_publish_storage_class: "unknown".to_owned(),
             workspace_mode: true,
@@ -6790,11 +6624,6 @@ rule remote_q {
             verbose_search_tree_gate_tier2_pruned: Some(0),
             verbose_search_tree_gate_special_docs_bypass: Some(0),
             verbose_search_docs_scanned: Some(2),
-            verbose_search_superblocks_skipped: Some(0),
-            verbose_search_tier1_superblock_loads: Some(0),
-            verbose_search_tier1_superblock_bytes: Some(0),
-            verbose_search_tier2_superblock_loads: Some(0),
-            verbose_search_tier2_superblock_bytes: Some(0),
             verbose_search_metadata_loads: Some(0),
             verbose_search_metadata_bytes: Some(0),
             verbose_search_tier1_bloom_loads: Some(2),
@@ -6857,11 +6686,6 @@ rule remote_q {
             verbose_search_tree_gate_tier2_pruned: None,
             verbose_search_tree_gate_special_docs_bypass: None,
             verbose_search_docs_scanned: None,
-            verbose_search_superblocks_skipped: None,
-            verbose_search_tier1_superblock_loads: None,
-            verbose_search_tier1_superblock_bytes: None,
-            verbose_search_tier2_superblock_loads: None,
-            verbose_search_tier2_superblock_bytes: None,
             verbose_search_metadata_loads: None,
             verbose_search_metadata_bytes: None,
             verbose_search_tier1_bloom_loads: None,
@@ -7037,10 +6861,7 @@ rule miss_rule {
             validate_forest_search_policy(&tree_groups).expect("search policy");
         assert_eq!(gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
         assert_eq!(active_identity_source.as_deref(), Some("sha256"));
-        assert_eq!(
-            summary_cap_bytes,
-            crate::candidate::DEFAULT_TIER2_SUPERBLOCK_SUMMARY_CAP_BYTES
-        );
+        assert_eq!(summary_cap_bytes, 0);
 
         let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
             &match_rule,
