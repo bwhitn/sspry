@@ -1,6 +1,6 @@
 # Implementation
 
-`sspry` is a mutable file-search engine built around per-document bloom filters, an optional Tier2 superblock-summary layer, and optional local YARA verification.
+`sspry` is a mutable file-search engine built around per-document bloom filters, per-shard tree-gate summaries, and optional local YARA verification.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ At a high level:
 3. The server stores:
    - per-document Tier1 bloom filters
    - per-document Tier2 bloom filters
-   - optional per-superblock Tier2 summaries when `--enable-pattern-superblocks` is enabled
+   - per-shard tree-gate summaries over Tier1 and Tier2
    - metadata and optional stored file paths
 4. `search` compiles a restricted YARA rule into a query plan.
 5. The store returns candidate digests.
@@ -47,7 +47,7 @@ The query path is:
 2. Extract Tier1 and Tier2 grams from the rule using the DB-wide gram sizes.
 3. Build an anchor plan with branch ordering, per-pattern anchor reduction, and preserved selected anchor literals.
 4. Query shards in parallel.
-5. If enabled for the DB, use Tier2 superblock summaries to skip groups of files.
+5. Use tree-gate summaries to skip branches that cannot match.
 6. Use per-document Tier1 and Tier2 blooms to refine candidates.
 7. Collect candidate digests without ranking guarantees.
 8. Optionally verify file paths locally.
@@ -55,7 +55,7 @@ The query path is:
 In direct forest mode, the query path adds one layer above shard search:
 
 1. open all tree stores under the forest root
-2. validate that gram sizes, identity source, and summary caps match across trees
+2. validate that gram sizes, identity source, and shared search policy match across trees
 3. build one compiled plan against the shared forest policy
 4. fan out the query across trees with up to `tree_search_workers`
 5. merge candidate hashes, query profiles, and optional external ids
@@ -68,15 +68,28 @@ In `search-batch`, that forest-open/validation work is done once for the whole s
 
 The current store is hash-sharded by document identity.
 
-Per shard, the implementation persists binary sidecars for:
+Shared policy metadata is written once as `meta.json`:
 
-- document metadata
-- normalized document ids
-- Tier1 bloom blobs
-- Tier2 bloom blobs
-- optional Tier2 superblock summaries
-- deleted state
-- optional `external_id` values
+- at the direct store root for standalone stores
+- at the workspace root for mutable RPC workspaces
+- at the forest root for `tree_*/current` forests
+
+Each direct store or published tree root keeps its own `shards.json`.
+
+Per shard, the implementation persists sidecars such as:
+
+- `store_meta.json`
+- `doc_meta.bin`
+- `tier2_doc_meta.bin`
+- `sha256_by_docid.dat`
+- `doc_metadata.bin`
+- `blooms.bin`
+- `tier2_blooms.bin`
+- `tree_tier1_gates.bin`
+- `tree_tier2_gates.bin`
+- `external_ids.dat` when `--store-path` is enabled
+
+Each shard also keeps a small compaction manifest beside the shard root.
 
 The open/search path is intentionally lazy:
 
@@ -92,7 +105,7 @@ Deletes are immediate logically:
 
 - the document is marked deleted
 - query paths stop returning it
-- Tier2 summaries are updated so deleted docs stop contributing to future block checks
+- tree-gate summaries are refreshed so deleted docs stop contributing to future gate checks
 
 Physical reclaim is deferred.
 
@@ -138,7 +151,7 @@ Important consequence:
 
 ## Gram Model
 
-`--gram-sizes <tier2,tier1>` is a DB-wide format choice.
+`--gram-sizes <tier1,tier2>` is a DB-wide format choice.
 
 Supported pairs:
 
@@ -149,8 +162,8 @@ Supported pairs:
 
 Rules:
 
-- smaller size = Tier2 bloom gram size
-- larger size = Tier1 bloom gram size
+- the first value is the Tier1 gram size
+- the second value is the Tier2 gram size
 - the choice is persisted in metadata
 - stores must be queried with the same gram model they were created with
 
@@ -234,6 +247,6 @@ These are the main implementation gaps worth keeping in view:
 The current tradeoffs are deliberate:
 
 - mutable store instead of rebuild-only index
-- bloom tiers and optional superblock summaries instead of retained exact gram postings
+- bloom tiers and tree-gate summaries instead of retained exact gram postings
 - server-owned store policy so clients stay simple
 - narrow public CLI so alpha users only touch meaningful knobs

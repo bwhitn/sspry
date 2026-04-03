@@ -18,6 +18,8 @@ cargo build --release
 
 That initializes the store if it does not exist yet.
 
+In the normal RPC workflow, `--root` is a workspace root. `sspry` manages `current/` under that path and creates `work_a/` / `work_b/` lazily when publish or remote ingest needs them.
+
 ## 3. Ingest Files
 
 ```bash
@@ -95,3 +97,4 @@ Signals:
 - Change `--set-fp` if you want smaller or larger bloom filters.
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
 - Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with a lower shard count than `256` reduces open and publish fanout.
+- If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 32-shard layout.

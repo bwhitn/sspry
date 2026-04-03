@@ -184,6 +184,8 @@ pub struct CandidateQueryResult {
     pub returned_count: usize,
     pub cursor: usize,
     pub next_cursor: Option<usize>,
+    pub truncated: bool,
+    pub truncated_limit: Option<usize>,
     pub tier_used: String,
     pub query_profile: CandidateQueryProfile,
 }
@@ -1262,15 +1264,6 @@ fn paginate_query_hits(
     let next_cursor = if end < total { Some(end) } else { None };
 
     (page, total, start, end, next_cursor)
-}
-
-pub(crate) fn candidate_limit_exceeded_error(
-    total_candidates: usize,
-    max_candidates: usize,
-) -> SspryError {
-    SspryError::from(format!(
-        "Candidate query exceeded max_candidates ({total_candidates} > {max_candidates}); narrow the rule or raise --max-candidates."
-    ))
 }
 
 fn load_forest_meta(root: &Path) -> Result<ForestMeta> {
@@ -3000,11 +2993,13 @@ impl CandidateStore {
                 returned_count: 0,
                 cursor: 0,
                 next_cursor: None,
+                truncated: false,
+                truncated_limit: None,
                 tier_used: "none".to_owned(),
                 query_profile: CandidateQueryProfile::default(),
             });
         }
-        let (matched_hits, used_tiers, query_profile) =
+        let (mut matched_hits, used_tiers, query_profile) =
             if let Some(identity_hits) = self.query_identity_seed_hits(plan, prepared)? {
                 identity_hits
             } else {
@@ -3068,11 +3063,14 @@ impl CandidateStore {
             matched_hits.len() as u64,
         );
         self.record_query_metrics(query_profile.docs_scanned, matched_hits.len() as u64);
-        if matched_hits.len() > plan.max_candidates {
-            return Err(candidate_limit_exceeded_error(
-                matched_hits.len(),
-                plan.max_candidates,
-            ));
+        let max_candidates = if plan.max_candidates <= 0.0 {
+            usize::MAX
+        } else {
+            plan.max_candidates.ceil().min(usize::MAX as f64) as usize
+        };
+        let truncated = max_candidates != usize::MAX && matched_hits.len() > max_candidates;
+        if truncated {
+            matched_hits.truncate(max_candidates);
         }
         let (page, total, start, end, next_cursor) =
             paginate_query_hits(&matched_hits, cursor, chunk_size);
@@ -3083,6 +3081,8 @@ impl CandidateStore {
             returned_count: end.saturating_sub(start),
             cursor: start,
             next_cursor,
+            truncated,
+            truncated_limit: truncated.then_some(max_candidates),
             tier_used: used_tiers.as_label(),
             query_profile,
         })
@@ -3309,8 +3309,12 @@ impl CandidateStore {
             .sum()
     }
 
+    pub fn live_doc_count(&self) -> usize {
+        self.docs.iter().filter(|doc| !doc.deleted).count()
+    }
+
     pub fn stats(&self) -> CandidateStats {
-        let doc_count = self.docs.iter().filter(|doc| !doc.deleted).count();
+        let doc_count = self.live_doc_count();
         let deleted_doc_count = self.docs.iter().filter(|doc| doc.deleted).count();
         let cooldown_remaining = self.compaction_cooldown_remaining_s();
         let tier2_match_ratio = if self.tier2_telemetry.tier2_scanned_docs_total > 0 {
@@ -6261,7 +6265,7 @@ mod tests {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 10,
+            max_candidates: 10.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -6349,7 +6353,7 @@ mod tests {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 10,
+            max_candidates: 10.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -8053,7 +8057,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 3,
+            max_candidates: 3.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -8129,7 +8133,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 32,
+            max_candidates: 32.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -8428,7 +8432,7 @@ rule q {
     }
 
     #[test]
-    fn query_candidates_errors_when_match_count_exceeds_max_candidates() {
+    fn query_candidates_truncates_when_match_count_exceeds_max_candidates() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path().join("candidate_db");
         let mut store = CandidateStore::init(
@@ -8524,19 +8528,19 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 2,
+            max_candidates: 2.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
 
-        let err = store
-            .query_candidates(&plan, 0, 1)
-            .expect_err("overflow must fail");
-        assert!(
-            err.to_string()
-                .contains("Candidate query exceeded max_candidates (3 > 2)"),
-            "unexpected error: {err}"
-        );
+        let result = store
+            .query_candidates(&plan, 0, 8)
+            .expect("overflow should truncate");
+        assert!(result.truncated);
+        assert_eq!(result.truncated_limit, Some(2));
+        assert_eq!(result.total_candidates, 2);
+        assert_eq!(result.returned_count, 2);
+        assert_eq!(result.sha256.len(), 2);
     }
 
     #[test]
@@ -8579,7 +8583,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 32,
+            max_candidates: 32.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -9035,7 +9039,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 64,
+            max_candidates: 64.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -9259,7 +9263,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -9339,7 +9343,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };

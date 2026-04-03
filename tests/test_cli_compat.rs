@@ -98,6 +98,8 @@ fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
                 addr,
                 "--rule",
                 rule.to_str().expect("rule path"),
+                "--max-candidates",
+                "100",
             ])
             .output()
             .expect("run search");
@@ -159,6 +161,8 @@ fn wait_for_verified_matches(
                 addr,
                 "--rule",
                 rule.to_str().expect("rule path"),
+                "--max-candidates",
+                "100",
                 "--verify",
             ])
             .output()
@@ -375,6 +379,8 @@ rule q {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
     ]);
     assert!(search.contains("tier_used:"));
     assert!(search.contains("candidates: 2"));
@@ -530,6 +536,8 @@ rule q {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(search.contains("candidates: 1"));
@@ -588,6 +596,8 @@ rule q {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(search.contains("candidates: 1"));
@@ -648,6 +658,8 @@ rule q {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
     ]);
     assert!(search.contains("candidates: 1"));
 
@@ -761,6 +773,8 @@ rule ModuleLnk {{
             &addr,
             "--rule",
             rule.to_str().expect("rule"),
+            "--max-candidates",
+            "100",
         ]);
         assert!(search.contains("candidates: 1"), "{rule:?}: {search}");
     }
@@ -860,6 +874,8 @@ rule ModuleMacho {
             &addr,
             "--rule",
             rule.to_str().expect("rule"),
+            "--max-candidates",
+            "100",
         ]);
         assert!(search.contains("candidates: 1"), "{rule:?}: {search}");
     }
@@ -957,6 +973,8 @@ rule MagicZip {
             &addr,
             "--rule",
             rule.to_str().expect("rule"),
+            "--max-candidates",
+            "100",
         ]);
         assert!(search.contains("candidates: 1"), "{rule:?}: {search}");
     }
@@ -1046,6 +1064,8 @@ rule q {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
         "--verbose",
     ]);
@@ -1115,6 +1135,8 @@ rule NumericSearch {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(search.contains("candidates: 1"));
@@ -1314,6 +1336,8 @@ rule NumericF64Be {
                     &addr,
                     "--rule",
                     rule_path.to_str().expect("rule"),
+                    "--max-candidates",
+                    "100",
                     "--verify",
                 ])
                 .output()
@@ -1346,6 +1370,8 @@ rule NumericF64Be {
             &addr,
             "--rule",
             rule_path.to_str().expect("rule"),
+            "--max-candidates",
+            "100",
             "--verify",
         ]);
         assert!(search.contains("candidates: 1"), "{file_name}: {search}");
@@ -1430,6 +1456,8 @@ rule CountRule {
                     &addr,
                     "--rule",
                     rule.to_str().expect("rule"),
+                    "--max-candidates",
+                    "100",
                     "--verify",
                 ])
                 .output()
@@ -1516,6 +1544,8 @@ rule FilesizeNotRule {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(search.contains("candidates: 2"), "{search}");
@@ -1576,6 +1606,8 @@ rule RangeRule {
                 &addr,
                 "--rule",
                 rule.to_str().expect("rule"),
+                "--max-candidates",
+                "100",
                 "--verify",
             ])
             .output()
@@ -1652,6 +1684,8 @@ rule NocaseRule {
                 &addr,
                 "--rule",
                 rule.to_str().expect("rule"),
+                "--max-candidates",
+                "100",
                 "--verify",
             ])
             .output()
@@ -1746,6 +1780,8 @@ rule AsciiLiteral {
             &addr,
             "--rule",
             rule.to_str().expect("rule"),
+            "--max-candidates",
+            "100",
         ]);
         assert!(search.contains("candidates: 1"), "{rule:?}: {search}");
     }
@@ -1777,6 +1813,8 @@ rule TimeNow {{
             &addr,
             "--rule",
             time_rule.to_str().expect("rule"),
+            "--max-candidates",
+            "100",
         ]);
         if search.contains("candidates: 1") {
             matched = true;
@@ -1873,6 +1911,8 @@ rule GroupedRegexLiteral {
         &addr,
         "--rule",
         fullword_rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(
@@ -1895,6 +1935,8 @@ rule GroupedRegexLiteral {
         &addr,
         "--rule",
         regex_rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(regex_search.contains("candidates: 2"), "{regex_search}");
@@ -1914,6 +1956,8 @@ rule GroupedRegexLiteral {
         &addr,
         "--rule",
         grouped_regex_rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(
@@ -1984,6 +2028,8 @@ rule SetSupport {
         &addr,
         "--rule",
         rule.to_str().expect("rule"),
+        "--max-candidates",
+        "100",
         "--verify",
     ]);
     assert!(search.contains("candidates: 1"), "{search}");

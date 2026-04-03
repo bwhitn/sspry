@@ -35,13 +35,13 @@ pub struct PatternPlan {
     pub fixed_literal_fullword: Vec<bool>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompiledQueryPlan {
     pub patterns: Vec<PatternPlan>,
     pub root: QueryNode,
     pub force_tier1_only: bool,
     pub allow_tier2_fallback: bool,
-    pub max_candidates: usize,
+    pub max_candidates: f64,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
 }
@@ -147,12 +147,23 @@ pub(crate) fn compiled_query_plan_memory_bytes(plan: &CompiledQueryPlan) -> u64 
         .saturating_add(query_node_memory_bytes(&plan.root))
 }
 
-pub fn normalize_max_candidates(max_candidates: usize) -> usize {
-    if max_candidates == 0 {
-        usize::MAX
+pub fn normalize_max_candidates(max_candidates: f64) -> f64 {
+    if !max_candidates.is_finite() || max_candidates <= 0.0 {
+        0.0
     } else {
-        max_candidates
+        max_candidates.clamp(0.0, 100.0)
     }
+}
+
+pub fn resolve_max_candidates(doc_count: usize, max_candidates_pct: f64) -> usize {
+    if !max_candidates_pct.is_finite() || max_candidates_pct <= 0.0 {
+        return usize::MAX;
+    }
+    if doc_count == 0 {
+        return 0;
+    }
+    let resolved = ((doc_count as f64) * (max_candidates_pct / 100.0)).ceil();
+    resolved.max(1.0).min(usize::MAX as f64) as usize
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4687,7 +4698,7 @@ fn resolve_rule_refs(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    max_candidates: usize,
+    max_candidates: f64,
 ) -> Result<()> {
     if node.kind == "rule_ref" {
         let referenced = node
@@ -4738,7 +4749,7 @@ fn finalize_rule_fragment(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    _max_candidates: usize,
+    _max_candidates: f64,
 ) -> Result<RulePlanFragment> {
     let mut root = prune_ignored_module_predicates(
         fragment
@@ -4948,7 +4959,7 @@ fn compile_rule_fragment(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    max_candidates: usize,
+    max_candidates: f64,
 ) -> Result<RulePlanFragment> {
     if rule_name != root_rule_name
         && let Some(fragment) = cache.get(rule_name)
@@ -5010,9 +5021,9 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    max_candidates: usize,
+    max_candidates: impl Into<f64>,
 ) -> Result<CompiledQueryPlan> {
-    let max_candidates = normalize_max_candidates(max_candidates);
+    let max_candidates = normalize_max_candidates(max_candidates.into());
     let rule_blocks = parse_rule_blocks(rule_text)?;
     let root_rule_name = rule_blocks
         .iter()
@@ -5112,7 +5123,7 @@ pub fn compile_query_plan_with_gram_sizes(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    max_candidates: usize,
+    max_candidates: impl Into<f64>,
 ) -> Result<CompiledQueryPlan> {
     compile_query_plan_with_gram_sizes_and_identity_source(
         rule_text,
@@ -5132,7 +5143,7 @@ pub fn compile_query_plan_from_file_with_gram_sizes_and_identity_source(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    max_candidates: usize,
+    max_candidates: impl Into<f64>,
 ) -> Result<CompiledQueryPlan> {
     let text = fs::read_to_string(rule_path)?;
     compile_query_plan_with_gram_sizes_and_identity_source(
@@ -5152,7 +5163,7 @@ pub fn compile_query_plan_from_file_with_gram_sizes(
     max_anchors_per_alt: usize,
     force_tier1_only: bool,
     allow_tier2_fallback: bool,
-    max_candidates: usize,
+    max_candidates: impl Into<f64>,
 ) -> Result<CompiledQueryPlan> {
     compile_query_plan_from_file_with_gram_sizes_and_identity_source(
         rule_path,
@@ -5186,7 +5197,7 @@ mod tests {
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
-        max_candidates: usize,
+        max_candidates: impl Into<f64>,
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_with_gram_sizes(
             rule_text,
@@ -5194,7 +5205,7 @@ mod tests {
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
-            max_candidates,
+            max_candidates.into(),
         )
     }
 
@@ -5204,7 +5215,7 @@ mod tests {
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
-        max_candidates: usize,
+        max_candidates: impl Into<f64>,
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_with_gram_sizes_and_identity_source(
             rule_text,
@@ -5213,7 +5224,7 @@ mod tests {
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
-            max_candidates,
+            max_candidates.into(),
         )
     }
 
@@ -5222,7 +5233,7 @@ mod tests {
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
-        max_candidates: usize,
+        max_candidates: impl Into<f64>,
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_from_file_with_gram_sizes(
             rule_path,
@@ -5230,7 +5241,7 @@ mod tests {
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
-            max_candidates,
+            max_candidates.into(),
         )
     }
 
@@ -5240,7 +5251,7 @@ mod tests {
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
-        max_candidates: usize,
+        max_candidates: impl Into<f64>,
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_with_gram_sizes(
             rule_text,
@@ -5248,7 +5259,7 @@ mod tests {
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
-            max_candidates,
+            max_candidates.into(),
         )
     }
 
@@ -5258,7 +5269,7 @@ mod tests {
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
-        max_candidates: usize,
+        max_candidates: impl Into<f64>,
     ) -> Result<CompiledQueryPlan> {
         compile_query_plan_from_file_with_gram_sizes(
             rule_path,
@@ -5266,7 +5277,7 @@ mod tests {
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
-            max_candidates,
+            max_candidates.into(),
         )
     }
 
@@ -6276,7 +6287,7 @@ rule sample {
         let plan = compile_query_plan_default(rule, 1, true, false, 9).expect("compile");
         assert!(plan.force_tier1_only);
         assert!(!plan.allow_tier2_fallback);
-        assert_eq!(plan.max_candidates, 9);
+        assert_eq!(plan.max_candidates, 9.0);
         assert_eq!(plan.patterns.len(), 3);
         assert!(matches!(plan.root.kind.as_str(), "and"));
         assert!(plan.patterns.iter().all(|pattern| {
@@ -6287,10 +6298,10 @@ rule sample {
         }));
 
         assert_eq!(
-            compile_query_plan_default(rule, 1, false, true, 0)
-                .expect("zero means unlimited")
+            compile_query_plan_default(rule, 1, false, true, 0.0)
+                .expect("zero remains unlimited percentage")
                 .max_candidates,
-            usize::MAX
+            0.0
         );
         assert!(
             compile_query_plan_default(
@@ -7006,7 +7017,7 @@ rule q {
         )
         .expect("plan from file");
         assert_eq!(plan.tier1_gram_size, 3);
-        assert_eq!(plan.max_candidates, 50);
+        assert_eq!(plan.max_candidates, 50.0);
     }
 
     #[test]
@@ -7113,7 +7124,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 1,
+            max_candidates: 1.0,
             tier2_gram_size: 3,
             tier1_gram_size: 4,
         };
@@ -7137,7 +7148,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 1,
+            max_candidates: 1.0,
             tier2_gram_size: 3,
             tier1_gram_size: 4,
         };

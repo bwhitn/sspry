@@ -49,7 +49,6 @@ The client can also distribute files across multiple servers in a round-robin fa
 
 ## Current Issues
 * Identifying search memory expansion: Currently, memory usage during search tends to grow rapidly for some rules. While it may be related to the candidate count, it doesn’t appear to be the main driver. Rule shape, scan breadth, prepared-query artifacts, and file-backed residency appear to matter more.
-* Configuration state files are duplicated among many trees when most of the information is forest-specific.
 * Deduplication across forest.
 
 ## Quick Links

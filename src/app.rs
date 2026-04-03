@@ -30,7 +30,7 @@ use crate::candidate::{
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
-    scan_file_features_bloom_only_with_gram_sizes,
+    resolve_max_candidates, scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::perf;
 use crate::rpc::{
@@ -58,6 +58,17 @@ const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
 const REMOTE_INDEX_ROTATION_RETRY_LIMIT: usize = 2400;
 const REMOTE_INDEX_ROTATION_RETRY_SLEEP_MS: u64 = 50;
 const INDEX_CLIENT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+
+fn parse_max_candidates_percent(value: &str) -> std::result::Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| "max-candidates must be a percentage between 0 and 100".to_owned())?;
+    if parsed.is_finite() && (0.0..=100.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("max-candidates must be a percentage between 0 and 100".to_owned())
+    }
+}
 
 struct ServeSignalFlags {
     shutdown: Arc<AtomicBool>,
@@ -1564,6 +1575,8 @@ struct LocalTreeQueryAggregate {
 struct LocalForestQueryAggregate {
     hashes: Vec<String>,
     total_candidates: usize,
+    truncated: bool,
+    truncated_limit: Option<usize>,
     tier_used: String,
     query_profile: crate::candidate::CandidateQueryProfile,
     external_ids: Option<Vec<Option<String>>>,
@@ -1577,6 +1590,8 @@ struct BatchSearchRecord {
     elapsed_ms_wall: f64,
     error: Option<String>,
     candidates: Option<usize>,
+    truncated: Option<bool>,
+    truncated_limit: Option<usize>,
     tier_used: Option<String>,
     verified_checked: Option<usize>,
     verified_matched: Option<usize>,
@@ -1616,7 +1631,7 @@ struct BatchSearchRecord {
     verbose_search_prepared_max_pattern_bytes: Option<u64>,
     verbose_search_prepared_max_pattern_id: Option<String>,
     verbose_search_prepared_impossible_query: Option<bool>,
-    verbose_search_max_candidates: Option<usize>,
+    verbose_search_max_candidates: Option<f64>,
     verbose_search_max_anchors_per_pattern: Option<usize>,
     verbose_search_candidates: Option<usize>,
     verbose_search_verify_enabled: Option<bool>,
@@ -1818,11 +1833,13 @@ fn query_store_group_all_candidates(
     include_external_ids: bool,
 ) -> Result<LocalTreeQueryAggregate> {
     let mut out = LocalTreeQueryAggregate::default();
-    let collect_chunk = plan.max_candidates.max(1).min(4096);
+    let mut scan_plan = plan.clone();
+    scan_plan.max_candidates = 0.0;
+    let collect_chunk = DEFAULT_SEARCH_RESULT_CHUNK_SIZE.max(1);
     for store in stores {
         let mut cursor = 0usize;
         loop {
-            let local = store.query_candidates(plan, cursor, collect_chunk)?;
+            let local = store.query_candidates(&scan_plan, cursor, collect_chunk)?;
             out.tier_used.push(local.tier_used.clone());
             out.query_profile.merge_from(&local.query_profile);
             if include_external_ids {
@@ -1851,6 +1868,12 @@ fn query_local_forest_all_candidates(
     include_external_ids: bool,
     tree_search_workers: usize,
 ) -> Result<LocalForestQueryAggregate> {
+    let searchable_doc_count = tree_groups
+        .iter()
+        .flat_map(|group| group.stores.iter())
+        .map(CandidateStore::live_doc_count)
+        .sum::<usize>();
+    let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
     let worker_count = tree_search_workers.max(1).min(tree_groups.len().max(1));
     let mut partials = Vec::<LocalTreeQueryAggregate>::new();
     if tree_groups.len() <= 1 || worker_count <= 1 {
@@ -1909,12 +1932,10 @@ fn query_local_forest_all_candidates(
             external_id_map.entry(sha256).or_insert(external_id);
         }
     }
-    let hashes = hashes.into_iter().collect::<Vec<_>>();
-    if hashes.len() > plan.max_candidates {
-        return Err(crate::candidate::store::candidate_limit_exceeded_error(
-            hashes.len(),
-            plan.max_candidates,
-        ));
+    let mut hashes = hashes.into_iter().collect::<Vec<_>>();
+    let truncated = resolved_limit != usize::MAX && hashes.len() > resolved_limit;
+    if truncated {
+        hashes.truncate(resolved_limit);
     }
     let external_ids = if include_external_ids {
         Some(
@@ -1928,6 +1949,8 @@ fn query_local_forest_all_candidates(
     };
     Ok(LocalForestQueryAggregate {
         total_candidates: hashes.len(),
+        truncated,
+        truncated_limit: truncated.then_some(resolved_limit),
         tier_used: merge_tier_used(tier_used),
         query_profile,
         external_ids,
@@ -3880,13 +3903,19 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 .as_ref(),
             );
             if stores.len() == 1 {
-                let result = stores[0].query_candidates(&plan, args.cursor, args.chunk_size)?;
+                let mut resolved_plan = plan.clone();
+                resolved_plan.max_candidates =
+                    resolve_max_candidates(stores[0].live_doc_count(), plan.max_candidates) as f64;
+                let result =
+                    stores[0].query_candidates(&resolved_plan, args.cursor, args.chunk_size)?;
                 rpc::CandidateQueryResponse {
                     sha256: result.sha256,
                     total_candidates: result.total_candidates,
                     returned_count: result.returned_count,
                     cursor: result.cursor,
                     next_cursor: result.next_cursor,
+                    truncated: result.truncated,
+                    truncated_limit: result.truncated_limit,
                     tier_used: result.tier_used,
                     query_profile: result.query_profile,
                     prepared_query_profile,
@@ -3896,11 +3925,19 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 let mut hashes = std::collections::HashSet::<String>::new();
                 let mut tier_used = Vec::<String>::new();
                 let mut query_profile = crate::candidate::CandidateQueryProfile::default();
-                let collect_chunk = plan.max_candidates.max(1).min(4096);
+                let mut scan_plan = plan.clone();
+                scan_plan.max_candidates = 0.0;
+                let collect_chunk = DEFAULT_SEARCH_RESULT_CHUNK_SIZE.max(1);
+                let searchable_doc_count = stores
+                    .iter()
+                    .map(CandidateStore::live_doc_count)
+                    .sum::<usize>();
+                let resolved_limit =
+                    resolve_max_candidates(searchable_doc_count, plan.max_candidates);
                 for store in &mut stores {
                     let mut cursor = 0usize;
                     loop {
-                        let local = store.query_candidates(&plan, cursor, collect_chunk)?;
+                        let local = store.query_candidates(&scan_plan, cursor, collect_chunk)?;
                         tier_used.push(local.tier_used.clone());
                         query_profile.merge_from(&local.query_profile);
                         hashes.extend(local.sha256);
@@ -3911,12 +3948,10 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                         }
                     }
                 }
-                let hashes = hashes.into_iter().collect::<Vec<_>>();
-                if hashes.len() > plan.max_candidates {
-                    return Err(crate::candidate::store::candidate_limit_exceeded_error(
-                        hashes.len(),
-                        plan.max_candidates,
-                    ));
+                let mut hashes = hashes.into_iter().collect::<Vec<_>>();
+                let truncated = resolved_limit != usize::MAX && hashes.len() > resolved_limit;
+                if truncated {
+                    hashes.truncate(resolved_limit);
                 }
                 let total_candidates = hashes.len();
                 let start = args.cursor.min(total_candidates);
@@ -3927,6 +3962,8 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     total_candidates,
                     cursor: start,
                     next_cursor: (end < total_candidates).then_some(end),
+                    truncated,
+                    truncated_limit: truncated.then_some(resolved_limit),
                     tier_used: merge_tier_used(tier_used),
                     query_profile,
                     prepared_query_profile,
@@ -3961,6 +3998,10 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
         );
         println!("tier_used: {}", result.tier_used);
         println!("candidates: {}", result.total_candidates);
+        println!("truncated: {}", result.truncated);
+        if let Some(limit) = result.truncated_limit {
+            println!("truncated_limit: {limit}");
+        }
         for sha256 in result.sha256 {
             println!("sha256: {sha256}");
         }
@@ -4097,118 +4138,162 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
         let mut tree_search_workers = None::<usize>;
 
         let started_plan = Instant::now();
-        let (plan, total, tier_used, rows, query_profile, prepared_query_profile, external_ids) =
-            if let Some(root) = &args.root {
-                let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
-                tree_count = Some(tree_groups.len());
-                let (gram_sizes, active_identity_source, summary_cap_bytes) =
-                    validate_forest_search_policy(&tree_groups)?;
-                let worker_count = args
-                    .tree_search_workers
-                    .max(1)
-                    .min(tree_groups.len().max(1));
-                tree_search_workers = Some(worker_count);
-                let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-                    &args.rule,
-                    gram_sizes,
-                    active_identity_source.as_deref(),
-                    args.max_anchors_per_pattern,
-                    false,
-                    true,
-                    args.max_candidates,
-                )?;
-                plan_time += started_plan.elapsed();
-                let started_query = Instant::now();
-                if args.gate_only {
-                    let query_profile =
-                        query_local_forest_tree_gates(&mut tree_groups, &plan, worker_count)?;
-                    query_time += started_query.elapsed();
-                    (
-                        plan,
-                        0usize,
-                        "gate-only".to_owned(),
-                        Vec::new(),
-                        query_profile,
-                        crate::candidate::CandidatePreparedQueryProfile::default(),
-                        Vec::new(),
-                    )
-                } else {
-                    let prepared_query_profile =
-                        forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
-                    let local = query_local_forest_all_candidates(
-                        &mut tree_groups,
-                        &plan,
-                        verify_yara_files,
-                        worker_count,
-                    )?;
-                    query_time += started_query.elapsed();
-                    (
-                        plan,
-                        local.total_candidates,
-                        local.tier_used,
-                        local.hashes,
-                        local.query_profile,
-                        prepared_query_profile,
-                        local.external_ids.unwrap_or_default(),
-                    )
-                }
-            } else {
-                let client = search_rpc_client(&args.connection);
-                let server_policy = server_scan_policy(&args.connection)?;
-                let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-                    &args.rule,
-                    server_policy.gram_sizes,
-                    Some(server_policy.id_source.as_str()),
-                    args.max_anchors_per_pattern,
-                    false,
-                    true,
-                    args.max_candidates,
-                )?;
-                plan_time += started_plan.elapsed();
-                let mut cursor = 0usize;
-                let mut rows = Vec::<String>::new();
-                let mut query_profile = None::<crate::candidate::CandidateQueryProfile>;
-                let mut prepared_query_profile =
-                    None::<crate::candidate::CandidatePreparedQueryProfile>;
-                let mut external_ids = Vec::<Option<String>>::new();
-                let (total, tier_used) = loop {
-                    let started_query = Instant::now();
-                    let result = client.candidate_query_plan_with_options(
-                        &plan,
-                        cursor,
-                        Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
-                        verify_yara_files,
-                    )?;
-                    query_time += started_query.elapsed();
-                    if query_profile.is_none() {
-                        query_profile = Some(result.query_profile.clone());
-                    }
-                    if prepared_query_profile.is_none() {
-                        prepared_query_profile = Some(result.prepared_query_profile.clone());
-                    }
-                    rows.extend(result.sha256.iter().cloned());
-                    if verify_yara_files {
-                        let mut page_external_ids = result.external_ids.unwrap_or_default();
-                        if page_external_ids.len() < result.sha256.len() {
-                            page_external_ids.resize(result.sha256.len(), None);
-                        }
-                        external_ids.extend(page_external_ids);
-                    }
-                    match result.next_cursor {
-                        Some(next) => cursor = next,
-                        None => break (result.total_candidates, result.tier_used),
-                    }
-                };
+        let (
+            plan,
+            total,
+            tier_used,
+            truncated,
+            truncated_limit,
+            rows,
+            query_profile,
+            prepared_query_profile,
+            external_ids,
+        ) = if let Some(root) = &args.root {
+            let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
+            tree_count = Some(tree_groups.len());
+            let (gram_sizes, active_identity_source, summary_cap_bytes) =
+                validate_forest_search_policy(&tree_groups)?;
+            let worker_count = args
+                .tree_search_workers
+                .max(1)
+                .min(tree_groups.len().max(1));
+            tree_search_workers = Some(worker_count);
+            let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+                &args.rule,
+                gram_sizes,
+                active_identity_source.as_deref(),
+                args.max_anchors_per_pattern,
+                false,
+                true,
+                args.max_candidates,
+            )?;
+            plan_time += started_plan.elapsed();
+            let started_query = Instant::now();
+            if args.gate_only {
+                let query_profile =
+                    query_local_forest_tree_gates(&mut tree_groups, &plan, worker_count)?;
+                query_time += started_query.elapsed();
                 (
                     plan,
-                    total,
-                    tier_used,
-                    rows,
-                    query_profile.unwrap_or_default(),
-                    prepared_query_profile.unwrap_or_default(),
-                    external_ids,
+                    0usize,
+                    "gate-only".to_owned(),
+                    false,
+                    None,
+                    Vec::new(),
+                    query_profile,
+                    crate::candidate::CandidatePreparedQueryProfile::default(),
+                    Vec::new(),
                 )
-            };
+            } else {
+                let prepared_query_profile =
+                    forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
+                let local = query_local_forest_all_candidates(
+                    &mut tree_groups,
+                    &plan,
+                    verify_yara_files,
+                    worker_count,
+                )?;
+                query_time += started_query.elapsed();
+                (
+                    plan,
+                    local.total_candidates,
+                    local.tier_used,
+                    local.truncated,
+                    local.truncated_limit,
+                    local.hashes,
+                    local.query_profile,
+                    prepared_query_profile,
+                    local.external_ids.unwrap_or_default(),
+                )
+            }
+        } else {
+            let client = search_rpc_client(&args.connection);
+            let server_policy = server_scan_policy(&args.connection)?;
+            let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+                &args.rule,
+                server_policy.gram_sizes,
+                Some(server_policy.id_source.as_str()),
+                args.max_anchors_per_pattern,
+                false,
+                true,
+                args.max_candidates,
+            )?;
+            plan_time += started_plan.elapsed();
+            let started_query = Instant::now();
+            let mut buffered_rows = Vec::<String>::new();
+            let mut buffered_external_ids = Vec::<Option<String>>::new();
+            let mut accepted_positions = HashMap::<String, usize>::new();
+            let mut query_profile = crate::candidate::CandidateQueryProfile::default();
+            let mut prepared_query_profile =
+                crate::candidate::CandidatePreparedQueryProfile::default();
+            let mut total = 0usize;
+            let mut tier_used = String::new();
+            let mut truncated = false;
+            let mut truncated_limit = None::<usize>;
+            client.candidate_query_plan_stream_with_options(
+                &plan,
+                Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
+                verify_yara_files,
+                |frame| {
+                    if truncated_limit.is_none() {
+                        truncated_limit = frame.candidate_limit;
+                    }
+                    if frame.stream_complete {
+                        tier_used = frame.tier_used;
+                        query_profile = frame.query_profile;
+                        prepared_query_profile = frame.prepared_query_profile;
+                        return Ok(());
+                    }
+                    let mut frame_external_ids = frame.external_ids.unwrap_or_default();
+                    if verify_yara_files && frame_external_ids.len() < frame.sha256.len() {
+                        frame_external_ids.resize(frame.sha256.len(), None);
+                    }
+                    for (idx, sha256) in frame.sha256.into_iter().enumerate() {
+                        let external_id = if verify_yara_files {
+                            frame_external_ids.get(idx).cloned().flatten()
+                        } else {
+                            None
+                        };
+                        if let Some(existing_idx) = accepted_positions.get(&sha256).copied() {
+                            if verify_yara_files
+                                && buffered_external_ids
+                                    .get(existing_idx)
+                                    .is_some_and(Option::is_none)
+                                && external_id.is_some()
+                            {
+                                buffered_external_ids[existing_idx] = external_id;
+                            }
+                            continue;
+                        }
+                        if truncated_limit.is_some_and(|limit| buffered_rows.len() >= limit) {
+                            truncated = true;
+                            continue;
+                        }
+                        accepted_positions.insert(sha256.clone(), buffered_rows.len());
+                        total = total.saturating_add(1);
+                        if verify_yara_files {
+                            buffered_external_ids.push(external_id);
+                        } else {
+                            println!("{sha256}");
+                        }
+                        buffered_rows.push(sha256);
+                    }
+                    Ok(())
+                },
+            )?;
+            query_time += started_query.elapsed();
+            (
+                plan,
+                total,
+                tier_used,
+                truncated,
+                truncated_limit,
+                buffered_rows,
+                query_profile,
+                prepared_query_profile,
+                buffered_external_ids,
+            )
+        };
 
         let started_verify = Instant::now();
         let verification = verify_search_candidates(
@@ -4228,6 +4313,10 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
 
         println!("tier_used: {tier_used}");
         println!("candidates: {total}");
+        println!("truncated: {truncated}");
+        if let Some(limit) = truncated_limit {
+            println!("truncated_limit: {limit}");
+        }
         if verify_yara_files {
             println!("verified_checked: {verified_checked}");
             println!("verified_matched: {verified_matched}");
@@ -4535,6 +4624,8 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     elapsed_ms_wall: total_ms,
                     error: None,
                     candidates: Some(local.total_candidates),
+                    truncated: Some(local.truncated),
+                    truncated_limit: local.truncated_limit,
                     tier_used: Some(local.tier_used),
                     verified_checked: Some(verification.verified_checked),
                     verified_matched: Some(verification.verified_matched),
@@ -4643,6 +4734,8 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     elapsed_ms_wall: started_total.elapsed().as_secs_f64() * 1000.0,
                     error: Some(err.to_string()),
                     candidates: None,
+                    truncated: None,
+                    truncated_limit: None,
                     tier_used: None,
                     verified_checked: None,
                     verified_matched: None,
@@ -4858,10 +4951,11 @@ struct SearchCommandArgs {
     max_anchors_per_pattern: usize,
     #[arg(
         long = "max-candidates",
-        default_value_t = 15000,
-        help = "Server-side cap on returned candidate set size; 0 means unlimited."
+        default_value_t = 7.5,
+        value_parser = parse_max_candidates_percent,
+        help = "Server-side candidate cap as a percentage of searchable documents; 0 means unlimited."
     )]
-    max_candidates: usize,
+    max_candidates: f64,
     #[arg(
         long = "gate-only",
         action = ArgAction::SetTrue,
@@ -4920,10 +5014,11 @@ struct SearchBatchArgs {
     max_anchors_per_pattern: usize,
     #[arg(
         long = "max-candidates",
-        default_value_t = 15000,
-        help = "Cap on returned candidate set size per rule; 0 means unlimited."
+        default_value_t = 7.5,
+        value_parser = parse_max_candidates_percent,
+        help = "Candidate cap per rule as a percentage of searchable documents; 0 means unlimited."
     )]
-    max_candidates: usize,
+    max_candidates: f64,
     #[arg(
         long = "verify",
         action = ArgAction::SetTrue,
@@ -5182,10 +5277,11 @@ struct InternalQueryArgs {
     no_tier2_fallback: bool,
     #[arg(
         long = "max-candidates",
-        default_value_t = 15000,
-        help = "Maximum candidate hashes returned before paging; 0 means unlimited."
+        default_value_t = 7.5,
+        value_parser = parse_max_candidates_percent,
+        help = "Maximum candidate percentage returned before paging; 0 means unlimited."
     )]
-    max_candidates: usize,
+    max_candidates: f64,
 }
 
 #[cfg(test)]
@@ -5832,7 +5928,7 @@ rule q {
             max_anchors_per_pattern: 8,
             force_tier1_only: false,
             no_tier2_fallback: false,
-            max_candidates: 100,
+            max_candidates: 100.0,
         };
         assert_eq!(cmd_internal_query(&query_args), 0);
 
@@ -6016,9 +6112,9 @@ rule q {
                 max_anchors_per_pattern: 2,
                 force_tier1_only: false,
                 no_tier2_fallback: false,
-                max_candidates: 2,
+                max_candidates: 2.0,
             }),
-            1
+            0
         );
         assert_eq!(
             cmd_internal_query(&InternalQueryArgs {
@@ -6030,7 +6126,7 @@ rule q {
                 max_anchors_per_pattern: 4,
                 force_tier1_only: true,
                 no_tier2_fallback: true,
-                max_candidates: 8,
+                max_candidates: 8.0,
             }),
             0
         );
@@ -6124,7 +6220,7 @@ rule remote_q {
                 max_anchors_per_pattern: 1,
                 force_tier1_only: false,
                 no_tier2_fallback: false,
-                max_candidates: 4,
+                max_candidates: 4.0,
             }),
             0
         );
@@ -6138,7 +6234,7 @@ rule remote_q {
                 max_anchors_per_pattern: 2,
                 force_tier1_only: true,
                 no_tier2_fallback: true,
-                max_candidates: 4,
+                max_candidates: 4.0,
             }),
             0
         );
@@ -6149,7 +6245,7 @@ rule remote_q {
                 rule: rule_path.display().to_string(),
                 tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
-                max_candidates: 8,
+                max_candidates: 8.0,
                 gate_only: false,
                 verify_yara_files: false,
                 verbose: false,
@@ -6163,7 +6259,7 @@ rule remote_q {
                 rule: rule_path.display().to_string(),
                 tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
-                max_candidates: 8,
+                max_candidates: 8.0,
                 gate_only: false,
                 verify_yara_files: true,
                 verbose: false,
@@ -6283,7 +6379,7 @@ rule remote_q {
                 max_anchors_per_pattern: 1,
                 force_tier1_only: false,
                 no_tier2_fallback: false,
-                max_candidates: 1,
+                max_candidates: 1.0,
             }),
             1
         );
@@ -6610,6 +6706,8 @@ rule remote_q {
             elapsed_ms_wall: 12.5,
             error: None,
             candidates: Some(2),
+            truncated: Some(false),
+            truncated_limit: None,
             tier_used: Some("tier1+tier2".to_owned()),
             verified_checked: Some(0),
             verified_matched: Some(0),
@@ -6649,7 +6747,7 @@ rule remote_q {
             verbose_search_prepared_max_pattern_bytes: Some(4),
             verbose_search_prepared_max_pattern_id: Some("$a".to_owned()),
             verbose_search_prepared_impossible_query: Some(false),
-            verbose_search_max_candidates: Some(100),
+            verbose_search_max_candidates: Some(100.0),
             verbose_search_max_anchors_per_pattern: Some(8),
             verbose_search_candidates: Some(2),
             verbose_search_verify_enabled: Some(false),
@@ -6672,6 +6770,8 @@ rule remote_q {
             elapsed_ms_wall: 3.5,
             error: Some("boom".to_owned()),
             candidates: None,
+            truncated: None,
+            truncated_limit: None,
             tier_used: None,
             verified_checked: None,
             verified_matched: None,
@@ -6921,7 +7021,7 @@ rule miss_rule {
                 json_out: json_out.display().to_string(),
                 tree_search_workers: 2,
                 max_anchors_per_pattern: 8,
-                max_candidates: 100,
+                max_candidates: 100.0,
                 verify_yara_files: false,
             }),
             0

@@ -31,7 +31,7 @@ use crate::candidate::{
     CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode, candidate_shard_index,
     candidate_shard_root, metadata_field_is_boolean, metadata_field_is_float,
     metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
-    read_candidate_shard_count, write_candidate_shard_count,
+    read_candidate_shard_count, resolve_max_candidates, write_candidate_shard_count,
 };
 use crate::perf::{record_counter, scope};
 use crate::{Result, SspryError};
@@ -63,6 +63,7 @@ const ACTION_CANDIDATE_INSERT_BATCH_BINARY: u8 = 17;
 const ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN: u8 = 18;
 const ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK: u8 = 19;
 const ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT: u8 = 20;
+const ACTION_CANDIDATE_QUERY_STREAM: u8 = 21;
 const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 const INDEX_CLIENT_LEASE_MULTIPLIER: u64 = 3;
@@ -179,6 +180,10 @@ pub struct CandidateQueryResponse {
     pub returned_count: usize,
     pub cursor: usize,
     pub next_cursor: Option<usize>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_limit: Option<usize>,
     pub tier_used: String,
     #[serde(default)]
     pub query_profile: CandidateQueryProfile,
@@ -186,6 +191,24 @@ pub struct CandidateQueryResponse {
     pub prepared_query_profile: CandidatePreparedQueryProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ids: Option<Vec<Option<String>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CandidateQueryStreamFrame {
+    #[serde(default)]
+    pub sha256: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ids: Option<Vec<Option<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_limit: Option<usize>,
+    #[serde(default)]
+    pub stream_complete: bool,
+    #[serde(default)]
+    pub tier_used: String,
+    #[serde(default)]
+    pub query_profile: CandidateQueryProfile,
+    #[serde(default)]
+    pub prepared_query_profile: CandidatePreparedQueryProfile,
 }
 
 #[cfg(test)]
@@ -514,6 +537,8 @@ struct ServerState {
 #[derive(Clone, Debug)]
 struct CachedCandidateQuery {
     ordered_hashes: Vec<String>,
+    truncated: bool,
+    truncated_limit: Option<usize>,
     tier_used: String,
     query_profile: CandidateQueryProfile,
     prepared_query_profile: CandidatePreparedQueryProfile,
@@ -981,6 +1006,58 @@ impl SspryClient {
             payload.insert("include_external_ids".to_owned(), Value::Bool(true));
         }
         self.request_typed_json(ACTION_CANDIDATE_QUERY, &Value::Object(payload))
+    }
+
+    pub(crate) fn candidate_query_plan_stream_with_options<F>(
+        &self,
+        plan: &CompiledQueryPlan,
+        chunk_size: Option<usize>,
+        include_external_ids: bool,
+        mut on_frame: F,
+    ) -> Result<()>
+    where
+        F: FnMut(CandidateQueryStreamFrame) -> Result<()>,
+    {
+        let mut payload = Map::new();
+        payload.insert("plan".to_owned(), compiled_query_plan_to_wire(plan));
+        if let Some(value) = chunk_size {
+            payload.insert("chunk_size".to_owned(), Value::from(value));
+        }
+        if include_external_ids {
+            payload.insert("include_external_ids".to_owned(), Value::Bool(true));
+        }
+
+        let mut stream = self.connect()?;
+        let payload_bytes = serde_json::to_vec(&Value::Object(payload))?;
+        write_frame(
+            &mut stream,
+            PROTOCOL_VERSION,
+            ACTION_CANDIDATE_QUERY_STREAM,
+            &payload_bytes,
+        )?;
+
+        loop {
+            let (version, status, response_payload) = read_frame(&mut stream)?;
+            if version != PROTOCOL_VERSION {
+                return Err(SspryError::from(format!(
+                    "Unsupported protocol version from server: {version}"
+                )));
+            }
+            if status != STATUS_OK {
+                let value: Value = serde_json::from_slice(&response_payload)?;
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Server returned an error.");
+                return Err(SspryError::from(message.to_owned()));
+            }
+            let frame: CandidateQueryStreamFrame = serde_json::from_slice(&response_payload)?;
+            let done = frame.stream_complete;
+            on_frame(frame)?;
+            if done {
+                return Ok(());
+            }
+        }
     }
 
     pub fn candidate_stats(&self) -> Result<Map<String, Value>> {
@@ -4570,11 +4647,17 @@ impl ServerState {
         let mut hits = Vec::<String>::new();
         let mut tier_used = Vec::<String>::new();
         let mut query_profile = CandidateQueryProfile::default();
-        let collect_chunk = plan.max_candidates.max(1).min(4096);
+        let mut scan_plan = plan.clone();
+        scan_plan.max_candidates = 0.0;
+        let collect_chunk = DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE.max(1);
         let mut cursor = 0usize;
         loop {
-            let local =
-                store.query_candidates_with_prepared(plan, prepared, cursor, collect_chunk)?;
+            let local = store.query_candidates_with_prepared(
+                &scan_plan,
+                prepared,
+                cursor,
+                collect_chunk,
+            )?;
             tier_used.push(local.tier_used.clone());
             hits.extend(local.sha256.into_iter());
             query_profile.merge_from(&local.query_profile);
@@ -4594,19 +4677,30 @@ impl ServerState {
         let prepared = self.shared_prepared_query_artifacts(plan)?;
         let prepared_query_profile = prepared_query_artifacts_profile(prepared.as_ref());
         let store_sets = self.published_query_store_sets()?;
+        let searchable_doc_count = store_sets
+            .iter()
+            .flat_map(|stores| stores.stores.iter())
+            .map(|store_lock| {
+                let store = lock_candidate_store_blocking(store_lock)?;
+                Ok::<usize, SspryError>(store.live_doc_count())
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum::<usize>();
+        let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
         if store_sets.len() == 1 && self.candidate_shard_count() == 1 {
             let mut store = lock_candidate_store_blocking(&store_sets[0].stores[0])?;
             let (hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
-            let ordered_hashes = hits;
-            if ordered_hashes.len() > plan.max_candidates {
-                return Err(crate::candidate::store::candidate_limit_exceeded_error(
-                    ordered_hashes.len(),
-                    plan.max_candidates,
-                ));
+            let mut ordered_hashes = hits;
+            let truncated = resolved_limit != usize::MAX && ordered_hashes.len() > resolved_limit;
+            if truncated {
+                ordered_hashes.truncate(resolved_limit);
             }
             return Ok(CachedCandidateQuery {
                 ordered_hashes,
+                truncated,
+                truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
                 query_profile,
                 prepared_query_profile,
@@ -4640,15 +4734,15 @@ impl ServerState {
                 tier_used.extend(local_tiers);
                 query_profile.merge_from(&local_profile);
             }
-            let ordered_hashes = hits.into_iter().collect::<Vec<_>>();
-            if ordered_hashes.len() > plan.max_candidates {
-                return Err(crate::candidate::store::candidate_limit_exceeded_error(
-                    ordered_hashes.len(),
-                    plan.max_candidates,
-                ));
+            let mut ordered_hashes = hits.into_iter().collect::<Vec<_>>();
+            let truncated = resolved_limit != usize::MAX && ordered_hashes.len() > resolved_limit;
+            if truncated {
+                ordered_hashes.truncate(resolved_limit);
             }
             return Ok(CachedCandidateQuery {
                 ordered_hashes,
+                truncated,
+                truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
                 query_profile,
                 prepared_query_profile,
@@ -4706,15 +4800,15 @@ impl ServerState {
             tier_used.extend(local_tiers);
             query_profile.merge_from(&local_profile);
         }
-        let ordered_hashes = hits.into_iter().collect::<Vec<_>>();
-        if ordered_hashes.len() > plan.max_candidates {
-            return Err(crate::candidate::store::candidate_limit_exceeded_error(
-                ordered_hashes.len(),
-                plan.max_candidates,
-            ));
+        let mut ordered_hashes = hits.into_iter().collect::<Vec<_>>();
+        let truncated = resolved_limit != usize::MAX && ordered_hashes.len() > resolved_limit;
+        if truncated {
+            ordered_hashes.truncate(resolved_limit);
         }
         Ok(CachedCandidateQuery {
             ordered_hashes,
+            truncated,
+            truncated_limit: truncated.then_some(resolved_limit),
             tier_used: Self::merge_candidate_tier_used(&tier_used),
             query_profile,
             prepared_query_profile,
@@ -5462,11 +5556,132 @@ impl ServerState {
             total_candidates,
             cursor: start,
             next_cursor,
+            truncated: cached.truncated,
+            truncated_limit: cached.truncated_limit,
             tier_used: cached.tier_used.clone(),
             query_profile: cached.query_profile.clone(),
             prepared_query_profile: cached.prepared_query_profile.clone(),
             external_ids,
         })
+    }
+
+    fn stream_candidate_query<W: Write>(
+        &self,
+        request: CandidateQueryRequest,
+        plan: &CompiledQueryPlan,
+        stream: &mut W,
+    ) -> Result<()> {
+        let _scope = scope("rpc.stream_candidate_query");
+        let _op = self
+            .operation_gate
+            .read()
+            .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
+        let chunk_size = request
+            .chunk_size
+            .unwrap_or(DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE)
+            .max(1);
+        let prepared = self.shared_prepared_query_artifacts(plan)?;
+        let prepared_query_profile = prepared_query_artifacts_profile(prepared.as_ref());
+        let store_sets = self.published_query_store_sets()?;
+        let searchable_doc_count = store_sets
+            .iter()
+            .flat_map(|stores| stores.stores.iter())
+            .map(|store_lock| {
+                let store = lock_candidate_store_blocking(store_lock)?;
+                Ok::<usize, SspryError>(store.live_doc_count())
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum::<usize>();
+        let candidate_limit =
+            match resolve_max_candidates(searchable_doc_count, plan.max_candidates) {
+                usize::MAX => None,
+                value => Some(value),
+            };
+
+        let mut tier_used = Vec::<String>::new();
+        let mut query_profile = CandidateQueryProfile::default();
+
+        for stores in &store_sets {
+            for store_lock in &stores.stores {
+                let mut store = lock_candidate_store_blocking(store_lock)?;
+                let (hits, local_tiers, local_profile) =
+                    Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
+                let external_ids = if request.include_external_ids {
+                    Some(store.external_ids_for_sha256(&hits))
+                } else {
+                    None
+                };
+                drop(store);
+
+                tier_used.extend(local_tiers);
+                query_profile.merge_from(&local_profile);
+
+                if hits.is_empty() {
+                    continue;
+                }
+
+                match external_ids {
+                    Some(values) => {
+                        for (hash_chunk, external_id_chunk) in
+                            hits.chunks(chunk_size).zip(values.chunks(chunk_size))
+                        {
+                            let frame = CandidateQueryStreamFrame {
+                                sha256: hash_chunk.to_vec(),
+                                external_ids: Some(external_id_chunk.to_vec()),
+                                candidate_limit,
+                                stream_complete: false,
+                                tier_used: String::new(),
+                                query_profile: CandidateQueryProfile::default(),
+                                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                            };
+                            write_frame(
+                                stream,
+                                PROTOCOL_VERSION,
+                                STATUS_OK,
+                                &serde_json::to_vec(&frame)?,
+                            )?;
+                        }
+                    }
+                    None => {
+                        for hash_chunk in hits.chunks(chunk_size) {
+                            let frame = CandidateQueryStreamFrame {
+                                sha256: hash_chunk.to_vec(),
+                                external_ids: None,
+                                candidate_limit,
+                                stream_complete: false,
+                                tier_used: String::new(),
+                                query_profile: CandidateQueryProfile::default(),
+                                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                            };
+                            write_frame(
+                                stream,
+                                PROTOCOL_VERSION,
+                                STATUS_OK,
+                                &serde_json::to_vec(&frame)?,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_frame = CandidateQueryStreamFrame {
+            sha256: Vec::new(),
+            external_ids: None,
+            candidate_limit,
+            stream_complete: true,
+            tier_used: Self::merge_candidate_tier_used(&tier_used),
+            query_profile,
+            prepared_query_profile,
+        };
+        write_frame(
+            stream,
+            PROTOCOL_VERSION,
+            STATUS_OK,
+            &serde_json::to_vec(&final_frame)?,
+        )?;
+        Ok(())
     }
 
     fn handle_publish(&self) -> Result<CandidatePublishResponse> {
@@ -5984,6 +6199,18 @@ where
         if payload.len() > max_request_bytes {
             write_error_frame(&mut stream, "Request is too large.")?;
             return Ok(());
+        }
+        if action == ACTION_CANDIDATE_QUERY_STREAM {
+            let result = (|| -> Result<()> {
+                let request: CandidateQueryRequest = json_from_bytes(&payload)?;
+                let plan = compiled_query_plan_from_wire(&request.plan)?;
+                state.stream_candidate_query(request, &plan, &mut stream)
+            })();
+            if let Err(err) = result {
+                let _ = write_error_frame(&mut stream, &err.to_string());
+                return Ok(());
+            }
+            continue;
         }
         match state.dispatch(action, &payload) {
             Ok(response_payload) => {
@@ -6571,8 +6798,8 @@ fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
         .unwrap_or_default();
     let max_candidates = flags
         .get("max_candidates")
-        .and_then(Value::as_u64)
-        .unwrap_or(100_000) as usize;
+        .and_then(Value::as_f64)
+        .unwrap_or(7.5);
     let max_candidates = normalize_max_candidates(max_candidates);
     Ok(CompiledQueryPlan {
         patterns,
@@ -7421,7 +7648,7 @@ mod tests {
         max_anchors_per_alt: usize,
         force_tier1_only: bool,
         allow_tier2_fallback: bool,
-        max_candidates: usize,
+        max_candidates: impl Into<f64>,
     ) -> Result<crate::candidate::CompiledQueryPlan> {
         crate::candidate::compile_query_plan_from_file_with_gram_sizes(
             rule_path,
@@ -7433,7 +7660,7 @@ mod tests {
             max_anchors_per_alt,
             force_tier1_only,
             allow_tier2_fallback,
-            max_candidates,
+            max_candidates.into(),
         )
     }
 
@@ -7499,7 +7726,7 @@ mod tests {
             },
             force_tier1_only: true,
             allow_tier2_fallback: false,
-            max_candidates: 8,
+            max_candidates: 100.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -7655,7 +7882,7 @@ mod tests {
             },
             force_tier1_only: true,
             allow_tier2_fallback: false,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -7823,7 +8050,7 @@ mod tests {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -7877,7 +8104,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_query_errors_when_matches_exceed_max_candidates() {
+    fn candidate_query_truncates_when_matches_exceed_max_candidates() {
         let tmp = tempdir().expect("tmp");
         let state = sample_workspace_server_state(tmp.path(), 1);
         let rule = tmp.path().join("overflow_rule.yar");
@@ -7901,7 +8128,7 @@ rule overflow_rule {
         state.handle_publish().expect("publish");
 
         let plan = compile_query_plan_from_file_default(&rule, 8, false, true, 1).expect("plan");
-        let err = state
+        let result = state
             .handle_candidate_query(
                 CandidateQueryRequest {
                     plan: Value::Null,
@@ -7911,12 +8138,12 @@ rule overflow_rule {
                 },
                 &plan,
             )
-            .expect_err("overflow must fail");
-        assert!(
-            err.to_string()
-                .contains("Candidate query exceeded max_candidates (2 > 1)"),
-            "unexpected error: {err}"
-        );
+            .expect("overflow should truncate");
+        assert!(result.truncated);
+        assert_eq!(result.truncated_limit, Some(1));
+        assert_eq!(result.total_candidates, 1);
+        assert_eq!(result.returned_count, 1);
+        assert_eq!(result.sha256.len(), 1);
     }
 
     #[test]
@@ -8697,7 +8924,7 @@ rule overflow_rule {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -8821,7 +9048,7 @@ rule overflow_rule {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -9435,7 +9662,7 @@ rule overflow_rule {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 123,
+            max_candidates: 23.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -9891,7 +10118,7 @@ rule overflow_rule {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 8.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -10035,9 +10262,9 @@ rule overflow_rule {
                 "ast": { "kind": "pattern", "pattern_id": "$a" },
                 "flags": { "max_candidates": 0 }
             }))
-            .expect("zero means unlimited")
+            .expect("zero remains unlimited percentage")
             .max_candidates,
-            usize::MAX
+            0.0
         );
     }
 
@@ -11027,7 +11254,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 100.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };
@@ -11305,7 +11532,7 @@ rule q {
                     },
                     force_tier1_only: false,
                     allow_tier2_fallback: true,
-                    max_candidates: 5,
+                    max_candidates: 5.0,
                     tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
                     tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
                 },
@@ -11413,7 +11640,7 @@ rule q {
             },
             force_tier1_only: false,
             allow_tier2_fallback: true,
-            max_candidates: 8,
+            max_candidates: 100.0,
             tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
             tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
         };

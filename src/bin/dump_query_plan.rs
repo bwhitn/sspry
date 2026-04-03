@@ -29,9 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rule_path = PathBuf::from(args.next().ok_or("missing rule path")?);
     let max_candidates = args
         .next()
-        .map(|value| value.parse::<usize>())
+        .map(|value| value.parse::<f64>())
         .transpose()?
-        .unwrap_or(10_000);
+        .unwrap_or(7.5);
     let rule = fs::read_to_string(&rule_path)?;
     let plan = compile_query_plan_with_gram_sizes_and_identity_source(
         &rule,
