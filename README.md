@@ -48,8 +48,9 @@ The client can also distribute files across multiple servers in a round-robin fa
 * When using “time.now” in a YARA rule, there is a chance of a false negative because the search evaluates it at the time it starts, whereas verification happens later, and it will be evaluated again during that time.
 
 ## Current Issues
-* Identifying search memory expansion: Currently, memory usage during search tends to grow rapidly for some rules. While it may be related to the candidate count, it doesn’t appear to be the main driver. Rule shape, scan breadth, prepared-query artifacts, and file-backed residency appear to matter more.
 * Deduplication across forest.
+* multi serve search
+* Clean up CLI
 
 ## Quick Links
 
