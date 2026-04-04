@@ -119,6 +119,21 @@ fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Chi
     command.spawn().expect("spawn serve")
 }
 
+fn spawn_serve_tcp_capture_stderr(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
+    let addr = tcp_addr(port);
+    let mut command = Command::new(bin_path());
+    command
+        .arg("serve")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("--root")
+        .arg(candidate_root)
+        .args(extra_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command.spawn().expect("spawn serve")
+}
+
 #[test]
 fn serve_validation_errors_are_reported() {
     let tmp = tempdir().expect("tmp");
@@ -199,6 +214,153 @@ fn serve_persists_candidate_shards() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn serve_ignores_init_only_options_for_existing_db_with_warning() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("candidate_db");
+
+    let init_port = reserve_tcp_port();
+    let init_addr = tcp_addr(init_port);
+    let mut init_child = spawn_serve_tcp(
+        init_port,
+        &root,
+        &[
+            "--shards",
+            "2",
+            "--tier1-set-fp",
+            "0.31",
+            "--tier2-set-fp",
+            "0.17",
+            "--id-source",
+            "md5",
+            "--gram-sizes",
+            "4,5",
+        ],
+    );
+    wait_for_info(&init_addr);
+    let _ = init_child.kill();
+    let _ = init_child.wait();
+
+    let restart_port = reserve_tcp_port();
+    let restart_addr = tcp_addr(restart_port);
+    let mut restart_child = spawn_serve_tcp_capture_stderr(
+        restart_port,
+        &root,
+        &[
+            "--layout-profile",
+            "incremental",
+            "--shards",
+            "9",
+            "--tier1-set-fp",
+            "0.99",
+            "--tier2-set-fp",
+            "0.88",
+            "--id-source",
+            "sha1",
+            "--store-path",
+            "--gram-sizes",
+            "5,6",
+        ],
+    );
+    wait_for_info(&restart_addr);
+
+    let info = run_ok(&["info", "--addr", &restart_addr]);
+    let parsed: Value = serde_json::from_str(&info).expect("stats json");
+    assert_eq!(
+        parsed.get("candidate_shards").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(parsed.get("id_source").and_then(Value::as_str), Some("md5"));
+    assert_eq!(
+        parsed.get("store_path").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        parsed.get("tier1_filter_target_fp").and_then(Value::as_f64),
+        Some(0.31)
+    );
+    assert_eq!(
+        parsed.get("tier2_filter_target_fp").and_then(Value::as_f64),
+        Some(0.17)
+    );
+    assert_eq!(
+        parsed.get("tier1_gram_size").and_then(Value::as_u64),
+        Some(4)
+    );
+    assert_eq!(
+        parsed.get("tier2_gram_size").and_then(Value::as_u64),
+        Some(5)
+    );
+
+    let _ = restart_child.kill();
+    let output = restart_child.wait_with_output().expect("restart output");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("warning:"));
+    assert!(stderr.contains("ignoring serve initialization options"));
+    assert!(stderr.contains("--layout-profile"));
+    assert!(stderr.contains("--shards"));
+    assert!(stderr.contains("--tier1-set-fp"));
+    assert!(stderr.contains("--tier2-set-fp"));
+    assert!(stderr.contains("--id-source"));
+    assert!(stderr.contains("--store-path"));
+    assert!(stderr.contains("--gram-sizes"));
+}
+
+#[test]
+fn serve_does_not_warn_when_explicit_existing_values_match() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("candidate_db");
+
+    let init_port = reserve_tcp_port();
+    let init_addr = tcp_addr(init_port);
+    let mut init_child = spawn_serve_tcp(
+        init_port,
+        &root,
+        &[
+            "--shards",
+            "2",
+            "--tier1-set-fp",
+            "0.31",
+            "--tier2-set-fp",
+            "0.17",
+            "--id-source",
+            "md5",
+            "--store-path",
+            "--gram-sizes",
+            "4,5",
+        ],
+    );
+    wait_for_info(&init_addr);
+    let _ = init_child.kill();
+    let _ = init_child.wait();
+
+    let restart_port = reserve_tcp_port();
+    let restart_addr = tcp_addr(restart_port);
+    let mut restart_child = spawn_serve_tcp_capture_stderr(
+        restart_port,
+        &root,
+        &[
+            "--shards",
+            "2",
+            "--tier1-set-fp",
+            "0.31",
+            "--tier2-set-fp",
+            "0.17",
+            "--id-source",
+            "md5",
+            "--store-path",
+            "--gram-sizes",
+            "4,5",
+        ],
+    );
+    wait_for_info(&restart_addr);
+
+    let _ = restart_child.kill();
+    let output = restart_child.wait_with_output().expect("restart output");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(!stderr.contains("ignoring serve initialization options"));
 }
 
 #[test]

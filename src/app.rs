@@ -309,6 +309,38 @@ enum ServeLayoutProfile {
     Incremental,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ServeInitOptionSources {
+    layout_profile: bool,
+    shards: bool,
+    tier1_filter_target_fp: bool,
+    tier2_filter_target_fp: bool,
+    id_source: bool,
+    store_path: bool,
+    gram_sizes: bool,
+}
+
+fn argv_has_long_flag(argv: &[String], flag: &str) -> bool {
+    argv.iter().any(|arg| {
+        arg == flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+
+fn serve_init_option_sources_from_argv(argv: &[String]) -> ServeInitOptionSources {
+    ServeInitOptionSources {
+        layout_profile: argv_has_long_flag(argv, "--layout-profile"),
+        shards: argv_has_long_flag(argv, "--shards"),
+        tier1_filter_target_fp: argv_has_long_flag(argv, "--tier1-set-fp"),
+        tier2_filter_target_fp: argv_has_long_flag(argv, "--tier2-set-fp"),
+        id_source: argv_has_long_flag(argv, "--id-source"),
+        store_path: argv_has_long_flag(argv, "--store-path"),
+        gram_sizes: argv_has_long_flag(argv, "--gram-sizes"),
+    }
+}
+
 fn default_shards_for_profile(profile: ServeLayoutProfile) -> usize {
     match profile {
         ServeLayoutProfile::Standard => DEFAULT_STANDARD_SHARDS,
@@ -1501,6 +1533,17 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
     )
 }
 
+fn store_root_has_markers(root: &Path) -> bool {
+    root.join("store_meta.json").exists()
+        || root.join("meta.json").exists()
+        || root.join("sha256_by_docid.dat").exists()
+        || root.join("doc_meta.bin").exists()
+        || root.join("shard_000").join("store_meta.json").exists()
+        || root.join("shard_000").join("meta.json").exists()
+        || root.join("shard_000").join("sha256_by_docid.dat").exists()
+        || root.join("shard_000").join("doc_meta.bin").exists()
+}
+
 fn placeholder_connection() -> ClientConnectionArgs {
     ClientConnectionArgs {
         addr: DEFAULT_RPC_ADDR.to_owned(),
@@ -2534,27 +2577,34 @@ fn cmd_yara(args: &YaraArgs) -> i32 {
     }
 }
 
+#[cfg(test)]
 fn cmd_serve(args: &ServeArgs) -> i32 {
+    cmd_serve_with_sources(args, ServeInitOptionSources::default())
+}
+
+fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSources) -> i32 {
     match (|| -> Result<i32> {
         let (host, port) = parse_host_port(&args.addr)?;
-        let candidate_shards = serve_candidate_shard_count(args);
-        let serve_workspace_mode = serve_uses_workspace_mode(Path::new(&args.root));
+        let resolved = resolve_serve_runtime_settings(args, option_sources)?;
         let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
             adaptive_publish_prior_for_root(Path::new(&args.root));
         let signals = serve_signal_flags()?;
+        for warning in &resolved.warnings {
+            eprintln!("{warning}");
+        }
         rpc::serve_with_signal_flags(
             &host,
             port,
             None,
             args.max_request_bytes,
             RpcServerConfig {
-                candidate_config: store_config_from_serve_args(args),
-                candidate_shards,
+                candidate_config: resolved.candidate_config,
+                candidate_shards: resolved.candidate_shards,
                 search_workers: args.search_workers.max(1),
                 memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
                 auto_publish_initial_idle_ms,
                 auto_publish_storage_class,
-                workspace_mode: serve_workspace_mode,
+                workspace_mode: resolved.workspace_mode,
             },
             signals.shutdown.clone(),
             Some(signals.status_dump.clone()),
@@ -2576,15 +2626,7 @@ fn serve_uses_workspace_mode(root: &Path) -> bool {
     {
         return true;
     }
-    if root.join("store_meta.json").exists()
-        || root.join("meta.json").exists()
-        || root.join("sha256_by_docid.dat").exists()
-        || root.join("doc_meta.bin").exists()
-        || root.join("shard_000").join("store_meta.json").exists()
-        || root.join("shard_000").join("meta.json").exists()
-        || root.join("shard_000").join("sha256_by_docid.dat").exists()
-        || root.join("shard_000").join("doc_meta.bin").exists()
-    {
+    if store_root_has_markers(root) {
         return false;
     }
     fs::read_dir(root)
@@ -2602,6 +2644,161 @@ fn serve_uses_workspace_mode(root: &Path) -> bool {
         })
         .map(|has_forest_trees| !has_forest_trees)
         .unwrap_or(true)
+}
+
+#[derive(Debug)]
+struct ResolvedServeRuntimeSettings {
+    candidate_config: CandidateConfig,
+    candidate_shards: usize,
+    workspace_mode: bool,
+    warnings: Vec<String>,
+}
+
+fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option<PathBuf>> {
+    if workspace_mode {
+        let current_root = root.join("current");
+        if store_root_has_markers(&current_root) {
+            return Ok(Some(current_root));
+        }
+        return Ok(None);
+    }
+    if store_root_has_markers(root) {
+        return Ok(Some(root.to_path_buf()));
+    }
+    let tree_roots = forest_tree_roots(root)?;
+    Ok(tree_roots
+        .into_iter()
+        .find(|tree_root| tree_root != root && store_root_has_markers(tree_root)))
+}
+
+fn resolve_serve_runtime_settings(
+    args: &ServeArgs,
+    option_sources: ServeInitOptionSources,
+) -> Result<ResolvedServeRuntimeSettings> {
+    let root = Path::new(&args.root);
+    let workspace_mode = serve_uses_workspace_mode(root);
+    if let Some(existing_root) = existing_serve_store_root(root, workspace_mode)? {
+        let stores = open_stores(&existing_root)?;
+        let first = stores
+            .first()
+            .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?;
+        let stats = first.stats();
+        let id_source = CandidateIdSource::parse_config_value(&stats.id_source)?;
+        let candidate_config = store_config_from_parts(
+            root.to_path_buf(),
+            id_source,
+            stats.store_path,
+            stats
+                .tier1_filter_target_fp
+                .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP),
+            stats
+                .tier2_filter_target_fp
+                .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP),
+            stats.tier2_gram_size,
+            stats.tier1_gram_size,
+            stats.compaction_idle_cooldown_s,
+        );
+        let mut ignored = Vec::<String>::new();
+        if option_sources.shards && serve_candidate_shard_count(args) != stores.len().max(1) {
+            ignored.push(format!(
+                "--shards {} (using existing candidate_shards={})",
+                serve_candidate_shard_count(args),
+                stores.len().max(1)
+            ));
+        }
+        if option_sources.layout_profile
+            && default_shards_for_profile(args.layout_profile) != stores.len().max(1)
+        {
+            let layout_name = match args.layout_profile {
+                ServeLayoutProfile::Standard => "standard",
+                ServeLayoutProfile::Incremental => "incremental",
+            };
+            ignored.push(format!(
+                "--layout-profile {} (using existing candidate_shards={})",
+                layout_name,
+                stores.len().max(1)
+            ));
+        }
+        if option_sources.tier1_filter_target_fp
+            && args.tier1_filter_target_fp
+                != Some(
+                    stats
+                        .tier1_filter_target_fp
+                        .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP),
+                )
+        {
+            let value = args
+                .tier1_filter_target_fp
+                .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP);
+            ignored.push(format!(
+                "--tier1-set-fp {} (using existing {})",
+                value,
+                stats
+                    .tier1_filter_target_fp
+                    .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP)
+            ));
+        }
+        if option_sources.tier2_filter_target_fp
+            && args.tier2_filter_target_fp
+                != Some(
+                    stats
+                        .tier2_filter_target_fp
+                        .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP),
+                )
+        {
+            let value = args
+                .tier2_filter_target_fp
+                .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP);
+            ignored.push(format!(
+                "--tier2-set-fp {} (using existing {})",
+                value,
+                stats
+                    .tier2_filter_target_fp
+                    .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP)
+            ));
+        }
+        if option_sources.id_source && args.id_source.as_str() != stats.id_source {
+            ignored.push(format!(
+                "--id-source {} (using existing {})",
+                args.id_source.as_str(),
+                stats.id_source
+            ));
+        }
+        if option_sources.store_path && !stats.store_path {
+            ignored.push(format!(
+                "--store-path (using existing store_path={})",
+                stats.store_path
+            ));
+        }
+        let existing_gram_sizes = format!("{},{}", stats.tier1_gram_size, stats.tier2_gram_size);
+        if option_sources.gram_sizes && args.gram_sizes != existing_gram_sizes {
+            ignored.push(format!(
+                "--gram-sizes {} (using existing {},{})",
+                args.gram_sizes, stats.tier1_gram_size, stats.tier2_gram_size
+            ));
+        }
+        let warnings = if ignored.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "warning: {} already exists; ignoring serve initialization options for this startup: {}",
+                root.display(),
+                ignored.join(", ")
+            )]
+        };
+        return Ok(ResolvedServeRuntimeSettings {
+            candidate_config,
+            candidate_shards: stores.len().max(1),
+            workspace_mode,
+            warnings,
+        });
+    }
+    Ok(ResolvedServeRuntimeSettings {
+        candidate_config: store_config_from_serve_args(args),
+        candidate_shards: serve_candidate_shard_count(args),
+        workspace_mode,
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -5390,14 +5587,14 @@ struct InternalStatsArgs {
 }
 
 pub fn main(argv: Option<Vec<String>>) -> i32 {
-    let cli = match argv {
-        Some(values) => Cli::parse_from(values),
-        None => Cli::parse(),
-    };
+    let argv_values = argv.unwrap_or_else(|| std::env::args().collect::<Vec<_>>());
+    let cli = Cli::parse_from(argv_values.clone());
     perf::configure(cli.perf_report.as_ref().map(PathBuf::from), cli.perf_stdout);
 
     let exit_code = match cli.command {
-        Commands::Serve(args) => cmd_serve(&args),
+        Commands::Serve(args) => {
+            cmd_serve_with_sources(&args, serve_init_option_sources_from_argv(&argv_values))
+        }
         Commands::Index(args) => cmd_index(&args),
         Commands::LocalIndex(args) => cmd_local_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
