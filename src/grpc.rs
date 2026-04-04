@@ -6,6 +6,7 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::candidate::{CandidatePreparedQueryProfile, CandidateQueryProfile};
+use crate::rpc::CandidateDeleteResponse;
 use crate::{Result, SspryError};
 
 pub mod v1 {
@@ -101,6 +102,25 @@ impl BlockingGrpcClient {
             .block_on(async { self.inner.publish(v1::PublishRequest {}).await })
             .map_err(tonic_error)?;
         Ok(response.into_inner().message)
+    }
+
+    pub fn candidate_delete_sha256(&mut self, sha256: &str) -> Result<CandidateDeleteResponse> {
+        let response = self
+            .runtime
+            .block_on(async {
+                self.inner
+                    .delete(v1::DeleteRequest {
+                        sha256: sha256.to_owned(),
+                    })
+                    .await
+            })
+            .map_err(tonic_error)?;
+        let response = response.into_inner();
+        Ok(CandidateDeleteResponse {
+            status: response.status,
+            sha256: response.sha256,
+            doc_id: response.has_doc_id.then_some(response.doc_id),
+        })
     }
 
     pub fn search_stream<F>(&mut self, request: v1::SearchRequest, mut on_frame: F) -> Result<()>

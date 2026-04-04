@@ -187,8 +187,18 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
     assert!(search.contains("tier_used:"));
     assert!(search.contains("candidates: 2"));
 
+    let deleted = run_ok(&[
+        "grpc-delete",
+        "--addr",
+        &addr,
+        sample_a.to_str().expect("sample a"),
+    ]);
+    assert!(deleted.contains("status: deleted"));
+
     let info = run_ok(&["grpc-info", "--addr", &addr]);
-    assert!(info.contains("\"active_doc_count\": 2"));
+    assert!(info.contains("\"doc_count\": 2"));
+    assert!(info.contains("\"active_doc_count\": 1"));
+    assert!(info.contains("\"deleted_doc_count\": 1"));
 
     let shutdown = run_ok(&["grpc-shutdown", "--addr", &addr]);
     assert!(shutdown.contains("shutdown requested"));

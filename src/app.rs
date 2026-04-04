@@ -4642,6 +4642,54 @@ fn cmd_delete(args: &DeleteArgs) -> i32 {
     }
 }
 
+fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let server_policy = server_scan_policy_grpc(&args.connection)?;
+        let mut client = grpc_client(&args.connection)?;
+        let mut exit_code = 0;
+        for value in &args.values {
+            match (|| -> Result<()> {
+                let sha256_hex = resolve_delete_value(
+                    value,
+                    server_policy.id_source,
+                    DEFAULT_FILE_READ_CHUNK_SIZE,
+                )?;
+                let result = client.candidate_delete_sha256(&sha256_hex)?;
+                println!("value: {value}");
+                println!("status: {}", result.status);
+                println!("sha256: {}", result.sha256);
+                println!(
+                    "doc_id: {}",
+                    result
+                        .doc_id
+                        .map(|doc_id| doc_id.to_string())
+                        .unwrap_or_else(|| "None".to_owned())
+                );
+                if result.status != "deleted" {
+                    return Err(SspryError::from(format!(
+                        "delete failed for `{value}`: {}",
+                        result.status
+                    )));
+                }
+                Ok(())
+            })() {
+                Ok(()) => {}
+                Err(err) => {
+                    println!("{err}");
+                    exit_code = 1;
+                }
+            }
+        }
+        Ok(exit_code)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
     cmd_internal_delete(&InternalDeleteArgs {
         connection: placeholder_connection(),
@@ -5522,6 +5570,7 @@ enum Commands {
     GrpcIndex(IndexArgs),
     LocalIndex(LocalIndexArgs),
     Delete(DeleteArgs),
+    GrpcDelete(DeleteArgs),
     LocalDelete(LocalDeleteArgs),
     Search(SearchCommandArgs),
     GrpcSearch(SearchCommandArgs),
@@ -6065,6 +6114,7 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
         Commands::GrpcIndex(args) => cmd_grpc_index(&args),
         Commands::LocalIndex(args) => cmd_local_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
+        Commands::GrpcDelete(args) => cmd_grpc_delete(&args),
         Commands::LocalDelete(args) => cmd_local_delete(&args),
         Commands::Search(args) => cmd_search(&args),
         Commands::GrpcSearch(args) => cmd_grpc_search(&args),

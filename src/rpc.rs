@@ -2008,11 +2008,26 @@ impl GrpcSspry for GrpcServerService {
 
     async fn delete(
         &self,
-        _request: GrpcRequest<GrpcDeleteRequest>,
+        request: GrpcRequest<GrpcDeleteRequest>,
     ) -> std::result::Result<GrpcResponse<GrpcDeleteResponse>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented(
-            "gRPC delete is not implemented yet",
-        ))
+        let request = request.into_inner();
+        if request.sha256.trim().is_empty() {
+            return Err(GrpcStatus::invalid_argument(
+                "Delete request is missing sha256.",
+            ));
+        }
+        let state = self.state.clone();
+        let response =
+            tokio::task::spawn_blocking(move || state.handle_candidate_delete(&request.sha256))
+                .await
+                .map_err(grpc_join_error_status)?
+                .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(GrpcDeleteResponse {
+            status: response.status,
+            sha256: response.sha256,
+            doc_id: response.doc_id.unwrap_or(0),
+            has_doc_id: response.doc_id.is_some(),
+        }))
     }
 
     type SearchStreamStream =

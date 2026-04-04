@@ -419,6 +419,7 @@ fn help_surface_has_only_public_commands() {
     assert!(out.contains("grpc-index"));
     assert!(out.contains("local-index"));
     assert!(out.contains("delete"));
+    assert!(out.contains("grpc-delete"));
     assert!(out.contains("local-delete"));
     assert!(out.contains("search"));
     assert!(out.contains("grpc-search"));

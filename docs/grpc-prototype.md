@@ -23,6 +23,7 @@ Prototype CLI surface:
 
 - `grpc-serve`
 - `grpc-index`
+- `grpc-delete`
 - `grpc-search`
 - `grpc-info`
 - `grpc-shutdown`
