@@ -9,14 +9,14 @@ A mutable file search database with fast candidate retrieval and optional YARA v
 SSPRY is a scalable way to reduce the set of files that need to be scanned based on the YARA rule you intend to use. This isn’t meant for many rules to scan at one time, but rather for one-off scanning of a corpus of files. It is intended to avoid false negatives and have limited false positives. Other projects have done similar things, but the goal of this one is to do so in a scalable way that trades upfront processing for reduced memory and search processing, while keeping the overall database (Forest) size smaller than the sum of the files; however, it has a fair amount of disk I/O during searches. In addition to those, the database needs to support the insertion and deletion of items.
 
 ## Terms
-Branch - A partition inside a Tree.
-Candidate - An individual document that is returned as a possible match.
-Document - An individual file.
-Document ID - The hash used to uniquely identify the file in the forest. (MD5, SHA1, SHA256, SHA512)
-Forest - A collection of Trees.
-Metadata sidecar - The metadata contains the subset of YARA-relevant values that can be checked during search.
-Tier 1 bloom filter - A broader filter used first to gate some Tier 2 reads and help improve the accuracy.
-Tier 2 bloom filter - A more precise filter used to further narrow candidate sets.
+Branch - A partition inside a Tree.<br>
+Candidate - An individual document that is returned as a possible match.<br>
+Document - An individual file.<br>
+Document ID - The hash used to uniquely identify the file in the forest. (MD5, SHA1, SHA256, SHA512)<br>
+Forest - A collection of Trees.<br>
+Metadata sidecar - The metadata contains the subset of YARA-relevant values that can be checked during search.<br>
+Tier 1 bloom filter - A broader filter used first to gate some Tier 2 reads and help improve the accuracy.<br>
+Tier 2 bloom filter - A more precise filter used to further narrow candidate sets.<br>
 Tree - A single logical storage unit that contains a number of Branches.
 
 ## General Methodology
