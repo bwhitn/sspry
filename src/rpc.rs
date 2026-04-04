@@ -1510,7 +1510,11 @@ pub fn serve_grpc_with_signal_flags(
     let shutdown_state = state.clone();
     let serve_result = runtime.block_on(async move {
         tonic::transport::Server::builder()
-            .add_service(SspryServer::new(service))
+            .add_service(
+                SspryServer::new(service)
+                    .max_decoding_message_size(DEFAULT_MAX_REQUEST_BYTES)
+                    .max_encoding_message_size(DEFAULT_MAX_REQUEST_BYTES),
+            )
             .serve_with_shutdown(addr, async move {
                 while !shutdown_state.is_shutting_down() {
                     tokio::time::sleep(Duration::from_millis(50)).await;

@@ -7,6 +7,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::candidate::{CandidatePreparedQueryProfile, CandidateQueryProfile};
 use crate::rpc::CandidateDeleteResponse;
+use crate::rpc::DEFAULT_MAX_REQUEST_BYTES;
 use crate::{Result, SspryError};
 
 pub mod v1 {
@@ -61,6 +62,9 @@ impl BlockingGrpcClient {
         let inner = runtime
             .block_on(async { v1::sspry_client::SspryClient::connect(endpoint).await })
             .map_err(tonic_error)?;
+        let inner = inner
+            .max_decoding_message_size(DEFAULT_MAX_REQUEST_BYTES)
+            .max_encoding_message_size(DEFAULT_MAX_REQUEST_BYTES);
         Ok(Self { runtime, inner })
     }
 
