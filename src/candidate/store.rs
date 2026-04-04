@@ -2817,51 +2817,36 @@ impl CandidateStore {
         )
     }
 
-    pub(crate) fn query_candidates_with_prepared(
+    pub(crate) fn collect_query_hits_with_prepared(
         &mut self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-        cursor: usize,
-        chunk_size: usize,
-    ) -> Result<CandidateQueryResult> {
-        let mut total_scope = scope("candidate.query_candidates");
-        self.query_candidates_with_prepared_and_scope(
-            plan,
-            prepared,
-            cursor,
-            chunk_size,
-            &mut total_scope,
-        )
+    ) -> Result<(Vec<String>, String, CandidateQueryProfile)> {
+        self.collect_query_hits_with_prepared_and_scope(plan, prepared, None)
     }
 
-    fn query_candidates_with_prepared_and_scope(
+    fn collect_query_hits_with_prepared_and_scope(
         &mut self,
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
-        cursor: usize,
-        chunk_size: usize,
-        total_scope: &mut crate::perf::Scope,
-    ) -> Result<CandidateQueryResult> {
+        mut total_scope: Option<&mut crate::perf::Scope>,
+    ) -> Result<(Vec<String>, String, CandidateQueryProfile)> {
         if prepared.impossible_query {
-            return Ok(CandidateQueryResult {
-                sha256: Vec::new(),
-                total_candidates: 0,
-                returned_count: 0,
-                cursor: 0,
-                next_cursor: None,
-                truncated: false,
-                truncated_limit: None,
-                tier_used: "none".to_owned(),
-                query_profile: CandidateQueryProfile::default(),
-            });
+            return Ok((
+                Vec::new(),
+                "none".to_owned(),
+                CandidateQueryProfile::default(),
+            ));
         }
-        let (mut matched_hits, used_tiers, query_profile) =
+        let (matched_hits, used_tiers, query_profile) =
             if let Some(identity_hits) = self.query_identity_seed_hits(plan, prepared)? {
                 identity_hits
             } else {
                 self.scan_query_hits(plan, prepared)?
             };
-        total_scope.add_items(query_profile.docs_scanned);
+        if let Some(scope) = total_scope.as_mut() {
+            scope.add_items(query_profile.docs_scanned);
+        }
         record_counter(
             "candidate.query_candidates_docs_scanned_total",
             query_profile.docs_scanned,
@@ -2899,6 +2884,19 @@ impl CandidateStore {
             matched_hits.len() as u64,
         );
         self.record_query_metrics(query_profile.docs_scanned, matched_hits.len() as u64);
+        Ok((matched_hits, used_tiers.as_label(), query_profile))
+    }
+
+    fn query_candidates_with_prepared_and_scope(
+        &mut self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+        cursor: usize,
+        chunk_size: usize,
+        total_scope: &mut crate::perf::Scope,
+    ) -> Result<CandidateQueryResult> {
+        let (mut matched_hits, tier_used, query_profile) =
+            self.collect_query_hits_with_prepared_and_scope(plan, prepared, Some(total_scope))?;
         let max_candidates = if plan.max_candidates <= 0.0 {
             usize::MAX
         } else {
@@ -2919,7 +2917,7 @@ impl CandidateStore {
             next_cursor,
             truncated,
             truncated_limit: truncated.then_some(max_candidates),
-            tier_used: used_tiers.as_label(),
+            tier_used,
             query_profile,
         })
     }

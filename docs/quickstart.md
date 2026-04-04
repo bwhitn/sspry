@@ -46,6 +46,8 @@ Unverified candidate search:
   --rule ./rule.yar
 ```
 
+By default, `search` caps returned candidates at `7.5%` of searchable documents. Set `--max-candidates 0` to disable that cap.
+
 Verified search:
 
 ```bash

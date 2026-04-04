@@ -4627,30 +4627,11 @@ impl ServerState {
         plan: &CompiledQueryPlan,
         prepared: &PreparedQueryArtifacts,
     ) -> Result<(Vec<String>, Vec<String>, CandidateQueryProfile)> {
-        let mut hits = Vec::<String>::new();
-        let mut tier_used = Vec::<String>::new();
-        let mut query_profile = CandidateQueryProfile::default();
         let mut scan_plan = plan.clone();
         scan_plan.max_candidates = 0.0;
-        let collect_chunk = DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE.max(1);
-        let mut cursor = 0usize;
-        loop {
-            let local = store.query_candidates_with_prepared(
-                &scan_plan,
-                prepared,
-                cursor,
-                collect_chunk,
-            )?;
-            tier_used.push(local.tier_used.clone());
-            hits.extend(local.sha256.into_iter());
-            query_profile.merge_from(&local.query_profile);
-            if let Some(next) = local.next_cursor {
-                cursor = next;
-            } else {
-                break;
-            }
-        }
-        Ok((hits, tier_used, query_profile))
+        let (hits, tier_used, query_profile) =
+            store.collect_query_hits_with_prepared(&scan_plan, prepared)?;
+        Ok((hits, vec![tier_used], query_profile))
     }
 
     fn collect_query_matches_store_set(
@@ -7756,6 +7737,72 @@ mod tests {
                 .iter()
                 .all(|value| value.is_some())
         );
+    }
+
+    #[test]
+    fn collect_query_matches_single_store_scans_once_when_hits_span_multiple_pages() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_server_state(tmp.path());
+        let stores = state.published_query_store_sets().expect("query stores");
+        let store_lock = &stores[0].stores[0];
+        {
+            let mut store = lock_candidate_store_blocking(store_lock).expect("lock store");
+            for idx in 0..129usize {
+                let doc_path = tmp.path().join(format!("single_store_{idx:03}.bin"));
+                let payload = format!("xxABCyy{idx:03}");
+                fs::write(&doc_path, payload.as_bytes()).expect("write sample");
+                let features = scan_features_default_grams(&doc_path).expect("features");
+                store
+                    .insert_document(
+                        features.sha256,
+                        features.file_size,
+                        None,
+                        None,
+                        None,
+                        None,
+                        features.bloom_filter.len(),
+                        &features.bloom_filter,
+                        features.tier2_bloom_filter.len(),
+                        &features.tier2_bloom_filter,
+                        Some(format!("single_store_{idx:03}.bin")),
+                    )
+                    .expect("insert doc");
+            }
+            let _ = store.persist_meta_if_dirty().expect("persist meta");
+            assert_eq!(store.stats().doc_count, 129);
+        }
+
+        let plan = CompiledQueryPlan {
+            patterns: vec![PatternPlan {
+                pattern_id: "$a".to_owned(),
+                alternatives: vec![vec![pack_exact_gram(b"ABC")]],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![Vec::new()],
+                fixed_literals: vec![Vec::new()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            }],
+            root: QueryNode {
+                kind: "pattern".to_owned(),
+                pattern_id: Some("$a".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            force_tier1_only: true,
+            allow_tier2_fallback: false,
+            max_candidates: 100.0,
+            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+        };
+        let prepared = state
+            .shared_prepared_query_artifacts(&plan)
+            .expect("prepared query");
+        let mut store = lock_candidate_store_blocking(store_lock).expect("lock store");
+        let (hits, _, profile) =
+            ServerState::collect_query_matches_single_store(&mut store, &plan, &prepared)
+                .expect("single-store query");
+        assert_eq!(hits.len(), 129);
+        assert_eq!(profile.docs_scanned, 129);
     }
 
     #[test]

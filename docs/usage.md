@@ -62,7 +62,8 @@ Options:
 - `--max-request-bytes <bytes>`
   - hard request-size cap
 - `--search-workers <n>`
-  - server-side shard search concurrency
+  - server-side tree query workers per search
+  - a forest search runs across at most this many trees at once
 - `--memory-budget-gb <n>`
   - configured indexing memory budget used for backpressure decisions
 - `--root <path>`
@@ -180,10 +181,8 @@ Options:
   - forest-level tree concurrency for `--root`
   - `0` means auto up to the tree count
 - `--max-anchors-per-pattern <n>`
-- `--max-candidates <n>` default `15000`; `0` means unlimited
-- `--gate-only`
-  - only valid with `--root`
-  - evaluates just the tree-gate layer and skips candidate/doc scanning
+- `--max-candidates <p>` default `7.5`; `0` means unlimited
+  - percentage of searchable documents
 - `--verify`
 - `--verbose`
 
@@ -194,7 +193,9 @@ Behavior:
 - `--addr` and `--root` are the two search transports:
   - `--addr` uses a persistent RPC server over either a direct store/workspace or a forest-root server
   - `--root` opens the forest locally in-process
-- `--tree-search-workers` and `--gate-only` only affect `--root`
+- `--tree-search-workers` only affects `--root`
+- remote `search --addr` streams candidate pages from the server and the client deduplicates across the forest before applying the final cap
+- if the candidate cap is reached, output includes `truncated: true` and `truncated_limit: <n>`
 - verified search requires stored file paths to still exist on disk
 - candidate order is not guaranteed; search returns an unordered match set
 
@@ -283,7 +284,7 @@ These fail-fast cases are intentional:
 Practical note:
 
 - for repeated rule-by-rule tuning on a preserved DB, `--addr` against a persistent server is usually faster than calling `search --root` once per rule
-- `search --root` is the right path for local forest correctness checks, tree-level threaded-search experiments, and `--gate-only` tree-gate inspection
+- `search --root` is the right path for local forest correctness checks and tree-level threaded-search experiments
 
 ## search-batch
 
@@ -304,7 +305,8 @@ Options:
 - `--tree-search-workers <n>`
   - forest-level tree concurrency
 - `--max-anchors-per-pattern <n>`
-- `--max-candidates <n>`
+- `--max-candidates <p>` default `7.5`
+  - percentage of searchable documents
 - `--verify`
 
 Behavior:
@@ -337,7 +339,6 @@ Returns JSON describing:
 - bloom policy
 - adaptive publish state
 - document counts and filter-bucket counts
-- tree-gate memory counters
 - startup cleanup counts for abandoned compaction roots
 - compaction generation / retired generation counts
 - current compaction runtime counters and reclaimed bytes
@@ -386,7 +387,7 @@ This bypasses the database and scans one file directly with `yara-x`.
 - treat `--gram-sizes` as a format choice, not a casual runtime knob
 - use `--set-fp`, `--tier1-set-fp`, and `--tier2-set-fp` to control the disk-size vs candidate-quality tradeoff
 - use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
-- use `--search-workers` to control server search parallelism
+- use `--search-workers` to control how many trees a forest server searches at once per query
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change
 - expect delete to be immediate logically but reclaimed physically later by shard-local compaction
 - `SIGINT` and `SIGTERM` trigger graceful drain and shutdown

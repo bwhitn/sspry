@@ -15,7 +15,7 @@
   <rect x="650" y="255" width="220" height="110" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
   <text x="688" y="295" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Binary Sidecars</text>
   <text x="682" y="323" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">tier1/tier2 blooms, ids,</text>
-  <text x="708" y="346" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">metadata, paths, tree gates</text>
+  <text x="708" y="346" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">metadata, paths, compaction</text>
   <rect x="345" y="270" width="240" height="95" rx="12" fill="#fde68a" stroke="#a16207" stroke-width="2"/>
   <text x="399" y="309" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#78350f">Local Verify</text>
   <text x="385" y="337" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#78350f">optional yara-x over stored paths</text>

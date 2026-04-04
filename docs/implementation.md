@@ -1,6 +1,6 @@
 # Implementation
 
-`sspry` is a mutable file-search engine built around per-document bloom filters, per-shard tree-gate summaries, and optional local YARA verification.
+`sspry` is a mutable file-search engine built around per-document bloom filters, compact metadata sidecars, and optional local YARA verification.
 
 ## Architecture
 
@@ -13,7 +13,6 @@ At a high level:
 3. The server stores:
    - per-document Tier1 bloom filters
    - per-document Tier2 bloom filters
-   - per-shard tree-gate summaries over Tier1 and Tier2
    - metadata and optional stored file paths
 4. `search` compiles a restricted YARA rule into a query plan.
 5. The store returns candidate digests.
@@ -46,9 +45,9 @@ The query path is:
 1. Parse restricted YARA into fixed literals / boolean structure.
 2. Extract Tier1 and Tier2 grams from the rule using the DB-wide gram sizes.
 3. Build an anchor plan with branch ordering, per-pattern anchor reduction, and preserved selected anchor literals.
-4. Query shards in parallel.
-5. Use tree-gate summaries to skip branches that cannot match.
-6. Use per-document Tier1 and Tier2 blooms to refine candidates.
+4. Query trees in parallel when searching a forest.
+5. Scan shard stores directly.
+6. Use per-document Tier1 and Tier2 blooms plus stored metadata to refine candidates.
 7. Collect candidate digests without ranking guarantees.
 8. Optionally verify file paths locally.
 
@@ -85,8 +84,6 @@ Per shard, the implementation persists sidecars such as:
 - `doc_metadata.bin`
 - `blooms.bin`
 - `tier2_blooms.bin`
-- `tree_tier1_gates.bin`
-- `tree_tier2_gates.bin`
 - `external_ids.dat` when `--store-path` is enabled
 
 Each shard also keeps a small compaction manifest beside the shard root.
@@ -105,7 +102,6 @@ Deletes are immediate logically:
 
 - the document is marked deleted
 - query paths stop returning it
-- tree-gate summaries are refreshed so deleted docs stop contributing to future gate checks
 
 Physical reclaim is deferred.
 
@@ -247,6 +243,6 @@ These are the main implementation gaps worth keeping in view:
 The current tradeoffs are deliberate:
 
 - mutable store instead of rebuild-only index
-- bloom tiers and tree-gate summaries instead of retained exact gram postings
+- bloom tiers and compact metadata instead of retained exact gram postings
 - server-owned store policy so clients stay simple
 - narrow public CLI so alpha users only touch meaningful knobs
