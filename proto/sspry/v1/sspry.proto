@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package sspry.v1;
+
+service Sspry {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Publish(PublishRequest) returns (PublishResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc SearchStream(SearchRequest) returns (stream SearchFrame);
+  rpc InsertStream(stream InsertChunk) returns (InsertSummary);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string message = 1;
+}
+
+message StatsRequest {}
+
+message StatusRequest {}
+
+message PublishRequest {}
+
+message ShutdownRequest {}
+
+message DeleteRequest {
+  string sha256 = 1;
+}
+
+message DeleteResponse {
+  string status = 1;
+  string sha256 = 2;
+  uint64 doc_id = 3;
+  bool has_doc_id = 4;
+}
+
+message PublishResponse {
+  string message = 1;
+}
+
+message ShutdownResponse {
+  string message = 1;
+}
+
+message StatsResponse {
+  string json = 1;
+}
+
+message StatusResponse {
+  string json = 1;
+}
+
+message SearchRequest {
+  oneof query {
+    string yara_rule_source = 1;
+    string compiled_plan_json = 2;
+  }
+  uint32 chunk_size = 3;
+  bool include_external_ids = 4;
+  double max_candidates_percent = 5;
+}
+
+message SearchProfile {
+  uint64 docs_scanned = 1;
+  uint64 tier1_loads = 2;
+  uint64 tier2_loads = 3;
+  uint64 returned_candidates = 4;
+}
+
+message SearchFrame {
+  repeated string sha256 = 1;
+  repeated string external_ids = 2;
+  uint64 candidate_limit = 3;
+  bool has_candidate_limit = 4;
+  bool stream_complete = 5;
+  bool truncated = 6;
+  string tier_used = 7;
+  SearchProfile query_profile = 8;
+}
+
+message InsertChunk {
+  uint64 stream_id = 1;
+  bytes payload = 2;
+  bool final_chunk = 3;
+}
+
+message InsertSummary {
+  uint64 inserted_count = 1;
+  repeated InsertResult results = 2;
+}
+
+message InsertResult {
+  string status = 1;
+  uint64 doc_id = 2;
+  string sha256 = 3;
+}

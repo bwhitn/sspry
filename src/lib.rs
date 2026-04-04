@@ -1,5 +1,6 @@
 pub mod app;
 pub mod candidate;
+pub mod grpc;
 pub mod perf;
 pub mod rpc;
 
