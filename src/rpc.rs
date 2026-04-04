@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status as GrpcStatus};
 
 use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
 use crate::candidate::store::{
@@ -32,6 +34,13 @@ use crate::candidate::{
     candidate_shard_root, metadata_field_is_boolean, metadata_field_is_float,
     metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
     read_candidate_shard_count, resolve_max_candidates, write_candidate_shard_count,
+};
+use crate::grpc::v1::{
+    DeleteRequest as GrpcDeleteRequest, DeleteResponse as GrpcDeleteResponse, PingRequest,
+    PingResponse, PublishRequest, PublishResponse as GrpcPublishResponse, SearchFrame,
+    SearchRequest, ShutdownRequest, ShutdownResponse as GrpcShutdownResponse, StatsRequest,
+    StatsResponse, StatusRequest, StatusResponse,
+    sspry_server::{Sspry as GrpcSspry, SspryServer},
 };
 use crate::perf::{record_counter, scope};
 use crate::{Result, SspryError};
@@ -603,6 +612,18 @@ struct StartupProfile {
     total_ms: u64,
     current: StoreRootStartupProfile,
     work: StoreRootStartupProfile,
+}
+
+struct ServerWorkers {
+    compaction_worker: thread::JoinHandle<()>,
+    auto_publish_worker: thread::JoinHandle<()>,
+    published_tier2_snapshot_seal_worker: thread::JoinHandle<()>,
+    status_worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct GrpcServerService {
+    state: Arc<ServerState>,
 }
 
 struct ActiveMutationGuard<'a> {
@@ -1424,12 +1445,7 @@ pub fn serve_with_signal_flags(
     shutdown: Arc<AtomicBool>,
     status_dump: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
-    let state = Arc::new(ServerState::new(config, shutdown)?);
-    let compaction_worker = start_compaction_worker(state.clone());
-    let auto_publish_worker = start_auto_publish_worker(state.clone());
-    let published_tier2_snapshot_seal_worker =
-        start_published_tier2_snapshot_seal_worker(state.clone());
-    let status_worker = start_status_dump_worker(state.clone(), status_dump);
+    let (state, workers) = start_server_runtime(config, shutdown, status_dump)?;
 
     let accept_result = if let Some(path) = socket_path {
         #[cfg(unix)]
@@ -1457,36 +1473,50 @@ pub fn serve_with_signal_flags(
         println!("sspry server listening on {}:{}", local.ip(), local.port());
         accept_tcp(listener, state.clone(), max_request_bytes)
     };
-
-    if state.is_shutting_down() {
-        eprintln!("sspry: shutdown requested, draining");
-        if let Ok(stats) = state.current_stats_json() {
-            if let Ok(text) = serde_json::to_string_pretty(&stats) {
-                eprintln!("{text}");
-            }
-        }
-    }
-    state.shutdown.store(true, Ordering::Relaxed);
-    if let Some(worker) = status_worker {
-        let _ = worker.join();
-    }
-    let _ = compaction_worker.join();
-    let _ = auto_publish_worker.join();
-    let _ = published_tier2_snapshot_seal_worker.join();
-    let mut last_reported_connections = usize::MAX;
-    while state.active_connections.load(Ordering::Acquire) > 0 {
-        let active_connections = state.active_connections.load(Ordering::Acquire);
-        if active_connections != last_reported_connections {
-            eprintln!("sspry: waiting for {active_connections} active connection(s) to drain");
-            last_reported_connections = active_connections;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    if let Err(err) = state.flush_store_meta_if_dirty() {
-        eprintln!("sspry: failed to flush dirty store metadata during shutdown: {err}");
-    }
-    eprintln!("sspry: shutdown complete");
+    drain_server_runtime(state, workers);
     accept_result
+}
+
+pub fn serve_grpc(host: &str, port: u16, config: ServerConfig) -> Result<()> {
+    serve_grpc_with_signal_flags(host, port, config, Arc::new(AtomicBool::new(false)), None)
+}
+
+pub fn serve_grpc_with_signal_flags(
+    host: &str,
+    port: u16,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    status_dump: Option<Arc<AtomicBool>>,
+) -> Result<()> {
+    let (state, workers) = start_server_runtime(config, shutdown, status_dump)?;
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| SspryError::from("Invalid TCP address."))?;
+    println!(
+        "sspry grpc server listening on {}:{}",
+        addr.ip(),
+        addr.port()
+    );
+    let service = GrpcServerService {
+        state: state.clone(),
+    };
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let shutdown_state = state.clone();
+    let serve_result = runtime.block_on(async move {
+        tonic::transport::Server::builder()
+            .add_service(SspryServer::new(service))
+            .serve_with_shutdown(addr, async move {
+                while !shutdown_state.is_shutting_down() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+    });
+    drain_server_runtime(state, workers);
+    serve_result.map_err(|err| SspryError::from(err.to_string()))
 }
 
 pub fn serve_with_shutdown(
@@ -1803,11 +1833,158 @@ fn start_status_dump_worker(
     }))
 }
 
+fn start_server_runtime(
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    status_dump: Option<Arc<AtomicBool>>,
+) -> Result<(Arc<ServerState>, ServerWorkers)> {
+    let state = Arc::new(ServerState::new(config, shutdown)?);
+    let workers = ServerWorkers {
+        compaction_worker: start_compaction_worker(state.clone()),
+        auto_publish_worker: start_auto_publish_worker(state.clone()),
+        published_tier2_snapshot_seal_worker: start_published_tier2_snapshot_seal_worker(
+            state.clone(),
+        ),
+        status_worker: start_status_dump_worker(state.clone(), status_dump),
+    };
+    Ok((state, workers))
+}
+
+fn drain_server_runtime(state: Arc<ServerState>, workers: ServerWorkers) {
+    if state.is_shutting_down() {
+        eprintln!("sspry: shutdown requested, draining");
+        if let Ok(stats) = state.current_stats_json() {
+            if let Ok(text) = serde_json::to_string_pretty(&stats) {
+                eprintln!("{text}");
+            }
+        }
+    }
+    state.shutdown.store(true, Ordering::Relaxed);
+    if let Some(worker) = workers.status_worker {
+        let _ = worker.join();
+    }
+    let _ = workers.compaction_worker.join();
+    let _ = workers.auto_publish_worker.join();
+    let _ = workers.published_tier2_snapshot_seal_worker.join();
+    let mut last_reported_connections = usize::MAX;
+    while state.active_connections.load(Ordering::Acquire) > 0 {
+        let active_connections = state.active_connections.load(Ordering::Acquire);
+        if active_connections != last_reported_connections {
+            eprintln!("sspry: waiting for {active_connections} active connection(s) to drain");
+            last_reported_connections = active_connections;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if let Err(err) = state.flush_store_meta_if_dirty() {
+        eprintln!("sspry: failed to flush dirty store metadata during shutdown: {err}");
+    }
+    eprintln!("sspry: shutdown complete");
+}
+
 fn current_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+fn grpc_join_error_status(err: tokio::task::JoinError) -> GrpcStatus {
+    GrpcStatus::internal(format!("gRPC background task failed: {err}"))
+}
+
+fn grpc_internal_status(err: SspryError) -> GrpcStatus {
+    GrpcStatus::internal(err.to_string())
+}
+
+#[tonic::async_trait]
+impl GrpcSspry for GrpcServerService {
+    async fn ping(
+        &self,
+        _request: GrpcRequest<PingRequest>,
+    ) -> std::result::Result<GrpcResponse<PingResponse>, GrpcStatus> {
+        Ok(GrpcResponse::new(PingResponse {
+            message: "pong".to_owned(),
+        }))
+    }
+
+    async fn stats(
+        &self,
+        _request: GrpcRequest<StatsRequest>,
+    ) -> std::result::Result<GrpcResponse<StatsResponse>, GrpcStatus> {
+        let state = self.state.clone();
+        let json = tokio::task::spawn_blocking(move || {
+            let stats = Value::Object(state.current_stats_json()?);
+            serde_json::to_string_pretty(&stats).map_err(SspryError::from)
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(StatsResponse { json }))
+    }
+
+    async fn status(
+        &self,
+        _request: GrpcRequest<StatusRequest>,
+    ) -> std::result::Result<GrpcResponse<StatusResponse>, GrpcStatus> {
+        let state = self.state.clone();
+        let json = tokio::task::spawn_blocking(move || {
+            let stats = Value::Object(state.status_json()?);
+            serde_json::to_string_pretty(&stats).map_err(SspryError::from)
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(StatusResponse { json }))
+    }
+
+    async fn publish(
+        &self,
+        _request: GrpcRequest<PublishRequest>,
+    ) -> std::result::Result<GrpcResponse<GrpcPublishResponse>, GrpcStatus> {
+        Err(GrpcStatus::unimplemented(
+            "gRPC publish is not implemented yet",
+        ))
+    }
+
+    async fn shutdown(
+        &self,
+        _request: GrpcRequest<ShutdownRequest>,
+    ) -> std::result::Result<GrpcResponse<GrpcShutdownResponse>, GrpcStatus> {
+        self.state.shutdown.store(true, Ordering::SeqCst);
+        Ok(GrpcResponse::new(GrpcShutdownResponse {
+            message: "shutdown requested".to_owned(),
+        }))
+    }
+
+    async fn delete(
+        &self,
+        _request: GrpcRequest<GrpcDeleteRequest>,
+    ) -> std::result::Result<GrpcResponse<GrpcDeleteResponse>, GrpcStatus> {
+        Err(GrpcStatus::unimplemented(
+            "gRPC delete is not implemented yet",
+        ))
+    }
+
+    type SearchStreamStream =
+        tokio_stream::wrappers::ReceiverStream<std::result::Result<SearchFrame, GrpcStatus>>;
+
+    async fn search_stream(
+        &self,
+        _request: GrpcRequest<SearchRequest>,
+    ) -> std::result::Result<GrpcResponse<Self::SearchStreamStream>, GrpcStatus> {
+        Err(GrpcStatus::unimplemented(
+            "gRPC search streaming is not implemented yet",
+        ))
+    }
+
+    async fn insert_stream(
+        &self,
+        _request: GrpcRequest<tonic::Streaming<crate::grpc::v1::InsertChunk>>,
+    ) -> std::result::Result<GrpcResponse<crate::grpc::v1::InsertSummary>, GrpcStatus> {
+        Err(GrpcStatus::unimplemented(
+            "gRPC insert streaming is not implemented yet",
+        ))
+    }
 }
 
 fn signed_delta_i64(current: u64, baseline: u64) -> i64 {

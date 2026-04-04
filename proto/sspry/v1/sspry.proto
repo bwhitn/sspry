@@ -55,10 +55,7 @@ message StatusResponse {
 }
 
 message SearchRequest {
-  oneof query {
-    string yara_rule_source = 1;
-    string compiled_plan_json = 2;
-  }
+  string yara_rule_source = 1;
   uint32 chunk_size = 3;
   bool include_external_ids = 4;
   double max_candidates_percent = 5;

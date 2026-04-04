@@ -2621,6 +2621,43 @@ fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSourc
     }
 }
 
+fn cmd_grpc_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSources) -> i32 {
+    match (|| -> Result<i32> {
+        let (host, port) = parse_host_port(&args.addr)?;
+        let resolved = resolve_serve_runtime_settings(args, option_sources)?;
+        let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
+            adaptive_publish_prior_for_root(Path::new(&args.root));
+        let signals = serve_signal_flags()?;
+        for warning in &resolved.warnings {
+            eprintln!("{warning}");
+        }
+        rpc::serve_grpc_with_signal_flags(
+            &host,
+            port,
+            rpc::ServerConfig {
+                candidate_config: resolved.candidate_config,
+                candidate_shards: resolved.candidate_shards,
+                search_workers: args.search_workers.max(1),
+                memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+                auto_publish_initial_idle_ms,
+                auto_publish_storage_class,
+                workspace_mode: resolved.workspace_mode,
+            },
+            signals.shutdown.clone(),
+            Some(signals.status_dump.clone()),
+        )?;
+        signals.shutdown.store(false, Ordering::SeqCst);
+        signals.status_dump.store(false, Ordering::SeqCst);
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn serve_uses_workspace_mode(root: &Path) -> bool {
     if root.join("current").is_dir() || root.join("work_a").is_dir() || root.join("work_b").is_dir()
     {
@@ -5059,6 +5096,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Serve(ServeArgs),
+    GrpcServe(ServeArgs),
     Index(IndexArgs),
     LocalIndex(LocalIndexArgs),
     Delete(DeleteArgs),
@@ -5594,6 +5632,9 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
     let exit_code = match cli.command {
         Commands::Serve(args) => {
             cmd_serve_with_sources(&args, serve_init_option_sources_from_argv(&argv_values))
+        }
+        Commands::GrpcServe(args) => {
+            cmd_grpc_serve_with_sources(&args, serve_init_option_sources_from_argv(&argv_values))
         }
         Commands::Index(args) => cmd_index(&args),
         Commands::LocalIndex(args) => cmd_local_index(&args),

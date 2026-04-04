@@ -414,6 +414,7 @@ fn help_surface_has_only_public_commands() {
     let out = run_ok(&["--help"]);
     assert!(out.contains("Scalable Screening and Prefiltering of Rules for YARA"));
     assert!(out.contains("serve"));
+    assert!(out.contains("grpc-serve"));
     assert!(out.contains("index"));
     assert!(out.contains("local-index"));
     assert!(out.contains("delete"));

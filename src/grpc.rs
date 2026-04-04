@@ -7,19 +7,17 @@ pub const PROTOTYPE_BRANCH_NOTE: &str =
 
 #[cfg(test)]
 mod tests {
-    use super::v1::{PingRequest, SearchRequest, search_request::Query};
+    use super::v1::{PingRequest, SearchRequest};
 
     #[test]
     fn generated_grpc_types_are_available() {
         let _ping = PingRequest {};
         let request = SearchRequest {
-            query: Some(Query::YaraRuleSource(
-                "rule test { condition: true }".to_owned(),
-            )),
+            yara_rule_source: "rule test { condition: true }".to_owned(),
             chunk_size: 128,
             include_external_ids: false,
             max_candidates_percent: 7.5,
         };
-        assert!(matches!(request.query, Some(Query::YaraRuleSource(_))));
+        assert!(request.yara_rule_source.contains("condition"));
     }
 }
