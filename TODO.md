@@ -146,11 +146,7 @@ Why:
 - block-level coarse summaries scale better than adding more per-file structures
 
 Immediate matrix:
-- baseline `50k`: current exact-gram path with the default `4 KiB` Tier2 superblock summary cap
 - bloom-only `50k`: `--no-grams` with the default `4 KiB` summary cap
-- bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 8`
-- bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 16`
-- bloom-only `50k`: `--no-grams --tier2-superblock-summary-cap-kib 32`
 
 Record for each run:
 - index wall time
@@ -166,14 +162,12 @@ Search set for the matrix:
 
 Interpretation target:
 - if bloom-only materially improves ingest while search timings/candidate counts stay acceptable, revisit whether exact grams and DF should remain in the default path
-- if bloom-only hurts search too much, keep exact grams and spend any extra budget on stronger block/superblock summaries before touching per-file bloom size
 
 Current read after the `8/16/32 KiB` matrix:
 - bloom-only is the current direction
 - `32 KiB` is the best point so far on the `50k` matrix
 - the DB growth from `8 KiB -> 32 KiB` is small enough to keep
 - the remaining search problems are concentrated in a few heavy rules, not the whole search path
-- `32 KiB` Tier2 superblock summaries consumed:
   - `301,526,016` bytes (`287.56 MiB`)
   - about `0.76%` of the whole `50k` DB
 
@@ -218,7 +212,6 @@ Immediate search improvements on the bloom-only baseline:
   - artifact:
     - `/root/pertest/results/sspry_searchprofile_50000_32k_20260319_r3/search_summary.json`
   - all supported rules still scanned all `50,000` docs
-  - all supported rules skipped `0` superblocks
   - all supported rules loaded all `50,000` tier1 blooms
   - tier1 bloom bytes touched per search:
     - `25,405,137,920` bytes (`23.66 GiB`)
@@ -233,7 +226,6 @@ Immediate search improvements on the bloom-only baseline:
   - metadata is no longer the problem
   - planner/DF work is no longer the problem
   - block admission is doing no useful filtering on the `50k` `32 KiB` baseline
-  - `64 KiB` helped some search totals on `50k`, but still skipped `0` superblocks and still loaded all `50,000` tier1 blooms
   - the next useful lever was smaller blocks plus a non-folded block-summary shape, not larger folded summaries
 5. bloom-size cleanup:
   - new chosen bloom sizes should stay aligned to `8` bytes so future `u64`-oriented bloom paths remain possible without another format change
@@ -241,17 +233,14 @@ Immediate search improvements on the bloom-only baseline:
   - block summaries now use sampled exact `u64` words instead of modulo-folded OR summaries
   - search mask evaluation now uses `u64` word masks
   - admitted blocks prefetch tier1 bloom slices before per-doc evaluation
-  - default `docs_per_block` is now `32` and still scales upward under the existing superblock-memory budget
   - local `26k` smoke comparison:
     - previous `128`-doc blocks:
       - artifact: `/root/pertest/results/sspry_searchsmoke_26000_32k_20260319_r1/search_summary.json`
       - `index_wall_ms = 722,055`
-      - superblocks skipped per supported rule: `0-1`
       - `01`: `6.128 s`
     - new `32`-doc blocks:
       - artifact: `/root/pertest/results/sspry_searchsmoke_26000_32k_20260319_r2_block32/search_summary.json`
       - `index_wall_ms = 561,343`
-      - superblocks skipped per supported rule: `10-49`
       - `01`: `1.104 s`
   - full `50k` validation on this baseline:
     - artifact: `/root/pertest/results/sspry_searchprofile_50000_32k_20260319_r4/search_summary.json`
@@ -266,7 +255,6 @@ Immediate search improvements on the bloom-only baseline:
       - `12`: `3.79 s`
     - supported-rule scan shape:
       - docs scanned: `49,884-49,966 / 50,000`
-      - superblocks skipped: `12-29`
       - tier1 bloom loads: `49,884-49,966`
       - tier1 bloom bytes per search: about `25.40 GiB`
     - read:
@@ -288,7 +276,6 @@ Immediate search improvements on the bloom-only baseline:
       - `12`: `3.16 s`
     - supported-rule scan shape:
       - docs scanned: `49,873-49,966 / 50,000`
-      - superblocks skipped: `12-30`
       - tier1 bloom loads: `49,873-49,966`
       - tier1 bloom bytes per search: still about `25.40 GiB`
     - read:
@@ -388,7 +375,6 @@ Current `100k` forest search result:
   - `12`: `209.681 s`, `203` candidates
 - query shape:
   - docs scanned stayed near full corpus: `98,325` to `99,919`
-  - superblocks skipped stayed tiny: `40` to `275`
   - tier1 bloom bytes per query stayed around `52.8-53.0 GiB`
 - read:
   - forest fanout fixes the old `01` timeout case decisively
@@ -431,12 +417,6 @@ Current local search-worker follow-up:
   - `last_publish_duration_ms = 85`
   - `last_publish_reused_work_stores = true`
 - supported-rule search totals:
-  - `01`: `0.166 s`, `docs_scanned = 1,286`, `superblocks_skipped = 114`
-  - `08`: `0.122 s`, `docs_scanned = 1,922`, `superblocks_skipped = 17`
-  - `09`: `0.172 s`, `docs_scanned = 1,791`, `superblocks_skipped = 42`
-  - `10`: `0.172 s`, `docs_scanned = 909`, `superblocks_skipped = 151`
-  - `11`: `0.146 s`, `docs_scanned = 1,494`, `superblocks_skipped = 84`
-  - `12`: `0.147 s`, `docs_scanned = 1,630`, `superblocks_skipped = 61`
 - read:
   - the bounded worker scan path is functionally clean on published search
   - the query wall times are now comfortably sub-second on this small published slice
@@ -466,12 +446,6 @@ Corrected `2000`-file published smoke on the lane-aware path:
   - `last_publish_duration_ms = 83`
   - `last_publish_reused_work_stores = true`
 - supported-rule search totals:
-  - `01`: `0.321 s`, `docs_scanned = 1,753`, `superblocks_skipped = 44`
-  - `08`: `0.147 s`, `docs_scanned = 1,988`, `superblocks_skipped = 5`
-  - `09`: `0.322 s`, `docs_scanned = 1,958`, `superblocks_skipped = 13`
-  - `10`: `0.398 s`, `docs_scanned = 1,226`, `superblocks_skipped = 117`
-  - `11`: `0.298 s`, `docs_scanned = 1,795`, `superblocks_skipped = 39`
-  - `12`: `0.197 s`, `docs_scanned = 1,938`, `superblocks_skipped = 18`
 - read:
   - correctness is fixed, but the lane-aware layout regressed block rejection versus the prior worker-path baseline
   - search is worse on `01/08/09/11/12` and only marginally acceptable on `10`
@@ -484,22 +458,12 @@ Rejected follow-ups on top of the worker path:
     - `/root/pertest/results/sspry_smoke_lane4_2000_20260319_r2/search_summary.json`
   - kept total summary bytes bounded and held `docs_per_block = 32`
   - but search got worse than the worker-only baseline:
-    - `08`: `docs_scanned 1993`, `superblocks_skipped 3`
-    - `09`: `docs_scanned 1954`, `superblocks_skipped 10`
-    - `10`: `docs_scanned 1287`, `superblocks_skipped 88`
-    - `11`: `docs_scanned 1808`, `superblocks_skipped 33`
-    - `12`: `docs_scanned 1936`, `superblocks_skipped 12`
   - not worth carrying to `50k`
 - folded `u64`-word lane signatures
   - artifact:
     - `/root/pertest/results/sspry_smoke_lane4_2000_20260319_r3/search_summary.json`
   - slightly better ingest/storage shape than sampled lanes
   - but block rejection collapsed even further:
-    - `08`: `docs_scanned 1998`, `superblocks_skipped 1`
-    - `09`: `docs_scanned 1989`, `superblocks_skipped 2`
-    - `10`: `docs_scanned 1955`, `superblocks_skipped 4`
-    - `11`: `docs_scanned 1988`, `superblocks_skipped 2`
-    - `12`: `docs_scanned 1988`, `superblocks_skipped 3`
   - rejected
 - current read:
   - deriving block gates from the existing per-doc bloom bytes is not strong enough
@@ -587,7 +551,6 @@ Accepted whole-tree search gate prototype:
 - implementation:
   - persisted whole-tree tier1/tier2 bloom-union gates
   - search now checks the tree gate before any block scan
-  - publish persists the tree-gate snapshots alongside the tier2 superblock snapshot
 - harness fixes:
   - forest search now passes CLI `--timeout`
   - per-tree search artifacts now use safe address filenames instead of `Path.with_suffix()` collisions
@@ -1095,9 +1058,6 @@ Next likely steps:
 
 Landed:
 - separate `tier1_filter_target_fp` and `tier2_filter_target_fp` config/stat surfaces
-- CLI fallback behavior:
-  - `--set-fp` still seeds both tiers
-  - `--tier1-set-fp` and `--tier2-set-fp` now override individually
 - forest probe now accepts the same FP knobs for reproducible sweeps
 
 `2k` exact-block A/B on the current baseline:
@@ -1240,10 +1200,8 @@ Read:
 - it gets the `25k` DB back to the top edge of the target size band without losing the homogeneous-block search win
 - the next bottleneck is now reopen memory, not DB bytes
 
-Week-slice reopen follow-up after snapshotting `tier2_pattern_superblocks` and shrinking in-memory block positions to `u32`:
 - code:
   - lazy-open sidecars remain in place
-  - `tier2_pattern_superblocks` now persist/load as snapshots
   - block-position vectors are stored as `u32` instead of `usize`
 - fast control run:
   - artifact: `/root/pertest/results/sspry_weekslice_lazycompact_20260320_r2`
@@ -1258,12 +1216,6 @@ Week-slice reopen follow-up after snapshotting `tier2_pattern_superblocks` and s
 - startup-side mapping/state after reopen:
   - `mapped_bloom_bytes = 619526144`
   - `mapped_tier2_bloom_bytes = 167189504`
-  - `tier1_superblock_summary_bytes = 1077685248`
-  - `tier2_superblock_summary_bytes = 1632401408`
-  - `tier1_superblock_positions_bytes = 12456`
-  - `tier2_pattern_superblock_positions_bytes = 12456`
-  - `store_open_loaded_tier2_superblocks_from_snapshot_shards = 256`
-  - `store_open_rebuild_tier2_superblocks_ms = 0`
 - comparison to the prior week-slice control:
   - startup fell from `1640 ms` to `991 ms`
   - search-start RSS fell from `1760720 KB` to `1395768 KB`
@@ -1274,7 +1226,6 @@ Week-slice reopen follow-up after snapshotting `tier2_pattern_superblocks` and s
 
 Startup budget coarsening follow-up on the same week-slice DB:
 - change:
-  - when runtime memory limits require larger superblocks, coarsen existing block unions in memory instead of rebuilding from per-doc blooms
   - this avoids startup reads of `blooms.bin` / `tier2_blooms.bin`
 - direct reopen probe against `/root/pertest/db/tree_00` after the new code:
   - `startup.total_ms = 775`

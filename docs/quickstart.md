@@ -2,6 +2,8 @@
 
 This is the shortest path from zero to a working `sspry` instance.
 
+This page shows the normal RPC workflow. If you want direct local operation without a server, use `local-index`, `local-search`, `local-info`, and `local-delete`.
+
 ## 1. Build
 
 ```bash
@@ -87,7 +89,8 @@ Signals:
   --addr 127.0.0.1:17653 \
   --root ./candidate_db \
   --shards 8 \
-  --set-fp 0.35 \
+  --tier1-set-fp 0.35 \
+  --tier2-set-fp 0.35 \
   --id-source sha256 \
   --gram-sizes 3,4 \
   --store-path
@@ -96,7 +99,7 @@ Signals:
 ## When To Change Defaults
 
 - Change `--gram-sizes` if you want a different recall/precision/storage tradeoff.
-- Change `--set-fp` if you want smaller or larger bloom filters.
+- Change `--tier1-set-fp` and `--tier2-set-fp` if you want smaller or larger bloom filters.
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
 - Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with a lower shard count than `256` reduces open and publish fanout.
 - If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 32-shard layout.

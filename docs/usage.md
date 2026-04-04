@@ -8,9 +8,10 @@
    - `serve` starts a long-lived TCP server.
    - `index`, `delete`, `search`, `info`, and `shutdown` talk to that server.
 2. Local/direct mode:
-   - `init` prepares a direct store root.
-   - `index --root ...` writes directly to that store without RPC.
-   - `search --root ...` and `search-batch --root ...` open a forest locally in-process.
+   - `local-index` writes directly to a local store root and auto-initializes it if needed.
+   - `local-delete` operates directly on a local store.
+   - `local-info` reports direct local store stats and can also aggregate a forest root.
+   - `local-search` and `search-batch` open a forest locally in-process.
 
 `yara` is separate from both of those paths. It scans a single file directly with `yara-x` and does not use the database.
 
@@ -21,32 +22,34 @@ Top-level:
 - `--perf-report <path>`: write a JSON perf report
 - `--perf-stdout`: print the perf report to stdout on exit
 
-## init
+## local-index
 
 ```bash
-./target/release/sspry init [options]
+./target/release/sspry local-index [options] --root <path> <paths>...
 ```
 
 Options:
 
 - `--root <path>`
-  - direct store root to initialize
+  - direct local store root
 - `--candidate-shards <n>`
-  - shard count to create
+  - shard count to create when initializing a new local store
 - `--force`
-  - overwrite an existing store root
-- `--set-fp <p>`
-  - fallback false-positive rate applied to both bloom tiers
+  - reinitialize an existing local store before indexing
 - `--tier1-set-fp <p>`
-  - Tier1 false-positive rate override
+  - Tier1 false-positive rate for a newly created local store
 - `--tier2-set-fp <p>`
-  - Tier2 false-positive rate override
+  - Tier2 false-positive rate for a newly created local store
 - `--gram-sizes <tier1,tier2>`
-  - DB-wide gram-size pair
+  - DB-wide gram-size pair for a newly created local store
 - `--compaction-idle-cooldown-s <seconds>`
-  - minimum idle time before shard-local compaction is allowed to run
+  - minimum idle time before shard-local compaction is allowed to run for a newly created local store
+- `--path-list`
+- `--batch-size <n>`
+- `--workers <n>`
+- `--verbose`
 
-Use `init` when you want a direct local store for `index --root ...` instead of the normal RPC workspace flow.
+Use `local-index` when you want direct local ingest without a running server.
 
 ## serve
 
@@ -64,8 +67,6 @@ Options:
 - `--search-workers <n>`
   - server-side tree query workers per search
   - a forest search runs across at most this many trees at once
-- `--memory-budget-gb <n>`
-  - configured indexing memory budget used for backpressure decisions
 - `--root <path>`
   - root path to open
   - auto-detected as one of:
@@ -79,8 +80,6 @@ Options:
   - `incremental` defaults to 32 shards
 - `--shards <n>`
   - explicit shard count override
-- `--set-fp <p>`
-  - fallback bloom false-positive rate
 - `--tier1-set-fp <p>`
   - Tier1 false-positive rate override
 - `--tier2-set-fp <p>`
@@ -99,7 +98,8 @@ Example:
   --addr 127.0.0.1:17653 \
   --root ./candidate_db \
   --shards 8 \
-  --set-fp 0.35 \
+  --tier1-set-fp 0.35 \
+  --tier2-set-fp 0.35 \
   --id-source sha256 \
   --gram-sizes 3,4 \
   --store-path
@@ -124,9 +124,6 @@ Options:
 
 - `--addr <host:port>`
 - `--timeout <seconds>`
-- `--root <path>`
-  - direct local indexing root
-  - bypasses RPC and writes directly to an initialized store
 - `--path-list`
   - treat each input path as a newline-delimited manifest of file paths
 - `--batch-size <n>`
@@ -143,7 +140,7 @@ Notes:
 - identity type is decided by the server or store's `--id-source`
 - `index` can take files and directories
 - large remote batches are automatically split by serialized request size
-- `index --root ...` expects a direct store created with `init`
+- use `local-index` for direct local ingest without RPC
 
 ## delete
 
@@ -163,6 +160,22 @@ Values can be:
 
 If a provided value does not match the server identity format, `delete` returns an error.
 
+## local-delete
+
+```bash
+./target/release/sspry local-delete [options] --root <path> <values>...
+```
+
+Options:
+
+- `--root <path>`
+  - direct local store root
+
+Values can be:
+
+- an existing file path
+- a digest string matching the store's configured identity format
+
 ## search
 
 ```bash
@@ -172,14 +185,8 @@ If a provided value does not match the server identity format, `delete` returns 
 Options:
 
 - `--addr <host:port>`
-- `--root <path>`
-  - in-process forest search root
-  - opens `tree_*/current` directly instead of using RPC
 - `--timeout <seconds>`
 - `--rule <path>`
-- `--tree-search-workers <n>`
-  - forest-level tree concurrency for `--root`
-  - `0` means auto up to the tree count
 - `--max-anchors-per-pattern <n>`
 - `--max-candidates <p>` default `7.5`; `0` means unlimited
   - percentage of searchable documents
@@ -190,14 +197,36 @@ Behavior:
 
 - default search is unverified candidate retrieval
 - `--verify` reopens candidate file paths and runs local `yara-x` verification
-- `--addr` and `--root` are the two search transports:
-  - `--addr` uses a persistent RPC server over either a direct store/workspace or a forest-root server
-  - `--root` opens the forest locally in-process
-- `--tree-search-workers` only affects `--root`
+- `search --addr` uses a persistent RPC server over either a direct store/workspace or a forest-root server
 - remote `search --addr` streams candidate pages from the server and the client deduplicates across the forest before applying the final cap
 - if the candidate cap is reached, output includes `truncated: true` and `truncated_limit: <n>`
 - verified search requires stored file paths to still exist on disk
 - candidate order is not guaranteed; search returns an unordered match set
+
+## local-search
+
+```bash
+./target/release/sspry local-search [options] --root <root> --rule <rule.yar>
+```
+
+Options:
+
+- `--root <path>`
+  - in-process forest search root
+- `--rule <path>`
+- `--tree-search-workers <n>`
+  - forest-level tree concurrency
+  - `0` means auto up to the tree count
+- `--max-anchors-per-pattern <n>`
+- `--max-candidates <p>` default `7.5`; `0` means unlimited
+  - percentage of searchable documents
+- `--verify`
+- `--verbose`
+
+Behavior:
+
+- `local-search` opens `tree_*/current` directly and searches the forest in-process
+- `--tree-search-workers` only applies to `local-search`
 
 Indexed search currently supports these searchable categories:
 
@@ -283,8 +312,8 @@ These fail-fast cases are intentional:
 
 Practical note:
 
-- for repeated rule-by-rule tuning on a preserved DB, `--addr` against a persistent server is usually faster than calling `search --root` once per rule
-- `search --root` is the right path for local forest correctness checks and tree-level threaded-search experiments
+- for repeated rule-by-rule tuning on a preserved DB, `--addr` against a persistent server is usually faster than calling `local-search` once per rule
+- `local-search` is the right path for local forest correctness checks and tree-level threaded-search experiments
 
 ## search-batch
 
@@ -343,6 +372,14 @@ Returns JSON describing:
 - compaction generation / retired generation counts
 - current compaction runtime counters and reclaimed bytes
 
+## local-info
+
+```bash
+./target/release/sspry local-info --root <path>
+```
+
+Returns JSON describing a direct local store, or aggregated stats for a local forest root.
+
 ## shutdown
 
 ```bash
@@ -385,7 +422,7 @@ This bypasses the database and scans one file directly with `yara-x`.
 
 - keep `--store-path` enabled if verified search matters
 - treat `--gram-sizes` as a format choice, not a casual runtime knob
-- use `--set-fp`, `--tier1-set-fp`, and `--tier2-set-fp` to control the disk-size vs candidate-quality tradeoff
+- use `--tier1-set-fp` and `--tier2-set-fp` to control the disk-size vs candidate-quality tradeoff
 - use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
 - use `--search-workers` to control how many trees a forest server searches at once per query
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change

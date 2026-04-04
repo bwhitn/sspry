@@ -67,7 +67,6 @@ def main() -> int:
         total_candidates = 0
         total_tp = 0
         total_docs = 0
-        total_skipped = 0
         total_wall = 0.0
         per_rule = []
         for record in search:
@@ -75,12 +74,10 @@ def main() -> int:
             tp = truth_counts[rule]['true_positives']
             candidates = int(pick_number(record, 'candidates', 'verbose_search_candidates', default=0))
             docs_scanned = int(pick_number(record, 'docs_scanned', 'verbose_search_docs_scanned', default=0))
-            skipped = int(pick_number(record, 'superblocks_skipped', 'verbose_search_superblocks_skipped', default=0))
             wall_ms = float(pick_number(record, 'elapsed_ms_wall_parallel', 'elapsed_ms_wall', 'verbose_search_total_ms', default=0.0))
             total_candidates += candidates
             total_tp += tp
             total_docs += docs_scanned
-            total_skipped += skipped
             total_wall += wall_ms
             per_rule.append(
                 {
@@ -89,7 +86,6 @@ def main() -> int:
                     'true_positives': tp,
                     'false_positive_candidates': candidates - tp,
                     'docs_scanned': docs_scanned,
-                    'superblocks_skipped': skipped,
                     'wall_ms': wall_ms,
                 }
             )
@@ -103,8 +99,6 @@ def main() -> int:
                 'db_bytes': forest['combined_db_bytes'],
                 'db_to_sample_ratio': forest['combined_db_bytes'] / args.sample_bytes,
                 'max_tree_peak_rss_kb': forest['max_tree_peak_rss_kb'],
-                'tier1_superblock_docs': forest['tier1_superblock_docs'],
-                'summary_cap_kib': forest['summary_cap_kib'],
                 'search_workers_per_tree': forest['search_workers_per_tree'],
                 'total_candidates': total_candidates,
                 'total_true_positives': total_tp,
@@ -117,8 +111,6 @@ def main() -> int:
                 'avg_true_positives': total_tp / count if count else 0.0,
                 'avg_docs_scanned': total_docs / count if count else 0.0,
                 'total_docs_scanned': total_docs,
-                'avg_superblocks_skipped': total_skipped / count if count else 0.0,
-                'total_superblocks_skipped': total_skipped,
                 'avg_wall_ms': total_wall / count if count else 0.0,
                 'per_rule': per_rule,
             }
@@ -141,7 +133,6 @@ def main() -> int:
                 'true_positives',
                 'false_positive_candidates',
                 'docs_scanned',
-                'superblocks_skipped',
                 'wall_ms',
             ]
         )
@@ -155,7 +146,6 @@ def main() -> int:
                         row['true_positives'],
                         row['false_positive_candidates'],
                         row['docs_scanned'],
-                        row['superblocks_skipped'],
                         f"{row['wall_ms']:.3f}",
                     ]
                 )
@@ -193,23 +183,17 @@ def main() -> int:
     lines.append('')
     lines.append('## Pruning / Search Work')
     lines.append('')
-    lines.append(
-        '| config | avg docs scanned | total docs scanned | avg superblocks skipped | total superblocks skipped | avg wall ms |'
-    )
-    lines.append('|---|---:|---:|---:|---:|---:|')
+    lines.append('| config | avg docs scanned | total docs scanned | avg wall ms |')
+    lines.append('|---|---:|---:|---:|')
     for cfg in sorted(configs, key=lambda item: item['avg_docs_scanned']):
         lines.append(
             f"| `{cfg['config']}` | `{cfg['avg_docs_scanned']:.1f}` | "
-            f"`{cfg['total_docs_scanned']}` | `{cfg['avg_superblocks_skipped']:.1f}` | "
-            f"`{cfg['total_superblocks_skipped']}` | `{cfg['avg_wall_ms']:.1f}` |"
+            f"`{cfg['total_docs_scanned']}` | `{cfg['avg_wall_ms']:.1f}` |"
         )
     lines.append('')
     lines.append('## Notes')
     lines.append('')
     lines.append('- pooled `cand/tp` is the main precision comparison')
-    lines.append(
-        '- skipped superblocks are directionally useful, but not perfectly comparable across different docs/block settings'
-    )
     lines.append(f"- per-rule details: [{(args.output_dir / 'per_rule.csv').name}]({args.output_dir / 'per_rule.csv'})")
     (args.output_dir / 'comparison_report.md').write_text('\n'.join(lines) + '\n')
     return 0

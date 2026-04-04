@@ -308,7 +308,6 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
         'verbose.search.verified_matched',
         'verbose.search.verified_skipped',
         'verbose.search.docs_scanned',
-        'verbose.search.superblocks_skipped',
         'verbose.search.metadata_loads',
         'verbose.search.metadata_bytes',
         'verbose.search.tier1_bloom_loads',
@@ -602,7 +601,7 @@ def run_search_one_local_forest(
         proc = run(
             [
                 str(sspry),
-                'search',
+                'local-search',
                 '--root',
                 str(db_root),
                 '--rule',
@@ -673,7 +672,6 @@ def aggregate_rule_results(rule: Path, tree_results: list[dict], elapsed_ms_para
         out['exit_code'] = 0
         out['candidates'] = sum(int(item.get('candidates', 0)) for item in tree_results)
         out['docs_scanned'] = sum(int(item.get('verbose_search_docs_scanned', 0)) for item in tree_results)
-        out['superblocks_skipped'] = sum(int(item.get('verbose_search_superblocks_skipped', 0)) for item in tree_results)
         out['tier1_bloom_bytes'] = sum(int(item.get('verbose_search_tier1_bloom_bytes', 0)) for item in tree_results)
         out['tier2_bloom_bytes'] = sum(int(item.get('verbose_search_tier2_bloom_bytes', 0)) for item in tree_results)
         out['verbose_search_total_ms_sum'] = sum(float(item.get('verbose_search_total_ms', 0.0)) for item in tree_results)
@@ -787,15 +785,10 @@ def main() -> int:
     parser.add_argument('--chunk-size', type=int, default=5000)
     parser.add_argument('--chunk-count', type=int)
     parser.add_argument('--balance-bytes', action='store_true')
-    parser.add_argument('--summary-cap-kib', type=int, default=32)
-    parser.add_argument('--tier1-superblock-docs', type=int, default=1)
     parser.add_argument('--gram-sizes', default='3,4')
-    parser.add_argument('--memory-budget-gb', type=int, default=16)
     parser.add_argument('--shards', type=int)
-    parser.add_argument('--set-fp', type=float)
     parser.add_argument('--tier1-set-fp', type=float)
     parser.add_argument('--tier2-set-fp', type=float)
-    parser.add_argument('--enable-pattern-superblocks', action='store_true')
     parser.add_argument('--search-workers', type=int, default=1)
     parser.add_argument('--index-workers', type=int, default=0)
     parser.add_argument('--collect-perf', action='store_true')
@@ -852,10 +845,7 @@ def main() -> int:
         'chunk_count': args.chunk_count,
         'balance_bytes': args.balance_bytes,
         'tree_count': len(manifests),
-        'summary_cap_kib': args.summary_cap_kib,
-        'tier1_superblock_docs': args.tier1_superblock_docs,
         'gram_sizes': args.gram_sizes,
-        'enable_pattern_superblocks': args.enable_pattern_superblocks,
         'candidate_shards': args.shards,
         'search_workers_per_tree': args.search_workers,
         'index_workers': args.index_workers,
@@ -913,8 +903,6 @@ def main() -> int:
             flush=True,
         )
         fp_args = []
-        if args.set_fp is not None:
-            fp_args.extend(['--set-fp', str(args.set_fp)])
         if args.tier1_set_fp is not None:
             fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
         if args.tier2_set_fp is not None:
@@ -922,27 +910,15 @@ def main() -> int:
         if args.index_mode == 'local-root':
             current_root = db_root / 'current'
             current_root.parent.mkdir(parents=True, exist_ok=True)
-            init_proc = run(
-                [
-                    str(sspry), 'init', '--root', str(current_root),
-                    '--candidate-shards', str(args.shards or 1),
-                    '--tier1-superblock-docs', str(args.tier1_superblock_docs),
-                    '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
-                    '--gram-sizes', args.gram_sizes,
-                    *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
-                    *fp_args,
-                ],
-                stdout=(tree_run_dir / 'init.stdout').open('w'),
-                stderr=(tree_run_dir / 'init.stderr').open('w'),
-            )
-            if init_proc.returncode != 0:
-                raise RuntimeError(f'init failed for {tree_name} with exit {init_proc.returncode}')
             started = time.monotonic()
             index_cmd = [
                 str(sspry),
-                'index', '--root', str(current_root), '--path-list', str(manifest['path']),
+                'local-index', '--root', str(current_root),
+                '--candidate-shards', str(args.shards or 1),
+                '--gram-sizes', args.gram_sizes,
+                *fp_args,
+                '--path-list', str(manifest['path']),
                 '--batch-size', '64',
-                '--timeout', str(args.index_timeout_s),
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
             ]
@@ -989,11 +965,7 @@ def main() -> int:
         server = subprocess.Popen(
             [
                 str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',
-                '--memory-budget-gb', str(args.memory_budget_gb),
-                '--tier1-superblock-docs', str(args.tier1_superblock_docs),
-                '--tier2-superblock-summary-cap-kib', str(args.summary_cap_kib),
                 '--gram-sizes', args.gram_sizes,
-                *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                 '--search-workers', str(args.search_workers),
                 *fp_args,
                 *(['--shards', str(args.shards)] if args.shards else []),
@@ -1086,8 +1058,6 @@ def main() -> int:
                 db_root = db_base / tree_name
                 addr = f'127.0.0.1:{args.base_port + idx}'
                 fp_args = []
-                if args.set_fp is not None:
-                    fp_args.extend(['--set-fp', str(args.set_fp)])
                 if args.tier1_set_fp is not None:
                     fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
                 if args.tier2_set_fp is not None:
@@ -1095,8 +1065,6 @@ def main() -> int:
                 server = subprocess.Popen(
                     [
                         str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
-                        '--tier1-superblock-docs', str(args.tier1_superblock_docs),
-                        *( ['--enable-pattern-superblocks'] if args.enable_pattern_superblocks else [] ),
                         '--search-workers', str(args.search_workers),
                         *fp_args,
                         *(['--shards', str(args.shards)] if args.shards else []),

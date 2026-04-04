@@ -6,7 +6,7 @@
   <text x="68" y="160" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">index / delete / search / info</text>
   <rect x="345" y="70" width="240" height="150" rx="12" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
   <text x="388" y="112" font-family="Helvetica, Arial, sans-serif" font-size="24" font-weight="700" fill="#7f1d1d">TCP RPC Server</text>
-  <text x="378" y="148" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">addr, shards, id-source, set-fp,</text>
+  <text x="340" y="148" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">addr, shards, id-source, tier1/tier2 fp,</text>
   <text x="378" y="172" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">gram-sizes, store-path, workers</text>
   <rect x="650" y="55" width="220" height="80" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
   <text x="686" y="98" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Search Store</text>

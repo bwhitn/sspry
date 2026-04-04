@@ -476,7 +476,6 @@ def main() -> int:
         "error",
         "verbose_search_query_ms",
         "verbose_search_docs_scanned",
-        "verbose_search_superblocks_skipped",
         "verbose_search_tier1_bloom_bytes",
     ]
     with (run_dir / "per_rule_recall.csv").open("w", newline="") as fh:

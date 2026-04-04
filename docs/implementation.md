@@ -18,19 +18,19 @@ At a high level:
 5. The store returns candidate digests.
 6. If `--verify` is enabled, the client reopens stored file paths and verifies matches locally with `yara-x`.
 
-`search` now has two execution modes:
+Public search now has two execution modes:
 
 - RPC mode: query one running `serve` process via `--addr`
-- direct forest mode: query one forest root in-process via `--root`
+- local forest mode: query one forest root in-process via `local-search --root`
 
 RPC mode itself now has two useful server shapes:
 
 - mutable workspace/direct-store servers for remote ingest and query
 - forest-root servers that open `tree_*/current` read-only and answer one RPC query across the whole forest
 
-Direct forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
+Local forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
 
-`search-batch` is the long-lived variant of direct forest mode:
+`search-batch` is the long-lived variant of local forest mode:
 
 - open the forest once
 - iterate many rules against the same live tree set
@@ -51,7 +51,7 @@ The query path is:
 7. Collect candidate digests without ranking guarantees.
 8. Optionally verify file paths locally.
 
-In direct forest mode, the query path adds one layer above shard search:
+In local forest mode, the query path adds one layer above shard search:
 
 1. open all tree stores under the forest root
 2. validate that gram sizes, identity source, and shared search policy match across trees

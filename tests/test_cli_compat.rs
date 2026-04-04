@@ -415,9 +415,14 @@ fn help_surface_has_only_public_commands() {
     assert!(out.contains("Scalable Screening and Prefiltering of Rules for YARA"));
     assert!(out.contains("serve"));
     assert!(out.contains("index"));
+    assert!(out.contains("local-index"));
     assert!(out.contains("delete"));
+    assert!(out.contains("local-delete"));
     assert!(out.contains("search"));
+    assert!(out.contains("local-search"));
+    assert!(out.contains("search-batch"));
     assert!(out.contains("info"));
+    assert!(out.contains("local-info"));
     assert!(out.contains("shutdown"));
     assert!(out.contains("yara"));
     assert!(!out.contains("publish"));

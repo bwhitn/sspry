@@ -130,10 +130,10 @@ fn serve_validation_errors_are_reported() {
         &tcp_addr(reserve_tcp_port()),
         "--root",
         candidate_root.to_str().expect("root"),
-        "--set-fp",
+        "--tier1-set-fp",
         "1.0",
     ]);
-    assert!(err.contains("filter_target_fp"));
+    assert!(err.contains("tier1_filter_target_fp"));
 }
 
 #[test]

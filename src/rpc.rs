@@ -9611,11 +9611,11 @@ rule overflow_rule {
         );
         assert_eq!(
             stats.get("tier1_filter_target_fp").and_then(Value::as_f64),
-            Some(0.40)
+            Some(0.38)
         );
         assert_eq!(
             stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
-            Some(0.23)
+            Some(0.18)
         );
         assert_eq!(stats.get("filter_target_fp"), None);
     }

@@ -23,7 +23,8 @@ use crate::candidate::query_plan::{
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateStore, DEFAULT_TIER1_FILTER_TARGET_FP,
+    BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
+    CandidateStore, CompiledQueryPlan, DEFAULT_TIER1_FILTER_TARGET_FP,
     DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index,
     candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_from_file_with_gram_sizes,
@@ -592,7 +593,6 @@ fn sha512_file(path: &Path, chunk_size: usize) -> Result<[u8; 64]> {
     Ok(out)
 }
 
-#[cfg(test)]
 fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -1458,26 +1458,20 @@ fn store_config_from_parts(
 }
 
 fn resolve_filter_target_fps(
-    filter_target_fp: Option<f64>,
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
 ) -> (f64, f64) {
-    let tier1_default = filter_target_fp.unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP);
-    let tier2_default = filter_target_fp.unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP);
     (
-        tier1_filter_target_fp.unwrap_or(tier1_default),
-        tier2_filter_target_fp.unwrap_or(tier2_default),
+        tier1_filter_target_fp.unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP),
+        tier2_filter_target_fp.unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP),
     )
 }
 
 fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible serve args");
-    let (tier1_filter_target_fp, tier2_filter_target_fp) = resolve_filter_target_fps(
-        args.filter_target_fp,
-        args.tier1_filter_target_fp,
-        args.tier2_filter_target_fp,
-    );
+    let (tier1_filter_target_fp, tier2_filter_target_fp) =
+        resolve_filter_target_fps(args.tier1_filter_target_fp, args.tier2_filter_target_fp);
     store_config_from_parts(
         PathBuf::from(&args.root),
         args.id_source,
@@ -1493,11 +1487,8 @@ fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
 fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible init args");
-    let (tier1_filter_target_fp, tier2_filter_target_fp) = resolve_filter_target_fps(
-        args.filter_target_fp,
-        args.tier1_filter_target_fp,
-        args.tier2_filter_target_fp,
-    );
+    let (tier1_filter_target_fp, tier2_filter_target_fp) =
+        resolve_filter_target_fps(args.tier1_filter_target_fp, args.tier2_filter_target_fp);
     store_config_from_parts(
         PathBuf::from(&args.root),
         CandidateIdSource::Sha256,
@@ -1508,6 +1499,13 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
         gram_sizes.tier1,
         args.compaction_idle_cooldown_s,
     )
+}
+
+fn placeholder_connection() -> ClientConnectionArgs {
+    ClientConnectionArgs {
+        addr: DEFAULT_RPC_ADDR.to_owned(),
+        timeout: DEFAULT_RPC_TIMEOUT,
+    }
 }
 
 fn ensure_store(config: CandidateConfig, force: bool) -> Result<CandidateStore> {
@@ -1535,6 +1533,69 @@ fn open_stores(root: &Path) -> Result<Vec<CandidateStore>> {
         .into_iter()
         .map(CandidateStore::open)
         .collect()
+}
+
+#[allow(dead_code)]
+struct LocalInitOutcome {
+    shard_count: usize,
+    stats: crate::candidate::CandidateStats,
+}
+
+fn ensure_local_root_initialized(args: &InitArgs) -> Result<LocalInitOutcome> {
+    let root = Path::new(&args.root);
+    let shard_count = args.candidate_shards.max(1);
+    if !args.force {
+        if let Some(existing) = read_candidate_shard_count(root)? {
+            if existing == shard_count {
+                let stats = open_stores(root)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
+                    .stats();
+                return Ok(LocalInitOutcome { shard_count, stats });
+            }
+            return Err(SspryError::from(format!(
+                "{} already initialized with {existing} shard(s)",
+                args.root
+            )));
+        }
+
+        let local_meta_path = root.join("store_meta.json");
+        let legacy_meta_path = root.join("meta.json");
+        let first_local_meta = root.join("shard_000").join("store_meta.json");
+        let first_legacy_meta = root.join("shard_000").join("meta.json");
+        if shard_count == 1 && (local_meta_path.exists() || legacy_meta_path.exists()) {
+            let stats = open_stores(root)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
+                .stats();
+            return Ok(LocalInitOutcome { shard_count, stats });
+        }
+        if shard_count > 1 && (first_local_meta.exists() || first_legacy_meta.exists()) {
+            let stats = open_stores(root)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
+                .stats();
+            return Ok(LocalInitOutcome { shard_count, stats });
+        }
+    }
+
+    let mut stats = None;
+    for shard_idx in 0..shard_count {
+        let mut config = store_config_from_init_args(args);
+        config.root = candidate_shard_root(root, shard_count, shard_idx);
+        let store = ensure_store(config, args.force)?;
+        if stats.is_none() {
+            stats = Some(store.stats());
+        }
+    }
+    write_candidate_shard_count(root, shard_count)?;
+    Ok(LocalInitOutcome {
+        shard_count,
+        stats: stats.expect("candidate init must create at least one shard"),
+    })
 }
 
 fn merge_tier_used<I>(values: I) -> String
@@ -1580,6 +1641,24 @@ struct LocalForestQueryAggregate {
     tier_used: String,
     query_profile: crate::candidate::CandidateQueryProfile,
     external_ids: Option<Vec<Option<String>>>,
+}
+
+#[derive(Debug)]
+struct SearchExecution {
+    plan: CompiledQueryPlan,
+    total_candidates: usize,
+    tier_used: String,
+    truncated: bool,
+    truncated_limit: Option<usize>,
+    rows: Vec<String>,
+    query_profile: CandidateQueryProfile,
+    prepared_query_profile: CandidatePreparedQueryProfile,
+    external_ids: Vec<Option<String>>,
+    tree_count: Option<usize>,
+    tree_search_workers: Option<usize>,
+    server_rss_kb: Option<(u64, u64)>,
+    plan_time: Duration,
+    query_time: Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -2472,7 +2551,7 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
                 candidate_config: store_config_from_serve_args(args),
                 candidate_shards,
                 search_workers: args.search_workers.max(1),
-                memory_budget_bytes: args.memory_budget_gb.saturating_mul(1024 * 1024 * 1024),
+                memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
                 auto_publish_initial_idle_ms,
                 auto_publish_storage_class,
                 workspace_mode: serve_workspace_mode,
@@ -2525,57 +2604,12 @@ fn serve_uses_workspace_mode(root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(test)]
 fn cmd_init(args: &InitArgs) -> i32 {
     match (|| -> Result<i32> {
-        let root = Path::new(&args.root);
-        let shard_count = args.candidate_shards.max(1);
-        if !args.force {
-            if let Some(existing) = read_candidate_shard_count(root)? {
-                if existing == shard_count {
-                    if shard_count == 1 {
-                        println!("Candidate store already initialized at {}", args.root);
-                    } else {
-                        println!(
-                            "Candidate store already initialized at {} with {} shard(s)",
-                            args.root, shard_count
-                        );
-                    }
-                    return Ok(0);
-                }
-                return Err(SspryError::from(format!(
-                    "{} already initialized with {existing} shard(s)",
-                    args.root
-                )));
-            }
-
-            let local_meta_path = root.join("store_meta.json");
-            let legacy_meta_path = root.join("meta.json");
-            let first_local_meta = root.join("shard_000").join("store_meta.json");
-            let first_legacy_meta = root.join("shard_000").join("meta.json");
-            if shard_count == 1 && (local_meta_path.exists() || legacy_meta_path.exists()) {
-                println!("Candidate store already initialized at {}", args.root);
-                return Ok(0);
-            }
-            if shard_count > 1 && (first_local_meta.exists() || first_legacy_meta.exists()) {
-                println!(
-                    "Candidate store already initialized at {} with {} shard(s)",
-                    args.root, shard_count
-                );
-                return Ok(0);
-            }
-        }
-
-        let mut stats = None;
-        for shard_idx in 0..shard_count {
-            let mut config = store_config_from_init_args(args);
-            config.root = candidate_shard_root(root, shard_count, shard_idx);
-            let store = ensure_store(config, args.force)?;
-            if stats.is_none() {
-                stats = Some(store.stats());
-            }
-        }
-        write_candidate_shard_count(root, shard_count)?;
-        let stats = stats.expect("candidate init must create at least one shard");
+        let outcome = ensure_local_root_initialized(args)?;
+        let shard_count = outcome.shard_count;
+        let stats = outcome.stats;
         println!("Initialized candidate store at {}", args.root);
         println!("candidate_shards: {shard_count}");
         println!("id_source: {}", stats.id_source);
@@ -3722,7 +3756,6 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
     }
 }
 
-#[cfg(test)]
 fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
     match (|| -> Result<i32> {
         if args.values.is_empty() {
@@ -3965,22 +3998,19 @@ fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
     }
 }
 
-fn cmd_index(args: &IndexArgs) -> i32 {
-    if args.root.is_some() {
-        return cmd_internal_index_batch(&InternalIndexBatchArgs {
-            connection: args.connection.clone(),
-            paths: args.paths.clone(),
-            path_list: args.path_list,
-            root: args.root.clone(),
-            batch_size: args.batch_size,
-            remote_batch_soft_limit_bytes: args.remote_batch_soft_limit_bytes,
-            workers: args.workers.unwrap_or(0),
-            chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
-            external_id_from_path: false,
-            verbose: args.verbose,
-            rotate_remote_sessions: false,
-        });
+fn init_args_from_local_index(args: &LocalIndexArgs) -> InitArgs {
+    InitArgs {
+        root: args.root.clone(),
+        candidate_shards: args.candidate_shards,
+        force: args.force,
+        tier1_filter_target_fp: args.tier1_filter_target_fp,
+        tier2_filter_target_fp: args.tier2_filter_target_fp,
+        gram_sizes: args.gram_sizes.clone(),
+        compaction_idle_cooldown_s: args.compaction_idle_cooldown_s,
     }
+}
+
+fn cmd_index(args: &IndexArgs) -> i32 {
     let server_policy = match server_scan_policy(&args.connection) {
         Ok(server_policy) => server_policy,
         Err(err) => {
@@ -4001,6 +4031,28 @@ fn cmd_index(args: &IndexArgs) -> i32 {
         verbose: args.verbose,
         rotate_remote_sessions: false,
     })
+}
+
+fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
+    match ensure_local_root_initialized(&init_args_from_local_index(args)) {
+        Ok(_) => cmd_internal_index_batch(&InternalIndexBatchArgs {
+            connection: placeholder_connection(),
+            paths: args.paths.clone(),
+            path_list: args.path_list,
+            root: Some(args.root.clone()),
+            batch_size: args.batch_size,
+            remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
+            workers: args.workers.unwrap_or(0),
+            chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
+            external_id_from_path: false,
+            verbose: args.verbose,
+            rotate_remote_sessions: false,
+        }),
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
 }
 
 fn cmd_delete(args: &DeleteArgs) -> i32 {
@@ -4048,355 +4100,396 @@ fn cmd_delete(args: &DeleteArgs) -> i32 {
     }
 }
 
+fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
+    cmd_internal_delete(&InternalDeleteArgs {
+        connection: placeholder_connection(),
+        root: Some(args.root.clone()),
+        values: args.values.clone(),
+    })
+}
+
+fn execute_remote_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
+    let started_plan = Instant::now();
+    let client = search_rpc_client(&args.connection);
+    let server_policy = server_scan_policy(&args.connection)?;
+    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        &args.rule,
+        server_policy.gram_sizes,
+        Some(server_policy.id_source.as_str()),
+        args.max_anchors_per_pattern,
+        false,
+        true,
+        args.max_candidates,
+    )?;
+    let plan_time = started_plan.elapsed();
+    let started_query = Instant::now();
+    let mut buffered_rows = Vec::<String>::new();
+    let mut buffered_external_ids = Vec::<Option<String>>::new();
+    let mut accepted_positions = HashMap::<String, usize>::new();
+    let mut query_profile = CandidateQueryProfile::default();
+    let mut prepared_query_profile = CandidatePreparedQueryProfile::default();
+    let mut total_candidates = 0usize;
+    let mut tier_used = String::new();
+    let mut truncated = false;
+    let mut truncated_limit = None::<usize>;
+    client.candidate_query_plan_stream_with_options(
+        &plan,
+        Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
+        args.verify_yara_files,
+        |frame| {
+            if truncated_limit.is_none() {
+                truncated_limit = frame.candidate_limit;
+            }
+            if frame.stream_complete {
+                tier_used = frame.tier_used;
+                query_profile = frame.query_profile;
+                prepared_query_profile = frame.prepared_query_profile;
+                return Ok(());
+            }
+            let mut frame_external_ids = frame.external_ids.unwrap_or_default();
+            if args.verify_yara_files && frame_external_ids.len() < frame.sha256.len() {
+                frame_external_ids.resize(frame.sha256.len(), None);
+            }
+            for (idx, sha256) in frame.sha256.into_iter().enumerate() {
+                let external_id = if args.verify_yara_files {
+                    frame_external_ids.get(idx).cloned().flatten()
+                } else {
+                    None
+                };
+                if let Some(existing_idx) = accepted_positions.get(&sha256).copied() {
+                    if args.verify_yara_files
+                        && buffered_external_ids
+                            .get(existing_idx)
+                            .is_some_and(Option::is_none)
+                        && external_id.is_some()
+                    {
+                        buffered_external_ids[existing_idx] = external_id;
+                    }
+                    continue;
+                }
+                if truncated_limit.is_some_and(|limit| buffered_rows.len() >= limit) {
+                    truncated = true;
+                    continue;
+                }
+                accepted_positions.insert(sha256.clone(), buffered_rows.len());
+                total_candidates = total_candidates.saturating_add(1);
+                buffered_rows.push(sha256);
+                if args.verify_yara_files {
+                    buffered_external_ids.push(external_id);
+                }
+            }
+            Ok(())
+        },
+    )?;
+    let query_time = started_query.elapsed();
+    let server_rss_kb = if args.verbose {
+        server_memory_kb(&args.connection)?
+    } else {
+        None
+    };
+    Ok(SearchExecution {
+        plan,
+        total_candidates,
+        tier_used,
+        truncated,
+        truncated_limit,
+        rows: buffered_rows,
+        query_profile,
+        prepared_query_profile,
+        external_ids: buffered_external_ids,
+        tree_count: None,
+        tree_search_workers: None,
+        server_rss_kb,
+        plan_time,
+        query_time,
+    })
+}
+
+fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
+    let started_plan = Instant::now();
+    let mut tree_groups = open_forest_tree_groups(Path::new(&args.root))?;
+    let tree_count = tree_groups.len();
+    let (gram_sizes, active_identity_source, summary_cap_bytes) =
+        validate_forest_search_policy(&tree_groups)?;
+    let worker_count = args
+        .tree_search_workers
+        .max(1)
+        .min(tree_groups.len().max(1));
+    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        &args.rule,
+        gram_sizes,
+        active_identity_source.as_deref(),
+        args.max_anchors_per_pattern,
+        false,
+        true,
+        args.max_candidates,
+    )?;
+    let plan_time = started_plan.elapsed();
+    let started_query = Instant::now();
+    let prepared_query_profile =
+        forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
+    let local = query_local_forest_all_candidates(
+        &mut tree_groups,
+        &plan,
+        args.verify_yara_files,
+        worker_count,
+    )?;
+    let query_time = started_query.elapsed();
+    Ok(SearchExecution {
+        plan,
+        total_candidates: local.total_candidates,
+        tier_used: local.tier_used,
+        truncated: local.truncated,
+        truncated_limit: local.truncated_limit,
+        rows: local.hashes,
+        query_profile: local.query_profile,
+        prepared_query_profile,
+        external_ids: local.external_ids.unwrap_or_default(),
+        tree_count: Some(tree_count),
+        tree_search_workers: Some(worker_count),
+        server_rss_kb: None,
+        plan_time,
+        query_time,
+    })
+}
+
+fn finish_search_execution(
+    rule: &str,
+    verify_yara_files: bool,
+    verbose: bool,
+    max_candidates: f64,
+    max_anchors_per_pattern: usize,
+    started_total: Instant,
+    execution: SearchExecution,
+) -> Result<i32> {
+    let started_verify = Instant::now();
+    let verification = verify_search_candidates(
+        Path::new(rule),
+        &execution.plan,
+        execution.rows,
+        execution.external_ids,
+        verify_yara_files,
+    )?;
+    let verify_time = started_verify.elapsed();
+    let SearchVerificationResult {
+        rows,
+        verified_checked,
+        verified_matched,
+        verified_skipped,
+    } = verification;
+
+    println!("tier_used: {}", execution.tier_used);
+    println!("candidates: {}", execution.total_candidates);
+    println!("truncated: {}", execution.truncated);
+    if let Some(limit) = execution.truncated_limit {
+        println!("truncated_limit: {limit}");
+    }
+    if verify_yara_files {
+        println!("verified_checked: {verified_checked}");
+        println!("verified_matched: {verified_matched}");
+        println!("verified_skipped: {verified_skipped}");
+    }
+    for row in rows {
+        println!("{row}");
+    }
+    if verbose {
+        let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
+        let plan_ms = execution.plan_time.as_secs_f64() * 1000.0;
+        let query_ms = execution.query_time.as_secs_f64() * 1000.0;
+        let verify_ms = verify_time.as_secs_f64() * 1000.0;
+        eprintln!("verbose.search.total_ms: {total_ms:.3}");
+        eprintln!("verbose.search.plan_ms: {plan_ms:.3}");
+        eprintln!("verbose.search.query_ms: {query_ms:.3}");
+        eprintln!("verbose.search.verify_ms: {verify_ms:.3}");
+        eprintln!(
+            "verbose.search.docs_scanned: {}",
+            execution.query_profile.docs_scanned
+        );
+        eprintln!(
+            "verbose.search.metadata_loads: {}",
+            execution.query_profile.metadata_loads
+        );
+        eprintln!(
+            "verbose.search.metadata_bytes: {}",
+            execution.query_profile.metadata_bytes
+        );
+        eprintln!(
+            "verbose.search.tier1_bloom_loads: {}",
+            execution.query_profile.tier1_bloom_loads
+        );
+        eprintln!(
+            "verbose.search.tier1_bloom_bytes: {}",
+            execution.query_profile.tier1_bloom_bytes
+        );
+        eprintln!(
+            "verbose.search.tier2_bloom_loads: {}",
+            execution.query_profile.tier2_bloom_loads
+        );
+        eprintln!(
+            "verbose.search.tier2_bloom_bytes: {}",
+            execution.query_profile.tier2_bloom_bytes
+        );
+        eprintln!(
+            "verbose.search.prepared_query_bytes: {}",
+            execution.prepared_query_profile.prepared_query_bytes
+        );
+        eprintln!(
+            "verbose.search.prepared_pattern_plan_bytes: {}",
+            execution.prepared_query_profile.prepared_pattern_plan_bytes
+        );
+        eprintln!(
+            "verbose.search.prepared_mask_cache_bytes: {}",
+            execution.prepared_query_profile.prepared_mask_cache_bytes
+        );
+        eprintln!(
+            "verbose.search.prepared_pattern_count: {}",
+            execution.prepared_query_profile.pattern_count
+        );
+        eprintln!(
+            "verbose.search.prepared_mask_cache_entries: {}",
+            execution.prepared_query_profile.mask_cache_entries
+        );
+        eprintln!(
+            "verbose.search.prepared_fixed_literal_count: {}",
+            execution.prepared_query_profile.fixed_literal_count
+        );
+        eprintln!(
+            "verbose.search.prepared_tier1_alternatives: {}",
+            execution.prepared_query_profile.tier1_alternatives
+        );
+        eprintln!(
+            "verbose.search.prepared_tier2_alternatives: {}",
+            execution.prepared_query_profile.tier2_alternatives
+        );
+        eprintln!(
+            "verbose.search.prepared_tier1_shift_variants: {}",
+            execution.prepared_query_profile.tier1_shift_variants
+        );
+        eprintln!(
+            "verbose.search.prepared_tier2_shift_variants: {}",
+            execution.prepared_query_profile.tier2_shift_variants
+        );
+        eprintln!(
+            "verbose.search.prepared_tier1_any_lane_alternatives: {}",
+            execution.prepared_query_profile.tier1_any_lane_alternatives
+        );
+        eprintln!(
+            "verbose.search.prepared_tier2_any_lane_alternatives: {}",
+            execution.prepared_query_profile.tier2_any_lane_alternatives
+        );
+        eprintln!(
+            "verbose.search.prepared_tier1_compacted_any_lane_alternatives: {}",
+            execution
+                .prepared_query_profile
+                .tier1_compacted_any_lane_alternatives
+        );
+        eprintln!(
+            "verbose.search.prepared_tier2_compacted_any_lane_alternatives: {}",
+            execution
+                .prepared_query_profile
+                .tier2_compacted_any_lane_alternatives
+        );
+        eprintln!(
+            "verbose.search.prepared_any_lane_variant_sets: {}",
+            execution.prepared_query_profile.any_lane_variant_sets
+        );
+        eprintln!(
+            "verbose.search.prepared_compacted_any_lane_grams: {}",
+            execution.prepared_query_profile.compacted_any_lane_grams
+        );
+        eprintln!(
+            "verbose.search.prepared_max_pattern_bytes: {}",
+            execution.prepared_query_profile.max_pattern_bytes
+        );
+        eprintln!(
+            "verbose.search.prepared_impossible_query: {}",
+            execution.prepared_query_profile.impossible_query
+        );
+        if let Some(max_pattern_id) = &execution.prepared_query_profile.max_pattern_id {
+            eprintln!("verbose.search.prepared_max_pattern_id: {max_pattern_id}");
+        }
+        eprintln!("verbose.search.max_candidates: {max_candidates}");
+        eprintln!("verbose.search.max_anchors_per_pattern: {max_anchors_per_pattern}");
+        eprintln!("verbose.search.candidates: {}", execution.total_candidates);
+        eprintln!("verbose.search.verify_enabled: {verify_yara_files}");
+        let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
+        let smaps_rollup = current_process_smaps_rollup_kb();
+        eprintln!("verbose.search.client_current_rss_kb: {client_current_rss_kb}");
+        eprintln!("verbose.search.client_peak_rss_kb: {client_peak_rss_kb}");
+        eprintln!(
+            "verbose.search.client_smaps_rss_kb: {}",
+            smaps_rollup.rss_kb
+        );
+        eprintln!(
+            "verbose.search.client_anonymous_kb: {}",
+            smaps_rollup.anonymous_kb
+        );
+        eprintln!(
+            "verbose.search.client_private_clean_kb: {}",
+            smaps_rollup.private_clean_kb
+        );
+        eprintln!(
+            "verbose.search.client_private_dirty_kb: {}",
+            smaps_rollup.private_dirty_kb
+        );
+        eprintln!(
+            "verbose.search.client_shared_clean_kb: {}",
+            smaps_rollup.shared_clean_kb
+        );
+        if let Some((server_current_rss_kb, server_peak_rss_kb)) = execution.server_rss_kb {
+            eprintln!("verbose.search.server_current_rss_kb: {server_current_rss_kb}");
+            eprintln!("verbose.search.server_peak_rss_kb: {server_peak_rss_kb}");
+        }
+        if let Some(tree_count) = execution.tree_count {
+            eprintln!("verbose.search.tree_count: {tree_count}");
+        }
+        if let Some(tree_search_workers) = execution.tree_search_workers {
+            eprintln!("verbose.search.tree_search_workers: {tree_search_workers}");
+        }
+        if verify_yara_files {
+            eprintln!("verbose.search.verified_checked: {verified_checked}");
+            eprintln!("verbose.search.verified_matched: {verified_matched}");
+            eprintln!("verbose.search.verified_skipped: {verified_skipped}");
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
-        let mut plan_time = Duration::ZERO;
-        let mut query_time = Duration::ZERO;
-        let mut verify_time = Duration::ZERO;
-        let mut server_rss_kb = None::<(u64, u64)>;
-        let verify_yara_files = args.verify_yara_files;
-        let mut tree_count = None::<usize>;
-        let mut tree_search_workers = None::<usize>;
+        let execution = execute_remote_search(args)?;
+        finish_search_execution(
+            &args.rule,
+            args.verify_yara_files,
+            args.verbose,
+            args.max_candidates,
+            args.max_anchors_per_pattern,
+            started_total,
+            execution,
+        )
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
 
-        let started_plan = Instant::now();
-        let (
-            plan,
-            total,
-            tier_used,
-            truncated,
-            truncated_limit,
-            rows,
-            query_profile,
-            prepared_query_profile,
-            external_ids,
-        ) = if let Some(root) = &args.root {
-            let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
-            tree_count = Some(tree_groups.len());
-            let (gram_sizes, active_identity_source, summary_cap_bytes) =
-                validate_forest_search_policy(&tree_groups)?;
-            let worker_count = args
-                .tree_search_workers
-                .max(1)
-                .min(tree_groups.len().max(1));
-            tree_search_workers = Some(worker_count);
-            let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-                &args.rule,
-                gram_sizes,
-                active_identity_source.as_deref(),
-                args.max_anchors_per_pattern,
-                false,
-                true,
-                args.max_candidates,
-            )?;
-            plan_time += started_plan.elapsed();
-            let started_query = Instant::now();
-            let prepared_query_profile =
-                forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
-            let local = query_local_forest_all_candidates(
-                &mut tree_groups,
-                &plan,
-                verify_yara_files,
-                worker_count,
-            )?;
-            query_time += started_query.elapsed();
-            (
-                plan,
-                local.total_candidates,
-                local.tier_used,
-                local.truncated,
-                local.truncated_limit,
-                local.hashes,
-                local.query_profile,
-                prepared_query_profile,
-                local.external_ids.unwrap_or_default(),
-            )
-        } else {
-            let client = search_rpc_client(&args.connection);
-            let server_policy = server_scan_policy(&args.connection)?;
-            let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-                &args.rule,
-                server_policy.gram_sizes,
-                Some(server_policy.id_source.as_str()),
-                args.max_anchors_per_pattern,
-                false,
-                true,
-                args.max_candidates,
-            )?;
-            plan_time += started_plan.elapsed();
-            let started_query = Instant::now();
-            let mut buffered_rows = Vec::<String>::new();
-            let mut buffered_external_ids = Vec::<Option<String>>::new();
-            let mut accepted_positions = HashMap::<String, usize>::new();
-            let mut query_profile = crate::candidate::CandidateQueryProfile::default();
-            let mut prepared_query_profile =
-                crate::candidate::CandidatePreparedQueryProfile::default();
-            let mut total = 0usize;
-            let mut tier_used = String::new();
-            let mut truncated = false;
-            let mut truncated_limit = None::<usize>;
-            client.candidate_query_plan_stream_with_options(
-                &plan,
-                Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
-                verify_yara_files,
-                |frame| {
-                    if truncated_limit.is_none() {
-                        truncated_limit = frame.candidate_limit;
-                    }
-                    if frame.stream_complete {
-                        tier_used = frame.tier_used;
-                        query_profile = frame.query_profile;
-                        prepared_query_profile = frame.prepared_query_profile;
-                        return Ok(());
-                    }
-                    let mut frame_external_ids = frame.external_ids.unwrap_or_default();
-                    if verify_yara_files && frame_external_ids.len() < frame.sha256.len() {
-                        frame_external_ids.resize(frame.sha256.len(), None);
-                    }
-                    for (idx, sha256) in frame.sha256.into_iter().enumerate() {
-                        let external_id = if verify_yara_files {
-                            frame_external_ids.get(idx).cloned().flatten()
-                        } else {
-                            None
-                        };
-                        if let Some(existing_idx) = accepted_positions.get(&sha256).copied() {
-                            if verify_yara_files
-                                && buffered_external_ids
-                                    .get(existing_idx)
-                                    .is_some_and(Option::is_none)
-                                && external_id.is_some()
-                            {
-                                buffered_external_ids[existing_idx] = external_id;
-                            }
-                            continue;
-                        }
-                        if truncated_limit.is_some_and(|limit| buffered_rows.len() >= limit) {
-                            truncated = true;
-                            continue;
-                        }
-                        accepted_positions.insert(sha256.clone(), buffered_rows.len());
-                        total = total.saturating_add(1);
-                        if verify_yara_files {
-                            buffered_external_ids.push(external_id);
-                        } else {
-                            println!("{sha256}");
-                        }
-                        buffered_rows.push(sha256);
-                    }
-                    Ok(())
-                },
-            )?;
-            query_time += started_query.elapsed();
-            (
-                plan,
-                total,
-                tier_used,
-                truncated,
-                truncated_limit,
-                buffered_rows,
-                query_profile,
-                prepared_query_profile,
-                buffered_external_ids,
-            )
-        };
-
-        let started_verify = Instant::now();
-        let verification = verify_search_candidates(
-            Path::new(&args.rule),
-            &plan,
-            rows,
-            external_ids,
-            verify_yara_files,
-        )?;
-        verify_time += started_verify.elapsed();
-        let SearchVerificationResult {
-            rows,
-            verified_checked,
-            verified_matched,
-            verified_skipped,
-        } = verification;
-
-        println!("tier_used: {tier_used}");
-        println!("candidates: {total}");
-        println!("truncated: {truncated}");
-        if let Some(limit) = truncated_limit {
-            println!("truncated_limit: {limit}");
-        }
-        if verify_yara_files {
-            println!("verified_checked: {verified_checked}");
-            println!("verified_matched: {verified_matched}");
-            println!("verified_skipped: {verified_skipped}");
-            for row in rows {
-                println!("{row}");
-            }
-        } else {
-            for row in rows {
-                println!("{row}");
-            }
-        }
-        if args.verbose && args.root.is_none() {
-            server_rss_kb = server_memory_kb(&args.connection)?;
-        }
-        if args.verbose {
-            let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
-            let plan_ms = plan_time.as_secs_f64() * 1000.0;
-            let query_ms = query_time.as_secs_f64() * 1000.0;
-            let verify_ms = verify_time.as_secs_f64() * 1000.0;
-            eprintln!("verbose.search.total_ms: {total_ms:.3}");
-            eprintln!("verbose.search.plan_ms: {plan_ms:.3}");
-            eprintln!("verbose.search.query_ms: {query_ms:.3}");
-            eprintln!("verbose.search.verify_ms: {verify_ms:.3}");
-            eprintln!(
-                "verbose.search.docs_scanned: {}",
-                query_profile.docs_scanned
-            );
-            eprintln!(
-                "verbose.search.metadata_loads: {}",
-                query_profile.metadata_loads
-            );
-            eprintln!(
-                "verbose.search.metadata_bytes: {}",
-                query_profile.metadata_bytes
-            );
-            eprintln!(
-                "verbose.search.tier1_bloom_loads: {}",
-                query_profile.tier1_bloom_loads
-            );
-            eprintln!(
-                "verbose.search.tier1_bloom_bytes: {}",
-                query_profile.tier1_bloom_bytes
-            );
-            eprintln!(
-                "verbose.search.tier2_bloom_loads: {}",
-                query_profile.tier2_bloom_loads
-            );
-            eprintln!(
-                "verbose.search.tier2_bloom_bytes: {}",
-                query_profile.tier2_bloom_bytes
-            );
-            eprintln!(
-                "verbose.search.prepared_query_bytes: {}",
-                prepared_query_profile.prepared_query_bytes
-            );
-            eprintln!(
-                "verbose.search.prepared_pattern_plan_bytes: {}",
-                prepared_query_profile.prepared_pattern_plan_bytes
-            );
-            eprintln!(
-                "verbose.search.prepared_mask_cache_bytes: {}",
-                prepared_query_profile.prepared_mask_cache_bytes
-            );
-            eprintln!(
-                "verbose.search.prepared_pattern_count: {}",
-                prepared_query_profile.pattern_count
-            );
-            eprintln!(
-                "verbose.search.prepared_mask_cache_entries: {}",
-                prepared_query_profile.mask_cache_entries
-            );
-            eprintln!(
-                "verbose.search.prepared_fixed_literal_count: {}",
-                prepared_query_profile.fixed_literal_count
-            );
-            eprintln!(
-                "verbose.search.prepared_tier1_alternatives: {}",
-                prepared_query_profile.tier1_alternatives
-            );
-            eprintln!(
-                "verbose.search.prepared_tier2_alternatives: {}",
-                prepared_query_profile.tier2_alternatives
-            );
-            eprintln!(
-                "verbose.search.prepared_tier1_shift_variants: {}",
-                prepared_query_profile.tier1_shift_variants
-            );
-            eprintln!(
-                "verbose.search.prepared_tier2_shift_variants: {}",
-                prepared_query_profile.tier2_shift_variants
-            );
-            eprintln!(
-                "verbose.search.prepared_tier1_any_lane_alternatives: {}",
-                prepared_query_profile.tier1_any_lane_alternatives
-            );
-            eprintln!(
-                "verbose.search.prepared_tier2_any_lane_alternatives: {}",
-                prepared_query_profile.tier2_any_lane_alternatives
-            );
-            eprintln!(
-                "verbose.search.prepared_tier1_compacted_any_lane_alternatives: {}",
-                prepared_query_profile.tier1_compacted_any_lane_alternatives
-            );
-            eprintln!(
-                "verbose.search.prepared_tier2_compacted_any_lane_alternatives: {}",
-                prepared_query_profile.tier2_compacted_any_lane_alternatives
-            );
-            eprintln!(
-                "verbose.search.prepared_any_lane_variant_sets: {}",
-                prepared_query_profile.any_lane_variant_sets
-            );
-            eprintln!(
-                "verbose.search.prepared_compacted_any_lane_grams: {}",
-                prepared_query_profile.compacted_any_lane_grams
-            );
-            eprintln!(
-                "verbose.search.prepared_max_pattern_bytes: {}",
-                prepared_query_profile.max_pattern_bytes
-            );
-            eprintln!(
-                "verbose.search.prepared_impossible_query: {}",
-                prepared_query_profile.impossible_query
-            );
-            if let Some(max_pattern_id) = &prepared_query_profile.max_pattern_id {
-                eprintln!("verbose.search.prepared_max_pattern_id: {max_pattern_id}");
-            }
-            eprintln!("verbose.search.max_candidates: {}", args.max_candidates);
-            eprintln!(
-                "verbose.search.max_anchors_per_pattern: {}",
-                args.max_anchors_per_pattern
-            );
-            eprintln!("verbose.search.candidates: {total}");
-            eprintln!("verbose.search.verify_enabled: {}", verify_yara_files);
-            let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
-            let smaps_rollup = current_process_smaps_rollup_kb();
-            eprintln!("verbose.search.client_current_rss_kb: {client_current_rss_kb}");
-            eprintln!("verbose.search.client_peak_rss_kb: {client_peak_rss_kb}");
-            eprintln!(
-                "verbose.search.client_smaps_rss_kb: {}",
-                smaps_rollup.rss_kb
-            );
-            eprintln!(
-                "verbose.search.client_anonymous_kb: {}",
-                smaps_rollup.anonymous_kb
-            );
-            eprintln!(
-                "verbose.search.client_private_clean_kb: {}",
-                smaps_rollup.private_clean_kb
-            );
-            eprintln!(
-                "verbose.search.client_private_dirty_kb: {}",
-                smaps_rollup.private_dirty_kb
-            );
-            eprintln!(
-                "verbose.search.client_shared_clean_kb: {}",
-                smaps_rollup.shared_clean_kb
-            );
-            if let Some((server_current_rss_kb, server_peak_rss_kb)) = server_rss_kb {
-                eprintln!("verbose.search.server_current_rss_kb: {server_current_rss_kb}");
-                eprintln!("verbose.search.server_peak_rss_kb: {server_peak_rss_kb}");
-            }
-            if let Some(tree_count) = tree_count {
-                eprintln!("verbose.search.tree_count: {tree_count}");
-            }
-            if let Some(tree_search_workers) = tree_search_workers {
-                eprintln!("verbose.search.tree_search_workers: {tree_search_workers}");
-            }
-            if verify_yara_files {
-                eprintln!("verbose.search.verified_checked: {verified_checked}");
-                eprintln!("verbose.search.verified_matched: {verified_matched}");
-                eprintln!("verbose.search.verified_skipped: {verified_skipped}");
-            }
-        }
-        Ok(0)
+fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let started_total = Instant::now();
+        let execution = execute_local_search(args)?;
+        finish_search_execution(
+            &args.rule,
+            args.verify_yara_files,
+            args.verbose,
+            args.max_candidates,
+            args.max_anchors_per_pattern,
+            started_total,
+            execution,
+        )
     })() {
         Ok(code) => code,
         Err(err) => {
@@ -4694,6 +4787,46 @@ fn cmd_info(args: &InfoCommandArgs) -> i32 {
     }
 }
 
+fn cmd_local_info(args: &LocalInfoArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let root = Path::new(&args.root);
+        let stats = if root.is_dir()
+            && fs::read_dir(root)
+                .ok()
+                .map(|entries| {
+                    entries.flatten().any(|entry| {
+                        entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                            && entry
+                                .file_name()
+                                .to_str()
+                                .map(|name| name.starts_with("tree_"))
+                                .unwrap_or(false)
+                            && entry.path().join("current").is_dir()
+                    })
+                })
+                .unwrap_or(false)
+        {
+            let tree_groups = open_forest_tree_groups(root)?;
+            let stores = tree_groups
+                .into_iter()
+                .flat_map(|group| group.stores)
+                .collect::<Vec<_>>();
+            serde_json::Value::Object(rpc::candidate_stats_json_for_stores(root, &stores))
+        } else {
+            let stores = open_stores(root)?;
+            serde_json::Value::Object(rpc::candidate_stats_json_for_stores(root, &stores))
+        };
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
     match (|| -> Result<i32> {
         let response = rpc_client(&args.connection).shutdown()?;
@@ -4729,12 +4862,15 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Serve(ServeArgs),
-    Init(InitArgs),
     Index(IndexArgs),
+    LocalIndex(LocalIndexArgs),
     Delete(DeleteArgs),
+    LocalDelete(LocalDeleteArgs),
     Search(SearchCommandArgs),
+    LocalSearch(LocalSearchArgs),
     SearchBatch(SearchBatchArgs),
     Info(InfoCommandArgs),
+    LocalInfo(LocalInfoArgs),
     Shutdown(ShutdownArgs),
     Yara(YaraArgs),
 }
@@ -4743,11 +4879,6 @@ enum Commands {
 struct IndexArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
-    #[arg(
-        long = "root",
-        help = "Candidate store root directory for direct local indexing. When set, indexing bypasses RPC and writes directly to this initialized root."
-    )]
-    root: Option<String>,
     #[arg(required = true, help = "File or directory paths.")]
     paths: Vec<String>,
     #[arg(
@@ -4782,6 +4913,75 @@ struct IndexArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct LocalIndexArgs {
+    #[arg(
+        long = "root",
+        required = true,
+        help = "Direct local store root directory."
+    )]
+    root: String,
+    #[arg(
+        long = "candidate-shards",
+        default_value_t = 1,
+        help = "Number of independent candidate shards (lock stripes) to initialize when creating a new local store."
+    )]
+    candidate_shards: usize,
+    #[arg(
+        long = "force",
+        action = ArgAction::SetTrue,
+        help = "Reinitialize an existing local store before indexing."
+    )]
+    force: bool,
+    #[arg(
+        long = "tier1-set-fp",
+        help = "Tier1 Bloom false-positive rate for a newly created local store. Defaults to 0.38 when omitted."
+    )]
+    tier1_filter_target_fp: Option<f64>,
+    #[arg(
+        long = "tier2-set-fp",
+        help = "Tier2 Bloom false-positive rate for a newly created local store. Defaults to 0.18 when omitted."
+    )]
+    tier2_filter_target_fp: Option<f64>,
+    #[arg(
+        long = "gram-sizes",
+        default_value = "3,4",
+        help = "DB-wide gram-size pair as tier1,tier2 for a newly created local store. Supported pairs: 3,4 4,5 5,6 7,8."
+    )]
+    gram_sizes: String,
+    #[arg(
+        long = "compaction-idle-cooldown-s",
+        default_value_t = 5.0,
+        help = "Minimum idle time after writes before compaction is allowed to run for a newly created local store."
+    )]
+    compaction_idle_cooldown_s: f64,
+    #[arg(required = true, help = "File or directory paths.")]
+    paths: Vec<String>,
+    #[arg(
+        long = "path-list",
+        action = ArgAction::SetTrue,
+        help = "Treat each input path as a newline-delimited manifest of file paths."
+    )]
+    path_list: bool,
+    #[arg(
+        long = "batch-size",
+        default_value_t = 64,
+        help = "Documents per local insert batch."
+    )]
+    batch_size: usize,
+    #[arg(
+        long = "workers",
+        help = "Process workers for recursive file scan/feature extraction before local batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
+    )]
+    workers: Option<usize>,
+    #[arg(
+        long = "verbose",
+        action = ArgAction::SetTrue,
+        help = "Print timing details to stderr."
+    )]
+    verbose: bool,
+}
+
+#[derive(Debug, clap::Args)]
 struct DeleteArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
@@ -4793,20 +4993,64 @@ struct DeleteArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct LocalDeleteArgs {
+    #[arg(
+        long = "root",
+        required = true,
+        help = "Direct local store root directory."
+    )]
+    root: String,
+    #[arg(
+        required = true,
+        help = "Existing file paths or hex digests in the store's identity format."
+    )]
+    values: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
 struct SearchCommandArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
+    #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
+    rule: String,
+    #[arg(
+        long = "max-anchors-per-pattern",
+        default_value_t = 16,
+        help = "Keep at most this many anchors per pattern alternative."
+    )]
+    max_anchors_per_pattern: usize,
+    #[arg(
+        long = "max-candidates",
+        default_value_t = 7.5,
+        value_parser = parse_max_candidates_percent,
+        help = "Server-side candidate cap as a percentage of searchable documents; 0 means unlimited."
+    )]
+    max_candidates: f64,
+    #[arg(
+        long = "verify",
+        action = ArgAction::SetTrue,
+        default_value_t = false,
+        help = "Enable local YARA verification over candidate file paths."
+    )]
+    verify_yara_files: bool,
+    #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
+    verbose: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct LocalSearchArgs {
     #[arg(
         long = "root",
-        help = "Candidate forest root for in-process search. When set, search runs directly against tree_*/current stores instead of RPC servers."
+        required = true,
+        help = "Candidate forest root for in-process search."
     )]
-    root: Option<String>,
+    root: String,
     #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
     rule: String,
     #[arg(
         long = "tree-search-workers",
         default_value_t = 0,
-        help = "Forest-level tree search workers for --root mode. 0 means auto up to the tree count."
+        help = "Forest-level tree search workers. 0 means auto up to the tree count."
     )]
     tree_search_workers: usize,
     #[arg(
@@ -4819,7 +5063,7 @@ struct SearchCommandArgs {
         long = "max-candidates",
         default_value_t = 7.5,
         value_parser = parse_max_candidates_percent,
-        help = "Server-side candidate cap as a percentage of searchable documents; 0 means unlimited."
+        help = "Candidate cap as a percentage of searchable documents; 0 means unlimited."
     )]
     max_candidates: f64,
     #[arg(
@@ -4899,6 +5143,16 @@ struct InfoCommandArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct LocalInfoArgs {
+    #[arg(
+        long = "root",
+        required = true,
+        help = "Direct local store or forest root directory."
+    )]
+    root: String,
+}
+
+#[derive(Debug, clap::Args)]
 struct ShutdownArgs {
     #[command(flatten)]
     connection: ClientConnectionArgs,
@@ -4942,12 +5196,6 @@ struct ServeArgs {
     )]
     search_workers: usize,
     #[arg(
-        long = "memory-budget-gb",
-        default_value_t = DEFAULT_MEMORY_BUDGET_GB,
-        help = "Configured indexing memory budget in GiB. Client-side indexing backpressure will use the lower of this value and available memory."
-    )]
-    memory_budget_gb: u64,
-    #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
         help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
@@ -4966,18 +5214,13 @@ struct ServeArgs {
     )]
     shards: Option<usize>,
     #[arg(
-        long = "set-fp",
-        help = "Fallback Bloom false-positive rate applied to both tiers when tier-specific values are not set."
-    )]
-    filter_target_fp: Option<f64>,
-    #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.40 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.23 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to 0.18 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(
@@ -5014,18 +5257,13 @@ struct InitArgs {
     #[arg(long = "force", action = ArgAction::SetTrue, help = "Overwrite an existing candidate store.")]
     force: bool,
     #[arg(
-        long = "set-fp",
-        help = "Fallback Bloom false-positive rate applied to both tiers when tier-specific values are not set."
-    )]
-    filter_target_fp: Option<f64>,
-    #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to --set-fp or 0.40 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to --set-fp or 0.23 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to 0.18 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(
@@ -5100,7 +5338,6 @@ struct InternalIndexBatchArgs {
     rotate_remote_sessions: bool,
 }
 
-#[cfg(test)]
 #[derive(Debug, clap::Args)]
 struct InternalDeleteArgs {
     #[command(flatten)]
@@ -5161,12 +5398,15 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
 
     let exit_code = match cli.command {
         Commands::Serve(args) => cmd_serve(&args),
-        Commands::Init(args) => cmd_init(&args),
         Commands::Index(args) => cmd_index(&args),
+        Commands::LocalIndex(args) => cmd_local_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
+        Commands::LocalDelete(args) => cmd_local_delete(&args),
         Commands::Search(args) => cmd_search(&args),
+        Commands::LocalSearch(args) => cmd_local_search(&args),
         Commands::SearchBatch(args) => cmd_search_batch(&args),
         Commands::Info(args) => cmd_info(&args),
+        Commands::LocalInfo(args) => cmd_local_info(&args),
         Commands::Shutdown(args) => cmd_shutdown(&args),
         Commands::Yara(args) => cmd_yara(&args),
     };
@@ -5198,7 +5438,6 @@ mod tests {
             root: root.display().to_string(),
             candidate_shards,
             force,
-            filter_target_fp: None,
             tier1_filter_target_fp: None,
             tier2_filter_target_fp: None,
             gram_sizes: "3,4".to_owned(),
@@ -5293,11 +5532,9 @@ mod tests {
             addr: DEFAULT_RPC_ADDR.to_owned(),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             search_workers: default_search_workers_for(4),
-            memory_budget_gb: DEFAULT_MEMORY_BUDGET_GB,
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
             shards: None,
-            filter_target_fp: None,
             tier1_filter_target_fp: None,
             tier2_filter_target_fp: None,
             id_source: CandidateIdSource::Sha256,
@@ -5917,21 +6154,22 @@ rule q {
         );
 
         assert_eq!(
-            cmd_internal_index_batch(&InternalIndexBatchArgs {
-                connection: default_connection(),
+            cmd_local_index(&LocalIndexArgs {
+                root: candidate_root.display().to_string(),
+                candidate_shards: 2,
+                force: false,
+                tier1_filter_target_fp: None,
+                tier2_filter_target_fp: None,
+                gram_sizes: "3,4".to_owned(),
+                compaction_idle_cooldown_s: 5.0,
                 paths: vec![
                     sample_dir.display().to_string(),
                     base.join("missing").display().to_string(),
                 ],
                 path_list: false,
-                root: Some(candidate_root.display().to_string()),
                 batch_size: 1,
-                remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
-                workers: 1,
-                chunk_size: 1024,
-                external_id_from_path: true,
+                workers: Some(1),
                 verbose: false,
-                rotate_remote_sessions: false,
             }),
             0
         );
@@ -5990,17 +6228,27 @@ rule q {
             0
         );
         assert_eq!(
-            cmd_internal_stats(&InternalStatsArgs {
-                connection: default_connection(),
-                root: Some(candidate_root.display().to_string()),
+            cmd_local_search(&LocalSearchArgs {
+                root: candidate_root.display().to_string(),
+                rule: rule_path.display().to_string(),
+                tree_search_workers: 2,
+                max_anchors_per_pattern: 4,
+                max_candidates: 8.0,
+                verify_yara_files: false,
+                verbose: false,
             }),
             0
         );
         let path_sha = hex::encode(sha256_file(&sample_b, 1024).expect("sha256"));
         assert_eq!(
-            cmd_internal_delete(&InternalDeleteArgs {
-                connection: default_connection(),
-                root: Some(candidate_root.display().to_string()),
+            cmd_local_info(&LocalInfoArgs {
+                root: candidate_root.display().to_string(),
+            }),
+            0
+        );
+        assert_eq!(
+            cmd_local_delete(&LocalDeleteArgs {
+                root: candidate_root.display().to_string(),
                 values: vec![path_sha],
             }),
             0
@@ -6039,8 +6287,8 @@ rule remote_q {
         let policy = server_scan_policy(&connection).expect("scan policy from server");
         assert_eq!(policy.id_source, CandidateIdSource::Sha256);
         assert!(!policy.store_path);
-        assert_eq!(policy.tier1_filter_target_fp, Some(0.40));
-        assert_eq!(policy.tier2_filter_target_fp, Some(0.23));
+        assert_eq!(policy.tier1_filter_target_fp, Some(0.38));
+        assert_eq!(policy.tier2_filter_target_fp, Some(0.18));
         assert_eq!(policy.gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
 
         assert_eq!(
@@ -6056,7 +6304,6 @@ rule remote_q {
         assert_eq!(
             cmd_index(&IndexArgs {
                 connection: connection.clone(),
-                root: None,
                 paths: vec![
                     sample_b.display().to_string(),
                     sample_c.display().to_string()
@@ -6100,9 +6347,7 @@ rule remote_q {
         assert_eq!(
             cmd_search(&SearchCommandArgs {
                 connection: connection.clone(),
-                root: None,
                 rule: rule_path.display().to_string(),
-                tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
                 max_candidates: 8.0,
                 verify_yara_files: false,
@@ -6113,9 +6358,7 @@ rule remote_q {
         assert_eq!(
             cmd_search(&SearchCommandArgs {
                 connection: connection.clone(),
-                root: None,
                 rule: rule_path.display().to_string(),
-                tree_search_workers: 0,
                 max_anchors_per_pattern: 2,
                 max_candidates: 8.0,
                 verify_yara_files: true,
@@ -6220,23 +6463,27 @@ rule remote_q {
             1
         );
         assert_eq!(
-            cmd_internal_stats(&InternalStatsArgs {
-                connection: default_connection(),
-                root: Some(missing_root.display().to_string()),
+            cmd_local_info(&LocalInfoArgs {
+                root: missing_root.display().to_string(),
             }),
             1
         );
         assert_eq!(
-            cmd_internal_query(&InternalQueryArgs {
-                connection: default_connection(),
-                root: Some(missing_root.display().to_string()),
+            cmd_local_search(&LocalSearchArgs {
+                root: missing_root.display().to_string(),
                 rule: missing_rule.display().to_string(),
-                cursor: 0,
-                chunk_size: 1,
+                tree_search_workers: 0,
                 max_anchors_per_pattern: 1,
-                force_tier1_only: false,
-                no_tier2_fallback: false,
                 max_candidates: 1.0,
+                verify_yara_files: false,
+                verbose: false,
+            }),
+            1
+        );
+        assert_eq!(
+            cmd_local_delete(&LocalDeleteArgs {
+                root: missing_root.display().to_string(),
+                values: vec![sample.display().to_string()],
             }),
             1
         );
@@ -6276,7 +6523,6 @@ rule remote_q {
         assert_eq!(
             cmd_index(&IndexArgs {
                 connection: connection.clone(),
-                root: None,
                 paths: vec![sample.display().to_string()],
                 path_list: false,
                 batch_size: 1,

@@ -389,10 +389,9 @@ def write_markdown(path: Path, summary: dict, records: list[dict]) -> None:
             dynamic = record.get("dynamic", {})
             total_ms = dynamic.get("verbose_search_total_ms", dynamic.get("elapsed_ms_wall", 0.0))
             docs = dynamic.get("verbose_search_docs_scanned", 0)
-            skipped = dynamic.get("verbose_search_superblocks_skipped", 0)
             lines.append(
                 f"- `{record['rule_file']}` source={record['source']} static={record['static_bucket']} "
-                f"ms={total_ms} docs={docs} skipped={skipped} hints={record['rewrite_hints']}"
+                f"ms={total_ms} docs={docs} hints={record['rewrite_hints']}"
             )
         if not bucket_records:
             lines.append("- none")
