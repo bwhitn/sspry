@@ -13,6 +13,11 @@ service Sspry {
   rpc InsertStream(stream InsertChunk) returns (InsertSummary);
 }
 
+message OptionalString {
+  bool has_value = 1;
+  string value = 2;
+}
+
 message PingRequest {}
 
 message PingResponse {
@@ -59,30 +64,26 @@ message SearchRequest {
   uint32 chunk_size = 3;
   bool include_external_ids = 4;
   double max_candidates_percent = 5;
-}
-
-message SearchProfile {
-  uint64 docs_scanned = 1;
-  uint64 tier1_loads = 2;
-  uint64 tier2_loads = 3;
-  uint64 returned_candidates = 4;
+  uint32 max_anchors_per_pattern = 6;
+  bool force_tier1_only = 7;
+  bool allow_tier2_fallback = 8;
 }
 
 message SearchFrame {
   repeated string sha256 = 1;
-  repeated string external_ids = 2;
+  repeated OptionalString external_ids = 2;
   uint64 candidate_limit = 3;
   bool has_candidate_limit = 4;
   bool stream_complete = 5;
   bool truncated = 6;
   string tier_used = 7;
-  SearchProfile query_profile = 8;
+  string query_profile_json = 8;
+  string prepared_query_profile_json = 9;
 }
 
 message InsertChunk {
-  uint64 stream_id = 1;
-  bytes payload = 2;
-  bool final_chunk = 3;
+  bytes payload = 1;
+  bool final_chunk = 2;
 }
 
 message InsertSummary {

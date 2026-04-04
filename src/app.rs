@@ -33,6 +33,7 @@ use crate::candidate::{
     estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
     resolve_max_candidates, scan_file_features_bloom_only_with_gram_sizes,
 };
+use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
 use crate::rpc::{
     self, ClientConfig as RpcClientConfig, PersistentSspryClient, ServerConfig as RpcServerConfig,
@@ -902,6 +903,27 @@ fn search_rpc_client(connection: &ClientConnectionArgs) -> SspryClient {
     )
 }
 
+fn grpc_client(connection: &ClientConnectionArgs) -> Result<BlockingGrpcClient> {
+    grpc_client_with_timeout(connection, connection.timeout)
+}
+
+fn grpc_client_with_timeout(
+    connection: &ClientConnectionArgs,
+    timeout_secs: f64,
+) -> Result<BlockingGrpcClient> {
+    BlockingGrpcClient::connect(
+        &connection.addr,
+        Duration::from_secs_f64(timeout_secs.max(0.0)),
+    )
+}
+
+fn search_grpc_client(connection: &ClientConnectionArgs) -> Result<BlockingGrpcClient> {
+    grpc_client_with_timeout(
+        connection,
+        connection.timeout.max(DEFAULT_SEARCH_RPC_TIMEOUT),
+    )
+}
+
 struct ScannedIndexBatchRow {
     row: IndexBatchRow,
     scan_elapsed: Duration,
@@ -937,10 +959,23 @@ struct ServerScanPolicy {
     tier2_filter_target_fp: Option<f64>,
     gram_sizes: GramSizes,
     memory_budget_bytes: u64,
+    workspace_mode: bool,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
     let stats = rpc_client(connection).candidate_stats()?;
+    server_scan_policy_from_stats(&stats)
+}
+
+fn server_scan_policy_grpc(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
+    let mut client = grpc_client(connection)?;
+    let stats = client.stats_json()?;
+    server_scan_policy_from_stats(&stats)
+}
+
+fn server_scan_policy_from_stats(
+    stats: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ServerScanPolicy> {
     let legacy_filter_target_fp = json_f64_opt(&stats, "filter_target_fp");
     let gram_sizes = GramSizes::new(
         stats
@@ -975,6 +1010,10 @@ fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPol
             .get("memory_budget_bytes")
             .and_then(|value| value.as_u64())
             .unwrap_or(DEFAULT_MEMORY_BUDGET_BYTES),
+        workspace_mode: stats
+            .get("workspace_mode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -1056,6 +1095,27 @@ const REMOTE_UPLOAD_QUEUE_MAX_BYTES: usize = 512 * 1024 * 1024;
 struct RemotePendingBatch {
     rows: Vec<Vec<u8>>,
     payload_size: usize,
+}
+
+trait RemoteBinaryInsertClient {
+    fn candidate_insert_binary_rows(&mut self, rows: &[Vec<u8>]) -> Result<usize>;
+}
+
+impl RemoteBinaryInsertClient for PersistentSspryClient {
+    fn candidate_insert_binary_rows(&mut self, rows: &[Vec<u8>]) -> Result<usize> {
+        Ok(self
+            .candidate_insert_batch_binary_rows(rows)?
+            .inserted_count)
+    }
+}
+
+impl RemoteBinaryInsertClient for BlockingGrpcClient {
+    fn candidate_insert_binary_rows(&mut self, rows: &[Vec<u8>]) -> Result<usize> {
+        let payload = rpc::serialized_candidate_insert_binary_batch_payload(rows);
+        let response =
+            self.insert_binary_payload(&payload, grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES)?;
+        Ok(usize::try_from(response.inserted_count).unwrap_or(usize::MAX))
+    }
 }
 
 struct RemoteUploadRow {
@@ -1215,8 +1275,8 @@ fn prepare_serialized_remote_batch_row(
             > remote_batch_soft_limit_bytes)
 }
 
-fn flush_remote_batch(
-    client: &mut PersistentSspryClient,
+fn flush_remote_batch<C: RemoteBinaryInsertClient>(
+    client: &mut C,
     pending: &mut RemotePendingBatch,
     processed: &mut usize,
     empty_payload_size: usize,
@@ -1228,9 +1288,7 @@ fn flush_remote_batch(
     let flush_rows = pending.rows.len();
     let flush_payload_size = pending.payload_size;
     let started = Instant::now();
-    let inserted_count = client
-        .candidate_insert_batch_binary_rows(&pending.rows)?
-        .inserted_count;
+    let inserted_count = client.candidate_insert_binary_rows(&pending.rows)?;
     if verbose {
         eprintln!(
             "verbose.index.remote_flush rows={} payload_bytes={} inserted={} elapsed_ms={:.3}",
@@ -1246,8 +1304,8 @@ fn flush_remote_batch(
     Ok(())
 }
 
-fn push_serialized_remote_upload_row(
-    client: &mut PersistentSspryClient,
+fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
+    client: &mut C,
     pending: &mut RemotePendingBatch,
     row_bytes: Vec<u8>,
     batch_size: usize,
@@ -1372,8 +1430,8 @@ fn flush_local_pending_rows(
     Ok(())
 }
 
-fn flush_remote_pending_rows(
-    client: &mut PersistentSspryClient,
+fn flush_remote_pending_rows<C: RemoteBinaryInsertClient>(
+    client: &mut C,
     pending: &mut RemotePendingBatch,
     processed: &mut usize,
     submit_time: &mut Duration,
@@ -4267,6 +4325,256 @@ fn cmd_index(args: &IndexArgs) -> i32 {
     })
 }
 
+fn cmd_grpc_index(args: &IndexArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let started_total = Instant::now();
+        let mut scan_time = Duration::ZERO;
+        let mut result_wait_time = Duration::ZERO;
+        let mut encode_time = Duration::ZERO;
+        let mut client_buffer_time = Duration::ZERO;
+        let mut submit_time = Duration::ZERO;
+        let input_roots = expand_input_paths(&args.paths, args.path_list)?;
+        let total_files = if args.path_list || input_paths_are_file_only(&input_roots) {
+            input_roots.len()
+        } else {
+            count_input_files(&input_roots)?
+        };
+        if total_files == 0 {
+            return Err(SspryError::from("No input files found."));
+        }
+        let show_progress = args.verbose
+            && (args.path_list
+                || input_roots.iter().any(|path| path.is_dir())
+                || total_files > input_roots.len());
+        let mut last_progress_reported = 0usize;
+        let mut last_progress_at = Instant::now();
+        let mut processed = 0usize;
+        let batch_size = args.batch_size.max(1);
+        let server_policy = server_scan_policy_grpc(&args.connection)?;
+        let resolved_workers =
+            resolve_ingest_workers(args.workers.unwrap_or(0), total_files, &input_roots, None);
+        let workers = resolved_workers.workers;
+        let policy = ScanPolicy {
+            fixed_filter_bytes: None,
+            tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
+            tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
+            gram_sizes: server_policy.gram_sizes,
+            chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
+            store_path: server_policy.store_path,
+            id_source: server_policy.id_source,
+        };
+        let configured_budget_bytes = server_policy.memory_budget_bytes;
+        let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
+        let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
+        let empty_payload_size = empty_remote_batch_payload_size()?;
+        let remote_batch_soft_limit_bytes = args
+            .remote_batch_soft_limit_bytes
+            .max(empty_payload_size.saturating_add(1));
+        let mut pending = RemotePendingBatch {
+            rows: Vec::new(),
+            payload_size: empty_payload_size,
+        };
+        let mut client = grpc_client(&args.connection)?;
+
+        if workers <= 1 {
+            stream_selected_input_files(&input_roots, args.path_list, |file_path| {
+                let started_scan = Instant::now();
+                let scanned = scan_index_batch_row(&file_path, policy)?;
+                scan_time += started_scan.elapsed();
+                let started_encode = Instant::now();
+                let row_bytes = serialize_candidate_document_binary_row(&scanned)?;
+                encode_time += started_encode.elapsed();
+                client_buffer_time += push_serialized_remote_upload_row(
+                    &mut client,
+                    &mut pending,
+                    row_bytes,
+                    batch_size,
+                    &mut processed,
+                    &mut submit_time,
+                    show_progress,
+                    total_files,
+                    &mut last_progress_reported,
+                    &mut last_progress_at,
+                    empty_payload_size,
+                    remote_batch_soft_limit_bytes,
+                    args.verbose,
+                )?;
+                maybe_report_index_progress(
+                    show_progress,
+                    processed.saturating_add(pending.rows.len()),
+                    total_files,
+                    &mut last_progress_reported,
+                    &mut last_progress_at,
+                    false,
+                );
+                Ok(())
+            })?;
+        } else {
+            let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+            let (result_tx, result_rx) = bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
+            thread::scope(|scope| {
+                for _worker_idx in 0..workers {
+                    let job_rx = job_rx.clone();
+                    let result_tx = result_tx.clone();
+                    scope.spawn(move || {
+                        for file_path in job_rx.iter() {
+                            let started_scan = Instant::now();
+                            let result = scan_index_batch_row(&file_path, policy).map(|row| {
+                                ScannedIndexBatchRow {
+                                    row,
+                                    scan_elapsed: started_scan.elapsed(),
+                                }
+                            });
+                            let _ = result_tx.send(result);
+                        }
+                    });
+                }
+                let producer_tx = job_tx.clone();
+                let producer_result_tx = result_tx.clone();
+                let producer_roots = input_roots.clone();
+                let producer_path_list = args.path_list;
+                scope.spawn(move || {
+                    let produce = stream_selected_input_files(
+                        &producer_roots,
+                        producer_path_list,
+                        |file_path| {
+                            producer_tx.send(file_path).map_err(|_| {
+                                SspryError::from(
+                                    "candidate ingest file producer terminated unexpectedly",
+                                )
+                            })?;
+                            Ok(())
+                        },
+                    );
+                    if let Err(err) = produce {
+                        let _ = producer_result_tx.send(Err(err));
+                    }
+                    drop(producer_tx);
+                });
+
+                drop(job_tx);
+                drop(result_tx);
+
+                let mut received = 0usize;
+                loop {
+                    let started_wait = Instant::now();
+                    let Some(scanned) = result_rx.recv().ok() else {
+                        break;
+                    };
+                    result_wait_time += started_wait.elapsed();
+                    let scanned = scanned?;
+                    received = received.saturating_add(1);
+                    scan_time += scanned.scan_elapsed;
+                    let started_encode = Instant::now();
+                    let row_bytes = serialize_candidate_document_binary_row(&scanned.row)?;
+                    encode_time += started_encode.elapsed();
+                    client_buffer_time += push_serialized_remote_upload_row(
+                        &mut client,
+                        &mut pending,
+                        row_bytes,
+                        batch_size,
+                        &mut processed,
+                        &mut submit_time,
+                        show_progress,
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        empty_payload_size,
+                        remote_batch_soft_limit_bytes,
+                        args.verbose,
+                    )?;
+                    maybe_report_index_progress(
+                        show_progress,
+                        processed.saturating_add(pending.rows.len()),
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        false,
+                    );
+                }
+                if received != total_files {
+                    return Err(SspryError::from(format!(
+                        "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
+                    )));
+                }
+                Ok::<(), SspryError>(())
+            })?;
+        }
+
+        flush_remote_pending_rows(
+            &mut client,
+            &mut pending,
+            &mut processed,
+            &mut submit_time,
+            show_progress,
+            total_files,
+            &mut last_progress_reported,
+            &mut last_progress_at,
+            empty_payload_size,
+            args.verbose,
+        )?;
+        if server_policy.workspace_mode {
+            let _ = client.publish()?;
+        }
+
+        maybe_report_index_progress(
+            show_progress,
+            processed,
+            total_files,
+            &mut last_progress_reported,
+            &mut last_progress_at,
+            true,
+        );
+
+        println!("submitted_documents: {total_files}");
+        println!("processed_documents: {processed}");
+        if args.verbose {
+            let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
+            let scan_ms = scan_time.as_secs_f64() * 1000.0;
+            let submit_ms = submit_time.as_secs_f64() * 1000.0;
+            let result_wait_ms = result_wait_time.as_secs_f64() * 1000.0;
+            let encode_ms = encode_time.as_secs_f64() * 1000.0;
+            let client_buffer_ms = client_buffer_time.as_secs_f64() * 1000.0;
+            eprintln!("verbose.index.total_ms: {total_ms:.3}");
+            eprintln!("verbose.index.scan_ms: {scan_ms:.3}");
+            eprintln!("verbose.index.worker_scan_cpu_ms: {scan_ms:.3}");
+            eprintln!("verbose.index.result_wait_ms: {result_wait_ms:.3}");
+            eprintln!("verbose.index.encode_ms: {encode_ms:.3}");
+            eprintln!("verbose.index.client_buffer_ms: {client_buffer_ms:.3}");
+            eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
+            eprintln!("verbose.index.batch_size: {}", batch_size);
+            eprintln!("verbose.index.workers: {workers}");
+            eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
+            eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
+            eprintln!("verbose.index.queue_capacity: {queue_capacity}");
+            eprintln!(
+                "verbose.index.remote_batch_soft_limit_bytes: {remote_batch_soft_limit_bytes}"
+            );
+            eprintln!("verbose.index.worker_auto: {}", resolved_workers.auto);
+            eprintln!(
+                "verbose.index.input_storage_class: {}",
+                resolved_workers.input_storage.as_str()
+            );
+            eprintln!(
+                "verbose.index.output_storage_class: {}",
+                resolved_workers.output_storage.as_str()
+            );
+            eprintln!("verbose.index.submitted_documents: {total_files}");
+            eprintln!("verbose.index.processed_documents: {processed}");
+            let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
+            eprintln!("verbose.index.client_current_rss_kb: {client_current_rss_kb}");
+            eprintln!("verbose.index.client_peak_rss_kb: {client_peak_rss_kb}");
+        }
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
     match ensure_local_root_initialized(&init_args_from_local_index(args)) {
         Ok(_) => cmd_internal_index_batch(&InternalIndexBatchArgs {
@@ -4342,20 +4650,16 @@ fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
     })
 }
 
-fn execute_remote_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
-    let started_plan = Instant::now();
-    let client = search_rpc_client(&args.connection);
-    let server_policy = server_scan_policy(&args.connection)?;
-    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-        &args.rule,
-        server_policy.gram_sizes,
-        Some(server_policy.id_source.as_str()),
-        args.max_anchors_per_pattern,
-        false,
-        true,
-        args.max_candidates,
-    )?;
-    let plan_time = started_plan.elapsed();
+fn collect_streamed_search_execution<F>(
+    args: &SearchCommandArgs,
+    plan: CompiledQueryPlan,
+    plan_time: Duration,
+    server_rss_kb: Option<(u64, u64)>,
+    mut pump: F,
+) -> Result<SearchExecution>
+where
+    F: FnMut(&mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>) -> Result<()>,
+{
     let started_query = Instant::now();
     let mut buffered_rows = Vec::<String>::new();
     let mut buffered_external_ids = Vec::<Option<String>>::new();
@@ -4366,61 +4670,50 @@ fn execute_remote_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
     let mut tier_used = String::new();
     let mut truncated = false;
     let mut truncated_limit = None::<usize>;
-    client.candidate_query_plan_stream_with_options(
-        &plan,
-        Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
-        args.verify_yara_files,
-        |frame| {
-            if truncated_limit.is_none() {
-                truncated_limit = frame.candidate_limit;
-            }
-            if frame.stream_complete {
-                tier_used = frame.tier_used;
-                query_profile = frame.query_profile;
-                prepared_query_profile = frame.prepared_query_profile;
-                return Ok(());
-            }
-            let mut frame_external_ids = frame.external_ids.unwrap_or_default();
-            if args.verify_yara_files && frame_external_ids.len() < frame.sha256.len() {
-                frame_external_ids.resize(frame.sha256.len(), None);
-            }
-            for (idx, sha256) in frame.sha256.into_iter().enumerate() {
-                let external_id = if args.verify_yara_files {
-                    frame_external_ids.get(idx).cloned().flatten()
-                } else {
-                    None
-                };
-                if let Some(existing_idx) = accepted_positions.get(&sha256).copied() {
-                    if args.verify_yara_files
-                        && buffered_external_ids
-                            .get(existing_idx)
-                            .is_some_and(Option::is_none)
-                        && external_id.is_some()
-                    {
-                        buffered_external_ids[existing_idx] = external_id;
-                    }
-                    continue;
+    pump(&mut |frame| {
+        if truncated_limit.is_none() {
+            truncated_limit = frame.candidate_limit;
+        }
+        if frame.stream_complete {
+            tier_used = frame.tier_used;
+            query_profile = frame.query_profile;
+            prepared_query_profile = frame.prepared_query_profile;
+            return Ok(());
+        }
+        let mut frame_external_ids = frame.external_ids.unwrap_or_default();
+        if args.verify_yara_files && frame_external_ids.len() < frame.sha256.len() {
+            frame_external_ids.resize(frame.sha256.len(), None);
+        }
+        for (idx, sha256) in frame.sha256.into_iter().enumerate() {
+            let external_id = if args.verify_yara_files {
+                frame_external_ids.get(idx).cloned().flatten()
+            } else {
+                None
+            };
+            if let Some(existing_idx) = accepted_positions.get(&sha256).copied() {
+                if args.verify_yara_files
+                    && buffered_external_ids
+                        .get(existing_idx)
+                        .is_some_and(Option::is_none)
+                    && external_id.is_some()
+                {
+                    buffered_external_ids[existing_idx] = external_id;
                 }
-                if truncated_limit.is_some_and(|limit| buffered_rows.len() >= limit) {
-                    truncated = true;
-                    continue;
-                }
-                accepted_positions.insert(sha256.clone(), buffered_rows.len());
-                total_candidates = total_candidates.saturating_add(1);
-                buffered_rows.push(sha256);
-                if args.verify_yara_files {
-                    buffered_external_ids.push(external_id);
-                }
+                continue;
             }
-            Ok(())
-        },
-    )?;
-    let query_time = started_query.elapsed();
-    let server_rss_kb = if args.verbose {
-        server_memory_kb(&args.connection)?
-    } else {
-        None
-    };
+            if truncated_limit.is_some_and(|limit| buffered_rows.len() >= limit) {
+                truncated = true;
+                continue;
+            }
+            accepted_positions.insert(sha256.clone(), buffered_rows.len());
+            total_candidates = total_candidates.saturating_add(1);
+            buffered_rows.push(sha256);
+            if args.verify_yara_files {
+                buffered_external_ids.push(external_id);
+            }
+        }
+        Ok(())
+    })?;
     Ok(SearchExecution {
         plan,
         total_candidates,
@@ -4435,7 +4728,79 @@ fn execute_remote_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
         tree_search_workers: None,
         server_rss_kb,
         plan_time,
-        query_time,
+        query_time: started_query.elapsed(),
+    })
+}
+
+fn execute_remote_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
+    let started_plan = Instant::now();
+    let client = search_rpc_client(&args.connection);
+    let server_policy = server_scan_policy(&args.connection)?;
+    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        &args.rule,
+        server_policy.gram_sizes,
+        Some(server_policy.id_source.as_str()),
+        args.max_anchors_per_pattern,
+        false,
+        true,
+        args.max_candidates,
+    )?;
+    let plan_time = started_plan.elapsed();
+    let server_rss_kb = if args.verbose {
+        server_memory_kb(&args.connection)?
+    } else {
+        None
+    };
+    collect_streamed_search_execution(args, plan.clone(), plan_time, server_rss_kb, |on_frame| {
+        client.candidate_query_plan_stream_with_options(
+            &plan,
+            Some(DEFAULT_SEARCH_RESULT_CHUNK_SIZE),
+            args.verify_yara_files,
+            |frame| on_frame(frame),
+        )
+    })
+}
+
+fn grpc_search_frame_to_internal(frame: grpc::GrpcSearchFrame) -> rpc::CandidateQueryStreamFrame {
+    rpc::CandidateQueryStreamFrame {
+        sha256: frame.sha256,
+        external_ids: Some(frame.external_ids),
+        candidate_limit: frame.candidate_limit,
+        stream_complete: frame.stream_complete,
+        tier_used: frame.tier_used,
+        query_profile: frame.query_profile,
+        prepared_query_profile: frame.prepared_query_profile,
+    }
+}
+
+fn execute_grpc_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
+    let started_plan = Instant::now();
+    let mut client = search_grpc_client(&args.connection)?;
+    let server_policy = server_scan_policy_grpc(&args.connection)?;
+    let rule_text = fs::read_to_string(&args.rule)?;
+    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        &args.rule,
+        server_policy.gram_sizes,
+        Some(server_policy.id_source.as_str()),
+        args.max_anchors_per_pattern,
+        false,
+        true,
+        args.max_candidates,
+    )?;
+    let plan_time = started_plan.elapsed();
+    collect_streamed_search_execution(args, plan, plan_time, None, |on_frame| {
+        client.search_stream(
+            grpc::v1::SearchRequest {
+                yara_rule_source: rule_text.clone(),
+                chunk_size: DEFAULT_SEARCH_RESULT_CHUNK_SIZE as u32,
+                include_external_ids: args.verify_yara_files,
+                max_candidates_percent: args.max_candidates,
+                max_anchors_per_pattern: args.max_anchors_per_pattern as u32,
+                force_tier1_only: false,
+                allow_tier2_fallback: true,
+            },
+            |frame| on_frame(grpc_search_frame_to_internal(frame)),
+        )
     })
 }
 
@@ -4693,6 +5058,28 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
         let execution = execute_remote_search(args)?;
+        finish_search_execution(
+            &args.rule,
+            args.verify_yara_files,
+            args.verbose,
+            args.max_candidates,
+            args.max_anchors_per_pattern,
+            started_total,
+            execution,
+        )
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let started_total = Instant::now();
+        let execution = execute_grpc_search(args)?;
         finish_search_execution(
             &args.rule,
             args.verify_yara_files,
@@ -5021,6 +5408,25 @@ fn cmd_info(args: &InfoCommandArgs) -> i32 {
     }
 }
 
+fn cmd_grpc_info(args: &InfoCommandArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let mut client = grpc_client(&args.connection)?;
+        let stats = if args.light {
+            client.status_json()?
+        } else {
+            client.stats_json()?
+        };
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn cmd_local_info(args: &LocalInfoArgs) -> i32 {
     match (|| -> Result<i32> {
         let root = Path::new(&args.root);
@@ -5075,6 +5481,21 @@ fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
     }
 }
 
+fn cmd_grpc_shutdown(args: &ShutdownArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let mut client = grpc_client(&args.connection)?;
+        let response = client.shutdown()?;
+        println!("{response}");
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sspry",
@@ -5098,15 +5519,19 @@ enum Commands {
     Serve(ServeArgs),
     GrpcServe(ServeArgs),
     Index(IndexArgs),
+    GrpcIndex(IndexArgs),
     LocalIndex(LocalIndexArgs),
     Delete(DeleteArgs),
     LocalDelete(LocalDeleteArgs),
     Search(SearchCommandArgs),
+    GrpcSearch(SearchCommandArgs),
     LocalSearch(LocalSearchArgs),
     SearchBatch(SearchBatchArgs),
     Info(InfoCommandArgs),
+    GrpcInfo(InfoCommandArgs),
     LocalInfo(LocalInfoArgs),
     Shutdown(ShutdownArgs),
+    GrpcShutdown(ShutdownArgs),
     Yara(YaraArgs),
 }
 
@@ -5637,15 +6062,19 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
             cmd_grpc_serve_with_sources(&args, serve_init_option_sources_from_argv(&argv_values))
         }
         Commands::Index(args) => cmd_index(&args),
+        Commands::GrpcIndex(args) => cmd_grpc_index(&args),
         Commands::LocalIndex(args) => cmd_local_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
         Commands::LocalDelete(args) => cmd_local_delete(&args),
         Commands::Search(args) => cmd_search(&args),
+        Commands::GrpcSearch(args) => cmd_grpc_search(&args),
         Commands::LocalSearch(args) => cmd_local_search(&args),
         Commands::SearchBatch(args) => cmd_search_batch(&args),
         Commands::Info(args) => cmd_info(&args),
+        Commands::GrpcInfo(args) => cmd_grpc_info(&args),
         Commands::LocalInfo(args) => cmd_local_info(&args),
         Commands::Shutdown(args) => cmd_shutdown(&args),
+        Commands::GrpcShutdown(args) => cmd_grpc_shutdown(&args),
         Commands::Yara(args) => cmd_yara(&args),
     };
     if let Err(err) = perf::write_report(exit_code) {

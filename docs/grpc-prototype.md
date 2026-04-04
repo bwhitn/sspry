@@ -12,12 +12,26 @@ Current status:
   - `Ping`
   - `Stats`
   - `Status`
-  - `Shutdown`
-- unimplemented gRPC methods currently return `UNIMPLEMENTED`:
   - `Publish`
-  - `Delete`
   - `SearchStream`
   - `InsertStream`
+  - `Shutdown`
+- unimplemented gRPC methods currently return `UNIMPLEMENTED`:
+  - `Delete`
+
+Prototype CLI surface:
+
+- `grpc-serve`
+- `grpc-index`
+- `grpc-search`
+- `grpc-info`
+- `grpc-shutdown`
+
+Current request model:
+
+- gRPC search sends validated YARA source to the server rather than a serialized compiled-plan JSON payload.
+- gRPC ingest sends the existing binary-row batch payload over client streaming rather than the old manual upload begin/chunk/commit flow.
+- `grpc-index` publishes automatically after ingest when the target server is running in workspace mode so newly indexed documents become visible to `grpc-search`.
 
 Design constraints to keep in mind during the migration:
 

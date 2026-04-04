@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio_stream::StreamExt;
 use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status as GrpcStatus};
 
 use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
@@ -30,16 +31,18 @@ use crate::candidate::store::{
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
-    CandidateStore, CompiledQueryPlan, PatternPlan, QueryNode, candidate_shard_index,
-    candidate_shard_root, metadata_field_is_boolean, metadata_field_is_float,
-    metadata_field_is_integer, normalize_max_candidates, normalize_query_metadata_field,
-    read_candidate_shard_count, resolve_max_candidates, write_candidate_shard_count,
+    CandidateStore, CompiledQueryPlan, GramSizes, PatternPlan, QueryNode, candidate_shard_index,
+    candidate_shard_root, compile_query_plan_with_gram_sizes_and_identity_source,
+    metadata_field_is_boolean, metadata_field_is_float, metadata_field_is_integer,
+    normalize_max_candidates, normalize_query_metadata_field, read_candidate_shard_count,
+    resolve_max_candidates, write_candidate_shard_count,
 };
 use crate::grpc::v1::{
-    DeleteRequest as GrpcDeleteRequest, DeleteResponse as GrpcDeleteResponse, PingRequest,
-    PingResponse, PublishRequest, PublishResponse as GrpcPublishResponse, SearchFrame,
-    SearchRequest, ShutdownRequest, ShutdownResponse as GrpcShutdownResponse, StatsRequest,
-    StatsResponse, StatusRequest, StatusResponse,
+    DeleteRequest as GrpcDeleteRequest, DeleteResponse as GrpcDeleteResponse, InsertChunk,
+    InsertResult, InsertSummary, OptionalString, PingRequest, PingResponse, PublishRequest,
+    PublishResponse as GrpcPublishResponse, SearchFrame, SearchRequest, ShutdownRequest,
+    ShutdownResponse as GrpcShutdownResponse, StatsRequest, StatsResponse, StatusRequest,
+    StatusResponse,
     sspry_server::{Sspry as GrpcSspry, SspryServer},
 };
 use crate::perf::{record_counter, scope};
@@ -1896,6 +1899,48 @@ fn grpc_internal_status(err: SspryError) -> GrpcStatus {
     GrpcStatus::internal(err.to_string())
 }
 
+fn tonic_error_to_status(err: tonic::Status) -> GrpcStatus {
+    err
+}
+
+fn grpc_optional_string(value: Option<String>) -> OptionalString {
+    OptionalString {
+        has_value: value.is_some(),
+        value: value.unwrap_or_default(),
+    }
+}
+
+fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<SearchFrame> {
+    Ok(SearchFrame {
+        sha256: frame.sha256,
+        external_ids: frame
+            .external_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(grpc_optional_string)
+            .collect(),
+        candidate_limit: frame
+            .candidate_limit
+            .unwrap_or(0)
+            .try_into()
+            .unwrap_or(u64::MAX),
+        has_candidate_limit: frame.candidate_limit.is_some(),
+        stream_complete: frame.stream_complete,
+        truncated: false,
+        tier_used: frame.tier_used,
+        query_profile_json: if frame.stream_complete {
+            serde_json::to_string(&frame.query_profile)?
+        } else {
+            String::new()
+        },
+        prepared_query_profile_json: if frame.stream_complete {
+            serde_json::to_string(&frame.prepared_query_profile)?
+        } else {
+            String::new()
+        },
+    })
+}
+
 #[tonic::async_trait]
 impl GrpcSspry for GrpcServerService {
     async fn ping(
@@ -1941,9 +1986,14 @@ impl GrpcSspry for GrpcServerService {
         &self,
         _request: GrpcRequest<PublishRequest>,
     ) -> std::result::Result<GrpcResponse<GrpcPublishResponse>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented(
-            "gRPC publish is not implemented yet",
-        ))
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || state.handle_publish())
+            .await
+            .map_err(grpc_join_error_status)?
+            .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(GrpcPublishResponse {
+            message: response.message,
+        }))
     }
 
     async fn shutdown(
@@ -1970,20 +2020,87 @@ impl GrpcSspry for GrpcServerService {
 
     async fn search_stream(
         &self,
-        _request: GrpcRequest<SearchRequest>,
+        request: GrpcRequest<SearchRequest>,
     ) -> std::result::Result<GrpcResponse<Self::SearchStreamStream>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented(
-            "gRPC search streaming is not implemented yet",
+        let request = request.into_inner();
+        let state = self.state.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let plan = match state.compile_search_plan_from_yara_source(&request) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(grpc_internal_status(err)));
+                    return;
+                }
+            };
+            let internal_request = CandidateQueryRequest {
+                plan: Value::Null,
+                cursor: 0,
+                chunk_size: Some(
+                    usize::try_from(request.chunk_size)
+                        .unwrap_or(DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE)
+                        .max(1),
+                ),
+                include_external_ids: request.include_external_ids,
+            };
+            let result = state.stream_candidate_query_frames(internal_request, &plan, |frame| {
+                let grpc_frame = grpc_search_frame_from_internal(frame)?;
+                tx.blocking_send(Ok(grpc_frame))
+                    .map_err(|_| SspryError::from("gRPC search stream receiver dropped"))?;
+                Ok(())
+            });
+            if let Err(err) = result {
+                let _ = tx.blocking_send(Err(grpc_internal_status(err)));
+            }
+        });
+        Ok(GrpcResponse::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
         ))
     }
 
     async fn insert_stream(
         &self,
-        _request: GrpcRequest<tonic::Streaming<crate::grpc::v1::InsertChunk>>,
-    ) -> std::result::Result<GrpcResponse<crate::grpc::v1::InsertSummary>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented(
-            "gRPC insert streaming is not implemented yet",
-        ))
+        request: GrpcRequest<tonic::Streaming<InsertChunk>>,
+    ) -> std::result::Result<GrpcResponse<InsertSummary>, GrpcStatus> {
+        let mut stream = request.into_inner();
+        let mut payload = Vec::<u8>::new();
+        let mut saw_final = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(tonic_error_to_status)?;
+            if saw_final {
+                return Err(GrpcStatus::invalid_argument(
+                    "received insert chunks after final_chunk=true",
+                ));
+            }
+            payload.extend_from_slice(&chunk.payload);
+            if chunk.final_chunk {
+                saw_final = true;
+            }
+        }
+        if !saw_final {
+            return Err(GrpcStatus::invalid_argument(
+                "gRPC insert stream ended without final_chunk=true",
+            ));
+        }
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            state.handle_candidate_insert_batch_binary(&payload)
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(InsertSummary {
+            inserted_count: response.inserted_count.try_into().unwrap_or(u64::MAX),
+            results: response
+                .results
+                .into_iter()
+                .map(|item| InsertResult {
+                    status: item.status,
+                    doc_id: item.doc_id,
+                    sha256: item.sha256,
+                })
+                .collect(),
+        }))
     }
 }
 
@@ -2261,6 +2378,39 @@ impl ServerState {
             StoreMode::Forest { trees, .. } => trees.clone(),
             StoreMode::Workspace { published, .. } => vec![published.clone()],
         })
+    }
+
+    fn active_query_compile_policy(&self) -> Result<(GramSizes, String)> {
+        let store_sets = self.published_query_store_sets()?;
+        let first_store_lock = store_sets
+            .first()
+            .and_then(|store_set| store_set.stores.first())
+            .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?;
+        let store = lock_candidate_store_blocking(first_store_lock)?;
+        let config = store.config();
+        let gram_sizes = GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)?;
+        Ok((gram_sizes, config.id_source.clone()))
+    }
+
+    fn compile_search_plan_from_yara_source(
+        &self,
+        request: &SearchRequest,
+    ) -> Result<CompiledQueryPlan> {
+        if request.yara_rule_source.trim().is_empty() {
+            return Err(SspryError::from(
+                "Search request is missing yara_rule_source.",
+            ));
+        }
+        let (gram_sizes, id_source) = self.active_query_compile_policy()?;
+        compile_query_plan_with_gram_sizes_and_identity_source(
+            &request.yara_rule_source,
+            gram_sizes,
+            Some(id_source.as_str()),
+            (request.max_anchors_per_pattern as usize).max(1),
+            request.force_tier1_only,
+            request.allow_tier2_fallback,
+            request.max_candidates_percent,
+        )
     }
 
     fn forest_mode_info(&self) -> Result<Option<(PathBuf, usize)>> {
@@ -5714,6 +5864,25 @@ impl ServerState {
         plan: &CompiledQueryPlan,
         stream: &mut W,
     ) -> Result<()> {
+        self.stream_candidate_query_frames(request, plan, |frame| {
+            write_frame(
+                stream,
+                PROTOCOL_VERSION,
+                STATUS_OK,
+                &serde_json::to_vec(&frame)?,
+            )
+        })
+    }
+
+    fn stream_candidate_query_frames<F>(
+        &self,
+        request: CandidateQueryRequest,
+        plan: &CompiledQueryPlan,
+        mut on_frame: F,
+    ) -> Result<()>
+    where
+        F: FnMut(CandidateQueryStreamFrame) -> Result<()>,
+    {
         let _scope = scope("rpc.stream_candidate_query");
         let _op = self
             .operation_gate
@@ -5769,7 +5938,7 @@ impl ServerState {
                         for (hash_chunk, external_id_chunk) in
                             hits.chunks(chunk_size).zip(values.chunks(chunk_size))
                         {
-                            let frame = CandidateQueryStreamFrame {
+                            on_frame(CandidateQueryStreamFrame {
                                 sha256: hash_chunk.to_vec(),
                                 external_ids: Some(external_id_chunk.to_vec()),
                                 candidate_limit,
@@ -5777,18 +5946,12 @@ impl ServerState {
                                 tier_used: String::new(),
                                 query_profile: CandidateQueryProfile::default(),
                                 prepared_query_profile: CandidatePreparedQueryProfile::default(),
-                            };
-                            write_frame(
-                                stream,
-                                PROTOCOL_VERSION,
-                                STATUS_OK,
-                                &serde_json::to_vec(&frame)?,
-                            )?;
+                            })?;
                         }
                     }
                     None => {
                         for hash_chunk in hits.chunks(chunk_size) {
-                            let frame = CandidateQueryStreamFrame {
+                            on_frame(CandidateQueryStreamFrame {
                                 sha256: hash_chunk.to_vec(),
                                 external_ids: None,
                                 candidate_limit,
@@ -5796,20 +5959,14 @@ impl ServerState {
                                 tier_used: String::new(),
                                 query_profile: CandidateQueryProfile::default(),
                                 prepared_query_profile: CandidatePreparedQueryProfile::default(),
-                            };
-                            write_frame(
-                                stream,
-                                PROTOCOL_VERSION,
-                                STATUS_OK,
-                                &serde_json::to_vec(&frame)?,
-                            )?;
+                            })?;
                         }
                     }
                 }
             }
         }
 
-        let final_frame = CandidateQueryStreamFrame {
+        on_frame(CandidateQueryStreamFrame {
             sha256: Vec::new(),
             external_ids: None,
             candidate_limit,
@@ -5817,13 +5974,7 @@ impl ServerState {
             tier_used: Self::merge_candidate_tier_used(&tier_used),
             query_profile,
             prepared_query_profile,
-        };
-        write_frame(
-            stream,
-            PROTOCOL_VERSION,
-            STATUS_OK,
-            &serde_json::to_vec(&final_frame)?,
-        )?;
+        })?;
         Ok(())
     }
 
