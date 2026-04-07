@@ -160,6 +160,12 @@ Values can be:
 
 If a provided value does not match the server identity format, `delete` returns an error.
 
+For mutable workspaces, `delete` only targets the published `current/` store set.
+
+- if the value exists only in `work_a/` or `work_b/`, the result is `missing`
+- `missing` is a normal outcome for multi-server delete fanout where only some servers actually contain the document
+- physical reclaim happens later through shard-local compaction of `current/`
+
 ## local-delete
 
 ```bash
@@ -426,6 +432,6 @@ This bypasses the database and scans one file directly with `yara-x`.
 - use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
 - use `--search-workers` to control how many trees a forest server searches at once per query
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change
-- expect delete to be immediate logically but reclaimed physically later by shard-local compaction
+- expect delete to be immediate logically in `current/`, return `missing` when the value is not present there, and be reclaimed physically later by shard-local compaction of `current/`
 - `SIGINT` and `SIGTERM` trigger graceful drain and shutdown
 - `SIGUSR1` prints a live `info` snapshot to `stderr`

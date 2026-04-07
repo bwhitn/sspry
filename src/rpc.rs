@@ -39,9 +39,8 @@ use crate::candidate::{
 };
 use crate::grpc::v1::{
     AdaptivePublishSummary, DeleteRequest as GrpcDeleteRequest,
-    DeleteResponse as GrpcDeleteResponse, IndexSessionBeginRequest,
-    IndexSessionEndRequest, IndexSessionProgressRequest, IndexSessionResponse,
-    IndexSessionSummary,
+    DeleteResponse as GrpcDeleteResponse, IndexSessionBeginRequest, IndexSessionEndRequest,
+    IndexSessionProgressRequest, IndexSessionResponse, IndexSessionSummary,
     InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
     PingRequest, PingResponse, PreparedQueryProfileSummary, PublishRequest,
     PublishResponse as GrpcPublishResponse, PublishSummary, QueryProfileSummary, SearchFrame,
@@ -1535,10 +1534,8 @@ pub fn serve_grpc_with_signal_flags(
     let shutdown_waiter = thread::spawn(move || {
         let mut maintenance_epoch = shutdown_state.current_maintenance_epoch();
         while !shutdown_state.is_shutting_down() {
-            shutdown_state.wait_for_maintenance_event(
-                &mut maintenance_epoch,
-                Some(Duration::from_secs(1)),
-            );
+            shutdown_state
+                .wait_for_maintenance_event(&mut maintenance_epoch, Some(Duration::from_secs(1)));
         }
         let _ = shutdown_tx.send(());
     });
@@ -2025,7 +2022,10 @@ fn grpc_store_summary_from_stats_map(stats: &Map<String, Value>) -> StoreSummary
             .get("tier1_gram_size")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        query_count: stats.get("query_count").and_then(Value::as_u64).unwrap_or(0),
+        query_count: stats
+            .get("query_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         retired_generation_count: stats
             .get("retired_generation_count")
             .and_then(Value::as_u64)
@@ -2050,7 +2050,9 @@ fn grpc_store_summary_from_stats_map(stats: &Map<String, Value>) -> StoreSummary
     }
 }
 
-fn grpc_adaptive_publish_summary_from_status_map(stats: &Map<String, Value>) -> AdaptivePublishSummary {
+fn grpc_adaptive_publish_summary_from_status_map(
+    stats: &Map<String, Value>,
+) -> AdaptivePublishSummary {
     let adaptive = stats
         .get("adaptive_publish")
         .and_then(Value::as_object)
@@ -2106,7 +2108,10 @@ fn grpc_adaptive_publish_summary_from_status_map(stats: &Map<String, Value>) -> 
 fn grpc_insert_batch_profile_summary_from_value(
     value: Option<&Value>,
 ) -> InsertBatchProfileSummary {
-    let summary = value.and_then(Value::as_object).cloned().unwrap_or_default();
+    let summary = value
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     InsertBatchProfileSummary {
         batches: summary.get("batches").and_then(Value::as_u64).unwrap_or(0),
         documents: summary
@@ -2212,7 +2217,10 @@ fn grpc_index_session_summary_from_status_map(stats: &Map<String, Value>) -> Ind
         .cloned()
         .unwrap_or_default();
     IndexSessionSummary {
-        active: session.get("active").and_then(Value::as_bool).unwrap_or(false),
+        active: session
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         client_active: session
             .get("client_active")
             .and_then(Value::as_bool)
@@ -2252,7 +2260,10 @@ fn grpc_index_session_summary_from_status_map(stats: &Map<String, Value>) -> Ind
 }
 
 fn grpc_startup_store_summary_from_value(value: Option<&Value>) -> StartupStoreSummary {
-    let summary = value.and_then(Value::as_object).cloned().unwrap_or_default();
+    let summary = value
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     StartupStoreSummary {
         total_ms: summary.get("total_ms").and_then(Value::as_u64).unwrap_or(0),
         opened_existing_shards: summary
@@ -2263,7 +2274,10 @@ fn grpc_startup_store_summary_from_value(value: Option<&Value>) -> StartupStoreS
             .get("initialized_new_shards")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        doc_count: summary.get("doc_count").and_then(Value::as_u64).unwrap_or(0),
+        doc_count: summary
+            .get("doc_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }
 }
 
@@ -2279,7 +2293,9 @@ fn grpc_startup_summary_from_status_map(stats: &Map<String, Value>) -> StartupSu
             .get("startup_cleanup_removed_roots")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        current: Some(grpc_startup_store_summary_from_value(startup.get("current"))),
+        current: Some(grpc_startup_store_summary_from_value(
+            startup.get("current"),
+        )),
         work: Some(grpc_startup_store_summary_from_value(startup.get("work"))),
     }
 }
@@ -2291,8 +2307,14 @@ fn grpc_publish_summary_from_status_map(stats: &Map<String, Value>) -> PublishSu
         .cloned()
         .unwrap_or_default();
     PublishSummary {
-        pending: publish.get("pending").and_then(Value::as_bool).unwrap_or(false),
-        eligible: publish.get("eligible").and_then(Value::as_bool).unwrap_or(false),
+        pending: publish
+            .get("pending")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        eligible: publish
+            .get("eligible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         blocked_reason: publish
             .get("blocked_reason")
             .and_then(Value::as_str)
@@ -2454,7 +2476,9 @@ fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<S
         truncated: false,
         tier_used: frame.tier_used,
         query_profile: if frame.stream_complete {
-            Some(grpc_query_profile_summary_from_internal(&frame.query_profile))
+            Some(grpc_query_profile_summary_from_internal(
+                &frame.query_profile,
+            ))
         } else {
             None
         },
@@ -2504,7 +2528,10 @@ impl GrpcSspry for GrpcServerService {
                     .get("current_rss_kb")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
-                peak_rss_kb: stats.get("peak_rss_kb").and_then(Value::as_u64).unwrap_or(0),
+                peak_rss_kb: stats
+                    .get("peak_rss_kb")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             })
         })
         .await
@@ -2522,7 +2549,10 @@ impl GrpcSspry for GrpcServerService {
             let stats = state.status_json()?;
             let published_stats = state.current_stats_json()?;
             Ok::<StatusResponse, SspryError>(StatusResponse {
-                draining: stats.get("draining").and_then(Value::as_bool).unwrap_or(false),
+                draining: stats
+                    .get("draining")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 active_connections: stats
                     .get("active_connections")
                     .and_then(Value::as_u64)
@@ -2563,7 +2593,10 @@ impl GrpcSspry for GrpcServerService {
                     .get("current_rss_kb")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
-                peak_rss_kb: stats.get("peak_rss_kb").and_then(Value::as_u64).unwrap_or(0),
+                peak_rss_kb: stats
+                    .get("peak_rss_kb")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 adaptive_publish: Some(grpc_adaptive_publish_summary_from_status_map(&stats)),
                 index_session: Some(grpc_index_session_summary_from_status_map(&stats)),
                 startup: Some(grpc_startup_summary_from_status_map(&stats)),
@@ -3046,7 +3079,10 @@ impl ServerState {
     }
 
     fn current_maintenance_epoch(&self) -> u64 {
-        self.maintenance_epoch.lock().map(|epoch| *epoch).unwrap_or(0)
+        self.maintenance_epoch
+            .lock()
+            .map(|epoch| *epoch)
+            .unwrap_or(0)
     }
 
     fn wait_for_maintenance_event(&self, last_seen: &mut u64, timeout: Option<Duration>) {
@@ -5560,13 +5596,13 @@ impl ServerState {
     }
 
     fn garbage_collect_retired_generations(&self, shard_idx: usize) -> Result<usize> {
-        let work = self.work_store_set()?;
-        let mut store = work.stores[shard_idx]
+        let stores = self.published_store_set()?;
+        let mut store = stores.stores[shard_idx]
             .lock()
             .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         let removed = store.garbage_collect_retired_generations()?;
         if removed > 0 {
-            let _ = self.invalidate_work_stats_cache();
+            let _ = self.invalidate_published_stats_cache();
         }
         Ok(removed)
     }
@@ -5597,8 +5633,8 @@ impl ServerState {
         &self,
         shard_idx: usize,
     ) -> Result<Option<CandidateCompactionSnapshot>> {
-        let work = self.work_store_set()?;
-        let store = work.stores[shard_idx]
+        let stores = self.published_store_set()?;
+        let store = stores.stores[shard_idx]
             .lock()
             .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         store.prepare_compaction_snapshot(false)
@@ -5610,8 +5646,8 @@ impl ServerState {
         snapshot: &CandidateCompactionSnapshot,
         compacted_root: &Path,
     ) -> Result<Option<CandidateCompactionResult>> {
-        let work = self.work_store_set()?;
-        let mut store = work.stores[shard_idx]
+        let stores = self.published_store_set()?;
+        let mut store = stores.stores[shard_idx]
             .lock()
             .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         store.apply_compaction_snapshot(snapshot, compacted_root)
@@ -5635,9 +5671,9 @@ impl ServerState {
             runtime.last_error = None;
         }
 
-        let work = self.work_store_set()?;
+        let stores = self.published_store_set()?;
         let compacted_root = compaction_work_root(
-            &candidate_shard_root(&work.root()?, self.candidate_shard_count(), shard_idx),
+            &candidate_shard_root(&stores.root()?, self.candidate_shard_count(), shard_idx),
             "compact",
         );
         let build_result = write_compacted_snapshot(&snapshot, &compacted_root);
@@ -5648,7 +5684,7 @@ impl ServerState {
 
         match apply_result {
             Ok(Some(result)) => {
-                let _ = self.invalidate_work_stats_cache();
+                let _ = self.invalidate_published_stats_cache();
                 let mut runtime = self
                     .compaction_runtime
                     .lock()
@@ -6530,35 +6566,17 @@ impl ServerState {
         drop(published_store);
         if published_result.status == "deleted" {
             let _ = self.enqueue_published_tier2_snapshot_shards([shard_idx]);
+            self.notify_maintenance_workers();
         }
 
-        let work = self.work_store_set()?;
-        let work_result = if Arc::ptr_eq(&published, &work) {
-            None
-        } else {
-            let mut work_store = lock_candidate_store_with_timeout(
-                &work.stores[shard_idx],
-                shard_idx,
-                "delete work",
-            )?;
-            Some(work_store.delete_document(sha256)?)
-        };
-
-        let result = match work_result {
-            Some(result) if published_result.status != "deleted" && result.status == "deleted" => {
-                result
-            }
-            _ => published_result,
-        };
-        if result.status == "deleted" {
+        if published_result.status == "deleted" {
             let _ = self.invalidate_published_stats_cache();
-            let _ = self.invalidate_work_stats_cache();
         }
         self.invalidate_search_caches();
         Ok(CandidateDeleteResponse {
-            status: result.status,
-            sha256: result.sha256,
-            doc_id: result.doc_id,
+            status: published_result.status,
+            sha256: published_result.sha256,
+            doc_id: published_result.doc_id,
         })
     }
 
@@ -9784,6 +9802,140 @@ rule overflow_rule {
                 .and_then(Value::as_u64)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn workspace_delete_only_targets_current_store() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let doc =
+            candidate_document_wire_from_bytes(&tmp.path().join("queued.bin"), b"queued-current");
+        let sha256 = doc.sha256.clone();
+
+        state
+            .handle_candidate_insert(&doc)
+            .expect("insert unpublished doc");
+
+        let deleted = state
+            .handle_candidate_delete(&sha256)
+            .expect("delete unpublished doc");
+        assert_eq!(deleted.status, "missing");
+
+        let work = state.work_store_set().expect("work stores");
+        let work_stats = work.stores[0].lock().expect("lock work store").stats();
+        assert_eq!(work_stats.doc_count, 1);
+        assert_eq!(work_stats.deleted_doc_count, 0);
+
+        let published = state.published_store_set().expect("published stores");
+        let published_stats = published.stores[0]
+            .lock()
+            .expect("lock published store")
+            .stats();
+        assert_eq!(published_stats.doc_count, 0);
+        assert_eq!(published_stats.deleted_doc_count, 0);
+
+        state.handle_publish().expect("publish queued doc");
+
+        let stats = state.current_stats_json().expect("published stats");
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            stats.get("active_doc_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats.get("deleted_doc_count").and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn workspace_compaction_reclaims_deleted_docs_from_current_store() {
+        let tmp = tempdir().expect("tmp");
+        let state = Arc::new(
+            ServerState::new(
+                ServerConfig {
+                    candidate_config: CandidateConfig {
+                        root: tmp.path().join("candidate_workspace_compact"),
+                        compaction_idle_cooldown_s: 0.0,
+                        ..CandidateConfig::default()
+                    },
+                    candidate_shards: 1,
+                    search_workers: 1,
+                    memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                    auto_publish_initial_idle_ms: 500,
+                    auto_publish_storage_class: "unknown".to_owned(),
+                    workspace_mode: true,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("workspace server state"),
+        );
+
+        let mut sha256s = Vec::new();
+        for (name, bytes) in [
+            ("compact-first.bin", b"first-current".as_slice()),
+            ("compact-second.bin", b"second-current".as_slice()),
+        ] {
+            let doc = candidate_document_wire_from_bytes(&tmp.path().join(name), bytes);
+            sha256s.push(doc.sha256.clone());
+            state.handle_candidate_insert(&doc).expect("insert doc");
+        }
+
+        state.handle_publish().expect("publish docs");
+
+        let deleted = state
+            .handle_candidate_delete(&sha256s[1])
+            .expect("delete published doc");
+        assert_eq!(deleted.status, "deleted");
+
+        let stats_after_delete = state.current_stats_json().expect("stats after delete");
+        assert_eq!(
+            stats_after_delete
+                .get("active_doc_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats_after_delete
+                .get("deleted_doc_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+
+        state
+            .run_compaction_cycle_for_tests()
+            .expect("run compaction cycle");
+
+        let stats = state.current_stats_json().expect("stats after compaction");
+        assert_eq!(stats.get("doc_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            stats.get("active_doc_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats.get("deleted_doc_count").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            stats.get("deleted_storage_bytes").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            stats.get("compaction_runs_total").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats
+                .get("last_compaction_reclaimed_docs")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+
+        let work = stats
+            .get("work")
+            .and_then(Value::as_object)
+            .expect("workspace work stats");
+        assert_eq!(work.get("doc_count").and_then(Value::as_u64), Some(0));
     }
 
     #[test]

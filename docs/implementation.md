@@ -105,6 +105,14 @@ Deletes are immediate logically:
 
 Physical reclaim is deferred.
 
+For mutable workspaces, delete semantics are `current`-only:
+
+- deletes are applied against the published `current/` store set
+- documents that exist only in `work_a/` or `work_b/` are treated as `missing`
+- that `missing` result is normal, especially when one client fans delete requests out to many servers and only some of them actually hold the file
+
+Compaction for delete reclaim also runs against `current/`, not `work_*`.
+
 This section applies to mutable workspace/direct-store roots. Forest-root servers are read-only views over published `tree_*/current` stores and do not expose ingest/delete/publish.
 
 Each shard now keeps a small compaction manifest with:
