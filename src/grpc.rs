@@ -318,12 +318,24 @@ fn optional_string_to_option(value: &v1::OptionalString) -> Option<String> {
 
 fn store_summary_to_json_map(summary: &v1::StoreSummary) -> Map<String, Value> {
     let mut out = Map::new();
-    out.insert("active_doc_count".to_owned(), json!(summary.active_doc_count));
-    out.insert("candidate_shards".to_owned(), json!(summary.candidate_shards));
+    out.insert(
+        "active_doc_count".to_owned(),
+        json!(summary.active_doc_count),
+    );
+    out.insert(
+        "candidate_shards".to_owned(),
+        json!(summary.candidate_shards),
+    );
     out.insert("id_source".to_owned(), json!(summary.id_source));
     out.insert("store_path".to_owned(), json!(summary.store_path));
-    out.insert("deleted_doc_count".to_owned(), json!(summary.deleted_doc_count));
-    out.insert("disk_usage_bytes".to_owned(), json!(summary.disk_usage_bytes));
+    out.insert(
+        "deleted_doc_count".to_owned(),
+        json!(summary.deleted_doc_count),
+    );
+    out.insert(
+        "disk_usage_bytes".to_owned(),
+        json!(summary.disk_usage_bytes),
+    );
     out.insert("doc_count".to_owned(), json!(summary.doc_count));
     out.insert(
         "compaction_generation".to_owned(),
@@ -481,7 +493,10 @@ fn status_response_to_json_map(response: &v1::StatusResponse) -> Map<String, Val
         "active_connections".to_owned(),
         json!(response.active_connections),
     );
-    out.insert("active_mutations".to_owned(), json!(response.active_mutations));
+    out.insert(
+        "active_mutations".to_owned(),
+        json!(response.active_mutations),
+    );
     out.insert(
         "publish_requested".to_owned(),
         json!(response.publish_requested),
@@ -517,7 +532,10 @@ fn status_response_to_json_map(response: &v1::StatusResponse) -> Map<String, Val
         );
     }
     if !response.work_root.is_empty() {
-        out.insert("work_root".to_owned(), Value::String(response.work_root.clone()));
+        out.insert(
+            "work_root".to_owned(),
+            Value::String(response.work_root.clone()),
+        );
     }
     if let Some(adaptive) = response.adaptive_publish.as_ref() {
         out.insert(
@@ -600,7 +618,10 @@ fn status_response_to_json_map(response: &v1::StatusResponse) -> Map<String, Val
     }
     if response.has_work {
         if let Some(work) = response.work.as_ref() {
-            out.insert("work".to_owned(), Value::Object(store_summary_to_json_map(work)));
+            out.insert(
+                "work".to_owned(),
+                Value::Object(store_summary_to_json_map(work)),
+            );
         }
     }
     if response.has_published {
@@ -684,7 +705,10 @@ fn prepared_query_profile_from_proto(
         any_lane_variant_sets: summary.any_lane_variant_sets,
         compacted_any_lane_grams: summary.compacted_any_lane_grams,
         max_pattern_bytes: summary.max_pattern_bytes,
-        max_pattern_id: summary.max_pattern_id.as_ref().and_then(optional_string_to_option),
+        max_pattern_id: summary
+            .max_pattern_id
+            .as_ref()
+            .and_then(optional_string_to_option),
     }
 }
 
