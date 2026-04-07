@@ -204,6 +204,33 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    pub fn begin_index_client(&mut self, heartbeat_interval_ms: u64) -> Result<(u64, u64)> {
+        let response = self
+            .runtime
+            .block_on(async {
+                self.inner
+                    .begin_index_client(v1::IndexClientBeginRequest {
+                        heartbeat_interval_ms,
+                    })
+                    .await
+            })
+            .map_err(tonic_error)?;
+        let response = response.into_inner();
+        Ok((response.client_id, response.lease_timeout_ms))
+    }
+
+    pub fn heartbeat_index_client(&mut self, client_id: u64) -> Result<()> {
+        let _response = self
+            .runtime
+            .block_on(async {
+                self.inner
+                    .heartbeat_index_client(v1::IndexClientHeartbeatRequest { client_id })
+                    .await
+            })
+            .map_err(tonic_error)?;
+        Ok(())
+    }
+
     pub fn update_index_session_progress(
         &mut self,
         total_documents: Option<usize>,
@@ -232,6 +259,18 @@ impl BlockingGrpcClient {
             .block_on(async {
                 self.inner
                     .end_index_session(v1::IndexSessionEndRequest {})
+                    .await
+            })
+            .map_err(tonic_error)?;
+        Ok(response.into_inner().message)
+    }
+
+    pub fn end_index_client(&mut self, client_id: u64) -> Result<String> {
+        let response = self
+            .runtime
+            .block_on(async {
+                self.inner
+                    .end_index_client(v1::IndexClientHeartbeatRequest { client_id })
                     .await
             })
             .map_err(tonic_error)?;

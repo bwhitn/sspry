@@ -7,8 +7,11 @@ service Sspry {
   rpc Stats(StatsRequest) returns (StatsResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc BeginIndexSession(IndexSessionBeginRequest) returns (IndexSessionResponse);
+  rpc BeginIndexClient(IndexClientBeginRequest) returns (IndexClientBeginResponse);
+  rpc HeartbeatIndexClient(IndexClientHeartbeatRequest) returns (IndexSessionResponse);
   rpc UpdateIndexSessionProgress(IndexSessionProgressRequest) returns (IndexSessionResponse);
   rpc EndIndexSession(IndexSessionEndRequest) returns (IndexSessionResponse);
+  rpc EndIndexClient(IndexClientHeartbeatRequest) returns (IndexSessionResponse);
   rpc Publish(PublishRequest) returns (PublishResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
@@ -34,6 +37,21 @@ message StatusRequest {}
 message IndexSessionBeginRequest {}
 
 message IndexSessionEndRequest {}
+
+message IndexClientBeginRequest {
+  uint64 heartbeat_interval_ms = 1;
+}
+
+message IndexClientHeartbeatRequest {
+  uint64 client_id = 1;
+}
+
+message IndexClientBeginResponse {
+  string message = 1;
+  uint64 client_id = 2;
+  uint64 heartbeat_interval_ms = 3;
+  uint64 lease_timeout_ms = 4;
+}
 
 message IndexSessionProgressRequest {
   uint64 total_documents = 1;

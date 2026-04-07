@@ -4445,102 +4445,133 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
             rows: Vec::new(),
             payload_size: empty_payload_size,
         };
-        let mut client = grpc_client(&args.connection)?;
-        client.set_insert_chunk_bytes(
+        let mut base_client = grpc_client(&args.connection)?;
+        base_client.set_insert_chunk_bytes(
             args.grpc_insert_chunk_bytes
                 .max(1)
                 .min(args.connection.grpc_max_message_bytes.max(1)),
         );
-        client.begin_index_session()?;
-        client.update_index_session_progress(Some(total_files), 0, 0)?;
-
-        let body_result = (|| -> Result<()> {
-            if workers <= 1 {
-                stream_selected_input_files(&input_roots, args.path_list, |file_path| {
-                    let started_scan = Instant::now();
-                    let scanned = scan_index_batch_row(&file_path, policy)?;
-                    scan_time += started_scan.elapsed();
-                    let started_encode = Instant::now();
-                    let row_bytes = serialize_candidate_document_binary_row(&scanned)?;
-                    encode_time += started_encode.elapsed();
-                    client_buffer_time += push_serialized_remote_upload_row(
-                        &mut client,
-                        &mut pending,
-                        row_bytes,
-                        batch_size,
-                        &mut processed,
-                        &mut submit_time,
-                        show_progress,
-                        total_files,
-                        &mut last_progress_reported,
-                        &mut last_progress_at,
-                        empty_payload_size,
-                        remote_batch_soft_limit_bytes,
-                        true,
-                        args.verbose,
-                    )?;
-                    maybe_report_index_progress(
-                        show_progress,
-                        processed.saturating_add(pending.rows.len()),
-                        total_files,
-                        &mut last_progress_reported,
-                        &mut last_progress_at,
-                        false,
-                    );
-                    Ok(())
-                })?;
-            } else {
-                let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
-                let (result_tx, result_rx) =
-                    bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
-                let upload_queue =
-                    Arc::new(RemoteUploadQueue::new(remote_upload_queue_limit_bytes));
-                thread::scope(|scope| {
-                    for _worker_idx in 0..workers {
-                        let job_rx = job_rx.clone();
-                        let result_tx = result_tx.clone();
-                        scope.spawn(move || {
-                            for file_path in job_rx.iter() {
-                                let started_scan = Instant::now();
-                                let result = scan_index_batch_row(&file_path, policy).map(|row| {
-                                    ScannedIndexBatchRow {
-                                        row,
-                                        scan_elapsed: started_scan.elapsed(),
-                                    }
-                                });
-                                let _ = result_tx.send(result);
-                            }
-                        });
+        let (index_client_id, _) =
+            base_client.begin_index_client(INDEX_CLIENT_HEARTBEAT_INTERVAL_MS)?;
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_error = Arc::new(Mutex::new(None::<String>));
+        let mut heartbeat_client = grpc_client(&args.connection)?;
+        heartbeat_client.set_insert_chunk_bytes(
+            args.grpc_insert_chunk_bytes
+                .max(1)
+                .min(args.connection.grpc_max_message_bytes.max(1)),
+        );
+        let heartbeat_stop_flag = heartbeat_stop.clone();
+        let heartbeat_error_slot = heartbeat_error.clone();
+        let heartbeat_handle = thread::spawn(move || {
+            while !heartbeat_stop_flag.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(INDEX_CLIENT_HEARTBEAT_INTERVAL_MS));
+                if heartbeat_stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Err(err) = heartbeat_client.heartbeat_index_client(index_client_id) {
+                    if let Ok(mut slot) = heartbeat_error_slot.lock() {
+                        if slot.is_none() {
+                            *slot = Some(err.to_string());
+                        }
                     }
-                    let producer_tx = job_tx.clone();
-                    let producer_result_tx = result_tx.clone();
-                    let producer_roots = input_roots.clone();
-                    let producer_path_list = args.path_list;
-                    scope.spawn(move || {
-                        let produce = stream_selected_input_files(
-                            &producer_roots,
-                            producer_path_list,
-                            |file_path| {
-                                producer_tx.send(file_path).map_err(|_| {
+                    break;
+                }
+            }
+        });
+        let remote_result = (|| -> Result<()> {
+            let mut client = base_client;
+            client.begin_index_session()?;
+            client.update_index_session_progress(Some(total_files), 0, 0)?;
+
+            let body_result = (|| -> Result<()> {
+                if workers <= 1 {
+                    stream_selected_input_files(&input_roots, args.path_list, |file_path| {
+                        let started_scan = Instant::now();
+                        let scanned = scan_index_batch_row(&file_path, policy)?;
+                        scan_time += started_scan.elapsed();
+                        let started_encode = Instant::now();
+                        let row_bytes = serialize_candidate_document_binary_row(&scanned)?;
+                        encode_time += started_encode.elapsed();
+                        client_buffer_time += push_serialized_remote_upload_row(
+                            &mut client,
+                            &mut pending,
+                            row_bytes,
+                            batch_size,
+                            &mut processed,
+                            &mut submit_time,
+                            show_progress,
+                            total_files,
+                            &mut last_progress_reported,
+                            &mut last_progress_at,
+                            empty_payload_size,
+                            remote_batch_soft_limit_bytes,
+                            true,
+                            args.verbose,
+                        )?;
+                        maybe_report_index_progress(
+                            show_progress,
+                            processed.saturating_add(pending.rows.len()),
+                            total_files,
+                            &mut last_progress_reported,
+                            &mut last_progress_at,
+                            false,
+                        );
+                        Ok(())
+                    })?;
+                } else {
+                    let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                    let (result_tx, result_rx) =
+                        bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
+                    let upload_queue =
+                        Arc::new(RemoteUploadQueue::new(remote_upload_queue_limit_bytes));
+                    thread::scope(|scope| {
+                        for _worker_idx in 0..workers {
+                            let job_rx = job_rx.clone();
+                            let result_tx = result_tx.clone();
+                            scope.spawn(move || {
+                                for file_path in job_rx.iter() {
+                                    let started_scan = Instant::now();
+                                    let result =
+                                        scan_index_batch_row(&file_path, policy).map(|row| {
+                                            ScannedIndexBatchRow {
+                                                row,
+                                                scan_elapsed: started_scan.elapsed(),
+                                            }
+                                        });
+                                    let _ = result_tx.send(result);
+                                }
+                            });
+                        }
+                        let producer_tx = job_tx.clone();
+                        let producer_result_tx = result_tx.clone();
+                        let producer_roots = input_roots.clone();
+                        let producer_path_list = args.path_list;
+                        scope.spawn(move || {
+                            let produce = stream_selected_input_files(
+                                &producer_roots,
+                                producer_path_list,
+                                |file_path| {
+                                    producer_tx.send(file_path).map_err(|_| {
                                     SspryError::from(
                                         "candidate ingest file producer terminated unexpectedly",
                                     )
                                 })?;
-                                Ok(())
-                            },
-                        );
-                        if let Err(err) = produce {
-                            let _ = producer_result_tx.send(Err(err));
-                        }
-                        drop(producer_tx);
-                    });
+                                    Ok(())
+                                },
+                            );
+                            if let Err(err) = produce {
+                                let _ = producer_result_tx.send(Err(err));
+                            }
+                            drop(producer_tx);
+                        });
 
-                    drop(job_tx);
-                    drop(result_tx);
+                        drop(job_tx);
+                        drop(result_tx);
 
-                    let scope_result = (|| -> Result<()> {
-                        let upload_queue_consumer = upload_queue.clone();
-                        let encoder_handle = scope.spawn(move || -> Result<RemoteEncodeStats> {
+                        let scope_result = (|| -> Result<()> {
+                            let upload_queue_consumer = upload_queue.clone();
+                            let encoder_handle = scope.spawn(move || -> Result<RemoteEncodeStats> {
                         let mut received = 0usize;
                         let mut local_scan_time = Duration::ZERO;
                         let mut local_result_wait_time = Duration::ZERO;
@@ -4581,78 +4612,98 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                         })
                     });
 
-                        let upload_result = (|| -> Result<()> {
-                            loop {
-                                let Some(upload_row) = upload_queue.pop()? else {
-                                    break;
-                                };
-                                client_buffer_time += push_serialized_remote_upload_row(
-                                    &mut client,
-                                    &mut pending,
-                                    upload_row.row_bytes,
-                                    batch_size,
-                                    &mut processed,
-                                    &mut submit_time,
-                                    show_progress,
-                                    total_files,
-                                    &mut last_progress_reported,
-                                    &mut last_progress_at,
-                                    empty_payload_size,
-                                    remote_batch_soft_limit_bytes,
-                                    true,
-                                    args.verbose,
-                                )?;
-                                maybe_report_index_progress(
-                                    show_progress,
-                                    processed.saturating_add(pending.rows.len()),
-                                    total_files,
-                                    &mut last_progress_reported,
-                                    &mut last_progress_at,
-                                    false,
-                                );
+                            let upload_result = (|| -> Result<()> {
+                                loop {
+                                    let Some(upload_row) = upload_queue.pop()? else {
+                                        break;
+                                    };
+                                    client_buffer_time += push_serialized_remote_upload_row(
+                                        &mut client,
+                                        &mut pending,
+                                        upload_row.row_bytes,
+                                        batch_size,
+                                        &mut processed,
+                                        &mut submit_time,
+                                        show_progress,
+                                        total_files,
+                                        &mut last_progress_reported,
+                                        &mut last_progress_at,
+                                        empty_payload_size,
+                                        remote_batch_soft_limit_bytes,
+                                        true,
+                                        args.verbose,
+                                    )?;
+                                    maybe_report_index_progress(
+                                        show_progress,
+                                        processed.saturating_add(pending.rows.len()),
+                                        total_files,
+                                        &mut last_progress_reported,
+                                        &mut last_progress_at,
+                                        false,
+                                    );
+                                }
+                                Ok(())
+                            })();
+                            if let Err(upload_err) = upload_result {
+                                let _ = upload_queue.close();
+                                let _ = encoder_handle.join();
+                                return Err(upload_err);
                             }
+                            let encoder_stats = encoder_handle.join().map_err(|_| {
+                                SspryError::from("candidate ingest encoder thread panicked")
+                            })??;
+                            scan_time += encoder_stats.scan_time;
+                            result_wait_time += encoder_stats.result_wait_time;
+                            encode_time += encoder_stats.encode_time;
                             Ok(())
                         })();
-                        if let Err(upload_err) = upload_result {
-                            let _ = upload_queue.close();
-                            let _ = encoder_handle.join();
-                            return Err(upload_err);
-                        }
-                        let encoder_stats = encoder_handle.join().map_err(|_| {
-                            SspryError::from("candidate ingest encoder thread panicked")
-                        })??;
-                        scan_time += encoder_stats.scan_time;
-                        result_wait_time += encoder_stats.result_wait_time;
-                        encode_time += encoder_stats.encode_time;
-                        Ok(())
-                    })();
-                    let _ = upload_queue.close();
-                    scope_result?;
-                    Ok::<(), SspryError>(())
-                })?;
-            }
+                        let _ = upload_queue.close();
+                        scope_result?;
+                        Ok::<(), SspryError>(())
+                    })?;
+                }
 
-            flush_remote_pending_rows(
-                &mut client,
-                &mut pending,
-                &mut processed,
-                &mut submit_time,
-                show_progress,
-                total_files,
-                &mut last_progress_reported,
-                &mut last_progress_at,
-                empty_payload_size,
-                args.verbose,
-            )?;
-            client.update_index_session_progress(Some(total_files), processed, processed)?;
-            if server_policy.workspace_mode {
-                let _ = client.publish()?;
-            }
+                flush_remote_pending_rows(
+                    &mut client,
+                    &mut pending,
+                    &mut processed,
+                    &mut submit_time,
+                    show_progress,
+                    total_files,
+                    &mut last_progress_reported,
+                    &mut last_progress_at,
+                    empty_payload_size,
+                    args.verbose,
+                )?;
+                client.update_index_session_progress(Some(total_files), processed, processed)?;
+                if server_policy.workspace_mode {
+                    let _ = client.publish()?;
+                }
+                Ok(())
+            })();
+            let end_session_result = client.end_index_session();
+            body_result?;
+            end_session_result?;
             Ok(())
         })();
-        let end_session_result = client.end_index_session();
-        body_result?;
-        end_session_result?;
+        heartbeat_stop.store(true, Ordering::SeqCst);
+        let _ = heartbeat_handle.join();
+        let heartbeat_result = heartbeat_error
+            .lock()
+            .map_err(|_| SspryError::from("Index heartbeat error slot poisoned."))?
+            .clone()
+            .map(|message| Err(SspryError::from(message)))
+            .unwrap_or(Ok(()));
+        let mut end_client = grpc_client(&args.connection)?;
+        end_client.set_insert_chunk_bytes(
+            args.grpc_insert_chunk_bytes
+                .max(1)
+                .min(args.connection.grpc_max_message_bytes.max(1)),
+        );
+        let end_client_result = end_client.end_index_client(index_client_id);
+        remote_result?;
+        heartbeat_result?;
+        end_client_result?;
 
         maybe_report_index_progress(
             show_progress,

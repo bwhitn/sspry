@@ -39,7 +39,8 @@ use crate::candidate::{
 };
 use crate::grpc::v1::{
     AdaptivePublishSummary, DeleteRequest as GrpcDeleteRequest,
-    DeleteResponse as GrpcDeleteResponse, IndexSessionBeginRequest, IndexSessionEndRequest,
+    DeleteResponse as GrpcDeleteResponse, IndexClientBeginRequest, IndexClientBeginResponse,
+    IndexClientHeartbeatRequest, IndexSessionBeginRequest, IndexSessionEndRequest,
     IndexSessionProgressRequest, IndexSessionResponse, IndexSessionSummary,
     InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
     PingRequest, PingResponse, PreparedQueryProfileSummary, PublishRequest,
@@ -95,6 +96,16 @@ const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
 pub const DEFAULT_AUTO_PUBLISH_IDLE_MS: u64 = 5_000;
 const DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP: usize = 0;
+
+fn search_trace_enabled() -> bool {
+    std::env::var_os("SSPRY_TRACE_SEARCH_STREAM").is_some()
+}
+
+fn search_trace_log(message: impl AsRef<str>) {
+    if search_trace_enabled() {
+        eprintln!("trace.search_stream {}", message.as_ref());
+    }
+}
 
 fn resolve_tree_query_workers(configured_workers: usize, tree_count: usize) -> usize {
     configured_workers.max(1).min(tree_count.max(1))
@@ -548,6 +559,8 @@ struct ServerState {
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
     query_cache: Mutex<BoundedCache<String, Arc<CachedCandidateQuery>>>,
+    search_admission: Mutex<SearchAdmissionState>,
+    search_admission_cv: Condvar,
     compaction_runtime: Mutex<CompactionRuntime>,
     next_compaction_shard: AtomicUsize,
     active_connections: AtomicUsize,
@@ -555,6 +568,30 @@ struct ServerState {
     maintenance_cv: Condvar,
     startup_cleanup_removed_roots: usize,
     startup_profile: StartupProfile,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SearchAdmissionState {
+    active: bool,
+    next_ticket: u64,
+    serving_ticket: u64,
+    waiting: usize,
+}
+
+struct ActiveSearchRequestGuard<'a> {
+    state: &'a ServerState,
+}
+
+impl Drop for ActiveSearchRequestGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.state.search_admission.lock() {
+            if admission.active {
+                admission.active = false;
+                admission.serving_ticket = admission.serving_ticket.wrapping_add(1);
+            }
+            self.state.search_admission_cv.notify_all();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2644,6 +2681,47 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    async fn begin_index_client(
+        &self,
+        request: GrpcRequest<IndexClientBeginRequest>,
+    ) -> std::result::Result<GrpcResponse<IndexClientBeginResponse>, GrpcStatus> {
+        let request = request.into_inner();
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            state.handle_begin_index_client(&CandidateIndexClientBeginRequest {
+                heartbeat_interval_ms: request.heartbeat_interval_ms,
+            })
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(IndexClientBeginResponse {
+            message: response.message,
+            client_id: response.client_id,
+            heartbeat_interval_ms: response.heartbeat_interval_ms,
+            lease_timeout_ms: response.lease_timeout_ms,
+        }))
+    }
+
+    async fn heartbeat_index_client(
+        &self,
+        request: GrpcRequest<IndexClientHeartbeatRequest>,
+    ) -> std::result::Result<GrpcResponse<IndexSessionResponse>, GrpcStatus> {
+        let request = request.into_inner();
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            state.handle_heartbeat_index_client(&CandidateIndexClientHeartbeatRequest {
+                client_id: request.client_id,
+            })
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(IndexSessionResponse {
+            message: response.message,
+        }))
+    }
+
     async fn update_index_session_progress(
         &self,
         request: GrpcRequest<IndexSessionProgressRequest>,
@@ -2676,6 +2754,25 @@ impl GrpcSspry for GrpcServerService {
             .await
             .map_err(grpc_join_error_status)?
             .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(IndexSessionResponse {
+            message: response.message,
+        }))
+    }
+
+    async fn end_index_client(
+        &self,
+        request: GrpcRequest<IndexClientHeartbeatRequest>,
+    ) -> std::result::Result<GrpcResponse<IndexSessionResponse>, GrpcStatus> {
+        let request = request.into_inner();
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            state.handle_end_index_client(&CandidateIndexClientHeartbeatRequest {
+                client_id: request.client_id,
+            })
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
         Ok(GrpcResponse::new(IndexSessionResponse {
             message: response.message,
         }))
@@ -2740,6 +2837,16 @@ impl GrpcSspry for GrpcServerService {
         let state = self.state.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::task::spawn_blocking(move || {
+            let grpc_started = Instant::now();
+            search_trace_log(format!(
+                "grpc.start chunk_size={} include_external_ids={} max_candidates_percent={} max_anchors_per_pattern={} force_tier1_only={} allow_tier2_fallback={}",
+                request.chunk_size,
+                request.include_external_ids,
+                request.max_candidates_percent,
+                request.max_anchors_per_pattern,
+                request.force_tier1_only,
+                request.allow_tier2_fallback
+            ));
             let plan = match state.compile_search_plan_from_yara_source(&request) {
                 Ok(plan) => plan,
                 Err(err) => {
@@ -2747,6 +2854,21 @@ impl GrpcSspry for GrpcServerService {
                     return;
                 }
             };
+            let plan_key = match ServerState::query_cache_key(&plan) {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(grpc_internal_status(err)));
+                    return;
+                }
+            };
+            search_trace_log(format!(
+                "grpc.plan plan_key={} compile_ms={} patterns={} max_candidates={} root={:?}",
+                plan_key,
+                grpc_started.elapsed().as_millis(),
+                plan.patterns.len(),
+                plan.max_candidates,
+                plan.root
+            ));
             let internal_request = CandidateQueryRequest {
                 plan: Value::Null,
                 cursor: 0,
@@ -2757,7 +2879,21 @@ impl GrpcSspry for GrpcServerService {
                 ),
                 include_external_ids: request.include_external_ids,
             };
+            let first_frame_started = Instant::now();
+            let mut frame_count = 0usize;
+            let mut candidate_count = 0usize;
             let result = state.stream_candidate_query_frames(internal_request, &plan, |frame| {
+                let frame_candidates = frame.sha256.len();
+                frame_count += 1;
+                candidate_count += frame_candidates;
+                search_trace_log(format!(
+                    "grpc.frame plan_key={} idx={} candidates={} stream_complete={} elapsed_ms={}",
+                    plan_key,
+                    frame_count,
+                    frame_candidates,
+                    frame.stream_complete,
+                    first_frame_started.elapsed().as_millis()
+                ));
                 let grpc_frame = grpc_search_frame_from_internal(frame)?;
                 tx.blocking_send(Ok(grpc_frame))
                     .map_err(|_| SspryError::from("gRPC search stream receiver dropped"))?;
@@ -2765,6 +2901,14 @@ impl GrpcSspry for GrpcServerService {
             });
             if let Err(err) = result {
                 let _ = tx.blocking_send(Err(grpc_internal_status(err)));
+            } else {
+                search_trace_log(format!(
+                    "grpc.done plan_key={} frames={} candidates={} total_ms={}",
+                    plan_key,
+                    frame_count,
+                    candidate_count,
+                    grpc_started.elapsed().as_millis()
+                ));
             }
         });
         Ok(GrpcResponse::new(
@@ -3057,6 +3201,8 @@ impl ServerState {
             normalized_plan_cache: Mutex::new(BoundedCache::new(NORMALIZED_PLAN_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(PREPARED_PLAN_CACHE_CAPACITY)),
             query_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
+            search_admission: Mutex::new(SearchAdmissionState::default()),
+            search_admission_cv: Condvar::new(),
             compaction_runtime: Mutex::new(CompactionRuntime::default()),
             next_compaction_shard: AtomicUsize::new(0),
             active_connections: AtomicUsize::new(0),
@@ -3109,6 +3255,27 @@ impl ServerState {
         *last_seen = *epoch;
     }
 
+    fn begin_search_request(&self) -> Result<ActiveSearchRequestGuard<'_>> {
+        let mut admission = self
+            .search_admission
+            .lock()
+            .map_err(|_| SspryError::from("Search admission lock poisoned."))?;
+        let ticket = admission.next_ticket;
+        admission.next_ticket = admission.next_ticket.wrapping_add(1);
+        admission.waiting = admission.waiting.saturating_add(1);
+        loop {
+            if !admission.active && ticket == admission.serving_ticket {
+                admission.active = true;
+                admission.waiting = admission.waiting.saturating_sub(1);
+                return Ok(ActiveSearchRequestGuard { state: self });
+            }
+            admission = self
+                .search_admission_cv
+                .wait(admission)
+                .map_err(|_| SspryError::from("Search admission lock poisoned."))?;
+        }
+    }
+
     fn prune_expired_index_clients(&self, now_unix_ms: u64) -> Result<usize> {
         let mut leases = self
             .index_client_leases
@@ -3120,12 +3287,23 @@ impl ServerState {
         });
         let after = leases.len();
         self.active_index_clients.store(after, Ordering::SeqCst);
+        let cleared_orphaned_session =
+            before > 0 && after == 0 && self.active_index_sessions.swap(0, Ordering::SeqCst) > 0;
         if before > 0 && after == 0 {
             self.publish_after_index_clients
                 .store(true, Ordering::SeqCst);
         }
+        if cleared_orphaned_session {
+            self.index_session_last_update_unix_ms
+                .store(now_unix_ms, Ordering::SeqCst);
+            let _ = self.update_adaptive_publish_from_index_session();
+        }
+        drop(leases);
         if before != after {
             self.notify_maintenance_workers();
+        }
+        if before > 0 && after == 0 {
+            let _ = self.maybe_force_publish_after_index_clients();
         }
         Ok(after)
     }
@@ -6586,6 +6764,7 @@ impl ServerState {
         plan: &CompiledQueryPlan,
     ) -> Result<CandidateQueryResponse> {
         let _scope = scope("rpc.handle_candidate_query");
+        let _search = self.begin_search_request()?;
         let _op = self
             .operation_gate
             .read()
@@ -6713,15 +6892,38 @@ impl ServerState {
         F: FnMut(CandidateQueryStreamFrame) -> Result<()>,
     {
         let _scope = scope("rpc.stream_candidate_query");
+        let _search = self.begin_search_request()?;
         let _op = self
             .operation_gate
             .read()
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
+        let trace_enabled = search_trace_enabled();
+        let plan_key = if trace_enabled {
+            Some(Self::query_cache_key(plan)?)
+        } else {
+            None
+        };
+        let stream_started = Instant::now();
         let chunk_size = request
             .chunk_size
             .unwrap_or(DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE)
             .max(1);
+        if let Some(plan_key) = plan_key.as_deref() {
+            search_trace_log(format!(
+                "stream.begin plan_key={} chunk_size={} include_external_ids={} max_candidates={} root={:?}",
+                plan_key, chunk_size, request.include_external_ids, plan.max_candidates, plan.root
+            ));
+        }
+        let prepared_started = Instant::now();
         let prepared = self.shared_prepared_query_artifacts(plan)?;
+        if let Some(plan_key) = plan_key.as_deref() {
+            search_trace_log(format!(
+                "stream.prepared plan_key={} elapsed_ms={} prepared_bytes={}",
+                plan_key,
+                prepared_started.elapsed().as_millis(),
+                prepared_query_artifacts_memory_bytes(prepared.as_ref())
+            ));
+        }
         let prepared_query_profile = prepared_query_artifacts_profile(prepared.as_ref());
         let store_sets = self.published_query_store_sets()?;
         let searchable_doc_count = store_sets
@@ -6739,15 +6941,50 @@ impl ServerState {
                 usize::MAX => None,
                 value => Some(value),
             };
+        if let Some(plan_key) = plan_key.as_deref() {
+            search_trace_log(format!(
+                "stream.scope plan_key={} store_sets={} searchable_doc_count={} candidate_limit={:?}",
+                plan_key,
+                store_sets.len(),
+                searchable_doc_count,
+                candidate_limit
+            ));
+        }
 
         let mut tier_used = Vec::<String>::new();
         let mut query_profile = CandidateQueryProfile::default();
 
-        for stores in &store_sets {
-            for store_lock in &stores.stores {
+        for (store_set_idx, stores) in store_sets.iter().enumerate() {
+            let store_set_root = if trace_enabled {
+                Some(stores.root()?.display().to_string())
+            } else {
+                None
+            };
+            if let (Some(plan_key), Some(root)) = (plan_key.as_deref(), store_set_root.as_deref()) {
+                search_trace_log(format!(
+                    "stream.store_set.begin plan_key={} idx={} root={}",
+                    plan_key, store_set_idx, root
+                ));
+            }
+            for (store_idx, store_lock) in stores.stores.iter().enumerate() {
                 let mut store = lock_candidate_store_blocking(store_lock)?;
+                let store_started = Instant::now();
                 let (hits, local_tiers, local_profile) =
                     Self::collect_query_matches_single_store(&mut store, plan, &prepared)?;
+                if let Some(plan_key) = plan_key.as_deref() {
+                    search_trace_log(format!(
+                        "stream.store.done plan_key={} store_set_idx={} store_idx={} hits={} tier_used={:?} docs_scanned={} tier1_loads={} tier2_loads={} elapsed_ms={}",
+                        plan_key,
+                        store_set_idx,
+                        store_idx,
+                        hits.len(),
+                        local_tiers,
+                        local_profile.docs_scanned,
+                        local_profile.tier1_bloom_loads,
+                        local_profile.tier2_bloom_loads,
+                        store_started.elapsed().as_millis()
+                    ));
+                }
                 let external_ids = if request.include_external_ids {
                     Some(store.external_ids_for_sha256(&hits))
                 } else {
@@ -6804,6 +7041,13 @@ impl ServerState {
             query_profile,
             prepared_query_profile,
         })?;
+        if let Some(plan_key) = plan_key.as_deref() {
+            search_trace_log(format!(
+                "stream.end plan_key={} total_ms={}",
+                plan_key,
+                stream_started.elapsed().as_millis()
+            ));
+        }
         Ok(())
     }
 
@@ -9602,6 +9846,57 @@ rule overflow_rule {
             err.to_string()
                 .contains("no active index client; heartbeat rejected"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expiring_last_index_client_clears_orphaned_index_session() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let started = state
+            .handle_begin_index_client(&CandidateIndexClientBeginRequest {
+                heartbeat_interval_ms: 1,
+            })
+            .expect("start client");
+        state.handle_begin_index_session().expect("start session");
+        assert_eq!(state.active_index_sessions.load(Ordering::Acquire), 1);
+        thread::sleep(Duration::from_millis(
+            started.lease_timeout_ms.saturating_add(2),
+        ));
+        let remaining = state
+            .prune_expired_index_clients(current_unix_ms())
+            .expect("prune expired clients");
+        assert_eq!(remaining, 0);
+        assert_eq!(state.active_index_clients.load(Ordering::Acquire), 0);
+        assert_eq!(state.active_index_sessions.load(Ordering::Acquire), 0);
+        assert!(
+            state.publish_after_index_clients.load(Ordering::Acquire),
+            "expiring the final client should request publish"
+        );
+    }
+
+    #[test]
+    fn search_requests_are_serialized() {
+        let tmp = tempdir().expect("tmp");
+        let state = sample_workspace_server_state(tmp.path(), 1);
+        let first = state.begin_search_request().expect("first search");
+        let second_acquired = Arc::new(AtomicBool::new(false));
+        let second_state = state.clone();
+        let second_acquired_flag = second_acquired.clone();
+        let second = thread::spawn(move || {
+            let _guard = second_state.begin_search_request().expect("second search");
+            second_acquired_flag.store(true, Ordering::SeqCst);
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !second_acquired.load(Ordering::SeqCst),
+            "second search should wait while the first is active"
+        );
+        drop(first);
+        second.join().expect("second join");
+        assert!(
+            second_acquired.load(Ordering::SeqCst),
+            "second search should acquire after the first completes"
         );
     }
 
