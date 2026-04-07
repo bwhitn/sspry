@@ -366,6 +366,12 @@ struct ClientConnectionArgs {
     addr: String,
     #[arg(long = "timeout", default_value_t = DEFAULT_RPC_TIMEOUT, help = "Connection/read timeout in seconds.")]
     timeout: f64,
+    #[arg(
+        long = "grpc-max-message-bytes",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
+        help = "Maximum gRPC message size in bytes for grpc-* commands."
+    )]
+    grpc_max_message_bytes: usize,
 }
 
 impl ClientConnectionArgs {
@@ -911,9 +917,10 @@ fn grpc_client_with_timeout(
     connection: &ClientConnectionArgs,
     timeout_secs: f64,
 ) -> Result<BlockingGrpcClient> {
-    BlockingGrpcClient::connect(
+    BlockingGrpcClient::connect_with_limits(
         &connection.addr,
         Duration::from_secs_f64(timeout_secs.max(0.0)),
+        connection.grpc_max_message_bytes.max(1),
     )
 }
 
@@ -1087,6 +1094,8 @@ fn serialize_candidate_document_binary_row(row: &IndexBatchRow) -> Result<Vec<u8
 }
 
 const REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES: usize = DEFAULT_MAX_REQUEST_BYTES - 1024;
+const GRPC_REMOTE_BATCH_SOFT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const GRPC_REMOTE_BATCH_MAX_ROWS: usize = 16;
 const REMOTE_INDEX_SESSION_MAX_DOCUMENTS: usize = 2048;
 const REMOTE_INDEX_SESSION_MIN_INPUT_BYTES: u64 = 1 << 30;
 const REMOTE_INDEX_SESSION_MAX_INPUT_BYTES: u64 = 4 << 30;
@@ -1098,22 +1107,20 @@ struct RemotePendingBatch {
 }
 
 trait RemoteBinaryInsertClient {
-    fn candidate_insert_binary_rows(&mut self, rows: &[Vec<u8>]) -> Result<usize>;
+    fn candidate_insert_binary_rows(&mut self, rows: Vec<Vec<u8>>) -> Result<usize>;
 }
 
 impl RemoteBinaryInsertClient for PersistentSspryClient {
-    fn candidate_insert_binary_rows(&mut self, rows: &[Vec<u8>]) -> Result<usize> {
+    fn candidate_insert_binary_rows(&mut self, rows: Vec<Vec<u8>>) -> Result<usize> {
         Ok(self
-            .candidate_insert_batch_binary_rows(rows)?
+            .candidate_insert_batch_binary_rows(&rows)?
             .inserted_count)
     }
 }
 
 impl RemoteBinaryInsertClient for BlockingGrpcClient {
-    fn candidate_insert_binary_rows(&mut self, rows: &[Vec<u8>]) -> Result<usize> {
-        let payload = rpc::serialized_candidate_insert_binary_batch_payload(rows);
-        let response =
-            self.insert_binary_payload(&payload, grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES)?;
+    fn candidate_insert_binary_rows(&mut self, rows: Vec<Vec<u8>>) -> Result<usize> {
+        let response = self.insert_binary_rows(rows)?;
         Ok(usize::try_from(response.inserted_count).unwrap_or(usize::MAX))
     }
 }
@@ -1152,7 +1159,7 @@ impl RemoteUploadQueue {
 
     fn push(&self, row: RemoteUploadRow) -> Result<()> {
         let row_bytes = row.row_bytes.len();
-        if row_bytes > self.byte_limit {
+        if row_bytes > self.byte_limit && self.byte_limit > 0 {
             return Err(SspryError::from(format!(
                 "serialized remote row exceeds upload queue limit ({} bytes > {} bytes)",
                 row_bytes, self.byte_limit
@@ -1163,6 +1170,7 @@ impl RemoteUploadQueue {
             .lock()
             .map_err(|_| SspryError::from("remote upload queue lock poisoned"))?;
         while !state.closed
+            && self.byte_limit > 0
             && state.queued_bytes.saturating_add(row_bytes) > self.byte_limit
             && !state.rows.is_empty()
         {
@@ -1254,14 +1262,31 @@ fn empty_remote_batch_payload_size() -> Result<usize> {
     Ok(rpc::serialized_candidate_insert_binary_batch_payload(&[]).len())
 }
 
+fn grpc_remote_batch_size(batch_size: usize) -> usize {
+    batch_size.max(1).min(GRPC_REMOTE_BATCH_MAX_ROWS)
+}
+
+fn grpc_remote_batch_soft_limit_bytes(
+    configured_limit_bytes: usize,
+    empty_payload_size: usize,
+) -> usize {
+    configured_limit_bytes
+        .max(empty_payload_size.saturating_add(1))
+        .min(GRPC_REMOTE_BATCH_SOFT_LIMIT_BYTES.max(empty_payload_size.saturating_add(1)))
+}
+
 fn prepare_serialized_remote_batch_row(
     pending: &RemotePendingBatch,
     row_payload_size: usize,
     empty_payload_size: usize,
     remote_batch_soft_limit_bytes: usize,
+    allow_oversize_single_row: bool,
 ) -> Result<bool> {
     let single_payload_size = empty_payload_size.saturating_add(row_payload_size);
     if single_payload_size > remote_batch_soft_limit_bytes {
+        if allow_oversize_single_row {
+            return Ok(!pending.rows.is_empty());
+        }
         return Err(SspryError::from(format!(
             "single document insert request exceeds payload limit ({} bytes)",
             single_payload_size
@@ -1287,8 +1312,9 @@ fn flush_remote_batch<C: RemoteBinaryInsertClient>(
     }
     let flush_rows = pending.rows.len();
     let flush_payload_size = pending.payload_size;
+    let flush_payload = std::mem::take(&mut pending.rows);
     let started = Instant::now();
-    let inserted_count = client.candidate_insert_binary_rows(&pending.rows)?;
+    let inserted_count = client.candidate_insert_binary_rows(flush_payload)?;
     if verbose {
         eprintln!(
             "verbose.index.remote_flush rows={} payload_bytes={} inserted={} elapsed_ms={:.3}",
@@ -1299,7 +1325,6 @@ fn flush_remote_batch<C: RemoteBinaryInsertClient>(
         );
     }
     *processed += inserted_count;
-    pending.rows.clear();
     pending.payload_size = empty_payload_size;
     Ok(())
 }
@@ -1317,6 +1342,7 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
     last_progress_at: &mut Instant,
     empty_payload_size: usize,
     remote_batch_soft_limit_bytes: usize,
+    allow_oversize_single_row: bool,
     verbose: bool,
 ) -> Result<Duration> {
     let started_buffer = Instant::now();
@@ -1325,6 +1351,7 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
         row_bytes.len(),
         empty_payload_size,
         remote_batch_soft_limit_bytes,
+        allow_oversize_single_row,
     )?;
     let mut buffer_time = started_buffer.elapsed();
     if flush_before {
@@ -1347,6 +1374,7 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
         row_bytes,
         batch_size,
         remote_batch_soft_limit_bytes,
+        allow_oversize_single_row,
     )?;
     buffer_time += started_buffer.elapsed();
     if flush_after {
@@ -1371,6 +1399,7 @@ fn push_serialized_remote_batch_row(
     row_bytes: Vec<u8>,
     batch_size: usize,
     remote_batch_soft_limit_bytes: usize,
+    allow_oversize_single_row: bool,
 ) -> Result<bool> {
     let row_payload_size = row_bytes.len();
     let separator_bytes = usize::from(!pending.rows.is_empty());
@@ -1379,6 +1408,11 @@ fn push_serialized_remote_batch_row(
         .saturating_add(separator_bytes)
         .saturating_add(row_payload_size);
     if payload_size > remote_batch_soft_limit_bytes {
+        if allow_oversize_single_row && pending.rows.is_empty() {
+            pending.rows.push(row_bytes);
+            pending.payload_size = payload_size;
+            return Ok(true);
+        }
         return Err(SspryError::from(
             "remote batch row exceeded payload limit before flush",
         ));
@@ -1606,6 +1640,7 @@ fn placeholder_connection() -> ClientConnectionArgs {
     ClientConnectionArgs {
         addr: DEFAULT_RPC_ADDR.to_owned(),
         timeout: DEFAULT_RPC_TIMEOUT,
+        grpc_max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
     }
 }
 
@@ -2692,6 +2727,7 @@ fn cmd_grpc_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOption
         rpc::serve_grpc_with_signal_flags(
             &host,
             port,
+            args.max_request_bytes,
             rpc::ServerConfig {
                 candidate_config: resolved.candidate_config,
                 candidate_shards: resolved.candidate_shards,
@@ -3309,6 +3345,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 &mut last_progress_at,
                                 empty_payload_size,
                                 remote_batch_soft_limit_bytes,
+                                false,
                                 args.verbose,
                             )?;
                             maybe_report_index_progress(
@@ -3418,6 +3455,14 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                             let row_bytes =
                                                 serialize_candidate_document_binary_row(&scanned.row)?;
                                             local_encode_time += started_encode.elapsed();
+                                            if args.verbose && received % 25 == 0 {
+                                                eprintln!(
+                                                    "verbose.grpc_index.encoder received={} row_bytes={} file_size={}",
+                                                    received,
+                                                    row_bytes.len(),
+                                                    file_size
+                                                );
+                                            }
                                             upload_queue_consumer.push(RemoteUploadRow {
                                                 row_bytes,
                                                 file_size,
@@ -3440,10 +3485,29 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                 });
 
                                 let upload_result = (|| -> Result<()> {
+                                    let mut uploaded = 0usize;
                                     loop {
                                         let Some(upload_row) = upload_queue.pop()? else {
+                                            if args.verbose {
+                                                eprintln!(
+                                                    "verbose.grpc_index.uploader queue_drained uploaded={} processed={} pending_rows={}",
+                                                    uploaded,
+                                                    processed,
+                                                    pending.rows.len()
+                                                );
+                                            }
                                             break;
                                         };
+                                        uploaded = uploaded.saturating_add(1);
+                                        if args.verbose && uploaded % 25 == 0 {
+                                            eprintln!(
+                                                "verbose.grpc_index.uploader uploaded={} row_bytes={} file_size={} pending_rows={}",
+                                                uploaded,
+                                                upload_row.row_bytes.len(),
+                                                upload_row.file_size,
+                                                pending.rows.len()
+                                            );
+                                        }
                                         session_submitted_documents =
                                             session_submitted_documents.saturating_add(1);
                                         session_submitted_input_bytes =
@@ -3462,6 +3526,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                                             &mut last_progress_at,
                                             empty_payload_size,
                                             remote_batch_soft_limit_bytes,
+                                            false,
                                             args.verbose,
                                         )?;
                                         maybe_report_index_progress(
@@ -4349,7 +4414,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
         let mut last_progress_reported = 0usize;
         let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
-        let batch_size = args.batch_size.max(1);
+        let batch_size = grpc_remote_batch_size(args.batch_size);
         let server_policy = server_scan_policy_grpc(&args.connection)?;
         let resolved_workers =
             resolve_ingest_workers(args.workers.unwrap_or(0), total_files, &input_roots, None);
@@ -4367,106 +4432,33 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
         let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
         let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
         let empty_payload_size = empty_remote_batch_payload_size()?;
-        let remote_batch_soft_limit_bytes = args
-            .remote_batch_soft_limit_bytes
-            .max(empty_payload_size.saturating_add(1));
+        let remote_batch_soft_limit_bytes = grpc_remote_batch_soft_limit_bytes(
+            args.remote_batch_soft_limit_bytes,
+            empty_payload_size,
+        );
+        let remote_upload_queue_limit_bytes =
+            remote_upload_queue_byte_limit(effective_budget_bytes, remote_batch_soft_limit_bytes);
         let mut pending = RemotePendingBatch {
             rows: Vec::new(),
             payload_size: empty_payload_size,
         };
         let mut client = grpc_client(&args.connection)?;
+        client.set_insert_chunk_bytes(
+            args.grpc_insert_chunk_bytes
+                .max(1)
+                .min(args.connection.grpc_max_message_bytes.max(1)),
+        );
+        client.begin_index_session()?;
+        client.update_index_session_progress(Some(total_files), 0, 0)?;
 
-        if workers <= 1 {
-            stream_selected_input_files(&input_roots, args.path_list, |file_path| {
-                let started_scan = Instant::now();
-                let scanned = scan_index_batch_row(&file_path, policy)?;
-                scan_time += started_scan.elapsed();
-                let started_encode = Instant::now();
-                let row_bytes = serialize_candidate_document_binary_row(&scanned)?;
-                encode_time += started_encode.elapsed();
-                client_buffer_time += push_serialized_remote_upload_row(
-                    &mut client,
-                    &mut pending,
-                    row_bytes,
-                    batch_size,
-                    &mut processed,
-                    &mut submit_time,
-                    show_progress,
-                    total_files,
-                    &mut last_progress_reported,
-                    &mut last_progress_at,
-                    empty_payload_size,
-                    remote_batch_soft_limit_bytes,
-                    args.verbose,
-                )?;
-                maybe_report_index_progress(
-                    show_progress,
-                    processed.saturating_add(pending.rows.len()),
-                    total_files,
-                    &mut last_progress_reported,
-                    &mut last_progress_at,
-                    false,
-                );
-                Ok(())
-            })?;
-        } else {
-            let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
-            let (result_tx, result_rx) = bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
-            thread::scope(|scope| {
-                for _worker_idx in 0..workers {
-                    let job_rx = job_rx.clone();
-                    let result_tx = result_tx.clone();
-                    scope.spawn(move || {
-                        for file_path in job_rx.iter() {
-                            let started_scan = Instant::now();
-                            let result = scan_index_batch_row(&file_path, policy).map(|row| {
-                                ScannedIndexBatchRow {
-                                    row,
-                                    scan_elapsed: started_scan.elapsed(),
-                                }
-                            });
-                            let _ = result_tx.send(result);
-                        }
-                    });
-                }
-                let producer_tx = job_tx.clone();
-                let producer_result_tx = result_tx.clone();
-                let producer_roots = input_roots.clone();
-                let producer_path_list = args.path_list;
-                scope.spawn(move || {
-                    let produce = stream_selected_input_files(
-                        &producer_roots,
-                        producer_path_list,
-                        |file_path| {
-                            producer_tx.send(file_path).map_err(|_| {
-                                SspryError::from(
-                                    "candidate ingest file producer terminated unexpectedly",
-                                )
-                            })?;
-                            Ok(())
-                        },
-                    );
-                    if let Err(err) = produce {
-                        let _ = producer_result_tx.send(Err(err));
-                    }
-                    drop(producer_tx);
-                });
-
-                drop(job_tx);
-                drop(result_tx);
-
-                let mut received = 0usize;
-                loop {
-                    let started_wait = Instant::now();
-                    let Some(scanned) = result_rx.recv().ok() else {
-                        break;
-                    };
-                    result_wait_time += started_wait.elapsed();
-                    let scanned = scanned?;
-                    received = received.saturating_add(1);
-                    scan_time += scanned.scan_elapsed;
+        let body_result = (|| -> Result<()> {
+            if workers <= 1 {
+                stream_selected_input_files(&input_roots, args.path_list, |file_path| {
+                    let started_scan = Instant::now();
+                    let scanned = scan_index_batch_row(&file_path, policy)?;
+                    scan_time += started_scan.elapsed();
                     let started_encode = Instant::now();
-                    let row_bytes = serialize_candidate_document_binary_row(&scanned.row)?;
+                    let row_bytes = serialize_candidate_document_binary_row(&scanned)?;
                     encode_time += started_encode.elapsed();
                     client_buffer_time += push_serialized_remote_upload_row(
                         &mut client,
@@ -4481,6 +4473,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                         &mut last_progress_at,
                         empty_payload_size,
                         remote_batch_soft_limit_bytes,
+                        true,
                         args.verbose,
                     )?;
                     maybe_report_index_progress(
@@ -4491,31 +4484,172 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                         &mut last_progress_at,
                         false,
                     );
-                }
-                if received != total_files {
-                    return Err(SspryError::from(format!(
-                        "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
-                    )));
-                }
-                Ok::<(), SspryError>(())
-            })?;
-        }
+                    Ok(())
+                })?;
+            } else {
+                let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                let (result_tx, result_rx) =
+                    bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
+                let upload_queue =
+                    Arc::new(RemoteUploadQueue::new(remote_upload_queue_limit_bytes));
+                thread::scope(|scope| {
+                    for _worker_idx in 0..workers {
+                        let job_rx = job_rx.clone();
+                        let result_tx = result_tx.clone();
+                        scope.spawn(move || {
+                            for file_path in job_rx.iter() {
+                                let started_scan = Instant::now();
+                                let result = scan_index_batch_row(&file_path, policy).map(|row| {
+                                    ScannedIndexBatchRow {
+                                        row,
+                                        scan_elapsed: started_scan.elapsed(),
+                                    }
+                                });
+                                let _ = result_tx.send(result);
+                            }
+                        });
+                    }
+                    let producer_tx = job_tx.clone();
+                    let producer_result_tx = result_tx.clone();
+                    let producer_roots = input_roots.clone();
+                    let producer_path_list = args.path_list;
+                    scope.spawn(move || {
+                        let produce = stream_selected_input_files(
+                            &producer_roots,
+                            producer_path_list,
+                            |file_path| {
+                                producer_tx.send(file_path).map_err(|_| {
+                                    SspryError::from(
+                                        "candidate ingest file producer terminated unexpectedly",
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        );
+                        if let Err(err) = produce {
+                            let _ = producer_result_tx.send(Err(err));
+                        }
+                        drop(producer_tx);
+                    });
 
-        flush_remote_pending_rows(
-            &mut client,
-            &mut pending,
-            &mut processed,
-            &mut submit_time,
-            show_progress,
-            total_files,
-            &mut last_progress_reported,
-            &mut last_progress_at,
-            empty_payload_size,
-            args.verbose,
-        )?;
-        if server_policy.workspace_mode {
-            let _ = client.publish()?;
-        }
+                    drop(job_tx);
+                    drop(result_tx);
+
+                    let scope_result = (|| -> Result<()> {
+                        let upload_queue_consumer = upload_queue.clone();
+                        let encoder_handle = scope.spawn(move || -> Result<RemoteEncodeStats> {
+                        let mut received = 0usize;
+                        let mut local_scan_time = Duration::ZERO;
+                        let mut local_result_wait_time = Duration::ZERO;
+                        let mut local_encode_time = Duration::ZERO;
+                        let encoder_result = (|| -> Result<()> {
+                            loop {
+                                let started_wait = Instant::now();
+                                let Some(scanned) = result_rx.recv().ok() else {
+                                    break;
+                                };
+                                local_result_wait_time += started_wait.elapsed();
+                                let scanned = scanned?;
+                                received = received.saturating_add(1);
+                                local_scan_time += scanned.scan_elapsed;
+                                let file_size = scanned.row.file_size;
+                                let started_encode = Instant::now();
+                                let row_bytes =
+                                    serialize_candidate_document_binary_row(&scanned.row)?;
+                                local_encode_time += started_encode.elapsed();
+                                upload_queue_consumer.push(RemoteUploadRow {
+                                    row_bytes,
+                                    file_size,
+                                })?;
+                            }
+                            if received != total_files {
+                                return Err(SspryError::from(format!(
+                                    "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
+                                )));
+                            }
+                            Ok(())
+                        })();
+                        let _ = upload_queue_consumer.close();
+                        encoder_result?;
+                        Ok(RemoteEncodeStats {
+                            scan_time: local_scan_time,
+                            result_wait_time: local_result_wait_time,
+                            encode_time: local_encode_time,
+                        })
+                    });
+
+                        let upload_result = (|| -> Result<()> {
+                            loop {
+                                let Some(upload_row) = upload_queue.pop()? else {
+                                    break;
+                                };
+                                client_buffer_time += push_serialized_remote_upload_row(
+                                    &mut client,
+                                    &mut pending,
+                                    upload_row.row_bytes,
+                                    batch_size,
+                                    &mut processed,
+                                    &mut submit_time,
+                                    show_progress,
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    empty_payload_size,
+                                    remote_batch_soft_limit_bytes,
+                                    true,
+                                    args.verbose,
+                                )?;
+                                maybe_report_index_progress(
+                                    show_progress,
+                                    processed.saturating_add(pending.rows.len()),
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    false,
+                                );
+                            }
+                            Ok(())
+                        })();
+                        if let Err(upload_err) = upload_result {
+                            let _ = upload_queue.close();
+                            let _ = encoder_handle.join();
+                            return Err(upload_err);
+                        }
+                        let encoder_stats = encoder_handle.join().map_err(|_| {
+                            SspryError::from("candidate ingest encoder thread panicked")
+                        })??;
+                        scan_time += encoder_stats.scan_time;
+                        result_wait_time += encoder_stats.result_wait_time;
+                        encode_time += encoder_stats.encode_time;
+                        Ok(())
+                    })();
+                    let _ = upload_queue.close();
+                    scope_result?;
+                    Ok::<(), SspryError>(())
+                })?;
+            }
+
+            flush_remote_pending_rows(
+                &mut client,
+                &mut pending,
+                &mut processed,
+                &mut submit_time,
+                show_progress,
+                total_files,
+                &mut last_progress_reported,
+                &mut last_progress_at,
+                empty_payload_size,
+                args.verbose,
+            )?;
+            client.update_index_session_progress(Some(total_files), processed, processed)?;
+            if server_policy.workspace_mode {
+                let _ = client.publish()?;
+            }
+            Ok(())
+        })();
+        let end_session_result = client.end_index_session();
+        body_result?;
+        end_session_result?;
 
         maybe_report_index_progress(
             show_progress,
@@ -4549,6 +4683,10 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
             eprintln!("verbose.index.queue_capacity: {queue_capacity}");
             eprintln!(
                 "verbose.index.remote_batch_soft_limit_bytes: {remote_batch_soft_limit_bytes}"
+            );
+            eprintln!(
+                "verbose.index.remote_upload_queue_limit_bytes: {}",
+                remote_upload_queue_limit_bytes
             );
             eprintln!("verbose.index.worker_auto: {}", resolved_workers.auto);
             eprintln!(
@@ -5609,6 +5747,12 @@ struct IndexArgs {
     )]
     remote_batch_soft_limit_bytes: usize,
     #[arg(
+        long = "grpc-insert-chunk-bytes",
+        default_value_t = grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
+        help = "Per-frame gRPC insert chunk size in bytes for grpc-index."
+    )]
+    grpc_insert_chunk_bytes: usize,
+    #[arg(
         long = "workers",
         help = "Process workers for recursive file scan/feature extraction before batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
     )]
@@ -6147,6 +6291,7 @@ mod tests {
         ClientConnectionArgs {
             addr: DEFAULT_RPC_ADDR.to_owned(),
             timeout: DEFAULT_RPC_TIMEOUT,
+            grpc_max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 
@@ -6194,6 +6339,7 @@ mod tests {
         let connection = ClientConnectionArgs {
             addr: format!("{DEFAULT_RPC_HOST}:{port}"),
             timeout: 0.5,
+            grpc_max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
         };
         for _ in 0..100 {
             if rpc_client(&connection).ping().is_ok() {
@@ -7028,6 +7174,7 @@ rule remote_q {
                 path_list: false,
                 batch_size: 1,
                 remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
+                grpc_insert_chunk_bytes: grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
                 workers: Some(2),
                 verbose: false,
             }),
@@ -7244,6 +7391,7 @@ rule remote_q {
                 path_list: false,
                 batch_size: 1,
                 remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
+                grpc_insert_chunk_bytes: grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
                 workers: Some(1),
                 verbose: false,
             }),

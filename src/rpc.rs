@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,11 +38,15 @@ use crate::candidate::{
     resolve_max_candidates, write_candidate_shard_count,
 };
 use crate::grpc::v1::{
-    DeleteRequest as GrpcDeleteRequest, DeleteResponse as GrpcDeleteResponse, InsertChunk,
-    InsertResult, InsertSummary, OptionalString, PingRequest, PingResponse, PublishRequest,
-    PublishResponse as GrpcPublishResponse, SearchFrame, SearchRequest, ShutdownRequest,
-    ShutdownResponse as GrpcShutdownResponse, StatsRequest, StatsResponse, StatusRequest,
-    StatusResponse,
+    AdaptivePublishSummary, DeleteRequest as GrpcDeleteRequest,
+    DeleteResponse as GrpcDeleteResponse, IndexSessionBeginRequest,
+    IndexSessionEndRequest, IndexSessionProgressRequest, IndexSessionResponse,
+    IndexSessionSummary,
+    InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
+    PingRequest, PingResponse, PreparedQueryProfileSummary, PublishRequest,
+    PublishResponse as GrpcPublishResponse, PublishSummary, QueryProfileSummary, SearchFrame,
+    SearchRequest, ShutdownRequest, ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary,
+    StartupSummary, StatsRequest, StatsResponse, StatusRequest, StatusResponse, StoreSummary,
     sspry_server::{Sspry as GrpcSspry, SspryServer},
 };
 use crate::perf::{record_counter, scope};
@@ -80,6 +84,8 @@ const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 const INDEX_CLIENT_LEASE_MULTIPLIER: u64 = 3;
 const CANDIDATE_INSERT_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const GRPC_STREAM_INSERT_BATCH_MAX_ROWS: usize = 32;
+const GRPC_STREAM_INSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
@@ -546,6 +552,8 @@ struct ServerState {
     compaction_runtime: Mutex<CompactionRuntime>,
     next_compaction_shard: AtomicUsize,
     active_connections: AtomicUsize,
+    maintenance_epoch: Mutex<u64>,
+    maintenance_cv: Condvar,
     startup_cleanup_removed_roots: usize,
     startup_profile: StartupProfile,
 }
@@ -593,6 +601,13 @@ struct CompactionRuntime {
     last_reclaimed_bytes: u64,
     last_completed_unix_ms: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionCycleOutcome {
+    Idle,
+    Progress,
+    RetryLater,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1481,12 +1496,20 @@ pub fn serve_with_signal_flags(
 }
 
 pub fn serve_grpc(host: &str, port: u16, config: ServerConfig) -> Result<()> {
-    serve_grpc_with_signal_flags(host, port, config, Arc::new(AtomicBool::new(false)), None)
+    serve_grpc_with_signal_flags(
+        host,
+        port,
+        DEFAULT_MAX_REQUEST_BYTES,
+        config,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
 }
 
 pub fn serve_grpc_with_signal_flags(
     host: &str,
     port: u16,
+    max_request_bytes: usize,
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
     status_dump: Option<Arc<AtomicBool>>,
@@ -1508,20 +1531,32 @@ pub fn serve_grpc_with_signal_flags(
         .enable_all()
         .build()?;
     let shutdown_state = state.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_waiter = thread::spawn(move || {
+        let mut maintenance_epoch = shutdown_state.current_maintenance_epoch();
+        while !shutdown_state.is_shutting_down() {
+            shutdown_state.wait_for_maintenance_event(
+                &mut maintenance_epoch,
+                Some(Duration::from_secs(1)),
+            );
+        }
+        let _ = shutdown_tx.send(());
+    });
     let serve_result = runtime.block_on(async move {
         tonic::transport::Server::builder()
             .add_service(
                 SspryServer::new(service)
-                    .max_decoding_message_size(DEFAULT_MAX_REQUEST_BYTES)
-                    .max_encoding_message_size(DEFAULT_MAX_REQUEST_BYTES),
+                    .max_decoding_message_size(max_request_bytes)
+                    .max_encoding_message_size(max_request_bytes),
             )
             .serve_with_shutdown(addr, async move {
-                while !shutdown_state.is_shutting_down() {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                let _ = shutdown_rx.await;
             })
             .await
     });
+    state.shutdown.store(true, Ordering::Relaxed);
+    state.notify_maintenance_workers();
+    let _ = shutdown_waiter.join();
     drain_server_runtime(state, workers);
     serve_result.map_err(|err| SspryError::from(err.to_string()))
 }
@@ -1773,26 +1808,45 @@ pub fn candidate_stats_json_for_stores(
 
 fn start_compaction_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut maintenance_epoch = state.current_maintenance_epoch();
         loop {
             if state.is_shutting_down() {
                 break;
             }
-            thread::sleep(Duration::from_millis(200));
+            state.wait_for_maintenance_event(&mut maintenance_epoch, Some(Duration::from_secs(30)));
             if state.is_shutting_down() {
                 break;
             }
-            let _ = state.run_compaction_cycle();
+            loop {
+                match state.run_compaction_cycle_once() {
+                    Ok(CompactionCycleOutcome::Progress) => continue,
+                    Ok(CompactionCycleOutcome::Idle | CompactionCycleOutcome::RetryLater) => break,
+                    Err(_) => break,
+                }
+            }
         }
     })
 }
 
 fn start_auto_publish_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut maintenance_epoch = state.current_maintenance_epoch();
         loop {
             if state.is_shutting_down() {
                 break;
             }
-            thread::sleep(Duration::from_millis(200));
+            let readiness = state.publish_readiness(current_unix_ms());
+            let timeout = if readiness.eligible {
+                Duration::from_millis(1)
+            } else if state.config.workspace_mode
+                && state.work_dirty.load(Ordering::Acquire)
+                && readiness.idle_remaining_ms > 0
+            {
+                Duration::from_millis(readiness.idle_remaining_ms.min(30_000))
+            } else {
+                Duration::from_secs(30)
+            };
+            state.wait_for_maintenance_event(&mut maintenance_epoch, Some(timeout));
             if state.is_shutting_down() {
                 break;
             }
@@ -1804,6 +1858,7 @@ fn start_auto_publish_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> 
 
 fn start_published_tier2_snapshot_seal_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut maintenance_epoch = state.current_maintenance_epoch();
         loop {
             if state.is_shutting_down()
                 && state
@@ -1813,8 +1868,14 @@ fn start_published_tier2_snapshot_seal_worker(state: Arc<ServerState>) -> thread
             {
                 break;
             }
-            thread::sleep(Duration::from_millis(50));
-            let _ = state.run_published_tier2_snapshot_seal_cycle();
+            state.wait_for_maintenance_event(&mut maintenance_epoch, Some(Duration::from_secs(30)));
+            loop {
+                match state.run_published_tier2_snapshot_seal_cycle() {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(_) => break,
+                }
+            }
         }
     })
 }
@@ -1825,6 +1886,7 @@ fn start_status_dump_worker(
 ) -> Option<thread::JoinHandle<()>> {
     let status_dump = status_dump?;
     Some(thread::spawn(move || {
+        let mut maintenance_epoch = state.current_maintenance_epoch();
         while !state.is_shutting_down() {
             if status_dump.swap(false, Ordering::SeqCst) {
                 match state.current_stats_json() {
@@ -1835,7 +1897,7 @@ fn start_status_dump_worker(
                     Err(err) => eprintln!("failed to collect status snapshot: {err}"),
                 }
             }
-            thread::sleep(Duration::from_millis(50));
+            state.wait_for_maintenance_event(&mut maintenance_epoch, Some(Duration::from_secs(1)));
         }
     }))
 }
@@ -1867,6 +1929,7 @@ fn drain_server_runtime(state: Arc<ServerState>, workers: ServerWorkers) {
         }
     }
     state.shutdown.store(true, Ordering::Relaxed);
+    state.notify_maintenance_workers();
     if let Some(worker) = workers.status_worker {
         let _ = worker.join();
     }
@@ -1914,6 +1977,464 @@ fn grpc_optional_string(value: Option<String>) -> OptionalString {
     }
 }
 
+fn grpc_store_summary_from_stats_map(stats: &Map<String, Value>) -> StoreSummary {
+    StoreSummary {
+        active_doc_count: stats
+            .get("active_doc_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        candidate_shards: stats
+            .get("candidate_shards")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        id_source: stats
+            .get("id_source")
+            .and_then(Value::as_str)
+            .unwrap_or("sha256")
+            .to_owned(),
+        store_path: stats
+            .get("store_path")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        deleted_doc_count: stats
+            .get("deleted_doc_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        disk_usage_bytes: stats
+            .get("disk_usage_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        doc_count: stats.get("doc_count").and_then(Value::as_u64).unwrap_or(0),
+        compaction_generation: stats
+            .get("compaction_generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        tier1_filter_target_fp: stats
+            .get("tier1_filter_target_fp")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        tier2_filter_target_fp: stats
+            .get("tier2_filter_target_fp")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        tier2_gram_size: stats
+            .get("tier2_gram_size")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        tier1_gram_size: stats
+            .get("tier1_gram_size")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        query_count: stats.get("query_count").and_then(Value::as_u64).unwrap_or(0),
+        retired_generation_count: stats
+            .get("retired_generation_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        tier2_docs_matched_total: stats
+            .get("tier2_docs_matched_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        tier2_match_ratio: stats
+            .get("tier2_match_ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        tier2_scanned_docs_total: stats
+            .get("tier2_scanned_docs_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        version: stats.get("version").and_then(Value::as_u64).unwrap_or(0),
+        deleted_storage_bytes: stats
+            .get("deleted_storage_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+fn grpc_adaptive_publish_summary_from_status_map(stats: &Map<String, Value>) -> AdaptivePublishSummary {
+    let adaptive = stats
+        .get("adaptive_publish")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    AdaptivePublishSummary {
+        storage_class: adaptive
+            .get("storage_class")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        current_idle_ms: adaptive
+            .get("current_idle_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        mode: adaptive
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        reason: adaptive
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        recent_publish_p95_ms: adaptive
+            .get("recent_publish_p95_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        recent_submit_p95_ms: adaptive
+            .get("recent_submit_p95_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        recent_store_p95_ms: adaptive
+            .get("recent_store_p95_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        recent_publishes_in_window: adaptive
+            .get("recent_publishes_in_window")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        tier2_pending_shards: adaptive
+            .get("tier2_pending_shards")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        healthy_cycles: adaptive
+            .get("healthy_cycles")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+fn grpc_insert_batch_profile_summary_from_value(
+    value: Option<&Value>,
+) -> InsertBatchProfileSummary {
+    let summary = value.and_then(Value::as_object).cloned().unwrap_or_default();
+    InsertBatchProfileSummary {
+        batches: summary.get("batches").and_then(Value::as_u64).unwrap_or(0),
+        documents: summary
+            .get("documents")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        shards_touched_total: summary
+            .get("shards_touched_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        total_us: summary.get("total_us").and_then(Value::as_u64).unwrap_or(0),
+        parse_us: summary.get("parse_us").and_then(Value::as_u64).unwrap_or(0),
+        group_us: summary.get("group_us").and_then(Value::as_u64).unwrap_or(0),
+        build_us: summary.get("build_us").and_then(Value::as_u64).unwrap_or(0),
+        store_us: summary.get("store_us").and_then(Value::as_u64).unwrap_or(0),
+        finalize_us: summary
+            .get("finalize_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_resolve_doc_state_us: summary
+            .get("store_resolve_doc_state_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_sidecars_us: summary
+            .get("store_append_sidecars_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_sidecar_payloads_us: summary
+            .get("store_append_sidecar_payloads_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_bloom_payload_assemble_us: summary
+            .get("store_append_bloom_payload_assemble_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_bloom_payload_us: summary
+            .get("store_append_bloom_payload_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_metadata_payload_us: summary
+            .get("store_append_metadata_payload_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_external_id_payload_us: summary
+            .get("store_append_external_id_payload_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_tier2_bloom_payload_us: summary
+            .get("store_append_tier2_bloom_payload_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_doc_row_build_us: summary
+            .get("store_append_doc_row_build_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_bloom_payload_bytes: summary
+            .get("store_append_bloom_payload_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_metadata_payload_bytes: summary
+            .get("store_append_metadata_payload_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_external_id_payload_bytes: summary
+            .get("store_append_external_id_payload_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_tier2_bloom_payload_bytes: summary
+            .get("store_append_tier2_bloom_payload_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_append_doc_records_us: summary
+            .get("store_append_doc_records_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_write_existing_us: summary
+            .get("store_write_existing_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_install_docs_us: summary
+            .get("store_install_docs_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_tier2_update_us: summary
+            .get("store_tier2_update_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_persist_meta_us: summary
+            .get("store_persist_meta_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        store_rebalance_tier2_us: summary
+            .get("store_rebalance_tier2_us")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+fn grpc_index_session_summary_from_status_map(stats: &Map<String, Value>) -> IndexSessionSummary {
+    let session = stats
+        .get("index_session")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    IndexSessionSummary {
+        active: session.get("active").and_then(Value::as_bool).unwrap_or(false),
+        client_active: session
+            .get("client_active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        total_documents: session
+            .get("total_documents")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        submitted_documents: session
+            .get("submitted_documents")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        processed_documents: session
+            .get("processed_documents")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        remaining_documents: session
+            .get("remaining_documents")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        progress_percent: session
+            .get("progress_percent")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        started_unix_ms: session
+            .get("started_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_update_unix_ms: session
+            .get("last_update_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        server_insert_batch_profile: Some(grpc_insert_batch_profile_summary_from_value(
+            session.get("server_insert_batch_profile"),
+        )),
+    }
+}
+
+fn grpc_startup_store_summary_from_value(value: Option<&Value>) -> StartupStoreSummary {
+    let summary = value.and_then(Value::as_object).cloned().unwrap_or_default();
+    StartupStoreSummary {
+        total_ms: summary.get("total_ms").and_then(Value::as_u64).unwrap_or(0),
+        opened_existing_shards: summary
+            .get("opened_existing_shards")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        initialized_new_shards: summary
+            .get("initialized_new_shards")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        doc_count: summary.get("doc_count").and_then(Value::as_u64).unwrap_or(0),
+    }
+}
+
+fn grpc_startup_summary_from_status_map(stats: &Map<String, Value>) -> StartupSummary {
+    let startup = stats
+        .get("startup")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    StartupSummary {
+        total_ms: startup.get("total_ms").and_then(Value::as_u64).unwrap_or(0),
+        startup_cleanup_removed_roots: startup
+            .get("startup_cleanup_removed_roots")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        current: Some(grpc_startup_store_summary_from_value(startup.get("current"))),
+        work: Some(grpc_startup_store_summary_from_value(startup.get("work"))),
+    }
+}
+
+fn grpc_publish_summary_from_status_map(stats: &Map<String, Value>) -> PublishSummary {
+    let publish = stats
+        .get("publish")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    PublishSummary {
+        pending: publish.get("pending").and_then(Value::as_bool).unwrap_or(false),
+        eligible: publish.get("eligible").and_then(Value::as_bool).unwrap_or(false),
+        blocked_reason: publish
+            .get("blocked_reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        trigger_mode: publish
+            .get("trigger_mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        trigger_reason: publish
+            .get("trigger_reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        idle_elapsed_ms: publish
+            .get("idle_elapsed_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        idle_remaining_ms: publish
+            .get("idle_remaining_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        work_buffer_estimated_documents: publish
+            .get("work_buffer_estimated_documents")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        work_buffer_estimated_input_bytes: publish
+            .get("work_buffer_estimated_input_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        work_buffer_document_threshold: publish
+            .get("work_buffer_document_threshold")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        work_buffer_input_bytes_threshold: publish
+            .get("work_buffer_input_bytes_threshold")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        work_buffer_rss_threshold_bytes: publish
+            .get("work_buffer_rss_threshold_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        current_rss_bytes: publish
+            .get("current_rss_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        pending_tier2_snapshot_shards: publish
+            .get("pending_tier2_snapshot_shards")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        index_backpressure_delay_ms: publish
+            .get("index_backpressure_delay_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        index_backpressure_events_total: publish
+            .get("index_backpressure_events_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        index_backpressure_sleep_ms_total: publish
+            .get("index_backpressure_sleep_ms_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_started_unix_ms: publish
+            .get("last_publish_started_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_completed_unix_ms: publish
+            .get("last_publish_completed_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_duration_ms: publish
+            .get("last_publish_duration_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_lock_wait_ms: publish
+            .get("last_publish_lock_wait_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_promote_work_ms: publish
+            .get("last_publish_promote_work_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_init_work_ms: publish
+            .get("last_publish_init_work_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_persisted_snapshot_shards: publish
+            .get("last_publish_persisted_snapshot_shards")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        last_publish_reused_work_stores: publish
+            .get("last_publish_reused_work_stores")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        publish_runs_total: publish
+            .get("publish_runs_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+fn grpc_query_profile_summary_from_internal(
+    profile: &CandidateQueryProfile,
+) -> QueryProfileSummary {
+    QueryProfileSummary {
+        docs_scanned: profile.docs_scanned,
+        metadata_loads: profile.metadata_loads,
+        metadata_bytes: profile.metadata_bytes,
+        tier1_bloom_loads: profile.tier1_bloom_loads,
+        tier1_bloom_bytes: profile.tier1_bloom_bytes,
+        tier2_bloom_loads: profile.tier2_bloom_loads,
+        tier2_bloom_bytes: profile.tier2_bloom_bytes,
+    }
+}
+
+fn grpc_prepared_query_profile_summary_from_internal(
+    profile: &CandidatePreparedQueryProfile,
+) -> PreparedQueryProfileSummary {
+    PreparedQueryProfileSummary {
+        impossible_query: profile.impossible_query,
+        prepared_query_bytes: profile.prepared_query_bytes,
+        prepared_pattern_plan_bytes: profile.prepared_pattern_plan_bytes,
+        prepared_mask_cache_bytes: profile.prepared_mask_cache_bytes,
+        pattern_count: profile.pattern_count,
+        mask_cache_entries: profile.mask_cache_entries,
+        fixed_literal_count: profile.fixed_literal_count,
+        tier1_alternatives: profile.tier1_alternatives,
+        tier2_alternatives: profile.tier2_alternatives,
+        tier1_shift_variants: profile.tier1_shift_variants,
+        tier2_shift_variants: profile.tier2_shift_variants,
+        tier1_any_lane_alternatives: profile.tier1_any_lane_alternatives,
+        tier2_any_lane_alternatives: profile.tier2_any_lane_alternatives,
+        tier1_compacted_any_lane_alternatives: profile.tier1_compacted_any_lane_alternatives,
+        tier2_compacted_any_lane_alternatives: profile.tier2_compacted_any_lane_alternatives,
+        any_lane_variant_sets: profile.any_lane_variant_sets,
+        compacted_any_lane_grams: profile.compacted_any_lane_grams,
+        max_pattern_bytes: profile.max_pattern_bytes,
+        max_pattern_id: Some(grpc_optional_string(profile.max_pattern_id.clone())),
+    }
+}
+
 fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<SearchFrame> {
     Ok(SearchFrame {
         sha256: frame.sha256,
@@ -1932,15 +2453,17 @@ fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<S
         stream_complete: frame.stream_complete,
         truncated: false,
         tier_used: frame.tier_used,
-        query_profile_json: if frame.stream_complete {
-            serde_json::to_string(&frame.query_profile)?
+        query_profile: if frame.stream_complete {
+            Some(grpc_query_profile_summary_from_internal(&frame.query_profile))
         } else {
-            String::new()
+            None
         },
-        prepared_query_profile_json: if frame.stream_complete {
-            serde_json::to_string(&frame.prepared_query_profile)?
+        prepared_query_profile: if frame.stream_complete {
+            Some(grpc_prepared_query_profile_summary_from_internal(
+                &frame.prepared_query_profile,
+            ))
         } else {
-            String::new()
+            None
         },
     })
 }
@@ -1961,14 +2484,33 @@ impl GrpcSspry for GrpcServerService {
         _request: GrpcRequest<StatsRequest>,
     ) -> std::result::Result<GrpcResponse<StatsResponse>, GrpcStatus> {
         let state = self.state.clone();
-        let json = tokio::task::spawn_blocking(move || {
-            let stats = Value::Object(state.current_stats_json()?);
-            serde_json::to_string_pretty(&stats).map_err(SspryError::from)
+        let response = tokio::task::spawn_blocking(move || {
+            let stats = state.current_stats_json()?;
+            Ok::<StatsResponse, SspryError>(StatsResponse {
+                stats: Some(grpc_store_summary_from_stats_map(&stats)),
+                memory_budget_bytes: stats
+                    .get("memory_budget_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                workspace_mode: stats
+                    .get("workspace_mode")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                search_workers: stats
+                    .get("search_workers")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                current_rss_kb: stats
+                    .get("current_rss_kb")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                peak_rss_kb: stats.get("peak_rss_kb").and_then(Value::as_u64).unwrap_or(0),
+            })
         })
         .await
         .map_err(grpc_join_error_status)?
         .map_err(grpc_internal_status)?;
-        Ok(GrpcResponse::new(StatsResponse { json }))
+        Ok(GrpcResponse::new(response))
     }
 
     async fn status(
@@ -1976,14 +2518,134 @@ impl GrpcSspry for GrpcServerService {
         _request: GrpcRequest<StatusRequest>,
     ) -> std::result::Result<GrpcResponse<StatusResponse>, GrpcStatus> {
         let state = self.state.clone();
-        let json = tokio::task::spawn_blocking(move || {
-            let stats = Value::Object(state.status_json()?);
-            serde_json::to_string_pretty(&stats).map_err(SspryError::from)
+        let response = tokio::task::spawn_blocking(move || {
+            let stats = state.status_json()?;
+            let published_stats = state.current_stats_json()?;
+            Ok::<StatusResponse, SspryError>(StatusResponse {
+                draining: stats.get("draining").and_then(Value::as_bool).unwrap_or(false),
+                active_connections: stats
+                    .get("active_connections")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                active_mutations: stats
+                    .get("active_mutations")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                publish_requested: stats
+                    .get("publish_requested")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                mutations_paused: stats
+                    .get("mutations_paused")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                publish_in_progress: stats
+                    .get("publish_in_progress")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                active_index_clients: stats
+                    .get("active_index_clients")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                active_index_sessions: stats
+                    .get("active_index_sessions")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                search_workers: stats
+                    .get("search_workers")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                memory_budget_bytes: stats
+                    .get("memory_budget_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                current_rss_kb: stats
+                    .get("current_rss_kb")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                peak_rss_kb: stats.get("peak_rss_kb").and_then(Value::as_u64).unwrap_or(0),
+                adaptive_publish: Some(grpc_adaptive_publish_summary_from_status_map(&stats)),
+                index_session: Some(grpc_index_session_summary_from_status_map(&stats)),
+                startup: Some(grpc_startup_summary_from_status_map(&stats)),
+                workspace_mode: stats
+                    .get("workspace_mode")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                published_root: stats
+                    .get("published_root")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                work_root: stats
+                    .get("work_root")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                has_work: stats.get("work").and_then(Value::as_object).is_some(),
+                work: stats
+                    .get("work")
+                    .and_then(Value::as_object)
+                    .map(grpc_store_summary_from_stats_map),
+                has_published: true,
+                published: Some(grpc_store_summary_from_stats_map(&published_stats)),
+                publish: Some(grpc_publish_summary_from_status_map(&stats)),
+            })
         })
         .await
         .map_err(grpc_join_error_status)?
         .map_err(grpc_internal_status)?;
-        Ok(GrpcResponse::new(StatusResponse { json }))
+        Ok(GrpcResponse::new(response))
+    }
+
+    async fn begin_index_session(
+        &self,
+        _request: GrpcRequest<IndexSessionBeginRequest>,
+    ) -> std::result::Result<GrpcResponse<IndexSessionResponse>, GrpcStatus> {
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || state.handle_begin_index_session())
+            .await
+            .map_err(grpc_join_error_status)?
+            .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(IndexSessionResponse {
+            message: response.message,
+        }))
+    }
+
+    async fn update_index_session_progress(
+        &self,
+        request: GrpcRequest<IndexSessionProgressRequest>,
+    ) -> std::result::Result<GrpcResponse<IndexSessionResponse>, GrpcStatus> {
+        let request = request.into_inner();
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            state.handle_update_index_session_progress(&CandidateIndexSessionProgressRequest {
+                total_documents: request
+                    .has_total_documents
+                    .then_some(request.total_documents),
+                submitted_documents: request.submitted_documents,
+                processed_documents: request.processed_documents,
+            })
+        })
+        .await
+        .map_err(grpc_join_error_status)?
+        .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(IndexSessionResponse {
+            message: response.message,
+        }))
+    }
+
+    async fn end_index_session(
+        &self,
+        _request: GrpcRequest<IndexSessionEndRequest>,
+    ) -> std::result::Result<GrpcResponse<IndexSessionResponse>, GrpcStatus> {
+        let state = self.state.clone();
+        let response = tokio::task::spawn_blocking(move || state.handle_end_index_session())
+            .await
+            .map_err(grpc_join_error_status)?
+            .map_err(grpc_internal_status)?;
+        Ok(GrpcResponse::new(IndexSessionResponse {
+            message: response.message,
+        }))
     }
 
     async fn publish(
@@ -2079,38 +2741,116 @@ impl GrpcSspry for GrpcServerService {
 
     async fn insert_stream(
         &self,
-        request: GrpcRequest<tonic::Streaming<InsertChunk>>,
+        request: GrpcRequest<tonic::Streaming<InsertFrame>>,
     ) -> std::result::Result<GrpcResponse<InsertSummary>, GrpcStatus> {
         let mut stream = request.into_inner();
-        let mut payload = Vec::<u8>::new();
-        let mut saw_final = false;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(tonic_error_to_status)?;
-            if saw_final {
+        let mut current_row = Vec::<u8>::new();
+        let mut parsed_documents = Vec::<ParsedCandidateInsertDocument>::new();
+        let mut batch_input_bytes = 0u64;
+        let mut batch_row_bytes = 0usize;
+        let mut batch_parse_elapsed = Duration::ZERO;
+        let mut summary = CandidateInsertBatchResponse {
+            inserted_count: 0,
+            results: Vec::new(),
+        };
+        let mut saw_stream_complete = false;
+
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(tonic_error_to_status)?;
+            if saw_stream_complete {
                 return Err(GrpcStatus::invalid_argument(
-                    "received insert chunks after final_chunk=true",
+                    "received insert frames after stream_complete=true",
                 ));
             }
-            payload.extend_from_slice(&chunk.payload);
-            if chunk.final_chunk {
-                saw_final = true;
+            if frame.stream_complete {
+                if frame.row_complete || !frame.payload.is_empty() {
+                    return Err(GrpcStatus::invalid_argument(
+                        "stream_complete frame must not include payload or row_complete=true",
+                    ));
+                }
+                if !current_row.is_empty() {
+                    return Err(GrpcStatus::invalid_argument(
+                        "gRPC insert stream ended with an incomplete row",
+                    ));
+                }
+                if !parsed_documents.is_empty() {
+                    let flush_documents = std::mem::take(&mut parsed_documents);
+                    let flush_input_bytes = batch_input_bytes;
+                    let flush_parse_elapsed = batch_parse_elapsed;
+                    batch_input_bytes = 0;
+                    batch_row_bytes = 0;
+                    batch_parse_elapsed = Duration::ZERO;
+                    let state = self.state.clone();
+                    let response = tokio::task::spawn_blocking(move || {
+                        state.handle_candidate_insert_batch_parsed(
+                            flush_documents,
+                            flush_input_bytes,
+                            flush_parse_elapsed,
+                        )
+                    })
+                    .await
+                    .map_err(grpc_join_error_status)?
+                    .map_err(grpc_internal_status)?;
+                    summary.inserted_count = summary
+                        .inserted_count
+                        .saturating_add(response.inserted_count);
+                    summary.results.extend(response.results);
+                }
+                saw_stream_complete = true;
+                continue;
             }
+
+            current_row.extend_from_slice(&frame.payload);
+            if !frame.row_complete {
+                continue;
+            }
+
+            let row_len = current_row.len();
+            let started_parse = Instant::now();
+            let parsed = parse_candidate_insert_binary_row(&current_row, "grpc.insert_stream.row")
+                .map_err(|err| GrpcStatus::invalid_argument(err.to_string()))?;
+            batch_parse_elapsed += started_parse.elapsed();
+            batch_input_bytes = batch_input_bytes.saturating_add(parsed.1);
+            batch_row_bytes = batch_row_bytes.saturating_add(row_len);
+            parsed_documents.push(parsed);
+            current_row = Vec::new();
+
+            if parsed_documents.len() < GRPC_STREAM_INSERT_BATCH_MAX_ROWS
+                && batch_row_bytes < GRPC_STREAM_INSERT_BATCH_MAX_BYTES
+            {
+                continue;
+            }
+
+            let flush_documents = std::mem::take(&mut parsed_documents);
+            let flush_input_bytes = batch_input_bytes;
+            let flush_parse_elapsed = batch_parse_elapsed;
+            batch_input_bytes = 0;
+            batch_row_bytes = 0;
+            batch_parse_elapsed = Duration::ZERO;
+            let state = self.state.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                state.handle_candidate_insert_batch_parsed(
+                    flush_documents,
+                    flush_input_bytes,
+                    flush_parse_elapsed,
+                )
+            })
+            .await
+            .map_err(grpc_join_error_status)?
+            .map_err(grpc_internal_status)?;
+            summary.inserted_count = summary
+                .inserted_count
+                .saturating_add(response.inserted_count);
+            summary.results.extend(response.results);
         }
-        if !saw_final {
+        if !saw_stream_complete {
             return Err(GrpcStatus::invalid_argument(
-                "gRPC insert stream ended without final_chunk=true",
+                "gRPC insert stream ended without stream_complete=true",
             ));
         }
-        let state = self.state.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            state.handle_candidate_insert_batch_binary(&payload)
-        })
-        .await
-        .map_err(grpc_join_error_status)?
-        .map_err(grpc_internal_status)?;
         Ok(GrpcResponse::new(InsertSummary {
-            inserted_count: response.inserted_count.try_into().unwrap_or(u64::MAX),
-            results: response
+            inserted_count: summary.inserted_count.try_into().unwrap_or(u64::MAX),
+            results: summary
                 .results
                 .into_iter()
                 .map(|item| InsertResult {
@@ -2287,6 +3027,8 @@ impl ServerState {
             compaction_runtime: Mutex::new(CompactionRuntime::default()),
             next_compaction_shard: AtomicUsize::new(0),
             active_connections: AtomicUsize::new(0),
+            maintenance_epoch: Mutex::new(1),
+            maintenance_cv: Condvar::new(),
             startup_cleanup_removed_roots,
             startup_profile,
         })
@@ -2294,6 +3036,41 @@ impl ServerState {
 
     fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    fn notify_maintenance_workers(&self) {
+        if let Ok(mut epoch) = self.maintenance_epoch.lock() {
+            *epoch = epoch.wrapping_add(1);
+            self.maintenance_cv.notify_all();
+        }
+    }
+
+    fn current_maintenance_epoch(&self) -> u64 {
+        self.maintenance_epoch.lock().map(|epoch| *epoch).unwrap_or(0)
+    }
+
+    fn wait_for_maintenance_event(&self, last_seen: &mut u64, timeout: Option<Duration>) {
+        let Ok(mut epoch) = self.maintenance_epoch.lock() else {
+            return;
+        };
+        if *epoch != *last_seen {
+            *last_seen = *epoch;
+            return;
+        }
+        if self.is_shutting_down() {
+            return;
+        }
+        epoch = match timeout {
+            Some(timeout) => match self.maintenance_cv.wait_timeout(epoch, timeout) {
+                Ok((epoch, _)) => epoch,
+                Err(_) => return,
+            },
+            None => match self.maintenance_cv.wait(epoch) {
+                Ok(epoch) => epoch,
+                Err(_) => return,
+            },
+        };
+        *last_seen = *epoch;
     }
 
     fn prune_expired_index_clients(&self, now_unix_ms: u64) -> Result<usize> {
@@ -2310,6 +3087,9 @@ impl ServerState {
         if before > 0 && after == 0 {
             self.publish_after_index_clients
                 .store(true, Ordering::SeqCst);
+        }
+        if before != after {
+            self.notify_maintenance_workers();
         }
         Ok(after)
     }
@@ -2544,6 +3324,7 @@ impl ServerState {
         self.last_work_mutation_unix_ms
             .store(current_unix_ms(), Ordering::SeqCst);
         let _ = self.invalidate_work_stats_cache();
+        self.notify_maintenance_workers();
     }
 
     fn invalidate_work_stats_cache(&self) -> Result<()> {
@@ -2724,8 +3505,12 @@ impl ServerState {
             .pending_published_tier2_snapshot_shards
             .lock()
             .map_err(|_| SspryError::from("Published Tier2 snapshot queue lock poisoned."))?;
+        let mut changed = false;
         for shard_idx in shard_indexes {
-            pending.insert(shard_idx);
+            changed |= pending.insert(shard_idx);
+        }
+        if changed {
+            self.notify_maintenance_workers();
         }
         Ok(())
     }
@@ -2801,9 +3586,9 @@ impl ServerState {
         Ok(())
     }
 
-    fn run_published_tier2_snapshot_seal_cycle(&self) -> Result<()> {
+    fn run_published_tier2_snapshot_seal_cycle(&self) -> Result<bool> {
         if self.publish_in_progress.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
         let shard_idx = {
             let mut pending = self
@@ -2811,7 +3596,7 @@ impl ServerState {
                 .lock()
                 .map_err(|_| SspryError::from("Published Tier2 snapshot queue lock poisoned."))?;
             let Some(shard_idx) = pending.iter().next().copied() else {
-                return Ok(());
+                return Ok(false);
             };
             pending.remove(&shard_idx);
             shard_idx
@@ -2861,7 +3646,7 @@ impl ServerState {
                 .store(current_unix_ms(), Ordering::SeqCst);
         }
         let _ = self.update_adaptive_publish_from_seal_backlog(current_unix_ms());
-        Ok(())
+        Ok(true)
     }
 
     fn handle_begin_index_session(&self) -> Result<CandidateIndexSessionResponse> {
@@ -2945,6 +3730,7 @@ impl ServerState {
                     .store(0, Ordering::SeqCst);
                 self.index_session_server_insert_batch_store_rebalance_tier2_us
                     .store(0, Ordering::SeqCst);
+                self.notify_maintenance_workers();
                 Ok(CandidateIndexSessionResponse {
                     message: "index session started".to_owned(),
                 })
@@ -2987,6 +3773,7 @@ impl ServerState {
             .store(leases.len(), Ordering::SeqCst);
         self.publish_after_index_clients
             .store(false, Ordering::SeqCst);
+        self.notify_maintenance_workers();
         Ok(CandidateIndexClientBeginResponse {
             message: "index client started".to_owned(),
             client_id,
@@ -3165,6 +3952,7 @@ impl ServerState {
         self.index_session_last_update_unix_ms
             .store(current_unix_ms(), Ordering::SeqCst);
         let _ = self.update_adaptive_publish_from_index_session();
+        self.notify_maintenance_workers();
         Ok(CandidateIndexSessionResponse {
             message: "index session finished".to_owned(),
         })
@@ -3193,6 +3981,7 @@ impl ServerState {
                 .store(true, Ordering::SeqCst);
         }
         drop(leases);
+        self.notify_maintenance_workers();
         let _ = self.maybe_force_publish_after_index_clients();
         Ok(CandidateIndexSessionResponse {
             message: "index client finished".to_owned(),
@@ -4828,13 +5617,13 @@ impl ServerState {
         store.apply_compaction_snapshot(snapshot, compacted_root)
     }
 
-    fn run_compaction_cycle(&self) -> Result<()> {
+    fn run_compaction_cycle_once(&self) -> Result<CompactionCycleOutcome> {
         let _op = self
             .operation_gate
             .read()
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let Some((shard_idx, snapshot)) = self.find_compaction_candidate()? else {
-            return Ok(());
+            return Ok(CompactionCycleOutcome::Idle);
         };
 
         {
@@ -4870,6 +5659,7 @@ impl ServerState {
                 runtime.last_reclaimed_bytes = result.reclaimed_bytes;
                 runtime.last_completed_unix_ms = Some(current_unix_ms());
                 runtime.last_error = None;
+                Ok(CompactionCycleOutcome::Progress)
             }
             Ok(None) => {
                 let _ = fs::remove_dir_all(&compacted_root);
@@ -4879,18 +5669,20 @@ impl ServerState {
                     .map_err(|_| SspryError::from("Compaction runtime lock poisoned."))?;
                 runtime.running_shard = None;
                 runtime.mutation_retries_total = runtime.mutation_retries_total.saturating_add(1);
+                Ok(CompactionCycleOutcome::RetryLater)
             }
             Err(err) => {
                 let _ = fs::remove_dir_all(&compacted_root);
                 self.record_compaction_error(err.to_string());
+                Ok(CompactionCycleOutcome::RetryLater)
             }
         }
-        Ok(())
     }
 
     #[cfg(test)]
     fn run_compaction_cycle_for_tests(&self) -> Result<()> {
-        self.run_compaction_cycle()
+        let _ = self.run_compaction_cycle_once()?;
+        Ok(())
     }
 
     fn query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
@@ -6008,6 +6800,7 @@ impl ServerState {
             ));
         }
         self.mutations_paused.store(true, Ordering::SeqCst);
+        self.notify_maintenance_workers();
         while self.active_mutations.load(Ordering::Acquire) > 0 {
             thread::sleep(Duration::from_millis(10));
         }
@@ -6414,6 +7207,7 @@ impl ServerState {
         self.publish_in_progress.store(false, Ordering::SeqCst);
         self.mutations_paused.store(false, Ordering::SeqCst);
         self.publish_requested.store(false, Ordering::SeqCst);
+        self.notify_maintenance_workers();
         result
     }
 }

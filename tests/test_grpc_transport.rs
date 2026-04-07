@@ -98,12 +98,15 @@ fn grpc_transport_covers_ping_stats_status_and_shutdown() {
         assert_eq!(ping.into_inner().message, "pong");
 
         let status = client.status(StatusRequest {}).await.expect("status");
-        assert!(status.into_inner().json.contains("draining"));
+        let status = status.into_inner();
+        assert!(!status.draining);
+        assert!(status.adaptive_publish.is_some());
 
         let stats = client.stats(StatsRequest {}).await.expect("stats");
-        let stats_json = stats.into_inner().json;
-        assert!(stats_json.contains("active_doc_count"));
-        assert!(stats_json.contains("candidate_shards"));
+        let stats = stats.into_inner();
+        let store = stats.stats.expect("store summary");
+        assert_eq!(store.active_doc_count, 0);
+        assert!(store.candidate_shards >= 1);
 
         let shutdown = client.shutdown(ShutdownRequest {}).await.expect("shutdown");
         assert_eq!(shutdown.into_inner().message, "shutdown requested");

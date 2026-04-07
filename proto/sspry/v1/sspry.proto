@@ -6,11 +6,14 @@ service Sspry {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  rpc BeginIndexSession(IndexSessionBeginRequest) returns (IndexSessionResponse);
+  rpc UpdateIndexSessionProgress(IndexSessionProgressRequest) returns (IndexSessionResponse);
+  rpc EndIndexSession(IndexSessionEndRequest) returns (IndexSessionResponse);
   rpc Publish(PublishRequest) returns (PublishResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc SearchStream(SearchRequest) returns (stream SearchFrame);
-  rpc InsertStream(stream InsertChunk) returns (InsertSummary);
+  rpc InsertStream(stream InsertFrame) returns (InsertSummary);
 }
 
 message OptionalString {
@@ -27,6 +30,21 @@ message PingResponse {
 message StatsRequest {}
 
 message StatusRequest {}
+
+message IndexSessionBeginRequest {}
+
+message IndexSessionEndRequest {}
+
+message IndexSessionProgressRequest {
+  uint64 total_documents = 1;
+  bool has_total_documents = 2;
+  uint64 submitted_documents = 3;
+  uint64 processed_documents = 4;
+}
+
+message IndexSessionResponse {
+  string message = 1;
+}
 
 message PublishRequest {}
 
@@ -51,12 +69,161 @@ message ShutdownResponse {
   string message = 1;
 }
 
+message StoreSummary {
+  uint64 active_doc_count = 1;
+  uint64 candidate_shards = 2;
+  string id_source = 3;
+  bool store_path = 4;
+  uint64 deleted_doc_count = 5;
+  uint64 disk_usage_bytes = 6;
+  uint64 doc_count = 7;
+  uint64 compaction_generation = 8;
+  double tier1_filter_target_fp = 9;
+  double tier2_filter_target_fp = 10;
+  uint64 tier2_gram_size = 11;
+  uint64 tier1_gram_size = 12;
+  uint64 query_count = 13;
+  uint64 retired_generation_count = 14;
+  uint64 tier2_docs_matched_total = 15;
+  double tier2_match_ratio = 16;
+  uint64 tier2_scanned_docs_total = 17;
+  uint64 version = 18;
+  uint64 deleted_storage_bytes = 19;
+}
+
+message AdaptivePublishSummary {
+  string storage_class = 1;
+  uint64 current_idle_ms = 2;
+  string mode = 3;
+  string reason = 4;
+  uint64 recent_publish_p95_ms = 5;
+  uint64 recent_submit_p95_ms = 6;
+  uint64 recent_store_p95_ms = 7;
+  uint64 recent_publishes_in_window = 8;
+  uint64 tier2_pending_shards = 9;
+  uint64 healthy_cycles = 10;
+}
+
+message InsertBatchProfileSummary {
+  uint64 batches = 1;
+  uint64 documents = 2;
+  uint64 shards_touched_total = 3;
+  uint64 total_us = 4;
+  uint64 parse_us = 5;
+  uint64 group_us = 6;
+  uint64 build_us = 7;
+  uint64 store_us = 8;
+  uint64 finalize_us = 9;
+  uint64 store_resolve_doc_state_us = 10;
+  uint64 store_append_sidecars_us = 11;
+  uint64 store_append_sidecar_payloads_us = 12;
+  uint64 store_append_bloom_payload_assemble_us = 13;
+  uint64 store_append_bloom_payload_us = 14;
+  uint64 store_append_metadata_payload_us = 15;
+  uint64 store_append_external_id_payload_us = 16;
+  uint64 store_append_tier2_bloom_payload_us = 17;
+  uint64 store_append_doc_row_build_us = 18;
+  uint64 store_append_bloom_payload_bytes = 19;
+  uint64 store_append_metadata_payload_bytes = 20;
+  uint64 store_append_external_id_payload_bytes = 21;
+  uint64 store_append_tier2_bloom_payload_bytes = 22;
+  uint64 store_append_doc_records_us = 23;
+  uint64 store_write_existing_us = 24;
+  uint64 store_install_docs_us = 25;
+  uint64 store_tier2_update_us = 26;
+  uint64 store_persist_meta_us = 27;
+  uint64 store_rebalance_tier2_us = 28;
+}
+
+message IndexSessionSummary {
+  bool active = 1;
+  bool client_active = 2;
+  uint64 total_documents = 3;
+  uint64 submitted_documents = 4;
+  uint64 processed_documents = 5;
+  uint64 remaining_documents = 6;
+  double progress_percent = 7;
+  uint64 started_unix_ms = 8;
+  uint64 last_update_unix_ms = 9;
+  InsertBatchProfileSummary server_insert_batch_profile = 10;
+}
+
+message StartupStoreSummary {
+  uint64 total_ms = 1;
+  uint64 opened_existing_shards = 2;
+  uint64 initialized_new_shards = 3;
+  uint64 doc_count = 4;
+}
+
+message StartupSummary {
+  uint64 total_ms = 1;
+  uint64 startup_cleanup_removed_roots = 2;
+  StartupStoreSummary current = 3;
+  StartupStoreSummary work = 4;
+}
+
+message PublishSummary {
+  bool pending = 1;
+  bool eligible = 2;
+  string blocked_reason = 3;
+  string trigger_mode = 4;
+  string trigger_reason = 5;
+  uint64 idle_elapsed_ms = 6;
+  uint64 idle_remaining_ms = 7;
+  uint64 work_buffer_estimated_documents = 8;
+  uint64 work_buffer_estimated_input_bytes = 9;
+  uint64 work_buffer_document_threshold = 10;
+  uint64 work_buffer_input_bytes_threshold = 11;
+  uint64 work_buffer_rss_threshold_bytes = 12;
+  uint64 current_rss_bytes = 13;
+  uint64 pending_tier2_snapshot_shards = 14;
+  uint64 index_backpressure_delay_ms = 15;
+  uint64 index_backpressure_events_total = 16;
+  uint64 index_backpressure_sleep_ms_total = 17;
+  uint64 last_publish_started_unix_ms = 18;
+  uint64 last_publish_completed_unix_ms = 19;
+  uint64 last_publish_duration_ms = 20;
+  uint64 last_publish_lock_wait_ms = 21;
+  uint64 last_publish_promote_work_ms = 22;
+  uint64 last_publish_init_work_ms = 23;
+  uint64 last_publish_persisted_snapshot_shards = 24;
+  bool last_publish_reused_work_stores = 25;
+  uint64 publish_runs_total = 26;
+}
+
 message StatsResponse {
-  string json = 1;
+  StoreSummary stats = 1;
+  uint64 memory_budget_bytes = 2;
+  bool workspace_mode = 3;
+  uint64 search_workers = 4;
+  uint64 current_rss_kb = 5;
+  uint64 peak_rss_kb = 6;
 }
 
 message StatusResponse {
-  string json = 1;
+  bool draining = 1;
+  uint64 active_connections = 2;
+  uint64 active_mutations = 3;
+  bool publish_requested = 4;
+  bool mutations_paused = 5;
+  bool publish_in_progress = 6;
+  uint64 active_index_clients = 7;
+  uint64 active_index_sessions = 8;
+  uint64 search_workers = 9;
+  uint64 memory_budget_bytes = 10;
+  uint64 current_rss_kb = 11;
+  uint64 peak_rss_kb = 12;
+  AdaptivePublishSummary adaptive_publish = 13;
+  IndexSessionSummary index_session = 14;
+  StartupSummary startup = 15;
+  bool workspace_mode = 16;
+  string published_root = 17;
+  string work_root = 18;
+  bool has_work = 19;
+  StoreSummary work = 20;
+  bool has_published = 21;
+  StoreSummary published = 22;
+  PublishSummary publish = 23;
 }
 
 message SearchRequest {
@@ -77,13 +244,46 @@ message SearchFrame {
   bool stream_complete = 5;
   bool truncated = 6;
   string tier_used = 7;
-  string query_profile_json = 8;
-  string prepared_query_profile_json = 9;
+  QueryProfileSummary query_profile = 8;
+  PreparedQueryProfileSummary prepared_query_profile = 9;
 }
 
-message InsertChunk {
+message QueryProfileSummary {
+  uint64 docs_scanned = 1;
+  uint64 metadata_loads = 2;
+  uint64 metadata_bytes = 3;
+  uint64 tier1_bloom_loads = 4;
+  uint64 tier1_bloom_bytes = 5;
+  uint64 tier2_bloom_loads = 6;
+  uint64 tier2_bloom_bytes = 7;
+}
+
+message PreparedQueryProfileSummary {
+  bool impossible_query = 1;
+  uint64 prepared_query_bytes = 2;
+  uint64 prepared_pattern_plan_bytes = 3;
+  uint64 prepared_mask_cache_bytes = 4;
+  uint64 pattern_count = 5;
+  uint64 mask_cache_entries = 6;
+  uint64 fixed_literal_count = 7;
+  uint64 tier1_alternatives = 8;
+  uint64 tier2_alternatives = 9;
+  uint64 tier1_shift_variants = 10;
+  uint64 tier2_shift_variants = 11;
+  uint64 tier1_any_lane_alternatives = 12;
+  uint64 tier2_any_lane_alternatives = 13;
+  uint64 tier1_compacted_any_lane_alternatives = 14;
+  uint64 tier2_compacted_any_lane_alternatives = 15;
+  uint64 any_lane_variant_sets = 16;
+  uint64 compacted_any_lane_grams = 17;
+  uint64 max_pattern_bytes = 18;
+  OptionalString max_pattern_id = 19;
+}
+
+message InsertFrame {
   bytes payload = 1;
-  bool final_chunk = 2;
+  bool row_complete = 2;
+  bool stream_complete = 3;
 }
 
 message InsertSummary {
