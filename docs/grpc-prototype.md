@@ -15,9 +15,8 @@ Current status:
   - `Publish`
   - `SearchStream`
   - `InsertStream`
-  - `Shutdown`
-- unimplemented gRPC methods currently return `UNIMPLEMENTED`:
   - `Delete`
+  - `Shutdown`
 
 Prototype CLI surface:
 
@@ -31,8 +30,9 @@ Prototype CLI surface:
 Current request model:
 
 - gRPC search sends validated YARA source to the server rather than a serialized compiled-plan JSON payload.
-- gRPC ingest sends the existing binary-row batch payload over client streaming rather than the old manual upload begin/chunk/commit flow.
+- gRPC ingest streams row-framed binary insert messages incrementally rather than the old manual upload begin/chunk/commit flow or a single whole-batch payload.
 - `grpc-index` publishes automatically after ingest when the target server is running in workspace mode so newly indexed documents become visible to `grpc-search`.
+- `grpc-serve` bounds per-message size with `--grpc-max-message-bytes`; large documents still stream incrementally and are not treated as one capped request.
 
 Design constraints to keep in mind during the migration:
 

@@ -2,12 +2,15 @@
 
 ## Overview
 
-`sspry` has two main operating styles:
+`sspry` has three main operating styles:
 
-1. RPC mode:
+1. Legacy RPC mode:
    - `serve` starts a long-lived TCP server.
    - `index`, `delete`, `search`, `info`, and `shutdown` talk to that server.
-2. Local/direct mode:
+2. gRPC prototype mode:
+   - `grpc-serve` starts a long-lived TCP gRPC server.
+   - `grpc-index`, `grpc-delete`, `grpc-search`, `grpc-info`, and `grpc-shutdown` talk to that server.
+3. Local/direct mode:
    - `local-index` writes directly to a local store root and auto-initializes it if needed.
    - `local-delete` operates directly on a local store.
    - `local-info` reports direct local store stats and can also aggregate a forest root.
@@ -114,6 +117,38 @@ Behavior:
 - shard-local state stays in each shard's `store_meta.json`
 - `current/` is always present in a workspace; `work_a/` and `work_b/` are created lazily only when publish/indexing needs them
 
+## grpc-serve
+
+```bash
+./target/release/sspry grpc-serve [options]
+```
+
+Options:
+
+- `--addr <host:port>`
+  - TCP bind address
+  - env: `SSPRY_ADDR`
+- `--grpc-max-message-bytes <bytes>`
+  - hard gRPC message-size cap
+- `--search-workers <n>`
+  - server-side tree query workers per search
+  - a forest search runs across at most this many trees at once
+- `--root <path>`
+  - same root semantics as `serve`
+- `--layout-profile <standard|incremental>`
+- `--shards <n>`
+- `--tier1-set-fp <p>`
+- `--tier2-set-fp <p>`
+- `--id-source <sha256|md5|sha1|sha512>`
+- `--store-path`
+- `--gram-sizes <tier1,tier2>`
+
+Behavior:
+
+- `grpc-serve` uses the same DB/workspace initialization rules as `serve`
+- gRPC ingest streams documents incrementally; the message cap is per gRPC message, not a whole-document cap
+- per-frame gRPC insert chunking is controlled on the client side by `grpc-index --grpc-insert-chunk-bytes`
+
 ## index
 
 ```bash
@@ -141,6 +176,24 @@ Notes:
 - `index` can take files and directories
 - large remote batches are automatically split by serialized request size
 - use `local-index` for direct local ingest without RPC
+
+## grpc-index
+
+```bash
+./target/release/sspry grpc-index [options] <paths>...
+```
+
+Options:
+
+- same ingest options as `index`
+- `--grpc-max-message-bytes <bytes>`
+  - gRPC client message-size cap
+- `--grpc-insert-chunk-bytes <bytes>`
+  - per-frame gRPC insert chunk size
+
+Notes:
+
+- `grpc-index` streams row-framed inserts over gRPC instead of using the legacy request-sized RPC batching model
 
 ## delete
 

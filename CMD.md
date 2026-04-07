@@ -11,16 +11,22 @@ Usage: sspry [OPTIONS] <COMMAND>
 
 Commands:
   serve
+  grpc-serve
   index
+  grpc-index
   local-index
   delete
+  grpc-delete
   local-delete
   search
+  grpc-search
   local-search
   search-batch
   info
+  grpc-info
   local-info
   shutdown
+  grpc-shutdown
   yara
   help
 ```
@@ -29,7 +35,9 @@ Commands:
 
 - `SSPRY_ADDR` sets the default server address for remote client commands.
 - `serve` is the only server command.
-- `index`, `delete`, `search`, `info`, and `shutdown` are RPC client commands.
+- `grpc-serve` is the parallel gRPC prototype server command.
+- `index`, `delete`, `search`, `info`, and `shutdown` are legacy custom-RPC client commands.
+- `grpc-index`, `grpc-delete`, `grpc-search`, `grpc-info`, and `grpc-shutdown` are gRPC client commands.
 - `local-index`, `local-delete`, `local-search`, and `local-info` operate directly on disk without RPC.
 - `search-batch` is the long-lived local forest runner for repeated sweeps.
 
@@ -43,6 +51,29 @@ Key options:
 
 - `--addr <ADDR>`
 - `--max-request-bytes <BYTES>`
+- `--search-workers <N>`
+  - server-side tree query workers per search
+  - one search runs across at most this many trees at once
+- `--root <ROOT>`
+  - workspace root, direct store root, or forest root
+- `--layout-profile <standard|incremental>`
+- `--shards <N>`
+- `--tier1-set-fp <P>` default `0.38`
+- `--tier2-set-fp <P>` default `0.18`
+- `--id-source <sha256|md5|sha1|sha512>`
+- `--store-path`
+- `--gram-sizes <tier1,tier2>` default `3,4`
+
+## `grpc-serve`
+
+```text
+Usage: sspry grpc-serve [OPTIONS]
+```
+
+Key options:
+
+- `--addr <ADDR>`
+- `--grpc-max-message-bytes <BYTES>`
 - `--search-workers <N>`
   - server-side tree query workers per search
   - one search runs across at most this many trees at once
@@ -71,6 +102,18 @@ Remote ingest options:
 - `--remote-batch-soft-limit-bytes <BYTES>`
 - `--workers <N>`
 - `--verbose`
+
+## `grpc-index`
+
+```text
+Usage: sspry grpc-index [OPTIONS] <PATHS>...
+```
+
+Remote ingest options:
+
+- same basic ingest options as `index`
+- `--grpc-max-message-bytes <BYTES>`
+- `--grpc-insert-chunk-bytes <BYTES>`
 
 ## `local-index`
 

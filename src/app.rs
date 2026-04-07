@@ -349,7 +349,7 @@ fn default_shards_for_profile(profile: ServeLayoutProfile) -> usize {
     }
 }
 
-fn serve_candidate_shard_count(args: &ServeArgs) -> usize {
+fn serve_candidate_shard_count(args: &ServeCommonArgs) -> usize {
     args.shards
         .unwrap_or_else(|| default_shards_for_profile(args.layout_profile))
         .max(1)
@@ -1591,7 +1591,7 @@ fn resolve_filter_target_fps(
     )
 }
 
-fn store_config_from_serve_args(args: &ServeArgs) -> CandidateConfig {
+fn store_config_from_serve_args(args: &ServeCommonArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible serve args");
     let (tier1_filter_target_fp, tier2_filter_target_fp) =
@@ -2677,10 +2677,10 @@ fn cmd_serve(args: &ServeArgs) -> i32 {
 
 fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSources) -> i32 {
     match (|| -> Result<i32> {
-        let (host, port) = parse_host_port(&args.addr)?;
-        let resolved = resolve_serve_runtime_settings(args, option_sources)?;
+        let (host, port) = parse_host_port(&args.common.addr)?;
+        let resolved = resolve_serve_runtime_settings(&args.common, option_sources)?;
         let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
-            adaptive_publish_prior_for_root(Path::new(&args.root));
+            adaptive_publish_prior_for_root(Path::new(&args.common.root));
         let signals = serve_signal_flags()?;
         for warning in &resolved.warnings {
             eprintln!("{warning}");
@@ -2693,7 +2693,7 @@ fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSourc
             RpcServerConfig {
                 candidate_config: resolved.candidate_config,
                 candidate_shards: resolved.candidate_shards,
-                search_workers: args.search_workers.max(1),
+                search_workers: args.common.search_workers.max(1),
                 memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
                 auto_publish_initial_idle_ms,
                 auto_publish_storage_class,
@@ -2714,12 +2714,15 @@ fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSourc
     }
 }
 
-fn cmd_grpc_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSources) -> i32 {
+fn cmd_grpc_serve_with_sources(
+    args: &GrpcServeArgs,
+    option_sources: ServeInitOptionSources,
+) -> i32 {
     match (|| -> Result<i32> {
-        let (host, port) = parse_host_port(&args.addr)?;
-        let resolved = resolve_serve_runtime_settings(args, option_sources)?;
+        let (host, port) = parse_host_port(&args.common.addr)?;
+        let resolved = resolve_serve_runtime_settings(&args.common, option_sources)?;
         let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
-            adaptive_publish_prior_for_root(Path::new(&args.root));
+            adaptive_publish_prior_for_root(Path::new(&args.common.root));
         let signals = serve_signal_flags()?;
         for warning in &resolved.warnings {
             eprintln!("{warning}");
@@ -2727,11 +2730,11 @@ fn cmd_grpc_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOption
         rpc::serve_grpc_with_signal_flags(
             &host,
             port,
-            args.max_request_bytes,
+            args.grpc_max_message_bytes,
             rpc::ServerConfig {
                 candidate_config: resolved.candidate_config,
                 candidate_shards: resolved.candidate_shards,
-                search_workers: args.search_workers.max(1),
+                search_workers: args.common.search_workers.max(1),
                 memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
                 auto_publish_initial_idle_ms,
                 auto_publish_storage_class,
@@ -2803,7 +2806,7 @@ fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option
 }
 
 fn resolve_serve_runtime_settings(
-    args: &ServeArgs,
+    args: &ServeCommonArgs,
     option_sources: ServeInitOptionSources,
 ) -> Result<ResolvedServeRuntimeSettings> {
     let root = Path::new(&args.root);
@@ -5703,7 +5706,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Serve(ServeArgs),
-    GrpcServe(ServeArgs),
+    GrpcServe(GrpcServeArgs),
     Index(IndexArgs),
     GrpcIndex(IndexArgs),
     LocalIndex(LocalIndexArgs),
@@ -6031,8 +6034,8 @@ struct YaraArgs {
     show_tags: bool,
 }
 
-#[derive(Debug, clap::Args)]
-struct ServeArgs {
+#[derive(Debug, Clone, clap::Args)]
+struct ServeCommonArgs {
     #[arg(
         long = "addr",
         env = "SSPRY_ADDR",
@@ -6040,8 +6043,6 @@ struct ServeArgs {
         help = "Bind address as host:port."
     )]
     addr: String,
-    #[arg(long = "max-request-bytes", default_value_t = DEFAULT_MAX_REQUEST_BYTES, help = "Maximum accepted request size in bytes.")]
-    max_request_bytes: usize,
     #[arg(
         long = "search-workers",
         default_value_t = default_search_workers(),
@@ -6095,6 +6096,30 @@ struct ServeArgs {
         help = "DB-wide gram-size pair as tier1,tier2. Supported pairs: 3,4 4,5 5,6 7,8."
     )]
     gram_sizes: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    #[command(flatten)]
+    common: ServeCommonArgs,
+    #[arg(
+        long = "max-request-bytes",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
+        help = "Maximum accepted request size in bytes."
+    )]
+    max_request_bytes: usize,
+}
+
+#[derive(Debug, clap::Args)]
+struct GrpcServeArgs {
+    #[command(flatten)]
+    common: ServeCommonArgs,
+    #[arg(
+        long = "grpc-max-message-bytes",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
+        help = "Maximum gRPC message size in bytes for grpc-serve."
+    )]
+    grpc_max_message_bytes: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -6390,10 +6415,9 @@ mod tests {
         }
     }
 
-    fn default_serve_args() -> ServeArgs {
-        ServeArgs {
+    fn default_serve_common_args() -> ServeCommonArgs {
+        ServeCommonArgs {
             addr: DEFAULT_RPC_ADDR.to_owned(),
-            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             search_workers: default_search_workers_for(4),
             root: DEFAULT_CANDIDATE_ROOT.to_owned(),
             layout_profile: ServeLayoutProfile::Standard,
@@ -6406,9 +6430,16 @@ mod tests {
         }
     }
 
+    fn default_serve_args() -> ServeArgs {
+        ServeArgs {
+            common: default_serve_common_args(),
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        }
+    }
+
     #[test]
     fn serve_candidate_shard_count_uses_profile_default() {
-        let mut args = default_serve_args();
+        let mut args = default_serve_common_args();
         args.layout_profile = ServeLayoutProfile::Incremental;
         assert_eq!(
             serve_candidate_shard_count(&args),
@@ -6418,7 +6449,7 @@ mod tests {
 
     #[test]
     fn serve_candidate_shard_count_explicit_override_wins() {
-        let mut args = default_serve_args();
+        let mut args = default_serve_common_args();
         args.layout_profile = ServeLayoutProfile::Incremental;
         args.shards = Some(17);
         assert_eq!(serve_candidate_shard_count(&args), 17);
@@ -7302,7 +7333,7 @@ rule remote_q {
             std::net::TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind occupied port");
         let port = listener.local_addr().expect("listener addr").port();
         let mut args = default_serve_args();
-        args.addr = format!("{DEFAULT_RPC_HOST}:{port}");
+        args.common.addr = format!("{DEFAULT_RPC_HOST}:{port}");
         assert_eq!(cmd_serve(&args), 1);
     }
 
