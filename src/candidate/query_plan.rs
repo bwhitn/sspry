@@ -4058,6 +4058,25 @@ fn source_match_for_condition_literal(rule_text: &str, literal: &str) -> Option<
     source_match_for_literal(rule_text, literal)
 }
 
+fn source_match_for_condition_pattern_id(
+    rule_text: &str,
+    pattern_id: &str,
+) -> Option<RuleSourceMatch> {
+    source_match_for_condition_literal(rule_text, pattern_id)
+}
+
+fn source_match_for_anchorless_verifier_only_condition(rule_text: &str) -> Option<RuleSourceMatch> {
+    for candidate in [
+        "uint8(", "uint16(", "uint32(", "uint64(", "int8(", "int16(", "int32(", "int64(",
+        "float32(", "float64(", " at ", " in (", "#", "for any", "for all",
+    ] {
+        if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+            return Some(found);
+        }
+    }
+    source_match_for_first_condition_line(rule_text)
+}
+
 fn source_match_for_first_condition_line(rule_text: &str) -> Option<RuleSourceMatch> {
     let condition_offset = rule_text.find("condition:")?;
     let tail = &rule_text[condition_offset..];
@@ -4265,17 +4284,29 @@ fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceM
         "low-information-range-rule" => source_match_for_condition_literal(rule_text, " in ("),
         "low-information-single-pattern" => source_match_for_first_condition_line(rule_text),
         "requires-anchorable-literal-direct" => extract_pattern_id_from_anchor_error(message)
-            .and_then(|pattern_id| source_match_for_condition_literal(rule_text, &pattern_id))
+            .and_then(|pattern_id| source_match_for_condition_pattern_id(rule_text, &pattern_id))
             .or_else(|| source_match_for_first_condition_line(rule_text)),
         "requires-anchorable-literal-at-in" => extract_pattern_id_from_anchor_error(message)
-            .and_then(|pattern_id| source_match_for_condition_literal(rule_text, &pattern_id))
+            .and_then(|pattern_id| {
+                source_match_for_condition_literal(rule_text, &format!("{pattern_id} at"))
+                    .or_else(|| {
+                        source_match_for_condition_literal(rule_text, &format!("{pattern_id} in"))
+                    })
+                    .or_else(|| source_match_for_condition_pattern_id(rule_text, &pattern_id))
+            })
             .or_else(|| source_match_for_condition_literal(rule_text, " at "))
             .or_else(|| source_match_for_condition_literal(rule_text, " in (")),
         "requires-anchorable-literal-loop" => {
             source_match_for_condition_literal(rule_text, "verifierloop(")
                 .or_else(|| source_match_for_condition_literal(rule_text, "for any"))
+                .or_else(|| source_match_for_condition_literal(rule_text, "for all"))
         }
         "requires-anchorable-literal-n-of" => {
+            if let Some(pattern_id) = extract_pattern_id_from_anchor_error(message)
+                && let Some(found) = source_match_for_condition_pattern_id(rule_text, &pattern_id)
+            {
+                return Some(found);
+            }
             for candidate in ["any of", "all of", "1 of", "2 of"] {
                 if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
                     return Some(found);
@@ -4283,7 +4314,7 @@ fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceM
             }
             source_match_for_first_condition_line(rule_text)
         }
-        "verifier-only-no-anchor" => source_match_for_first_condition_line(rule_text),
+        "verifier-only-no-anchor" => source_match_for_anchorless_verifier_only_condition(rule_text),
         _ => None,
     }
 }
@@ -7964,6 +7995,122 @@ rule low_information_entrypoint_stub {
                 .unwrap_or_default()
                 .contains("longer mandatory literal")
         );
+    }
+
+    #[test]
+    fn rule_check_marks_direct_unanchorable_pattern_with_direct_condition_snippet() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule bad_unanchorable_pattern {
+  strings:
+    $a = { 41 ?? 42 }
+  condition:
+    $a
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "requires-anchorable-literal-direct")
+            .expect("direct anchorability issue");
+        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_pattern"));
+        assert_eq!(issue.snippet.as_deref(), Some("$a"));
+    }
+
+    #[test]
+    fn rule_check_marks_at_in_unanchorable_pattern_with_condition_snippet() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule bad_unanchorable_at {
+  strings:
+    $a = { E8 ?? ?? ?? ?? 5D }
+  condition:
+    $a at pe.entry_point
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "requires-anchorable-literal-at-in")
+            .expect("at/in anchorability issue");
+        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_at"));
+        assert_eq!(issue.snippet.as_deref(), Some("$a at pe.entry_point"));
+    }
+
+    #[test]
+    fn rule_check_marks_loop_unanchorable_pattern_with_condition_snippet() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule bad_unanchorable_loop {
+  strings:
+    $a = { FF 75 ?? FF 55 ?? }
+  condition:
+    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "requires-anchorable-literal-loop")
+            .expect("loop anchorability issue");
+        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_loop"));
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_n_of_unanchorable_pattern_with_condition_snippet() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule bad_unanchorable_n_of {
+  strings:
+    $a = { 41 ?? 42 }
+    $b = "ABCD"
+  condition:
+    any of ($a, $b)
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "requires-anchorable-literal-n-of")
+            .expect("n-of anchorability issue");
+        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_n_of"));
+        assert_eq!(issue.snippet.as_deref(), Some("any of ($a, $b)"));
     }
 
     #[test]
