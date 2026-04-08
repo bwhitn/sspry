@@ -1,30 +1,44 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430">
-  <rect width="960" height="430" fill="#fbfaf5"/>
-  <text x="32" y="40" font-family="Helvetica, Arial, sans-serif" font-size="26" font-weight="700" fill="#1f2937">Current Store Layout</text>
-  <rect x="40" y="80" width="180" height="300" rx="12" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
-  <text x="84" y="118" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#1e3a8a">Root</text>
-  <text x="68" y="154" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">meta.json</text>
-  <text x="68" y="180" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">shards.json</text>
-  <text x="68" y="206" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">shard_000</text>
-  <text x="68" y="232" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">shard_001</text>
-  <text x="68" y="258" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">...</text>
-  <text x="68" y="284" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#1e3a8a">shard_255</text>
-  <rect x="290" y="80" width="260" height="300" rx="12" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
-  <text x="350" y="118" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#14532d">Per-shard metadata</text>
-  <text x="320" y="156" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">store_meta.json</text>
-  <text x="320" y="182" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">doc_meta.bin</text>
-  <text x="320" y="208" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">sha256_by_docid.dat</text>
-  <text x="320" y="234" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">tier2_doc_meta.bin</text>
-  <text x="320" y="260" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#14532d">compaction.json</text>
-  <rect x="620" y="80" width="280" height="300" rx="12" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
-  <text x="700" y="118" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#7f1d1d">Per-shard blobs</text>
-  <text x="650" y="156" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">blooms.bin</text>
-  <text x="650" y="182" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">tier2_blooms.bin</text>
-  <text x="650" y="208" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">doc_metadata.bin</text>
-  <text x="650" y="234" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">external_ids.dat</text>
-  <text x="650" y="260" font-family="Helvetica, Arial, sans-serif" font-size="16" fill="#7f1d1d">metadata sidecars</text>
-  <path d="M220 230 H290" stroke="#334155" stroke-width="3" fill="none"/>
-  <polygon points="290,230 278,224 278,236" fill="#334155"/>
-  <path d="M550 230 H620" stroke="#334155" stroke-width="3" fill="none"/>
-  <polygon points="620,230 608,224 608,236" fill="#334155"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470">
+  <rect width="1100" height="470" fill="#fbfaf5"/>
+  <text x="32" y="42" font-family="Helvetica, Arial, sans-serif" font-size="28" font-weight="700" fill="#1f2937">Current Store Layout</text>
+
+  <g font-family="Helvetica, Arial, sans-serif">
+    <rect x="40" y="86" width="230" height="330" rx="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+    <text x="155" y="122" text-anchor="middle" font-size="24" font-weight="700" fill="#1e3a8a">Root Policy</text>
+    <text x="72" y="164" font-size="16" fill="#1e3a8a">meta.json</text>
+    <text x="72" y="192" font-size="16" fill="#1e3a8a">shards.json</text>
+    <text x="72" y="220" font-size="16" fill="#1e3a8a">shard_000</text>
+    <text x="72" y="248" font-size="16" fill="#1e3a8a">shard_001</text>
+    <text x="72" y="276" font-size="16" fill="#1e3a8a">...</text>
+    <text x="72" y="304" font-size="16" fill="#1e3a8a">shard_NNN</text>
+    <text x="72" y="344" font-size="15" fill="#1e3a8a">direct store root, workspace root,</text>
+    <text x="72" y="366" font-size="15" fill="#1e3a8a">or forest root policy lives here</text>
+
+    <rect x="320" y="86" width="320" height="330" rx="14" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <text x="480" y="122" text-anchor="middle" font-size="24" font-weight="700" fill="#14532d">Per-shard Metadata</text>
+    <text x="350" y="164" font-size="16" fill="#14532d">store_meta.json</text>
+    <text x="350" y="192" font-size="16" fill="#14532d">doc_meta.bin</text>
+    <text x="350" y="220" font-size="16" fill="#14532d">tier2_doc_meta.bin</text>
+    <text x="350" y="248" font-size="16" fill="#14532d">sha256_by_docid.dat</text>
+    <text x="350" y="276" font-size="16" fill="#14532d">compaction.json</text>
+    <text x="350" y="316" font-size="15" fill="#14532d">doc state, generation info,</text>
+    <text x="350" y="338" font-size="15" fill="#14532d">identity mapping, small manifests</text>
+
+    <rect x="690" y="86" width="360" height="330" rx="14" fill="#fee2e2" stroke="#b91c1c" stroke-width="2"/>
+    <text x="870" y="122" text-anchor="middle" font-size="24" font-weight="700" fill="#7f1d1d">Per-shard Sidecars</text>
+    <text x="720" y="164" font-size="16" fill="#7f1d1d">blooms.bin</text>
+    <text x="720" y="192" font-size="16" fill="#7f1d1d">tier2_blooms.bin</text>
+    <text x="720" y="220" font-size="16" fill="#7f1d1d">doc_metadata.bin</text>
+    <text x="720" y="248" font-size="16" fill="#7f1d1d">external_ids.dat</text>
+    <text x="720" y="276" font-size="16" fill="#7f1d1d">other binary sidecars</text>
+    <text x="720" y="316" font-size="15" fill="#7f1d1d">large mmap-friendly payloads for search:</text>
+    <text x="720" y="338" font-size="15" fill="#7f1d1d">blooms, metadata payloads, stored paths</text>
+  </g>
+
+  <g stroke="#334155" stroke-width="3" fill="#334155">
+    <line x1="270" y1="252" x2="320" y2="252"/>
+    <polygon points="320,252 308,246 308,258"/>
+    <line x1="640" y1="252" x2="690" y2="252"/>
+    <polygon points="690,252 678,246 678,258"/>
+  </g>
 </svg>
