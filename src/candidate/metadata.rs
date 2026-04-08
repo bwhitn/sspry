@@ -7,6 +7,7 @@ use yara_x::mods::{self, pe::OptionalMagic};
 
 const METADATA_VERSION: u8 = 1;
 const MAX_MACHO_ARCHES: usize = 32;
+pub const PE_ENTRY_POINT_PREFIX_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoolField {
@@ -345,8 +346,10 @@ fn extract_yarax_module_metadata(bytes: &[u8], builder: &mut MetadataBuilder) {
         }
         if pe.has_entry_point() {
             let entry_point = pe.entry_point() as usize;
-            let end = entry_point.saturating_add(16);
-            if end <= bytes.len() {
+            if entry_point < bytes.len() {
+                let end = bytes
+                    .len()
+                    .min(entry_point.saturating_add(PE_ENTRY_POINT_PREFIX_BYTES));
                 builder.set_bytes(BytesField::PeEntryPointPrefix, &bytes[entry_point..end]);
             }
         }
@@ -1308,6 +1311,38 @@ mod tests {
                 )
                 .expect("lnk lt")
                 .expect("known lnk lt"),
+        );
+    }
+
+    #[test]
+    fn extracts_variable_length_pe_entry_point_prefix() {
+        let tmp = tempdir().expect("tmp");
+        let pe_path = tmp.path().join("short-entry.exe");
+        let mut pe = vec![0u8; 0x204];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+        pe[0x96..0x98].copy_from_slice(&0x0200u16.to_le_bytes());
+        pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[0x98 + 16..0x98 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0x98 + 60..0x98 + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x98 + 68..0x98 + 70].copy_from_slice(&1u16.to_le_bytes());
+        let text_section = 0x80 + 24 + 0xf0;
+        pe[text_section..text_section + 8].copy_from_slice(b".text\0\0\0");
+        pe[text_section + 8..text_section + 12].copy_from_slice(&0x04u32.to_le_bytes());
+        pe[text_section + 12..text_section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[text_section + 16..text_section + 20].copy_from_slice(&0x04u32.to_le_bytes());
+        pe[text_section + 20..text_section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x200..0x204].copy_from_slice(b"EP!!");
+        fs::write(&pe_path, &pe).expect("write pe");
+
+        let pe_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
+        assert_eq!(
+            metadata_pe_entry_point_prefix(&pe_bytes).expect("entry point prefix"),
+            Some(b"EP!!".to_vec())
         );
     }
 

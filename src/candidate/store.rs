@@ -26,8 +26,9 @@ use crate::candidate::grams::{
 };
 use crate::candidate::query_plan::{CompiledQueryPlan, PatternPlan, QueryNode};
 use crate::candidate::{
-    MetadataCompareOp, metadata_field_matches_compare, metadata_field_matches_compare_f32,
-    metadata_fields_compare, metadata_file_prefix_8,
+    MetadataCompareOp, PE_ENTRY_POINT_PREFIX_BYTES, metadata_field_matches_compare,
+    metadata_field_matches_compare_f32, metadata_fields_compare, metadata_file_prefix_8,
+    metadata_pe_entry_point_prefix,
 };
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
@@ -4957,6 +4958,16 @@ fn pattern_matches_file_prefix_at_zero(
     file_prefix: &[u8],
     file_size: u64,
 ) -> Option<bool> {
+    let _ = file_size;
+    pattern_matches_prefix_window(pattern, file_prefix, 0, 8)
+}
+
+fn pattern_matches_prefix_window(
+    pattern: &PatternPlan,
+    prefix: &[u8],
+    offset: usize,
+    max_window_bytes: usize,
+) -> Option<bool> {
     let mut saw_supported = false;
     let mut all_supported = true;
     for idx in 0..pattern.alternatives.len() {
@@ -4971,15 +4982,20 @@ fn pattern_matches_file_prefix_at_zero(
             .get(idx)
             .copied()
             .unwrap_or(false);
-        if literal.is_empty() || wide || fullword || literal.len() > 8 {
+        if literal.is_empty()
+            || wide
+            || fullword
+            || offset.saturating_add(literal.len()) > max_window_bytes
+        {
             all_supported = false;
             continue;
         }
         saw_supported = true;
-        if file_size < literal.len() as u64 || file_prefix.len() < literal.len() {
+        let required_len = offset.saturating_add(literal.len());
+        if prefix.len() < required_len {
             continue;
         }
-        if file_prefix[..literal.len()] == *literal {
+        if prefix[offset..required_len] == *literal {
             return Some(true);
         }
     }
@@ -4987,6 +5003,17 @@ fn pattern_matches_file_prefix_at_zero(
         Some(false)
     } else {
         None
+    }
+}
+
+fn entry_point_prefix_offset(offset_text: &str) -> Option<usize> {
+    if offset_text == "pe.entry_point" {
+        Some(0)
+    } else {
+        offset_text
+            .strip_prefix("pe.entry_point+")?
+            .parse::<usize>()
+            .ok()
     }
 }
 
@@ -5338,6 +5365,33 @@ where
                             } else {
                                 true
                             }
+                        } else {
+                            true
+                        }
+                    } else if let Some(offset) = entry_point_prefix_offset(offset_text) {
+                        let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+                        if let Some(entry_point_prefix) =
+                            metadata_pe_entry_point_prefix(metadata_bytes)?
+                        {
+                            if let Some(pattern) = patterns.get(pattern_id) {
+                                pattern_matches_prefix_window(
+                                    pattern,
+                                    &entry_point_prefix,
+                                    offset,
+                                    PE_ENTRY_POINT_PREFIX_BYTES,
+                                )
+                                .unwrap_or(true)
+                            } else {
+                                true
+                            }
+                        } else if let Some(pattern) = patterns.get(pattern_id) {
+                            pattern_matches_prefix_window(
+                                pattern,
+                                &[],
+                                offset,
+                                PE_ENTRY_POINT_PREFIX_BYTES,
+                            )
+                            .unwrap_or(true)
                         } else {
                             true
                         }
@@ -7932,23 +7986,33 @@ rule q {
     fn evaluate_node_supports_metadata_and_time_conditions() {
         let tmp = tempdir().expect("tmp");
         let pe_path = tmp.path().join("sample.exe");
-        let mut pe = vec![0u8; 512];
+        let mut pe = vec![0u8; 0x240];
         pe[0..2].copy_from_slice(b"MZ");
         pe[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
         pe[0x80..0x84].copy_from_slice(b"PE\0\0");
         pe[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
         pe[0x88..0x8c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         pe[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
         pe[0x96..0x98].copy_from_slice(&0x2000u16.to_le_bytes());
         pe[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        pe[0x98 + 16..0x98 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0x98 + 60..0x98 + 64].copy_from_slice(&0x200u32.to_le_bytes());
         pe[0x98 + 68..0x98 + 70].copy_from_slice(&3u16.to_le_bytes());
+        let text_section = 0x80 + 24 + 0xf0;
+        pe[text_section..text_section + 8].copy_from_slice(b".text\0\0\0");
+        pe[text_section + 8..text_section + 12].copy_from_slice(&0x20u32.to_le_bytes());
+        pe[text_section + 12..text_section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[text_section + 16..text_section + 20].copy_from_slice(&0x20u32.to_le_bytes());
+        pe[text_section + 20..text_section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x200..0x210].copy_from_slice(b"ENTRYPOINT-PE!!!");
         fs::write(&pe_path, &pe).expect("write pe");
         let metadata_bytes = extract_compact_document_metadata(&pe_path).expect("metadata");
 
         let doc = CandidateDoc {
             doc_id: 1,
             sha256: hex::encode([0x11; 32]),
-            file_size: 512,
+            file_size: pe.len() as u64,
             filter_bytes: 8,
             bloom_hashes: 2,
             tier2_filter_bytes: 8,
@@ -8351,6 +8415,99 @@ rule q {
             ),
             "negative $str at 0 prefix shortcut must match YARA-X semantics"
         );
+
+        let entrypoint_patterns = HashMap::from([(
+            "$ep".to_owned(),
+            PatternPlan {
+                pattern_id: "$ep".to_owned(),
+                alternatives: vec![Vec::new()],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![b"ENTRY".to_vec()],
+                fixed_literals: vec![b"ENTRY".to_vec()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            },
+        )]);
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let at_entrypoint_true = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_at".to_owned(),
+                pattern_id: Some("$ep@pe.entry_point".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &entrypoint_patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("entrypoint prefix true");
+        assert!(at_entrypoint_true.matched);
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &[], &[], &[]);
+        let at_entrypoint_without_metadata = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_at".to_owned(),
+                pattern_id: Some("$ep@pe.entry_point".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &entrypoint_patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("entrypoint prefix missing metadata");
+        assert!(
+            !at_entrypoint_without_metadata.matched,
+            "missing PE entry-point metadata should fail exact entry-point matches"
+        );
+
+        let shifted_entrypoint_patterns = HashMap::from([(
+            "$ep_plus".to_owned(),
+            PatternPlan {
+                pattern_id: "$ep_plus".to_owned(),
+                alternatives: vec![Vec::new()],
+                tier2_alternatives: vec![Vec::new()],
+                anchor_literals: vec![b"POINT".to_vec()],
+                fixed_literals: vec![b"POINT".to_vec()],
+                fixed_literal_wide: vec![false],
+                fixed_literal_fullword: vec![false],
+            },
+        )]);
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
+        let at_entrypoint_plus_true = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_at".to_owned(),
+                pattern_id: Some("$ep_plus@pe.entry_point+5".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &shifted_entrypoint_patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("entrypoint prefix plus offset");
+        assert!(at_entrypoint_plus_true.matched);
     }
 
     #[test]

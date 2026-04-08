@@ -218,19 +218,38 @@ rule mismatched_hash {
             .and_then(Value::as_str),
         Some("explicit")
     );
+    let issue = parsed
+        .get("issues")
+        .and_then(Value::as_array)
+        .and_then(|issues| issues.first())
+        .expect("issue");
+    assert_eq!(
+        issue.get("code").and_then(Value::as_str),
+        Some("hash-identity-mismatch")
+    );
+    assert_eq!(
+        issue.get("rule").and_then(Value::as_str),
+        Some("mismatched_hash")
+    );
+    assert_eq!(issue.get("line").and_then(Value::as_u64), Some(4));
+    assert!(issue.get("column").and_then(Value::as_u64).is_some());
     assert!(
-        parsed
-            .get("issues")
-            .and_then(Value::as_array)
-            .expect("issues")
-            .iter()
-            .any(|issue| {
-                issue
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .contains("current source is sha256")
-            })
+        issue
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("current source is sha256")
+    );
+    assert!(
+        issue
+            .get("remediation")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("--id-source")
+    );
+    assert_eq!(
+        issue.get("snippet").and_then(Value::as_str),
+        Some("hash.md5(0, filesize) == \"0123456789abcdef0123456789abcdef\"")
     );
 }
 
@@ -351,6 +370,67 @@ rule mismatched_hash {
             .and_then(Value::as_str),
         Some("sha256")
     );
+}
+
+#[test]
+fn rule_check_plain_text_prints_location_and_remediation() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule verifier_rule {
+  strings:
+    $a = "ABCDEFGHIJKLMNOPQ"
+  condition:
+    $a at pe.entry_point
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should succeed with warning"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: searchable-needs-verify"));
+    assert!(stdout.contains("warning in verifier_rule at 6:"));
+    assert!(stdout.contains("source: $a at pe.entry_point"));
+    assert!(stdout.contains("remediation: Run `search --verify`"));
+}
+
+#[test]
+fn rule_check_plain_text_omits_warning_for_exact_entrypoint_prefix_rule() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("exact-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule exact_entrypoint_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a at pe.entry_point
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should accept exact entry-point literal rules"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: searchable"));
+    assert!(!stdout.contains("warning"));
+    assert!(!stdout.contains("remediation:"));
 }
 
 #[test]

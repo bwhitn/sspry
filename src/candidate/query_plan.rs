@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::candidate::{
-    GramSizes, metadata_field_is_boolean, metadata_field_is_float, metadata_field_is_integer,
-    normalize_query_metadata_field, pack_exact_gram,
+    GramSizes, PE_ENTRY_POINT_PREFIX_BYTES, metadata_field_is_boolean, metadata_field_is_float,
+    metadata_field_is_integer, normalize_query_metadata_field, pack_exact_gram,
 };
 use crate::{Result, SspryError};
 
@@ -85,6 +85,16 @@ pub struct RuleCheckIssue {
     pub code: String,
     pub severity: RuleCheckSeverity,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +366,14 @@ struct RulePlanFragment {
 
 fn normalize_rule_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
+}
+
+fn active_rule_name_from_blocks(blocks: &[ParsedRuleBlock]) -> Option<String> {
+    blocks
+        .iter()
+        .find(|rule| !rule.is_private)
+        .or_else(|| blocks.first())
+        .map(|rule| rule.name.clone())
 }
 
 fn comparison_op_from_token(token: &Token) -> Option<ComparisonOp> {
@@ -3798,7 +3816,86 @@ fn contains_verifier_only_node(node: &QueryNode) -> bool {
     ) || node.children.iter().any(contains_verifier_only_node)
 }
 
-fn collect_verifier_only_kinds(node: &QueryNode, out: &mut BTreeSet<String>) {
+const FILE_PREFIX_8_BYTES: usize = 8;
+
+fn verifier_only_at_prefix_offset(offset_text: &str) -> Option<(usize, usize)> {
+    if offset_text == "0" {
+        Some((0, FILE_PREFIX_8_BYTES))
+    } else if offset_text == "pe.entry_point" {
+        Some((0, PE_ENTRY_POINT_PREFIX_BYTES))
+    } else {
+        offset_text
+            .strip_prefix("pe.entry_point+")?
+            .parse::<usize>()
+            .ok()
+            .map(|offset| (offset, PE_ENTRY_POINT_PREFIX_BYTES))
+    }
+}
+
+fn pattern_supports_exact_prefix_window(
+    pattern: &PatternPlan,
+    offset: usize,
+    max_window_bytes: usize,
+) -> bool {
+    let mut saw_supported = false;
+    let mut all_supported = true;
+    for idx in 0..pattern.alternatives.len() {
+        let Some(literal) = pattern.fixed_literals.get(idx) else {
+            return false;
+        };
+        let wide = pattern
+            .fixed_literal_wide
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
+        let fullword = pattern
+            .fixed_literal_fullword
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
+        if literal.is_empty()
+            || wide
+            || fullword
+            || offset.saturating_add(literal.len()) > max_window_bytes
+        {
+            all_supported = false;
+            continue;
+        }
+        saw_supported = true;
+    }
+    saw_supported && all_supported
+}
+
+fn verifier_only_node_is_index_exact(
+    node: &QueryNode,
+    pattern_map: &HashMap<String, &PatternPlan>,
+) -> bool {
+    match node.kind.as_str() {
+        "verifier_only_at" => {
+            let Some(expr) = node.pattern_id.as_deref() else {
+                return false;
+            };
+            let Some((pattern_id, offset_text)) = expr.split_once('@') else {
+                return false;
+            };
+            let Some((offset, max_window_bytes)) = verifier_only_at_prefix_offset(offset_text)
+            else {
+                return false;
+            };
+            let Some(pattern) = pattern_map.get(pattern_id).copied() else {
+                return false;
+            };
+            pattern_supports_exact_prefix_window(pattern, offset, max_window_bytes)
+        }
+        _ => false,
+    }
+}
+
+fn collect_unresolved_verifier_only_kinds(
+    node: &QueryNode,
+    pattern_map: &HashMap<String, &PatternPlan>,
+    out: &mut BTreeSet<String>,
+) {
     if matches!(
         node.kind.as_str(),
         "verifier_only_eq"
@@ -3806,11 +3903,12 @@ fn collect_verifier_only_kinds(node: &QueryNode, out: &mut BTreeSet<String>) {
             | "verifier_only_count"
             | "verifier_only_in_range"
             | "verifier_only_loop"
-    ) {
+    ) && !verifier_only_node_is_index_exact(node, pattern_map)
+    {
         out.insert(node.kind.clone());
     }
     for child in &node.children {
-        collect_verifier_only_kinds(child, out);
+        collect_unresolved_verifier_only_kinds(child, pattern_map, out);
     }
 }
 
@@ -3825,53 +3923,208 @@ fn verifier_only_kind_label(kind: &str) -> &'static str {
     }
 }
 
-fn join_human_list(values: &[String]) -> String {
-    match values {
-        [] => String::new(),
-        [only] => only.clone(),
-        [first, second] => format!("{first} and {second}"),
-        _ => {
-            let mut out = values[..values.len() - 1].join(", ");
-            out.push_str(", and ");
-            out.push_str(values.last().expect("non-empty list"));
-            out
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuleSourceLocation {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuleSourceMatch {
+    location: RuleSourceLocation,
+    snippet: String,
+}
+
+fn source_location_for_offset(rule_text: &str, offset: usize) -> RuleSourceLocation {
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for ch in rule_text[..offset.min(rule_text.len())].chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
         }
+    }
+    RuleSourceLocation { line, column }
+}
+
+fn source_snippet_for_offset(rule_text: &str, offset: usize) -> String {
+    let bounded_offset = offset.min(rule_text.len());
+    let line_start = rule_text[..bounded_offset]
+        .rfind('\n')
+        .map(|value| value + 1)
+        .unwrap_or(0);
+    let line_end = rule_text[bounded_offset..]
+        .find('\n')
+        .map(|value| bounded_offset + value)
+        .unwrap_or(rule_text.len());
+    rule_text[line_start..line_end].trim().to_owned()
+}
+
+fn source_match_for_offset(rule_text: &str, offset: usize) -> RuleSourceMatch {
+    RuleSourceMatch {
+        location: source_location_for_offset(rule_text, offset),
+        snippet: source_snippet_for_offset(rule_text, offset),
     }
 }
 
+fn source_match_for_literal(rule_text: &str, literal: &str) -> Option<RuleSourceMatch> {
+    rule_text
+        .find(literal)
+        .map(|offset| source_match_for_offset(rule_text, offset))
+}
+
+fn verifier_only_kind_match(rule_text: &str, kind: &str) -> Option<RuleSourceMatch> {
+    let candidates: &[&str] = match kind {
+        "verifier_only_at" => &[" at ", " at\t", " at\r", " at\n"],
+        "verifier_only_count" => &["#", " of ("],
+        "verifier_only_in_range" => &[" in ("],
+        "verifier_only_loop" => &["for any", "for all"],
+        "verifier_only_eq" => &[
+            "uint8(", "uint16(", "uint32(", "uint64(", "int8(", "int16(", "int32(", "int64(",
+        ],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .find_map(|candidate| source_match_for_literal(rule_text, candidate))
+}
+
+fn rule_check_issue(
+    rule_name: Option<&str>,
+    code: &str,
+    severity: RuleCheckSeverity,
+    message: impl Into<String>,
+    source_match: Option<RuleSourceMatch>,
+    remediation: Option<String>,
+) -> RuleCheckIssue {
+    RuleCheckIssue {
+        code: code.to_owned(),
+        severity,
+        message: message.into(),
+        rule: rule_name.map(str::to_owned),
+        line: source_match.as_ref().map(|value| value.location.line),
+        column: source_match.as_ref().map(|value| value.location.column),
+        snippet: source_match.map(|value| value.snippet),
+        remediation,
+    }
+}
+
+fn remediation_for_issue_code(code: &str) -> Option<String> {
+    match code {
+        "verifier-only-constraint" => Some(
+            "Run `search --verify` for exact results, or rewrite the rule around searchable anchored literals only."
+                .to_owned(),
+        ),
+        "ignored-module-predicate" => Some(
+            "Use `search --verify` if these module predicates matter, or rewrite the rule to rely on indexed literals or metadata that sspry can evaluate directly."
+                .to_owned(),
+        ),
+        "hash-identity-mismatch" => Some(
+            "Point the check at a DB or server with the matching `--id-source`, or rewrite the rule to use the identity source that DB was built with."
+                .to_owned(),
+        ),
+        "hash-identity-source-unknown" => Some(
+            "Run `rule-check` with `--addr`, `--root`, or an explicit `--id-source` so whole-file hash rules can be evaluated against a real DB identity policy."
+                .to_owned(),
+        ),
+        "unsupported-hash-function" => Some(
+            "Use one of the searchable whole-file hash forms: `hash.md5(0, filesize)`, `hash.sha1(0, filesize)`, or `hash.sha256(0, filesize)`."
+                .to_owned(),
+        ),
+        "whole-file-only" => Some(
+            "Rewrite the rule to the searchable whole-file form, or expect it to be unsupported for sspry candidate search."
+                .to_owned(),
+        ),
+        "requires-anchorable-literal" => Some(
+            "Add a sufficiently specific literal anchor to the rule, or simplify the pattern so sspry can derive searchable grams from it."
+                .to_owned(),
+        ),
+        "unsupported" => Some(
+            "Rewrite the rule into sspry's searchable subset, or use direct/local YARA verification for exact evaluation."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+fn classify_unsupported_issue_code(message: &str) -> &'static str {
+    if message.contains("current source is") && message.starts_with("hash.") {
+        "hash-identity-mismatch"
+    } else if message.contains("requires a known DB identity source") {
+        "hash-identity-source-unknown"
+    } else if message.contains("Unsupported searchable hash function") {
+        "unsupported-hash-function"
+    } else if message.contains("Only whole-file") {
+        "whole-file-only"
+    } else if message.contains("requires an anchorable literal") {
+        "requires-anchorable-literal"
+    } else {
+        "unsupported"
+    }
+}
+
+fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceMatch> {
+    if let Some(hash_start) = message.find("hash.") {
+        let suffix = &message[hash_start..];
+        let end = suffix.find('(').unwrap_or(suffix.len());
+        let literal = &suffix[..end];
+        if !literal.is_empty() {
+            return source_match_for_literal(rule_text, literal);
+        }
+    }
+    if message.contains("math.entropy") {
+        return source_match_for_literal(rule_text, "math.entropy(");
+    }
+    None
+}
+
 fn build_rule_check_report(
+    rule_text: &str,
+    rule_name: Option<&str>,
     plan_result: Result<CompiledQueryPlan>,
     ignored_module_calls: Vec<String>,
 ) -> RuleCheckReport {
     match plan_result {
         Ok(plan) => {
+            let pattern_map = plan
+                .patterns
+                .iter()
+                .map(|pattern| (pattern.pattern_id.clone(), pattern))
+                .collect::<HashMap<_, _>>();
             let mut verifier_only_kinds = BTreeSet::<String>::new();
-            collect_verifier_only_kinds(&plan.root, &mut verifier_only_kinds);
+            collect_unresolved_verifier_only_kinds(
+                &plan.root,
+                &pattern_map,
+                &mut verifier_only_kinds,
+            );
             let verifier_only_kinds = verifier_only_kinds.into_iter().collect::<Vec<_>>();
             let mut issues = Vec::<RuleCheckIssue>::new();
-            if !verifier_only_kinds.is_empty() {
-                let verifier_only_labels = verifier_only_kinds
-                    .iter()
-                    .map(|kind| verifier_only_kind_label(kind).to_owned())
-                    .collect::<Vec<_>>();
-                issues.push(RuleCheckIssue {
-                    code: "verifier-only-constraint".to_owned(),
-                    severity: RuleCheckSeverity::Warning,
-                    message: format!(
+            for kind in &verifier_only_kinds {
+                issues.push(rule_check_issue(
+                    rule_name,
+                    "verifier-only-constraint",
+                    RuleCheckSeverity::Warning,
+                    format!(
                         "This rule uses {}. sspry can anchor it for candidate search, but exact evaluation requires local verification with --verify.",
-                        join_human_list(&verifier_only_labels)
+                        verifier_only_kind_label(kind)
                     ),
-                });
+                    verifier_only_kind_match(rule_text, kind),
+                    remediation_for_issue_code("verifier-only-constraint"),
+                ));
             }
-            if !ignored_module_calls.is_empty() {
-                issues.push(RuleCheckIssue {
-                    code: "ignored-module-predicate".to_owned(),
-                    severity: RuleCheckSeverity::Warning,
-                    message: format!(
-                        "Indexed candidate search prunes module predicates for {}. Use --verify if you need exact module-aware results.",
-                        join_human_list(&ignored_module_calls)
+            for module_call in &ignored_module_calls {
+                issues.push(rule_check_issue(
+                    rule_name,
+                    "ignored-module-predicate",
+                    RuleCheckSeverity::Warning,
+                    format!(
+                        "Indexed candidate search prunes the module predicate `{module_call}`. Use --verify if you need exact module-aware results."
                     ),
-                });
+                    source_match_for_literal(rule_text, module_call),
+                    remediation_for_issue_code("ignored-module-predicate"),
+                ));
             }
             RuleCheckReport {
                 status: if issues.is_empty() {
@@ -3885,20 +4138,27 @@ fn build_rule_check_report(
             }
         }
         Err(err) => {
-            let mut issues = vec![RuleCheckIssue {
-                code: "unsupported".to_owned(),
-                severity: RuleCheckSeverity::Error,
-                message: err.to_string(),
-            }];
-            if !ignored_module_calls.is_empty() {
-                issues.push(RuleCheckIssue {
-                    code: "ignored-module-predicate".to_owned(),
-                    severity: RuleCheckSeverity::Warning,
-                    message: format!(
-                        "The rule also references ignored module predicates for {}.",
-                        join_human_list(&ignored_module_calls)
+            let error_message = err.to_string();
+            let error_code = classify_unsupported_issue_code(&error_message);
+            let mut issues = vec![rule_check_issue(
+                rule_name,
+                error_code,
+                RuleCheckSeverity::Error,
+                error_message.clone(),
+                unsupported_issue_match(rule_text, &error_message),
+                remediation_for_issue_code(error_code),
+            )];
+            for module_call in &ignored_module_calls {
+                issues.push(rule_check_issue(
+                    rule_name,
+                    "ignored-module-predicate",
+                    RuleCheckSeverity::Warning,
+                    format!(
+                        "The rule also references the ignored module predicate `{module_call}`."
                     ),
-                });
+                    source_match_for_literal(rule_text, module_call),
+                    remediation_for_issue_code("ignored-module-predicate"),
+                ));
             }
             RuleCheckReport {
                 status: RuleCheckStatus::Unsupported,
@@ -5387,7 +5647,12 @@ pub fn rule_check_with_gram_sizes_and_identity_source(
     allow_tier2_fallback: bool,
     max_candidates: impl Into<f64>,
 ) -> RuleCheckReport {
-    let ignored_module_calls = parse_rule_blocks(rule_text)
+    let parsed_blocks = parse_rule_blocks(rule_text).ok();
+    let rule_name = parsed_blocks
+        .as_deref()
+        .and_then(active_rule_name_from_blocks);
+    let ignored_module_calls = parsed_blocks
+        .as_ref()
         .map(|blocks| {
             blocks
                 .iter()
@@ -5398,6 +5663,8 @@ pub fn rule_check_with_gram_sizes_and_identity_source(
         })
         .unwrap_or_default();
     build_rule_check_report(
+        rule_text,
+        rule_name.as_deref(),
         compile_query_plan_with_gram_sizes_and_identity_source(
             rule_text,
             gram_sizes,
@@ -6986,9 +7253,32 @@ rule simple_rule {
     fn rule_check_marks_verifier_only_constraints_as_needing_verify() {
         let report = rule_check_with_gram_sizes_and_identity_source(
             r#"
-rule verifier_rule {
+rule exact_entrypoint_rule {
   strings:
     $a = "ABCD"
+  condition:
+    $a at pe.entry_point
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.verifier_only_kinds.is_empty());
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_marks_long_entrypoint_literals_as_needing_verify() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule verifier_rule {
+  strings:
+    $a = "ABCDEFGHIJKLMNOPQ"
   condition:
     $a at pe.entry_point
 }
@@ -7011,6 +7301,22 @@ rule verifier_rule {
                     .message
                     .contains("exact evaluation requires local verification")
         }));
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "verifier-only-constraint")
+            .expect("verifier issue");
+        assert_eq!(issue.rule.as_deref(), Some("verifier_rule"));
+        assert_eq!(issue.line, Some(6));
+        assert!(issue.column.is_some());
+        assert_eq!(issue.snippet.as_deref(), Some("$a at pe.entry_point"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("search --verify")
+        );
     }
 
     #[test]
@@ -7046,6 +7352,25 @@ rule ignored_module_rule {
         assert!(report.issues.iter().any(|issue| {
             issue.code == "ignored-module-predicate" && issue.message.contains("Use --verify")
         }));
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.message.contains("console.log"))
+            .expect("console issue");
+        assert_eq!(issue.rule.as_deref(), Some("ignored_module_rule"));
+        assert_eq!(issue.line, Some(6));
+        assert!(issue.column.is_some());
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("$a and console.log(\"dbg\") and androguard.url(/evil\\.example/)")
+        );
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("module predicates")
+        );
     }
 
     #[test]
@@ -7066,8 +7391,24 @@ rule mismatched_hash {
         );
         assert_eq!(report.status, RuleCheckStatus::Unsupported);
         assert!(report.issues.iter().any(|issue| {
-            issue.code == "unsupported" && issue.message.contains("current source is sha256")
+            issue.code == "hash-identity-mismatch"
+                && issue.message.contains("current source is sha256")
         }));
+        let issue = report.issues.first().expect("unsupported issue");
+        assert_eq!(issue.rule.as_deref(), Some("mismatched_hash"));
+        assert_eq!(issue.line, Some(4));
+        assert!(issue.column.is_some());
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("hash.md5(0, filesize) == \"0123456789abcdef0123456789abcdef\"")
+        );
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--id-source")
+        );
     }
 
     #[test]

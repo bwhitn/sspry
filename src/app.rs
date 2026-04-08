@@ -2539,7 +2539,39 @@ fn print_rule_check_output(output: &RuleCheckOutput) {
         return;
     }
     for issue in &output.issues {
-        println!("{}: {}", issue.severity.as_str(), issue.message);
+        match (&issue.rule, issue.line, issue.column) {
+            (Some(rule), Some(line), Some(column)) => {
+                println!(
+                    "{} in {} at {}:{}: {}",
+                    issue.severity.as_str(),
+                    rule,
+                    line,
+                    column,
+                    issue.message
+                );
+            }
+            (Some(rule), _, _) => {
+                println!("{} in {}: {}", issue.severity.as_str(), rule, issue.message);
+            }
+            (_, Some(line), Some(column)) => {
+                println!(
+                    "{} at {}:{}: {}",
+                    issue.severity.as_str(),
+                    line,
+                    column,
+                    issue.message
+                );
+            }
+            _ => {
+                println!("{}: {}", issue.severity.as_str(), issue.message);
+            }
+        }
+        if let Some(snippet) = &issue.snippet {
+            println!("source: {snippet}");
+        }
+        if let Some(remediation) = &issue.remediation {
+            println!("remediation: {remediation}");
+        }
     }
 }
 

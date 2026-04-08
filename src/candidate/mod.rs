@@ -18,10 +18,11 @@ pub use filter_policy::{
 };
 pub use grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes, pack_exact_gram};
 pub use metadata::{
-    MetadataCompareOp, extract_compact_document_metadata, metadata_field_is_boolean,
-    metadata_field_is_float, metadata_field_is_integer, metadata_field_matches_compare,
-    metadata_field_matches_compare_f32, metadata_field_matches_eq, metadata_fields_compare,
-    metadata_file_prefix_8, metadata_pe_entry_point_prefix, normalize_query_metadata_field,
+    MetadataCompareOp, PE_ENTRY_POINT_PREFIX_BYTES, extract_compact_document_metadata,
+    metadata_field_is_boolean, metadata_field_is_float, metadata_field_is_integer,
+    metadata_field_matches_compare, metadata_field_matches_compare_f32, metadata_field_matches_eq,
+    metadata_fields_compare, metadata_file_prefix_8, metadata_pe_entry_point_prefix,
+    normalize_query_metadata_field,
 };
 pub use query_plan::{
     CompiledQueryPlan, PatternPlan, QueryNode, RuleCheckIssue, RuleCheckReport, RuleCheckSeverity,
