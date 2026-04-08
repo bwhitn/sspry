@@ -752,7 +752,6 @@ struct PublishReadiness {
     work_buffer_input_bytes_threshold: u64,
     work_buffer_rss_threshold_bytes: u64,
     current_rss_bytes: u64,
-    pressure_publish_blocked_by_seal_backlog: bool,
     pending_tier2_snapshot_shards: u64,
     index_backpressure_delay_ms: u64,
 }
@@ -765,7 +764,6 @@ struct WorkBufferPressure {
     document_threshold: u64,
     input_bytes_threshold: u64,
     rss_threshold_bytes: u64,
-    pressure_publish_blocked_by_seal_backlog: bool,
     pending_tier2_snapshot_shards: u64,
     index_backpressure_delay_ms: u64,
 }
@@ -3387,7 +3385,6 @@ impl ServerState {
             );
         }
         let rss_threshold_bytes = self.work_buffer_rss_threshold_bytes();
-        let pressure_publish_blocked_by_seal_backlog = pending_tier2_snapshot_shards > 0;
         let index_backpressure_delay_ms = if self.active_index_sessions.load(Ordering::Acquire) == 0
         {
             0
@@ -3414,7 +3411,6 @@ impl ServerState {
             document_threshold,
             input_bytes_threshold,
             rss_threshold_bytes,
-            pressure_publish_blocked_by_seal_backlog,
             pending_tier2_snapshot_shards,
             index_backpressure_delay_ms,
         }
@@ -4228,8 +4224,6 @@ impl ServerState {
             work_buffer_input_bytes_threshold: pressure.input_bytes_threshold,
             work_buffer_rss_threshold_bytes: pressure.rss_threshold_bytes,
             current_rss_bytes: pressure.current_rss_bytes,
-            pressure_publish_blocked_by_seal_backlog: pressure
-                .pressure_publish_blocked_by_seal_backlog,
             pending_tier2_snapshot_shards: pressure.pending_tier2_snapshot_shards,
             index_backpressure_delay_ms: pressure.index_backpressure_delay_ms,
         }
@@ -4932,7 +4926,7 @@ impl ServerState {
             );
             publish.insert(
                 "pressure_publish_blocked_by_seal_backlog".to_owned(),
-                json!(readiness.pressure_publish_blocked_by_seal_backlog),
+                json!(readiness.pending_tier2_snapshot_shards > 0),
             );
             publish.insert(
                 "pending_tier2_snapshot_shards".to_owned(),
@@ -5455,7 +5449,7 @@ impl ServerState {
             );
             publish.insert(
                 "pressure_publish_blocked_by_seal_backlog".to_owned(),
-                json!(readiness.pressure_publish_blocked_by_seal_backlog),
+                json!(readiness.pending_tier2_snapshot_shards > 0),
             );
             publish.insert(
                 "pending_tier2_snapshot_shards".to_owned(),
@@ -10748,7 +10742,7 @@ rule overflow_rule {
         let readiness = state.publish_readiness(current_unix_ms());
         assert!(!readiness.eligible);
         assert_eq!(readiness.blocked_reason, "active_index_sessions");
-        assert!(readiness.pressure_publish_blocked_by_seal_backlog);
+        assert!(readiness.pending_tier2_snapshot_shards > 0);
         assert_eq!(readiness.pending_tier2_snapshot_shards, 1);
     }
 
@@ -10765,7 +10759,7 @@ rule overflow_rule {
             .expect("enqueue tier2 shard");
 
         let pressure = state.work_buffer_pressure_snapshot(0, 1);
-        assert!(pressure.pressure_publish_blocked_by_seal_backlog);
+        assert!(pressure.pending_tier2_snapshot_shards > 0);
         assert_eq!(pressure.index_backpressure_delay_ms, 0);
     }
 

@@ -46,6 +46,7 @@ pub struct CompiledQueryPlan {
     pub tier1_gram_size: usize,
 }
 
+#[cfg(test)]
 fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
     let alternatives_bytes = pattern
         .alternatives
@@ -111,6 +112,7 @@ fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
         )
 }
 
+#[cfg(test)]
 fn query_node_memory_bytes(node: &QueryNode) -> u64 {
     (std::mem::size_of::<QueryNode>() as u64)
         .saturating_add(node.kind.capacity() as u64)
@@ -132,6 +134,7 @@ fn query_node_memory_bytes(node: &QueryNode) -> u64 {
         )
 }
 
+#[cfg(test)]
 pub(crate) fn compiled_query_plan_memory_bytes(plan: &CompiledQueryPlan) -> u64 {
     (std::mem::size_of::<CompiledQueryPlan>() as u64)
         .saturating_add(
