@@ -4937,9 +4937,6 @@ fn verifier_only_eq_matches_file_prefix(
     let Ok(offset) = offset_text.parse::<usize>() else {
         return Ok(None);
     };
-    if offset != 0 {
-        return Ok(None);
-    }
     let expected = match numeric_read_literal_bytes(name, literal_text) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
@@ -4947,10 +4944,14 @@ fn verifier_only_eq_matches_file_prefix(
     if expected.len() > 8 {
         return Ok(None);
     }
-    if file_size < expected.len() as u64 || file_prefix.len() < expected.len() {
+    let required_len = offset.saturating_add(expected.len());
+    if required_len > 8 {
+        return Ok(None);
+    }
+    if file_size < required_len as u64 || file_prefix.len() < required_len {
         return Ok(Some(false));
     }
-    Ok(Some(file_prefix[..expected.len()] == expected))
+    Ok(Some(file_prefix[offset..required_len] == expected))
 }
 
 fn pattern_matches_file_prefix_at_zero(
@@ -8203,6 +8204,35 @@ rule q {
                 &numeric_bytes,
             ),
             "uint32(0) prefix shortcut must match YARA-X semantics"
+        );
+
+        let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
+            prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
+        let numeric_u32_offset = evaluate_node(
+            &QueryNode {
+                kind: "verifier_only_eq".to_owned(),
+                pattern_id: Some("uint32(4)==287454020".to_owned()),
+                threshold: None,
+                children: Vec::new(),
+            },
+            &mut doc_inputs,
+            &mut load_metadata,
+            &mut load_tier1,
+            &mut load_tier2,
+            &patterns,
+            &mask_cache,
+            &eval_plan,
+            0,
+            &mut QueryEvalCache::default(),
+        )
+        .expect("uint32 prefix eq at offset 4");
+        assert_eq!(
+            numeric_u32_offset.matched,
+            yara_rule_matches_bytes(
+                "rule test { condition: uint32(4) == 287454020 }",
+                &numeric_bytes,
+            ),
+            "uint32(4) prefix shortcut must match YARA-X semantics"
         );
 
         let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =

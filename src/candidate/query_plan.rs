@@ -3866,11 +3866,25 @@ fn pattern_supports_exact_prefix_window(
     saw_supported && all_supported
 }
 
+fn verifier_only_eq_is_index_exact(expr: &str) -> bool {
+    let Ok((name, offset, literal_text)) = parse_numeric_read_expression(expr) else {
+        return false;
+    };
+    let Ok(expected) = numeric_read_anchor_bytes(name, literal_text) else {
+        return false;
+    };
+    offset.saturating_add(expected.len()) <= FILE_PREFIX_8_BYTES
+}
+
 fn verifier_only_node_is_index_exact(
     node: &QueryNode,
     pattern_map: &HashMap<String, &PatternPlan>,
 ) -> bool {
     match node.kind.as_str() {
+        "verifier_only_eq" => node
+            .pattern_id
+            .as_deref()
+            .is_some_and(verifier_only_eq_is_index_exact),
         "verifier_only_at" => {
             let Some(expr) = node.pattern_id.as_deref() else {
                 return false;
@@ -7317,6 +7331,78 @@ rule verifier_rule {
                 .unwrap_or_default()
                 .contains("search --verify")
         );
+    }
+
+    #[test]
+    fn rule_check_marks_prefix_numeric_reads_as_searchable() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule exact_prefix_numeric_rule {
+  condition:
+    uint32(0) == 16909060
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.verifier_only_kinds.is_empty());
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_marks_in_prefix_numeric_reads_as_searchable() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule in_prefix_numeric_rule {
+  condition:
+    uint32(4) == 16909060
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.verifier_only_kinds.is_empty());
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_marks_out_of_prefix_numeric_reads_as_needing_verify() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule verifier_numeric_rule {
+  condition:
+    uint32(5) == 16909060
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        assert_eq!(
+            report.verifier_only_kinds,
+            vec!["verifier_only_eq".to_owned()]
+        );
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "verifier-only-constraint")
+            .expect("verifier issue");
+        assert_eq!(issue.rule.as_deref(), Some("verifier_numeric_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("uint32(5) == 16909060"));
     }
 
     #[test]
