@@ -4154,6 +4154,14 @@ fn remediation_for_issue_code(code: &str) -> Option<String> {
             "Run `search --verify` for exact `for any` or `for all` evaluation, or rewrite the iterator into directly searchable anchored literals."
                 .to_owned(),
         ),
+        "verifier-only-negation" => Some(
+            "Run `search --verify` for exact negative conditions, or rewrite the rule so the excluded terms become positive searchable anchors in separate filtering steps."
+                .to_owned(),
+        ),
+        "negated-search-unbounded" => Some(
+            "Add a positive searchable anchor outside the negated condition, or use direct/local YARA verification instead of sspry's indexed candidate search for this rule."
+                .to_owned(),
+        ),
         "ignored-module-predicate" => Some(
             "Use `search --verify` if these module predicates matter, or rewrite the rule to rely on indexed literals or metadata that sspry can evaluate directly."
                 .to_owned(),
@@ -4346,6 +4354,9 @@ fn build_rule_check_report(
             );
             let verifier_only_kinds = verifier_only_kinds.into_iter().collect::<Vec<_>>();
             let mut issues = Vec::<RuleCheckIssue>::new();
+            let negated_search_match = first_negated_search_condition_match(&plan.root, rule_text);
+            let negated_search_unbounded =
+                negated_search_condition_makes_candidate_branch_unbounded(&plan.root);
             for kind in &verifier_only_kinds {
                 let code = verifier_only_issue_code(kind);
                 issues.push(rule_check_issue(
@@ -4355,6 +4366,25 @@ fn build_rule_check_report(
                     verifier_only_issue_message(kind),
                     verifier_only_kind_match(rule_text, kind),
                     remediation_for_issue_code(code),
+                ));
+            }
+            if negated_search_unbounded {
+                issues.push(rule_check_issue(
+                    rule_name,
+                    "negated-search-unbounded",
+                    RuleCheckSeverity::Error,
+                    "This rule negates searchable string, hex, or verifier-only conditions without any exact positive prefilter. sspry's indexed candidate stage would treat that negated branch as always true, so the rule is not suitable for scalable indexed search as written.",
+                    negated_search_match.clone(),
+                    remediation_for_issue_code("negated-search-unbounded"),
+                ));
+            } else if let Some(source_match) = negated_search_match {
+                issues.push(rule_check_issue(
+                    rule_name,
+                    "verifier-only-negation",
+                    RuleCheckSeverity::Warning,
+                    "This rule negates searchable string, hex, or verifier-only conditions. sspry can keep the positive prefilter, but exact negative evaluation requires local verification with --verify.",
+                    Some(source_match),
+                    remediation_for_issue_code("verifier-only-negation"),
                 ));
             }
             for module_call in &ignored_module_calls {
@@ -4370,7 +4400,9 @@ fn build_rule_check_report(
                 ));
             }
             RuleCheckReport {
-                status: if issues.is_empty() {
+                status: if negated_search_unbounded {
+                    RuleCheckStatus::Unsupported
+                } else if issues.is_empty() {
                     RuleCheckStatus::Searchable
                 } else {
                     RuleCheckStatus::SearchableNeedsVerify
@@ -4419,6 +4451,57 @@ fn contains_identity_node(node: &QueryNode) -> bool {
 
 fn contains_pattern_node(node: &QueryNode) -> bool {
     node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
+}
+
+fn contains_pattern_or_verifier_only_node(node: &QueryNode) -> bool {
+    contains_pattern_node(node) || contains_verifier_only_node(node)
+}
+
+fn first_negated_search_condition_match(
+    node: &QueryNode,
+    rule_text: &str,
+) -> Option<RuleSourceMatch> {
+    if node.kind == "not"
+        && node
+            .children
+            .first()
+            .is_some_and(contains_pattern_or_verifier_only_node)
+    {
+        return source_match_for_condition_literal(rule_text, "not ")
+            .or_else(|| source_match_for_first_condition_line(rule_text));
+    }
+    node.children
+        .iter()
+        .find_map(|child| first_negated_search_condition_match(child, rule_text))
+}
+
+fn negated_search_condition_makes_candidate_branch_unbounded(node: &QueryNode) -> bool {
+    match node.kind.as_str() {
+        "not" => node
+            .children
+            .first()
+            .is_some_and(contains_pattern_or_verifier_only_node),
+        "and" => {
+            !node.children.is_empty()
+                && node
+                    .children
+                    .iter()
+                    .all(negated_search_condition_makes_candidate_branch_unbounded)
+        }
+        "or" => node
+            .children
+            .iter()
+            .any(negated_search_condition_makes_candidate_branch_unbounded),
+        "n_of" => {
+            let threshold = node.threshold.unwrap_or(1);
+            node.children
+                .iter()
+                .filter(|child| negated_search_condition_makes_candidate_branch_unbounded(child))
+                .count()
+                >= threshold
+        }
+        _ => false,
+    }
 }
 
 const OVERBROAD_UNION_FANOUT_LIMIT: usize = 160;
@@ -7716,7 +7799,7 @@ rule trivial_count_exists_rule {
     }
 
     #[test]
-    fn rule_check_marks_trivial_zero_count_constraints_as_searchable() {
+    fn rule_check_marks_trivial_zero_count_constraints_as_unsupported() {
         let report = rule_check_with_gram_sizes_and_identity_source(
             r#"
 rule trivial_count_zero_rule {
@@ -7733,9 +7816,13 @@ rule trivial_count_zero_rule {
             true,
             7.5,
         );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.verifier_only_kinds.is_empty());
-        assert!(report.issues.is_empty());
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "negated-search-unbounded")
+            .expect("negated-search issue");
+        assert_eq!(issue.snippet.as_deref(), Some("#a == 0"));
     }
 
     #[test]
@@ -7822,6 +7909,104 @@ rule loop_rule {
                 .unwrap_or_default()
                 .contains("for any")
         );
+    }
+
+    #[test]
+    fn rule_check_marks_negated_search_constraints_as_needing_verify() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule negated_search_rule {
+  strings:
+    $a = "ABCD"
+    $b = "WXYZ"
+  condition:
+    $a and not $b and filesize >= 8 and filesize < 9
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "verifier-only-negation")
+            .expect("negation issue");
+        assert_eq!(issue.rule.as_deref(), Some("negated_search_rule"));
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("$a and not $b and filesize >= 8 and filesize < 9")
+        );
+        assert!(issue.message.contains("negates searchable"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("search --verify")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_unbounded_negated_search_as_unsupported() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule negated_only_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    not $a
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "negated-search-unbounded")
+            .expect("negated unbounded issue");
+        assert_eq!(issue.rule.as_deref(), Some("negated_only_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("not $a"));
+        assert!(issue.message.contains("always true"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("positive searchable anchor")
+        );
+    }
+
+    #[test]
+    fn rule_check_keeps_metadata_negation_with_positive_anchor_as_searchable() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule metadata_negation_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and not filesize < 5KB
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.issues.is_empty());
     }
 
     #[test]

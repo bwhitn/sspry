@@ -520,6 +520,39 @@ rule count_rule {
 }
 
 #[test]
+fn rule_check_plain_text_reports_negated_search_constraints() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("negated-search-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule negated_search_rule {
+  strings:
+    $a = "ABCD"
+    $b = "WXYZ"
+  condition:
+    $a and not $b and filesize >= 8 and filesize < 9
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should warn rather than fail for negated searchable constraints"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: searchable-needs-verify"));
+    assert!(stdout.contains("warning in negated_search_rule"));
+    assert!(stdout.contains("negates searchable string"));
+    assert!(stdout.contains("source: $a and not $b and filesize >= 8 and filesize < 9"));
+    assert!(stdout.contains("search --verify"));
+}
+
+#[test]
 fn rule_check_plain_text_omits_warning_for_trivial_positive_count_rule() {
     let tmp = tempdir().expect("tmp");
     let rule_path = tmp.path().join("count-exists-rule.yar");
@@ -549,7 +582,7 @@ rule trivial_count_exists_rule {
 }
 
 #[test]
-fn rule_check_plain_text_omits_warning_for_trivial_zero_count_rule() {
+fn rule_check_plain_text_reports_trivial_zero_count_rule_as_unsupported() {
     let tmp = tempdir().expect("tmp");
     let rule_path = tmp.path().join("count-zero-rule.yar");
     fs::write(
@@ -569,12 +602,13 @@ rule trivial_count_zero_rule {
         .output()
         .expect("run rule-check");
     assert!(
-        output.status.success(),
-        "rule-check should accept trivial zero count rules"
+        !output.status.success(),
+        "rule-check should reject trivial zero-count rules because they simplify to unbounded negation"
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("status: searchable"));
-    assert!(!stdout.contains("warning"));
+    assert!(stdout.contains("status: unsupported"));
+    assert!(stdout.contains("always true"));
+    assert!(stdout.contains("source: #a == 0"));
 }
 
 #[test]
@@ -610,6 +644,38 @@ rule overbroad_iron_tiger_style {
     assert!(stdout.contains("union fanout"));
     assert!(stdout.contains("source: uint16(0) == 0x5a4d and any of them"));
     assert!(stdout.contains("mandatory anchor"));
+}
+
+#[test]
+fn rule_check_plain_text_reports_unbounded_negated_search_as_unsupported() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("negated-only-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule negated_only_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    not $a
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail unsupported unbounded negated-search rules"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: unsupported"));
+    assert!(stdout.contains("error in negated_only_rule"));
+    assert!(stdout.contains("always true"));
+    assert!(stdout.contains("source: not $a"));
+    assert!(stdout.contains("positive searchable anchor"));
 }
 
 #[test]
