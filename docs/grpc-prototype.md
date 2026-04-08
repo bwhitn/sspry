@@ -38,6 +38,6 @@ What was validated on this branch:
 - fresh 50k end-to-end run
 - warm 50k search parity checks against the older remote path
 
-Remaining migration note:
+Current codebase note:
 
-- legacy framed-RPC code still exists internally in the tree for compatibility and test scaffolding, but it is no longer the public remote interface
+- the public remote path is gRPC-only; the old framed RPC transport is no longer part of the production interface

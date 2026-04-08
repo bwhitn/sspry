@@ -13,9 +13,6 @@ pub mod v1 {
     tonic::include_proto!("sspry.v1");
 }
 
-pub const PROTOTYPE_BRANCH_NOTE: &str =
-    "Parallel gRPC prototype surface. The custom RPC transport remains authoritative.";
-
 pub const DEFAULT_GRPC_INSERT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 struct GrpcInsertFrameIter {
