@@ -1,43 +1,43 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="310" viewBox="0 0 1120 310">
-  <rect width="1120" height="310" fill="#fbfaf5"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="340" viewBox="0 0 1400 340">
+  <rect width="1400" height="340" fill="#fbfaf5"/>
   <text x="32" y="42" font-family="Helvetica, Arial, sans-serif" font-size="28" font-weight="700" fill="#1f2937">Query Flow</text>
 
   <g font-family="Helvetica, Arial, sans-serif" text-anchor="middle">
-    <rect x="30" y="100" width="150" height="86" rx="12" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
-    <text x="105" y="136" font-size="22" font-weight="700" fill="#1e3a8a">Rule Parse</text>
-    <text x="105" y="160" font-size="15" fill="#1e3a8a">restricted YARA</text>
+    <rect x="30" y="104" width="180" height="98" rx="12" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+    <text x="120" y="144" font-size="20" font-weight="700" fill="#1e3a8a">Rule Parse</text>
+    <text x="120" y="171" font-size="14" fill="#1e3a8a">restricted YARA</text>
 
-    <rect x="210" y="100" width="180" height="86" rx="12" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
-    <text x="300" y="132" font-size="22" font-weight="700" fill="#065f46">Plan + Anchors</text>
-    <text x="300" y="156" font-size="15" fill="#065f46">branch ordering, grams</text>
+    <rect x="250" y="104" width="210" height="98" rx="12" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+    <text x="355" y="142" font-size="20" font-weight="700" fill="#065f46">Plan + Anchors</text>
+    <text x="355" y="169" font-size="14" fill="#065f46">branch ordering, grams</text>
 
-    <rect x="420" y="100" width="180" height="86" rx="12" fill="#fde68a" stroke="#a16207" stroke-width="2"/>
-    <text x="510" y="132" font-size="22" font-weight="700" fill="#78350f">Tree / Shard Fanout</text>
-    <text x="510" y="156" font-size="15" fill="#78350f">server workers</text>
+    <rect x="500" y="104" width="230" height="98" rx="12" fill="#fde68a" stroke="#a16207" stroke-width="2"/>
+    <text x="615" y="142" font-size="19" font-weight="700" fill="#78350f">Tree / Shard Fanout</text>
+    <text x="615" y="169" font-size="14" fill="#78350f">server workers</text>
 
-    <rect x="630" y="100" width="180" height="86" rx="12" fill="#fecaca" stroke="#b91c1c" stroke-width="2"/>
-    <text x="720" y="132" font-size="22" font-weight="700" fill="#7f1d1d">Bloom + Metadata</text>
-    <text x="720" y="156" font-size="15" fill="#7f1d1d">tier1 / tier2 / sidecars</text>
+    <rect x="770" y="104" width="230" height="98" rx="12" fill="#fecaca" stroke="#b91c1c" stroke-width="2"/>
+    <text x="885" y="142" font-size="19" font-weight="700" fill="#7f1d1d">Bloom + Metadata</text>
+    <text x="885" y="169" font-size="14" fill="#7f1d1d">tier1 / tier2 / sidecars</text>
 
-    <rect x="840" y="100" width="150" height="86" rx="12" fill="#e9d5ff" stroke="#7e22ce" stroke-width="2"/>
-    <text x="915" y="136" font-size="22" font-weight="700" fill="#581c87">Candidate Set</text>
-    <text x="915" y="160" font-size="15" fill="#581c87">unordered digests</text>
+    <rect x="1040" y="104" width="200" height="98" rx="12" fill="#e9d5ff" stroke="#7e22ce" stroke-width="2"/>
+    <text x="1140" y="142" font-size="20" font-weight="700" fill="#581c87">Candidate Set</text>
+    <text x="1140" y="169" font-size="14" fill="#581c87">unordered digests</text>
 
-    <rect x="1020" y="100" width="70" height="86" rx="12" fill="#fbcfe8" stroke="#be185d" stroke-width="2"/>
-    <text x="1055" y="136" font-size="22" font-weight="700" fill="#831843">Verify</text>
-    <text x="1055" y="160" font-size="15" fill="#831843">opt</text>
+    <rect x="1280" y="104" width="90" height="98" rx="12" fill="#fbcfe8" stroke="#be185d" stroke-width="2"/>
+    <text x="1325" y="142" font-size="20" font-weight="700" fill="#831843">Verify</text>
+    <text x="1325" y="169" font-size="14" fill="#831843">opt</text>
   </g>
 
   <g stroke="#334155" stroke-width="3" fill="#334155">
-    <line x1="180" y1="143" x2="210" y2="143"/>
-    <polygon points="210,143 198,137 198,149"/>
-    <line x1="390" y1="143" x2="420" y2="143"/>
-    <polygon points="420,143 408,137 408,149"/>
-    <line x1="600" y1="143" x2="630" y2="143"/>
-    <polygon points="630,143 618,137 618,149"/>
-    <line x1="810" y1="143" x2="840" y2="143"/>
-    <polygon points="840,143 828,137 828,149"/>
-    <line x1="990" y1="143" x2="1020" y2="143"/>
-    <polygon points="1020,143 1008,137 1008,149"/>
+    <line x1="210" y1="153" x2="250" y2="153"/>
+    <polygon points="250,153 238,147 238,159"/>
+    <line x1="460" y1="153" x2="500" y2="153"/>
+    <polygon points="500,153 488,147 488,159"/>
+    <line x1="730" y1="153" x2="770" y2="153"/>
+    <polygon points="770,153 758,147 758,159"/>
+    <line x1="1000" y1="153" x2="1040" y2="153"/>
+    <polygon points="1040,153 1028,147 1028,159"/>
+    <line x1="1240" y1="153" x2="1280" y2="153"/>
+    <polygon points="1280,153 1268,147 1268,159"/>
   </g>
 </svg>
