@@ -4046,6 +4046,33 @@ fn source_match_for_literal(rule_text: &str, literal: &str) -> Option<RuleSource
         .map(|offset| source_match_for_offset(rule_text, offset))
 }
 
+fn source_match_for_condition_literal(rule_text: &str, literal: &str) -> Option<RuleSourceMatch> {
+    if let Some(condition_offset) = rule_text.find("condition:")
+        && let Some(relative_offset) = rule_text[condition_offset..].find(literal)
+    {
+        return Some(source_match_for_offset(
+            rule_text,
+            condition_offset + relative_offset,
+        ));
+    }
+    source_match_for_literal(rule_text, literal)
+}
+
+fn source_match_for_first_condition_line(rule_text: &str) -> Option<RuleSourceMatch> {
+    let condition_offset = rule_text.find("condition:")?;
+    let tail = &rule_text[condition_offset..];
+    let newline_offset = tail.find('\n')?;
+    let body_start = condition_offset + newline_offset + 1;
+    let remaining = &rule_text[body_start..];
+    let first_non_ws = remaining
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))?;
+    Some(source_match_for_offset(
+        rule_text,
+        body_start + first_non_ws,
+    ))
+}
+
 fn verifier_only_kind_match(rule_text: &str, kind: &str) -> Option<RuleSourceMatch> {
     let candidates: &[&str] = match kind {
         "verifier_only_at" => &[" at ", " at\t", " at\r", " at\n"],
@@ -4120,6 +4147,42 @@ fn remediation_for_issue_code(code: &str) -> Option<String> {
             "Run `rule-check` with `--addr`, `--root`, or an explicit `--id-source` so whole-file hash rules can be evaluated against a real DB identity policy."
                 .to_owned(),
         ),
+        "overbroad-union" => Some(
+            "Add a stable mandatory anchor that every matching branch must satisfy, or split the rule so the union fanout stays selective."
+                .to_owned(),
+        ),
+        "low-information-entrypoint-stub" => Some(
+            "Add a longer mandatory literal at the entry point, or rewrite the rule around a stronger PE-specific anchor."
+                .to_owned(),
+        ),
+        "low-information-range-rule" => Some(
+            "Add a longer mandatory literal outside the suffix/range constraint, or split the rule into a stronger searchable prefilter plus verification."
+                .to_owned(),
+        ),
+        "low-information-single-pattern" => Some(
+            "Use a longer literal or combine the pattern with another mandatory searchable condition."
+                .to_owned(),
+        ),
+        "requires-anchorable-literal-direct" => Some(
+            "Add a sufficiently specific literal anchor to the direct search condition, or simplify the pattern so sspry can derive searchable grams from it."
+                .to_owned(),
+        ),
+        "requires-anchorable-literal-at-in" => Some(
+            "Add a sufficiently specific literal anchor to the `at` or `in` condition, or simplify the pattern so sspry can derive searchable grams from it."
+                .to_owned(),
+        ),
+        "requires-anchorable-literal-loop" => Some(
+            "Add a sufficiently specific literal anchor before the iterator, or simplify the looped pattern so sspry can derive searchable grams from it."
+                .to_owned(),
+        ),
+        "requires-anchorable-literal-n-of" => Some(
+            "Add a sufficiently specific literal anchor to each `any of` or `all of` branch, or reduce the rule to a smaller searchable subset."
+                .to_owned(),
+        ),
+        "verifier-only-no-anchor" => Some(
+            "Add a searchable string or hex anchor so sspry can narrow candidates before verification."
+                .to_owned(),
+        ),
         "unsupported-hash-function" => Some(
             "Use one of the searchable whole-file hash forms: `hash.md5(0, filesize)`, `hash.sha1(0, filesize)`, or `hash.sha256(0, filesize)`."
                 .to_owned(),
@@ -4145,6 +4208,24 @@ fn classify_unsupported_issue_code(message: &str) -> &'static str {
         "hash-identity-mismatch"
     } else if message.contains("requires a known DB identity source") {
         "hash-identity-source-unknown"
+    } else if message.contains("no mandatory anchorable pattern and union fanout") {
+        "overbroad-union"
+    } else if message.contains("entry-point stub provides only low-information gram anchors") {
+        "low-information-entrypoint-stub"
+    } else if message.contains("short range/suffix anchors are too weak at scale") {
+        "low-information-range-rule"
+    } else if message.contains("single-pattern rule provides only tiny gram anchors") {
+        "low-information-single-pattern"
+    } else if message.contains("requires an anchorable literal for direct search use") {
+        "requires-anchorable-literal-direct"
+    } else if message.contains("requires an anchorable literal for at/in search use") {
+        "requires-anchorable-literal-at-in"
+    } else if message.contains("requires an anchorable literal for verifier-loop search use") {
+        "requires-anchorable-literal-loop"
+    } else if message.contains("requires an anchorable literal for N-of search use") {
+        "requires-anchorable-literal-n-of"
+    } else if message.contains("Verifier-only indexed conditions require an anchorable literal") {
+        "verifier-only-no-anchor"
     } else if message.contains("Unsupported searchable hash function") {
         "unsupported-hash-function"
     } else if message.contains("Only whole-file") {
@@ -4157,6 +4238,7 @@ fn classify_unsupported_issue_code(message: &str) -> &'static str {
 }
 
 fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceMatch> {
+    let code = classify_unsupported_issue_code(message);
     if let Some(hash_start) = message.find("hash.") {
         let suffix = &message[hash_start..];
         let end = suffix.find('(').unwrap_or(suffix.len());
@@ -4168,7 +4250,48 @@ fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceM
     if message.contains("math.entropy") {
         return source_match_for_literal(rule_text, "math.entropy(");
     }
-    None
+    match code {
+        "overbroad-union" => {
+            for candidate in ["any of", "or", "1 of", "2 of"] {
+                if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+                    return Some(found);
+                }
+            }
+            source_match_for_first_condition_line(rule_text)
+        }
+        "low-information-entrypoint-stub" => {
+            source_match_for_condition_literal(rule_text, "at pe.entry_point")
+        }
+        "low-information-range-rule" => source_match_for_condition_literal(rule_text, " in ("),
+        "low-information-single-pattern" => source_match_for_first_condition_line(rule_text),
+        "requires-anchorable-literal-direct" => extract_pattern_id_from_anchor_error(message)
+            .and_then(|pattern_id| source_match_for_condition_literal(rule_text, &pattern_id))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "requires-anchorable-literal-at-in" => extract_pattern_id_from_anchor_error(message)
+            .and_then(|pattern_id| source_match_for_condition_literal(rule_text, &pattern_id))
+            .or_else(|| source_match_for_condition_literal(rule_text, " at "))
+            .or_else(|| source_match_for_condition_literal(rule_text, " in (")),
+        "requires-anchorable-literal-loop" => {
+            source_match_for_condition_literal(rule_text, "verifierloop(")
+                .or_else(|| source_match_for_condition_literal(rule_text, "for any"))
+        }
+        "requires-anchorable-literal-n-of" => {
+            for candidate in ["any of", "all of", "1 of", "2 of"] {
+                if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+                    return Some(found);
+                }
+            }
+            source_match_for_first_condition_line(rule_text)
+        }
+        "verifier-only-no-anchor" => source_match_for_first_condition_line(rule_text),
+        _ => None,
+    }
+}
+
+fn extract_pattern_id_from_anchor_error(message: &str) -> Option<String> {
+    let suffix = message.strip_prefix("Pattern ")?;
+    let end = suffix.find(" requires an anchorable literal")?;
+    Some(suffix[..end].to_owned())
 }
 
 fn build_rule_check_report(
@@ -7759,6 +7882,87 @@ rule mismatched_hash {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("--id-source")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_overbroad_union_as_specific_unsupported_issue() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule overbroad_iron_tiger_style {
+  strings:
+    $a = "Game Over Good Luck By Wind" nocase wide ascii
+    $b = "ReleiceName" nocase wide ascii
+    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
+    $d = "Winds Update" nocase wide ascii
+  condition:
+    uint16(0) == 0x5a4d and any of them
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "overbroad-union")
+            .expect("overbroad issue");
+        assert_eq!(issue.rule.as_deref(), Some("overbroad_iron_tiger_style"));
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("uint16(0) == 0x5a4d and any of them")
+        );
+        assert!(issue.message.contains("union fanout"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mandatory anchor")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_low_information_entrypoint_stub_as_specific_unsupported_issue() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule low_information_entrypoint_stub {
+  strings:
+    $a0 = { 50 BE [4] 8D BE [4] 57 83 CD }
+  condition:
+    $a0 at pe.entry_point
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "low-information-entrypoint-stub")
+            .expect("entrypoint issue");
+        assert_eq!(
+            issue.rule.as_deref(),
+            Some("low_information_entrypoint_stub")
+        );
+        assert_eq!(issue.snippet.as_deref(), Some("$a0 at pe.entry_point"));
+        assert!(issue.message.contains("entry-point stub"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("longer mandatory literal")
         );
     }
 

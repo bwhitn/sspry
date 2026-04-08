@@ -578,6 +578,41 @@ rule trivial_count_zero_rule {
 }
 
 #[test]
+fn rule_check_plain_text_reports_specific_overbroad_union_details() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("overbroad-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule overbroad_iron_tiger_style {
+  strings:
+    $a = "Game Over Good Luck By Wind" nocase wide ascii
+    $b = "ReleiceName" nocase wide ascii
+    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
+    $d = "Winds Update" nocase wide ascii
+  condition:
+    uint16(0) == 0x5a4d and any of them
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail unsupported overbroad unions"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: unsupported"));
+    assert!(stdout.contains("error in overbroad_iron_tiger_style"));
+    assert!(stdout.contains("union fanout"));
+    assert!(stdout.contains("source: uint16(0) == 0x5a4d and any of them"));
+    assert!(stdout.contains("mandatory anchor"));
+}
+
+#[test]
 fn serve_persists_candidate_shards() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
