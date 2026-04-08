@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -44,6 +44,58 @@ pub struct CompiledQueryPlan {
     pub max_candidates: f64,
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleCheckStatus {
+    Searchable,
+    SearchableNeedsVerify,
+    Unsupported,
+}
+
+impl RuleCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Searchable => "searchable",
+            Self::SearchableNeedsVerify => "searchable-needs-verify",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleCheckSeverity {
+    Error,
+    Warning,
+}
+
+impl RuleCheckSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCheckIssue {
+    pub code: String,
+    pub severity: RuleCheckSeverity,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCheckReport {
+    pub status: RuleCheckStatus,
+    #[serde(default)]
+    pub issues: Vec<RuleCheckIssue>,
+    #[serde(default)]
+    pub verifier_only_kinds: Vec<String>,
+    #[serde(default)]
+    pub ignored_module_calls: Vec<String>,
 }
 
 #[cfg(test)]
@@ -287,6 +339,7 @@ struct ParsedRuleBlock {
     name: String,
     is_private: bool,
     strings_lines: Vec<String>,
+    raw_condition_text: String,
     condition_text: String,
 }
 
@@ -389,6 +442,39 @@ fn ignored_search_module_name(name: &str) -> bool {
                 .strip_prefix(module)
                 .is_some_and(|rest| rest.starts_with('.'))
     })
+}
+
+fn collect_ignored_module_call_names(condition_text: &str) -> BTreeSet<String> {
+    let chars = condition_text.chars().collect::<Vec<_>>();
+    let mut out = BTreeSet::<String>::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_ascii_alphabetic() {
+            let mut cursor = index + 1;
+            while cursor < chars.len()
+                && (chars[cursor].is_ascii_alphanumeric()
+                    || chars[cursor] == '_'
+                    || chars[cursor] == '.')
+            {
+                cursor += 1;
+            }
+            let name = chars[index..cursor].iter().collect::<String>();
+            if ignored_search_module_name(&name) {
+                let mut next = cursor;
+                while next < chars.len() && chars[next].is_whitespace() {
+                    next += 1;
+                }
+                if let Some(end) = consume_parenthesized_span(&chars, next) {
+                    out.insert(name);
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    out
 }
 
 impl ConditionParser {
@@ -1640,7 +1726,7 @@ fn strip_rule_comments(rule_text: &str) -> String {
     out
 }
 
-fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
+fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String, String)> {
     let sanitized = strip_rule_comments(rule_text);
     let mut strings_lines = Vec::new();
     let mut condition_lines = Vec::new();
@@ -1675,11 +1761,11 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String)> {
             "Rule does not contain a condition section.",
         ));
     }
+    let raw_condition_text = condition_lines.join(" ");
     Ok((
         strings_lines,
-        rewrite_verifier_only_for_any_loops(&rewrite_ignored_module_calls(
-            &condition_lines.join(" "),
-        )),
+        raw_condition_text.clone(),
+        rewrite_verifier_only_for_any_loops(&rewrite_ignored_module_calls(&raw_condition_text)),
     ))
 }
 
@@ -1783,11 +1869,12 @@ fn parse_rule_blocks(rule_text: &str) -> Result<Vec<ParsedRuleBlock>> {
             .ok_or_else(|| SspryError::from(format!("Rule {name} is missing an opening brace.")))?;
         let end_idx = match_rule_brace_span(&sanitized, open_idx)?;
         let block_text = &sanitized[line_start..end_idx];
-        let (strings_lines, condition_text) = parse_rule_sections(block_text)?;
+        let (strings_lines, raw_condition_text, condition_text) = parse_rule_sections(block_text)?;
         blocks.push(ParsedRuleBlock {
             name,
             is_private: tokens[..rule_idx].contains(&"private"),
             strings_lines,
+            raw_condition_text,
             condition_text,
         });
     }
@@ -3711,6 +3798,118 @@ fn contains_verifier_only_node(node: &QueryNode) -> bool {
     ) || node.children.iter().any(contains_verifier_only_node)
 }
 
+fn collect_verifier_only_kinds(node: &QueryNode, out: &mut BTreeSet<String>) {
+    if matches!(
+        node.kind.as_str(),
+        "verifier_only_eq"
+            | "verifier_only_at"
+            | "verifier_only_count"
+            | "verifier_only_in_range"
+            | "verifier_only_loop"
+    ) {
+        out.insert(node.kind.clone());
+    }
+    for child in &node.children {
+        collect_verifier_only_kinds(child, out);
+    }
+}
+
+fn verifier_only_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "verifier_only_eq" => "byte-equality constraints around a match",
+        "verifier_only_at" => "fixed or computed match offsets",
+        "verifier_only_count" => "match-count constraints",
+        "verifier_only_in_range" => "match range constraints",
+        "verifier_only_loop" => "loop or iterator constraints",
+        _ => "verifier-only constraints",
+    }
+}
+
+fn join_human_list(values: &[String]) -> String {
+    match values {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut out = values[..values.len() - 1].join(", ");
+            out.push_str(", and ");
+            out.push_str(values.last().expect("non-empty list"));
+            out
+        }
+    }
+}
+
+fn build_rule_check_report(
+    plan_result: Result<CompiledQueryPlan>,
+    ignored_module_calls: Vec<String>,
+) -> RuleCheckReport {
+    match plan_result {
+        Ok(plan) => {
+            let mut verifier_only_kinds = BTreeSet::<String>::new();
+            collect_verifier_only_kinds(&plan.root, &mut verifier_only_kinds);
+            let verifier_only_kinds = verifier_only_kinds.into_iter().collect::<Vec<_>>();
+            let mut issues = Vec::<RuleCheckIssue>::new();
+            if !verifier_only_kinds.is_empty() {
+                let verifier_only_labels = verifier_only_kinds
+                    .iter()
+                    .map(|kind| verifier_only_kind_label(kind).to_owned())
+                    .collect::<Vec<_>>();
+                issues.push(RuleCheckIssue {
+                    code: "verifier-only-constraint".to_owned(),
+                    severity: RuleCheckSeverity::Warning,
+                    message: format!(
+                        "This rule uses {}. sspry can anchor it for candidate search, but exact evaluation requires local verification with --verify.",
+                        join_human_list(&verifier_only_labels)
+                    ),
+                });
+            }
+            if !ignored_module_calls.is_empty() {
+                issues.push(RuleCheckIssue {
+                    code: "ignored-module-predicate".to_owned(),
+                    severity: RuleCheckSeverity::Warning,
+                    message: format!(
+                        "Indexed candidate search prunes module predicates for {}. Use --verify if you need exact module-aware results.",
+                        join_human_list(&ignored_module_calls)
+                    ),
+                });
+            }
+            RuleCheckReport {
+                status: if issues.is_empty() {
+                    RuleCheckStatus::Searchable
+                } else {
+                    RuleCheckStatus::SearchableNeedsVerify
+                },
+                issues,
+                verifier_only_kinds,
+                ignored_module_calls,
+            }
+        }
+        Err(err) => {
+            let mut issues = vec![RuleCheckIssue {
+                code: "unsupported".to_owned(),
+                severity: RuleCheckSeverity::Error,
+                message: err.to_string(),
+            }];
+            if !ignored_module_calls.is_empty() {
+                issues.push(RuleCheckIssue {
+                    code: "ignored-module-predicate".to_owned(),
+                    severity: RuleCheckSeverity::Warning,
+                    message: format!(
+                        "The rule also references ignored module predicates for {}.",
+                        join_human_list(&ignored_module_calls)
+                    ),
+                });
+            }
+            RuleCheckReport {
+                status: RuleCheckStatus::Unsupported,
+                issues,
+                verifier_only_kinds: Vec::new(),
+                ignored_module_calls,
+            }
+        }
+    }
+}
+
 fn contains_identity_node(node: &QueryNode) -> bool {
     node.kind == "identity_eq" || node.children.iter().any(contains_identity_node)
 }
@@ -5179,6 +5378,98 @@ pub fn compile_query_plan_from_file_with_gram_sizes(
     )
 }
 
+pub fn rule_check_with_gram_sizes_and_identity_source(
+    rule_text: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> RuleCheckReport {
+    let ignored_module_calls = parse_rule_blocks(rule_text)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .flat_map(|block| collect_ignored_module_call_names(&block.raw_condition_text))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    build_rule_check_report(
+        compile_query_plan_with_gram_sizes_and_identity_source(
+            rule_text,
+            gram_sizes,
+            active_identity_source,
+            max_anchors_per_alt,
+            force_tier1_only,
+            allow_tier2_fallback,
+            max_candidates,
+        ),
+        ignored_module_calls,
+    )
+}
+
+pub fn rule_check_with_gram_sizes(
+    rule_text: &str,
+    gram_sizes: GramSizes,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> RuleCheckReport {
+    rule_check_with_gram_sizes_and_identity_source(
+        rule_text,
+        gram_sizes,
+        None,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
+pub fn rule_check_from_file_with_gram_sizes_and_identity_source(
+    rule_path: impl AsRef<Path>,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> Result<RuleCheckReport> {
+    let text = fs::read_to_string(rule_path)?;
+    Ok(rule_check_with_gram_sizes_and_identity_source(
+        &text,
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    ))
+}
+
+pub fn rule_check_from_file_with_gram_sizes(
+    rule_path: impl AsRef<Path>,
+    gram_sizes: GramSizes,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> Result<RuleCheckReport> {
+    rule_check_from_file_with_gram_sizes_and_identity_source(
+        rule_path,
+        gram_sizes,
+        None,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -6004,7 +6295,7 @@ rule anon {
                 .all(|id| id.starts_with(ANONYMOUS_PATTERN_PREFIX))
         );
 
-        let (strings, condition) = parse_rule_sections(
+        let (strings, _raw_condition, condition) = parse_rule_sections(
             r#"
 rule sample {
   strings:
@@ -6017,7 +6308,7 @@ rule sample {
         .expect("rule sections");
         assert_eq!(strings.len(), 1);
         assert_eq!(condition.trim(), "$a");
-        let (strings, condition) = parse_rule_sections(
+        let (strings, _raw_condition, condition) = parse_rule_sections(
             r#"
 rule commented {
   /*
@@ -6038,7 +6329,7 @@ rule commented {
         assert!(strings[0].contains(r#"$a = "ABCD""#));
         assert!(strings[1].contains(r#"$b = /foo\/bar/"#));
         assert_eq!(condition.trim(), "$a or $b");
-        let (strings, condition) = parse_rule_sections(
+        let (strings, _raw_condition, condition) = parse_rule_sections(
             r#"
 rule empty {
   condition:
@@ -6049,7 +6340,7 @@ rule empty {
         .expect("condition-only rule");
         assert!(strings.is_empty());
         assert_eq!(condition.trim(), "true");
-        let (_strings, condition) = parse_rule_sections(
+        let (_strings, _raw_condition, condition) = parse_rule_sections(
             r#"
 rule looped {
   strings:
@@ -6667,6 +6958,116 @@ rule numeric_rhs {
             .to_string()
             .contains("requires equality against a literal constant")
         );
+    }
+
+    #[test]
+    fn rule_check_marks_simple_rule_as_searchable() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule simple_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_marks_verifier_only_constraints_as_needing_verify() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule verifier_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a at pe.entry_point
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        assert_eq!(
+            report.verifier_only_kinds,
+            vec!["verifier_only_at".to_owned()]
+        );
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "verifier-only-constraint"
+                && issue
+                    .message
+                    .contains("exact evaluation requires local verification")
+        }));
+    }
+
+    #[test]
+    fn rule_check_marks_ignored_modules_as_needing_verify() {
+        let direct_ignored = collect_ignored_module_call_names(
+            r#"$a and console.log("dbg") and androguard.url(/evil\.example/)"#,
+        );
+        assert_eq!(
+            direct_ignored.into_iter().collect::<Vec<_>>(),
+            vec!["androguard.url".to_owned(), "console.log".to_owned()]
+        );
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule ignored_module_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and console.log("dbg") and androguard.url(/evil\.example/)
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        assert_eq!(
+            report.ignored_module_calls,
+            vec!["androguard.url".to_owned(), "console.log".to_owned()]
+        );
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "ignored-module-predicate" && issue.message.contains("Use --verify")
+        }));
+    }
+
+    #[test]
+    fn rule_check_marks_hash_identity_mismatch_as_unsupported() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule mismatched_hash {
+  condition:
+    hash.md5(0, filesize) == "0123456789abcdef0123456789abcdef"
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "unsupported" && issue.message.contains("current source is sha256")
+        }));
     }
 
     #[test]

@@ -31,7 +31,8 @@ use crate::candidate::{
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
-    resolve_max_candidates, scan_file_features_bloom_only_with_gram_sizes,
+    resolve_max_candidates, rule_check_from_file_with_gram_sizes_and_identity_source,
+    scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
@@ -924,6 +925,48 @@ struct ServerScanPolicy {
     gram_sizes: GramSizes,
     memory_budget_bytes: u64,
     workspace_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleCheckPolicySource {
+    Defaults,
+    Explicit,
+    LocalRoot,
+    Server,
+}
+
+impl RuleCheckPolicySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Defaults => "defaults",
+            Self::Explicit => "explicit",
+            Self::LocalRoot => "local-root",
+            Self::Server => "server",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuleCheckPolicy {
+    source: RuleCheckPolicySource,
+    id_source: CandidateIdSource,
+    gram_sizes: GramSizes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RuleCheckPolicyOutput {
+    source: String,
+    id_source: String,
+    gram_sizes: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RuleCheckOutput {
+    status: crate::candidate::RuleCheckStatus,
+    policy: RuleCheckPolicyOutput,
+    issues: Vec<crate::candidate::RuleCheckIssue>,
+    verifier_only_kinds: Vec<String>,
+    ignored_module_calls: Vec<String>,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
@@ -2424,6 +2467,80 @@ fn validate_forest_search_policy(
         }
     }
     Ok((gram_sizes.unwrap_or(GramSizes::new(3, 4)?), id_source, 0))
+}
+
+fn rule_check_policy_from_root(root: &Path) -> Result<RuleCheckPolicy> {
+    let tree_groups = open_forest_tree_groups(root)?;
+    let (gram_sizes, active_identity_source, _summary_cap_bytes) =
+        validate_forest_search_policy(&tree_groups)?;
+    let id_source =
+        CandidateIdSource::parse_config_value(active_identity_source.as_deref().ok_or_else(
+            || SspryError::from("candidate stores do not expose an identity source"),
+        )?)?;
+    Ok(RuleCheckPolicy {
+        source: RuleCheckPolicySource::LocalRoot,
+        id_source,
+        gram_sizes,
+    })
+}
+
+fn rule_check_policy(args: &RuleCheckArgs) -> Result<RuleCheckPolicy> {
+    if let Some(root) = &args.root {
+        return rule_check_policy_from_root(Path::new(root));
+    }
+    if let Some(addr) = &args.addr {
+        let server_policy = server_scan_policy(&ClientConnectionArgs {
+            addr: addr.clone(),
+            timeout: args.timeout,
+            max_message_bytes: args.max_message_bytes,
+        })?;
+        return Ok(RuleCheckPolicy {
+            source: RuleCheckPolicySource::Server,
+            id_source: server_policy.id_source,
+            gram_sizes: server_policy.gram_sizes,
+        });
+    }
+    let source = if args.id_source.is_some() || args.gram_sizes.is_some() {
+        RuleCheckPolicySource::Explicit
+    } else {
+        RuleCheckPolicySource::Defaults
+    };
+    Ok(RuleCheckPolicy {
+        source,
+        id_source: args.id_source.unwrap_or(CandidateIdSource::Sha256),
+        gram_sizes: GramSizes::parse(args.gram_sizes.as_deref().unwrap_or("3,4"))?,
+    })
+}
+
+fn rule_check_output(
+    policy: RuleCheckPolicy,
+    report: crate::candidate::RuleCheckReport,
+) -> RuleCheckOutput {
+    RuleCheckOutput {
+        status: report.status,
+        policy: RuleCheckPolicyOutput {
+            source: policy.source.as_str().to_owned(),
+            id_source: policy.id_source.as_str().to_owned(),
+            gram_sizes: format!("{},{}", policy.gram_sizes.tier1, policy.gram_sizes.tier2),
+        },
+        issues: report.issues,
+        verifier_only_kinds: report.verifier_only_kinds,
+        ignored_module_calls: report.ignored_module_calls,
+    }
+}
+
+fn print_rule_check_output(output: &RuleCheckOutput) {
+    println!("status: {}", output.status.as_str());
+    println!("policy_source: {}", output.policy.source);
+    println!("id_source: {}", output.policy.id_source);
+    println!("gram_sizes: {}", output.policy.gram_sizes);
+    if output.issues.is_empty() {
+        println!("summary: rule is compatible with sspry candidate search under this policy.");
+        return;
+    }
+    for issue in &output.issues {
+        println!("{}: {}", issue.severity.as_str(), issue.message);
+    }
 }
 
 fn forest_prepared_query_profile(
@@ -4576,6 +4693,39 @@ fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
     })
 }
 
+fn cmd_rule_check(args: &RuleCheckArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let policy = rule_check_policy(args)?;
+        let report = rule_check_from_file_with_gram_sizes_and_identity_source(
+            &args.rule,
+            policy.gram_sizes,
+            Some(policy.id_source.as_str()),
+            args.max_anchors_per_pattern,
+            false,
+            true,
+            7.5,
+        )?;
+        let exit_code = if report.status == crate::candidate::RuleCheckStatus::Unsupported {
+            1
+        } else {
+            0
+        };
+        let output = rule_check_output(policy, report);
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_rule_check_output(&output);
+        }
+        Ok(exit_code)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 fn collect_streamed_search_execution<F>(
     args: &SearchCommandArgs,
     plan: CompiledQueryPlan,
@@ -5375,6 +5525,7 @@ enum Commands {
     LocalIndex(LocalIndexArgs),
     Delete(DeleteArgs),
     LocalDelete(LocalDeleteArgs),
+    RuleCheck(RuleCheckArgs),
     Search(SearchCommandArgs),
     LocalSearch(LocalSearchArgs),
     SearchBatch(SearchBatchArgs),
@@ -5520,6 +5671,63 @@ struct LocalDeleteArgs {
         help = "Existing file paths or hex digests in the store's identity format."
     )]
     values: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct RuleCheckArgs {
+    #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
+    rule: String,
+    #[arg(
+        long = "addr",
+        conflicts_with = "root",
+        help = "Use the active scan policy from a live server at host:port."
+    )]
+    addr: Option<String>,
+    #[arg(
+        long = "timeout",
+        default_value_t = DEFAULT_RPC_TIMEOUT,
+        requires = "addr",
+        help = "Connection/read timeout in seconds when --addr is used."
+    )]
+    timeout: f64,
+    #[arg(
+        long = "max-message-bytes",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
+        requires = "addr",
+        help = "Maximum remote message size in bytes when --addr is used."
+    )]
+    max_message_bytes: usize,
+    #[arg(
+        long = "root",
+        conflicts_with = "addr",
+        help = "Use the active scan policy from a local store or forest root."
+    )]
+    root: Option<String>,
+    #[arg(
+        long = "id-source",
+        value_enum,
+        conflicts_with_all = ["addr", "root"],
+        help = "Assumed DB identity source when no live server or local root is provided."
+    )]
+    id_source: Option<CandidateIdSource>,
+    #[arg(
+        long = "gram-sizes",
+        conflicts_with_all = ["addr", "root"],
+        help = "Assumed DB gram-size pair as tier1,tier2 when no live server or local root is provided."
+    )]
+    gram_sizes: Option<String>,
+    #[arg(
+        long = "max-anchors-per-pattern",
+        default_value_t = 16,
+        help = "Keep at most this many anchors per pattern alternative while checking."
+    )]
+    max_anchors_per_pattern: usize,
+    #[arg(
+        long = "json",
+        action = ArgAction::SetTrue,
+        help = "Emit structured JSON instead of text."
+    )]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -5912,6 +6120,7 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
         Commands::LocalIndex(args) => cmd_local_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
         Commands::LocalDelete(args) => cmd_local_delete(&args),
+        Commands::RuleCheck(args) => cmd_rule_check(&args),
         Commands::Search(args) => cmd_search(&args),
         Commands::LocalSearch(args) => cmd_local_search(&args),
         Commands::SearchBatch(args) => cmd_search_batch(&args),

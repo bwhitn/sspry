@@ -7,6 +7,7 @@
 1. Remote/server mode:
    - `serve` starts the long-lived remote server.
    - `index`, `delete`, `search`, `info`, and `shutdown` talk to that server over gRPC.
+   - `rule-check` can pull the active scan policy from a live server with `--addr`.
 2. Local/direct mode:
    - `local-index` writes directly to a local store root and auto-initializes it if needed.
    - `local-delete` operates directly on a local store.
@@ -14,6 +15,7 @@
    - `local-search` and `search-batch` open a forest locally in-process.
 3. Direct YARA scan mode:
    - `yara` scans one file directly with `yara-x` and does not use the database.
+   - `rule-check` can also validate a rule offline with explicit `--id-source` / `--gram-sizes` or against a local root with `--root`.
 
 ## Global Options
 
@@ -189,6 +191,44 @@ Values can be:
 
 - an existing file path
 - a digest string matching the store's configured identity format
+
+## rule-check
+
+```bash
+./target/release/sspry rule-check [options] --rule <rule.yar>
+```
+
+Options:
+
+- `--rule <path>`
+- `--addr <host:port>`
+  - use a live server's active scan policy
+- `--timeout <seconds>`
+  - only used with `--addr`
+- `--max-message-bytes <bytes>`
+  - only used with `--addr`
+- `--root <path>`
+  - use a local store or forest root's active scan policy
+- `--id-source <sha256|md5|sha1|sha512>`
+  - assumed identity source when neither `--addr` nor `--root` is used
+- `--gram-sizes <tier1,tier2>`
+  - assumed gram-size pair when neither `--addr` nor `--root` is used
+- `--max-anchors-per-pattern <n>`
+- `--json`
+
+Behavior:
+
+- classifies rules as:
+  - `searchable`
+  - `searchable-needs-verify`
+  - `unsupported`
+- reports hard planner failures directly, including policy mismatches such as whole-file hash equality against the wrong DB identity source
+- warns when exact semantics require `search --verify`, including:
+  - verifier-only offset/count/range/loop constraints
+  - ignored indexed-search module predicates like `androguard.*`, `console.*`, and `cuckoo.*`
+- `--addr` and `--root` use real DB policy instead of assumptions
+- without `--json`, output is plain text intended for humans
+- with `--json`, output includes the effective policy, issues, ignored module calls, and verifier-only node kinds
 
 ## search
 

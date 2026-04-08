@@ -15,6 +15,7 @@ Commands:
   local-index
   delete
   local-delete
+  rule-check
   search
   local-search
   search-batch
@@ -30,6 +31,7 @@ Commands:
 - `SSPRY_ADDR` sets the default server address for remote client commands.
 - `serve` is the only public server command.
 - `index`, `delete`, `search`, `info`, and `shutdown` are the public remote client commands.
+- `rule-check` validates a rule against a live server policy, a local root, or explicit offline assumptions.
 - the public remote transport is gRPC
 - `local-index`, `local-delete`, `local-search`, and `local-info` operate directly on disk without RPC.
 - `search-batch` is the long-lived local forest runner for repeated sweeps.
@@ -124,6 +126,30 @@ Usage: sspry local-delete [OPTIONS] --root <ROOT> <VALUES>...
 ```
 
 - `--root <ROOT>`
+
+## `rule-check`
+
+```text
+Usage: sspry rule-check [OPTIONS] --rule <RULE>
+```
+
+- `--rule <RULE>`
+- `--addr <ADDR>`
+- `--timeout <SECONDS>` when using `--addr`
+- `--max-message-bytes <BYTES>` when using `--addr`
+- `--root <ROOT>`
+- `--id-source <sha256|md5|sha1|sha512>`
+- `--gram-sizes <tier1,tier2>`
+- `--max-anchors-per-pattern <N>` default `16`
+- `--json`
+
+Behavior:
+
+- returns `searchable`, `searchable-needs-verify`, or `unsupported`
+- uses live server policy with `--addr`
+- uses on-disk store or forest policy with `--root`
+- otherwise falls back to explicit or default offline assumptions
+- warns about verifier-only constraints and ignored indexed-search module predicates
 
 ## `search`
 

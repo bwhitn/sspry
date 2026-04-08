@@ -177,6 +177,183 @@ fn info_over_tcp_returns_json_after_auto_init() {
 }
 
 #[test]
+fn rule_check_reports_unsupported_hash_mismatch_with_explicit_policy() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule mismatched_hash {
+  condition:
+    hash.md5(0, filesize) == "0123456789abcdef0123456789abcdef"
+}
+"#,
+    )
+    .expect("write rule");
+
+    let output = Command::new(bin_path())
+        .args([
+            "rule-check",
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--id-source",
+            "sha256",
+            "--json",
+        ])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail for unsupported rule"
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("rule-check json");
+    assert_eq!(
+        parsed.get("status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str),
+        Some("explicit")
+    );
+    assert!(
+        parsed
+            .get("issues")
+            .and_then(Value::as_array)
+            .expect("issues")
+            .iter()
+            .any(|issue| {
+                issue
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("current source is sha256")
+            })
+    );
+}
+
+#[test]
+fn rule_check_uses_server_policy_from_live_addr() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("candidate_db");
+    let port = reserve_tcp_port();
+    let addr = tcp_addr(port);
+    let mut child = spawn_serve_tcp(port, &root, &["--id-source", "md5"]);
+    wait_for_info(&addr);
+
+    let rule_path = tmp.path().join("rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule mismatched_hash {
+  condition:
+    hash.sha256(0, filesize) == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args([
+            "rule-check",
+            "--addr",
+            &addr,
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--json",
+        ])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail for unsupported rule"
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("rule-check json");
+    assert_eq!(
+        parsed.get("status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str),
+        Some("server")
+    );
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|value| value.get("id_source"))
+            .and_then(Value::as_str),
+        Some("md5")
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn rule_check_uses_local_root_policy() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("local_db");
+    let sample = tmp.path().join("sample.bin");
+    fs::write(&sample, b"sample local root rule check").expect("write sample");
+    let _ = run_ok(&[
+        "local-index",
+        "--root",
+        root.to_str().expect("root"),
+        sample.to_str().expect("sample"),
+    ]);
+
+    let rule_path = tmp.path().join("rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule mismatched_hash {
+  condition:
+    hash.md5(0, filesize) == "0123456789abcdef0123456789abcdef"
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args([
+            "rule-check",
+            "--root",
+            root.to_str().expect("root"),
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--json",
+        ])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail for unsupported rule"
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("rule-check json");
+    assert_eq!(
+        parsed.get("status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str),
+        Some("local-root")
+    );
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|value| value.get("id_source"))
+            .and_then(Value::as_str),
+        Some("sha256")
+    );
+}
+
+#[test]
 fn serve_persists_candidate_shards() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
