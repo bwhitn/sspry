@@ -647,6 +647,36 @@ rule overbroad_iron_tiger_style {
 }
 
 #[test]
+fn rule_check_plain_text_reports_nonliteral_byte_offset_details() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("dynamic-offset-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule dynamic_offset_rule {
+  condition:
+    uint32(filesize) == 1
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail unsupported nonliteral byte offsets"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: unsupported"));
+    assert!(stdout.contains("error in dynamic_offset_rule"));
+    assert!(stdout.contains("integer byte offset"));
+    assert!(stdout.contains("source: uint32(filesize) == 1"));
+    assert!(stdout.contains("literal constant"));
+}
+
+#[test]
 fn rule_check_plain_text_reports_unbounded_negated_search_as_unsupported() {
     let tmp = tempdir().expect("tmp");
     let rule_path = tmp.path().join("negated-only-rule.yar");

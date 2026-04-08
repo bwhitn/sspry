@@ -4065,6 +4065,43 @@ fn source_match_for_condition_pattern_id(
     source_match_for_condition_literal(rule_text, pattern_id)
 }
 
+fn source_match_for_strings_literal(rule_text: &str, literal: &str) -> Option<RuleSourceMatch> {
+    let strings_offset = rule_text.find("strings:")?;
+    let section_end = rule_text[strings_offset..]
+        .find("condition:")
+        .map(|offset| strings_offset + offset)
+        .unwrap_or(rule_text.len());
+    let strings_section = &rule_text[strings_offset..section_end];
+    strings_section.find(literal).map(|relative_offset| {
+        source_match_for_offset(rule_text, strings_offset + relative_offset)
+    })
+}
+
+fn source_match_for_first_strings_line(rule_text: &str) -> Option<RuleSourceMatch> {
+    let strings_offset = rule_text.find("strings:")?;
+    let tail = &rule_text[strings_offset..];
+    let newline_offset = tail.find('\n')?;
+    let body_start = strings_offset + newline_offset + 1;
+    let section_end = rule_text[body_start..]
+        .find("condition:")
+        .map(|offset| body_start + offset)
+        .unwrap_or(rule_text.len());
+    let remaining = &rule_text[body_start..section_end];
+    let first_non_ws = remaining
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))?;
+    Some(source_match_for_offset(
+        rule_text,
+        body_start + first_non_ws,
+    ))
+}
+
+fn extract_message_fragment(message: &str, prefix: &str) -> Option<String> {
+    let suffix = message.strip_prefix(prefix)?.trim();
+    let quoted = suffix.strip_prefix('"')?.strip_suffix('"')?;
+    Some(quoted.to_owned())
+}
+
 fn source_match_for_anchorless_verifier_only_condition(rule_text: &str) -> Option<RuleSourceMatch> {
     for candidate in [
         "uint8(", "uint16(", "uint32(", "uint64(", "int8(", "int16(", "int32(", "int64(",
@@ -4162,6 +4199,78 @@ fn remediation_for_issue_code(code: &str) -> Option<String> {
             "Add a positive searchable anchor outside the negated condition, or use direct/local YARA verification instead of sspry's indexed candidate search for this rule."
                 .to_owned(),
         ),
+        "no-parseable-rule-block" => Some(
+            "Point `rule-check` at a real YARA rule file rather than an index/include list, or expand the include file before checking it."
+                .to_owned(),
+        ),
+        "no-condition-section" => Some(
+            "Add a `condition:` section to the rule so sspry can analyze the searchable logic."
+                .to_owned(),
+        ),
+        "ignored-module-no-anchor" => Some(
+            "Add a searchable string or hex anchor that survives after module predicates are pruned, or use `search --verify` on a positively anchored companion rule."
+                .to_owned(),
+        ),
+        "unsupported-regex-flags" => Some(
+            "Remove unsupported regex flags such as `nocase`, or rewrite the regex as anchored literals or hex that sspry can index."
+                .to_owned(),
+        ),
+        "unsupported-literal-flags" => Some(
+            "Remove unsupported literal flags such as `base64`, or pre-expand the transformed strings into ordinary searchable literals."
+                .to_owned(),
+        ),
+        "unsupported-hex-syntax" => Some(
+            "Rewrite the hex string to use sspry's supported syntax: concrete bytes, `??`, bounded gaps like `[n]` or `[n-m]`, and simple same-length groups."
+                .to_owned(),
+        ),
+        "regex-no-mandatory-literal" => Some(
+            "Rewrite the regex so it contains a stable mandatory literal anchor, or add a separate mandatory string/hex anchor alongside it."
+                .to_owned(),
+        ),
+        "unsupported-regex-syntax" => Some(
+            "Rewrite the regex to avoid unsupported regex syntax, or replace it with anchored literals or hex that sspry can index."
+                .to_owned(),
+        ),
+        "nocase-no-anchorable-window" => Some(
+            "Use a longer `nocase` literal, remove `nocase`, or add a separate mandatory anchorable literal so sspry can derive searchable grams."
+                .to_owned(),
+        ),
+        "unsupported-strings-declaration" => Some(
+            "Rewrite the string declaration into one of the supported forms: plain literal, regex, or hex with sspry's supported syntax."
+                .to_owned(),
+        ),
+        "unsupported-condition-field" => Some(
+            "Rewrite the rule around supported metadata or anchored literals, or reserve this predicate for local verification instead of indexed search."
+                .to_owned(),
+        ),
+        "nonliteral-byte-offset" => Some(
+            "Rewrite the byte-read offset to a literal constant that fits an indexed exact window, or move this condition behind `search --verify`."
+                .to_owned(),
+        ),
+        "count-requires-integer-literal" => Some(
+            "Rewrite the count comparison to use an integer literal, or verify the rule locally if it depends on dynamic count expressions."
+                .to_owned(),
+        ),
+        "numeric-read-literal-out-of-range" => Some(
+            "Use a literal constant that fits the numeric read width, or rewrite the comparison to avoid out-of-range values."
+                .to_owned(),
+        ),
+        "invalid-literal-string" => Some(
+            "Fix the string escaping so the literal is valid YARA text, then rerun `rule-check`."
+                .to_owned(),
+        ),
+        "unknown-rule-reference" => Some(
+            "Include or inline the referenced helper rule before checking, or fix the rule name reference."
+                .to_owned(),
+        ),
+        "unsupported-condition-syntax" => Some(
+            "Rewrite the condition into sspry's supported searchable subset; complex array indexing, bitwise expressions, and iterator-heavy module access are not currently indexed."
+                .to_owned(),
+        ),
+        "unsupported-comparison-operator" => Some(
+            "Rewrite the comparison into a supported searchable form such as equality or a positively anchored verify-only rule."
+                .to_owned(),
+        ),
         "ignored-module-predicate" => Some(
             "Use `search --verify` if these module predicates matter, or rewrite the rule to rely on indexed literals or metadata that sspry can evaluate directly."
                 .to_owned(),
@@ -4231,7 +4340,50 @@ fn remediation_for_issue_code(code: &str) -> Option<String> {
 }
 
 fn classify_unsupported_issue_code(message: &str) -> &'static str {
-    if message.contains("current source is") && message.starts_with("hash.") {
+    if message == "Rule does not contain a parseable rule block." {
+        "no-parseable-rule-block"
+    } else if message == "Rule does not contain a condition section." {
+        "no-condition-section"
+    } else if message.contains("after pruning ignored module predicates") {
+        "ignored-module-no-anchor"
+    } else if message.starts_with("Unsupported regex flag(s) for ") {
+        "unsupported-regex-flags"
+    } else if message.starts_with("Unsupported literal flag(s) for ") {
+        "unsupported-literal-flags"
+    } else if message.starts_with("Unsupported hex token for ") {
+        "unsupported-hex-syntax"
+    } else if message == "Regex string does not contain a searchable mandatory literal." {
+        "regex-no-mandatory-literal"
+    } else if message.starts_with("Unsupported regex quantifier")
+        || message == "Unsupported regex quantifier body."
+        || message == "Unsupported regex group extension in searchable regex."
+    {
+        "unsupported-regex-syntax"
+    } else if message == "nocase literal does not contain an anchorable window for the active gram sizes" {
+        "nocase-no-anchorable-window"
+    } else if message.starts_with("Unsupported strings declaration: ") {
+        "unsupported-strings-declaration"
+    } else if message.starts_with("Unsupported condition field: ") {
+        "unsupported-condition-field"
+    } else if message.ends_with("requires an integer byte offset.") {
+        "nonliteral-byte-offset"
+    } else if message == "Count conditions require an integer literal." {
+        "count-requires-integer-literal"
+    } else if message.starts_with("Numeric read literal is out of range for ") {
+        "numeric-read-literal-out-of-range"
+    } else if message.starts_with("Invalid literal string: ") {
+        "invalid-literal-string"
+    } else if message.starts_with("Condition references unknown rule: ") {
+        "unknown-rule-reference"
+    } else if message.starts_with("Unsupported token in condition near: ")
+        || message.starts_with("Unexpected trailing token in condition:")
+    {
+        "unsupported-condition-syntax"
+    } else if message.starts_with("Unsupported count comparison token: ")
+        || message.starts_with("Expected token EqEq, got ")
+    {
+        "unsupported-comparison-operator"
+    } else if message.contains("current source is") && message.starts_with("hash.") {
         "hash-identity-mismatch"
     } else if message.contains("requires a known DB identity source") {
         "hash-identity-source-unknown"
@@ -4278,6 +4430,64 @@ fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceM
         return source_match_for_literal(rule_text, "math.entropy(");
     }
     match code {
+        "no-condition-section" => source_match_for_literal(rule_text, "strings:")
+            .or_else(|| source_match_for_first_strings_line(rule_text)),
+        "ignored-module-no-anchor" => {
+            for candidate in ["androguard.", "console.", "cuckoo."] {
+                if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+                    return Some(found);
+                }
+            }
+            source_match_for_first_condition_line(rule_text)
+        }
+        "unsupported-regex-flags" | "unsupported-literal-flags" => message
+            .split_once(" for ")
+            .and_then(|(_, suffix)| suffix.split_once(':'))
+            .and_then(|(pattern_id, _)| source_match_for_strings_literal(rule_text, pattern_id))
+            .or_else(|| source_match_for_first_strings_line(rule_text)),
+        "unsupported-hex-syntax" => message
+            .split_once(" for ")
+            .and_then(|(_, suffix)| suffix.split_once(':'))
+            .and_then(|(pattern_id, _)| source_match_for_strings_literal(rule_text, pattern_id))
+            .or_else(|| source_match_for_first_strings_line(rule_text)),
+        "regex-no-mandatory-literal" => source_match_for_first_strings_line(rule_text),
+        "unsupported-regex-syntax" | "nocase-no-anchorable-window" => {
+            source_match_for_first_strings_line(rule_text)
+        }
+        "unsupported-strings-declaration" => {
+            extract_message_fragment(message, "Unsupported strings declaration: ")
+                .and_then(|fragment| source_match_for_strings_literal(rule_text, &fragment))
+                .or_else(|| source_match_for_first_strings_line(rule_text))
+        }
+        "unsupported-condition-field" => message
+            .strip_prefix("Unsupported condition field: ")
+            .and_then(|field| source_match_for_condition_literal(rule_text, field))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "nonliteral-byte-offset" => message
+            .strip_suffix(" requires an integer byte offset.")
+            .and_then(|name| source_match_for_condition_literal(rule_text, &format!("{name}(")))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "count-requires-integer-literal" => source_match_for_condition_literal(rule_text, "#")
+            .or_else(|| source_match_for_condition_literal(rule_text, " of ("))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "numeric-read-literal-out-of-range" => message
+            .strip_prefix("Numeric read literal is out of range for ")
+            .and_then(|suffix| suffix.split_once(':').map(|(name, _)| name))
+            .and_then(|name| source_match_for_condition_literal(rule_text, &format!("{name}(")))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "invalid-literal-string" => source_match_for_first_strings_line(rule_text),
+        "unknown-rule-reference" => message
+            .strip_prefix("Condition references unknown rule: ")
+            .and_then(|rule_name| source_match_for_condition_literal(rule_text, rule_name))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "unsupported-condition-syntax" => {
+            extract_message_fragment(message, "Unsupported token in condition near: ")
+                .and_then(|fragment| source_match_for_condition_literal(rule_text, &fragment))
+                .or_else(|| source_match_for_first_condition_line(rule_text))
+        }
+        "unsupported-comparison-operator" => source_match_for_condition_literal(rule_text, "!=")
+            .or_else(|| source_match_for_condition_literal(rule_text, "#"))
+            .or_else(|| source_match_for_first_condition_line(rule_text)),
         "overbroad-union" => {
             for candidate in ["any of", "or", "1 of", "2 of"] {
                 if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
@@ -8099,6 +8309,235 @@ rule mismatched_hash {
                 .unwrap_or_default()
                 .contains("--id-source")
         );
+    }
+
+    #[test]
+    fn rule_check_marks_parseable_rule_block_errors_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"include "index.yar""#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report.issues.first().expect("unsupported issue");
+        assert_eq!(issue.code, "no-parseable-rule-block");
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("real YARA rule file")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_ignored_module_only_rules_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule ignored_only_rule {
+  condition:
+    console.log("dbg")
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "ignored-module-no-anchor")
+            .expect("ignored-module-no-anchor issue");
+        assert_eq!(issue.rule.as_deref(), Some("ignored_only_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("console.log(\"dbg\")"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("searchable string or hex anchor")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_unsupported_regex_flags_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule regex_flag_rule {
+  strings:
+    $a = /evil/ nocase
+  condition:
+    $a
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "unsupported-regex-flags")
+            .expect("regex flag issue");
+        assert_eq!(issue.rule.as_deref(), Some("regex_flag_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("$a = /evil/ nocase"));
+    }
+
+    #[test]
+    fn rule_check_marks_unsupported_hex_syntax_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule bad_hex_rule {
+  strings:
+    $a = { 6a?? }
+  condition:
+    $a
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "unsupported-hex-syntax")
+            .expect("hex syntax issue");
+        assert_eq!(issue.rule.as_deref(), Some("bad_hex_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("$a = { 6a?? }"));
+    }
+
+    #[test]
+    fn rule_check_marks_nonliteral_byte_offsets_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule dynamic_offset_rule {
+  condition:
+    uint32(filesize) == 1
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "nonliteral-byte-offset")
+            .expect("byte offset issue");
+        assert_eq!(issue.rule.as_deref(), Some("dynamic_offset_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("uint32(filesize) == 1"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("literal constant")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_short_nocase_literals_without_anchor_window() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule short_nocase_rule {
+  strings:
+    $a = "ab" nocase
+  condition:
+    $a
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "nocase-no-anchorable-window")
+            .expect("nocase anchor issue");
+        assert_eq!(issue.rule.as_deref(), Some("short_nocase_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("$a = \"ab\" nocase"));
+    }
+
+    #[test]
+    fn rule_check_marks_missing_rule_references_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule parent_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a and missing_helper
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "unknown-rule-reference")
+            .expect("unknown rule issue");
+        assert_eq!(issue.rule.as_deref(), Some("parent_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("$a and missing_helper"));
+    }
+
+    #[test]
+    fn rule_check_marks_unsupported_comparison_operator_with_specific_issue_code() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule unsupported_comparison_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a != 1
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "unsupported-comparison-operator")
+            .expect("unsupported comparison issue");
+        assert_eq!(issue.rule.as_deref(), Some("unsupported_comparison_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("#a != 1"));
     }
 
     #[test]
