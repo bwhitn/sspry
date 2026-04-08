@@ -825,6 +825,119 @@ rule unsupported_rule {
 }
 
 #[test]
+fn rule_check_json_ignores_private_helper_rule_in_top_level_status() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("private-helper.yar");
+    fs::write(
+        &rule_path,
+        r#"
+private rule helper {
+  strings:
+    $a = "ABCD"
+  condition:
+    not $a
+}
+
+rule top {
+  strings:
+    $b = "WXYZ"
+  condition:
+    $b
+}
+"#,
+    )
+    .expect("write rule");
+
+    let output = Command::new(bin_path())
+        .args([
+            "rule-check",
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--json",
+        ])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should succeed when only private helper rules are unsupported"
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("rule-check json");
+    assert_eq!(
+        parsed.get("status").and_then(Value::as_str),
+        Some("searchable")
+    );
+    assert!(
+        parsed
+            .get("issues")
+            .and_then(Value::as_array)
+            .is_some_and(|issues| issues.is_empty())
+    );
+    let rules = parsed
+        .get("rules")
+        .and_then(Value::as_array)
+        .expect("rules array");
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].get("is_private").and_then(Value::as_bool), Some(true));
+    assert_eq!(rules[0].get("status").and_then(Value::as_str), Some("unsupported"));
+    assert_eq!(rules[1].get("status").and_then(Value::as_str), Some("searchable"));
+}
+
+#[test]
+fn rule_check_json_preserves_locations_with_comments_before_later_rules() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("commented-multi.yar");
+    fs::write(
+        &rule_path,
+        r#"
+// leading comment with enough text to skew offsets
+rule one {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+
+// another long comment line to change stripped length
+rule two {
+  strings:
+    $b = "WXYZ"
+  condition:
+    not $b
+}
+"#,
+    )
+    .expect("write rule");
+
+    let output = Command::new(bin_path())
+        .args([
+            "rule-check",
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--json",
+        ])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail because rule two is unsupported"
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("rule-check json");
+    let rules = parsed
+        .get("rules")
+        .and_then(Value::as_array)
+        .expect("rules array");
+    let issue = rules[1]
+        .get("issues")
+        .and_then(Value::as_array)
+        .and_then(|issues| issues.first())
+        .expect("issue");
+    assert_eq!(issue.get("rule").and_then(Value::as_str), Some("two"));
+    assert_eq!(issue.get("line").and_then(Value::as_u64), Some(15));
+    assert_eq!(issue.get("column").and_then(Value::as_u64), Some(5));
+    assert_eq!(issue.get("snippet").and_then(Value::as_str), Some("not $b"));
+}
+
+#[test]
 fn serve_persists_candidate_shards() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");

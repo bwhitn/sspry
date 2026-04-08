@@ -1727,9 +1727,13 @@ fn strip_rule_comments(rule_text: &str) -> String {
         if in_block_comment {
             if ch == '\n' {
                 out.push('\n');
-            } else if ch == '*' && next == Some('/') {
-                in_block_comment = false;
-                index += 1;
+            } else {
+                out.push(' ');
+                if ch == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    out.push(' ');
+                    index += 1;
+                }
             }
             index += 1;
             continue;
@@ -1738,6 +1742,8 @@ fn strip_rule_comments(rule_text: &str) -> String {
             if ch == '\n' {
                 in_line_comment = false;
                 out.push('\n');
+            } else {
+                out.push(' ');
             }
             index += 1;
             continue;
@@ -1772,11 +1778,15 @@ fn strip_rule_comments(rule_text: &str) -> String {
         }
 
         if ch == '/' && next == Some('*') {
+            out.push(' ');
+            out.push(' ');
             in_block_comment = true;
             index += 2;
             continue;
         }
         if ch == '/' && next == Some('/') {
+            out.push(' ');
+            out.push(' ');
             in_line_comment = true;
             index += 2;
             continue;
@@ -4744,11 +4754,18 @@ fn first_negated_search_condition_match(
 }
 
 fn summarize_rule_check_rules(rules: Vec<RuleCheckRuleReport>) -> RuleCheckFileReport {
+    let considered_rules = if rules.iter().any(|rule| !rule.is_private) {
+        rules.iter()
+            .filter(|rule| !rule.is_private)
+            .collect::<Vec<_>>()
+    } else {
+        rules.iter().collect::<Vec<_>>()
+    };
     let mut status = RuleCheckStatus::Searchable;
     let mut issues = Vec::<RuleCheckIssue>::new();
     let mut verifier_only_kinds = BTreeSet::<String>::new();
     let mut ignored_module_calls = BTreeSet::<String>::new();
-    for rule in &rules {
+    for rule in considered_rules {
         status = status.combine(rule.status);
         issues.extend(rule.issues.iter().cloned());
         verifier_only_kinds.extend(rule.verifier_only_kinds.iter().cloned());
@@ -8145,6 +8162,80 @@ rule unsupported_rule {
                 .and_then(|issue| issue.snippet.as_deref()),
             Some("not $b")
         );
+    }
+
+    #[test]
+    fn rule_check_all_ignores_private_helper_status_in_file_summary() {
+        let report = rule_check_all_with_gram_sizes_and_identity_source(
+            r#"
+private rule helper {
+  strings:
+    $a = "ABCD"
+  condition:
+    not $a
+}
+
+rule top {
+  strings:
+    $b = "WXYZ"
+  condition:
+    $b
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.issues.is_empty());
+        assert_eq!(report.rules.len(), 2);
+        assert!(report.rules[0].is_private);
+        assert_eq!(report.rules[0].status, RuleCheckStatus::Unsupported);
+        assert_eq!(report.rules[1].rule, "top");
+        assert_eq!(report.rules[1].status, RuleCheckStatus::Searchable);
+    }
+
+    #[test]
+    fn rule_check_all_preserves_file_locations_with_comments_before_later_rules() {
+        let report = rule_check_all_with_gram_sizes_and_identity_source(
+            r#"
+// leading comment with enough text to skew offsets
+rule one {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+
+// another long comment line to change stripped length
+rule two {
+  strings:
+    $b = "WXYZ"
+  condition:
+    not $b
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+
+        let issue = report.rules[1]
+            .issues
+            .iter()
+            .find(|issue| issue.code == "negated-search-unbounded")
+            .expect("negated issue");
+        assert_eq!(issue.rule.as_deref(), Some("two"));
+        assert_eq!(issue.line, Some(15));
+        assert_eq!(issue.column, Some(5));
+        assert_eq!(issue.snippet.as_deref(), Some("not $b"));
     }
 
     #[test]
