@@ -996,6 +996,10 @@ impl ConditionParser {
                         )));
                     }
                 };
+                if let Some(simplified) = self.simplify_trivial_count_constraint(&raw_id, op, value)
+                {
+                    return Ok(simplified);
+                }
                 let mut children = Vec::new();
                 if !self.verifier_only_pattern_ids.contains(&raw_id) {
                     children.push(QueryNode {
@@ -1361,6 +1365,34 @@ impl ConditionParser {
             )));
         }
         Ok(vec![raw_id.to_owned()])
+    }
+
+    fn simplify_trivial_count_constraint(
+        &self,
+        raw_id: &str,
+        op: &str,
+        value: usize,
+    ) -> Option<QueryNode> {
+        if self.verifier_only_pattern_ids.contains(raw_id) {
+            return None;
+        }
+        let pattern_node = || QueryNode {
+            kind: "pattern".to_owned(),
+            pattern_id: Some(raw_id.to_owned()),
+            threshold: None,
+            children: Vec::new(),
+        };
+        let not_pattern_node = || QueryNode {
+            kind: "not".to_owned(),
+            pattern_id: None,
+            threshold: None,
+            children: vec![pattern_node()],
+        };
+        match (op, value) {
+            ("gt", 0) | ("ge", 1) => Some(pattern_node()),
+            ("eq", 0) | ("le", 0) | ("lt", 1) => Some(not_pattern_node()),
+            _ => None,
+        }
     }
 }
 
@@ -3937,6 +3969,31 @@ fn verifier_only_kind_label(kind: &str) -> &'static str {
     }
 }
 
+fn verifier_only_issue_code(kind: &str) -> &'static str {
+    match kind {
+        "verifier_only_eq" => "verifier-only-byte-equality",
+        "verifier_only_at" => "verifier-only-offset",
+        "verifier_only_count" => "verifier-only-count",
+        "verifier_only_in_range" => "verifier-only-range",
+        "verifier_only_loop" => "verifier-only-loop",
+        _ => "verifier-only-constraint",
+    }
+}
+
+fn verifier_only_issue_message(kind: &str) -> String {
+    match kind {
+        "verifier_only_eq" => "This rule uses byte-read equality outside sspry's exact indexed prefix window. sspry can narrow candidates, but exact evaluation requires local verification with --verify.".to_owned(),
+        "verifier_only_at" => "This rule constrains a string match to a specific offset that sspry cannot prove exactly from indexed prefix metadata alone. sspry can anchor candidate search, but exact evaluation requires local verification with --verify.".to_owned(),
+        "verifier_only_count" => "This rule constrains the number of string matches. sspry can narrow candidates, but exact match-count evaluation requires local verification with --verify.".to_owned(),
+        "verifier_only_in_range" => "This rule constrains matches to a byte range. sspry can narrow candidates, but exact range evaluation requires local verification with --verify.".to_owned(),
+        "verifier_only_loop" => "This rule uses a for-any or for-all iterator over match conditions. sspry can narrow candidates, but exact iterator evaluation requires local verification with --verify.".to_owned(),
+        _ => format!(
+            "This rule uses {}. sspry can anchor it for candidate search, but exact evaluation requires local verification with --verify.",
+            verifier_only_kind_label(kind)
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RuleSourceLocation {
     line: usize,
@@ -4031,6 +4088,26 @@ fn remediation_for_issue_code(code: &str) -> Option<String> {
             "Run `search --verify` for exact results, or rewrite the rule around searchable anchored literals only."
                 .to_owned(),
         ),
+        "verifier-only-byte-equality" => Some(
+            "Run `search --verify` for exact numeric or byte-read checks, or keep the full read inside the stored 8-byte file prefix."
+                .to_owned(),
+        ),
+        "verifier-only-offset" => Some(
+            "Run `search --verify` for exact offset checks, or rewrite the rule so the match fits inside an exact indexed prefix window such as `at 0` or `at pe.entry_point`."
+                .to_owned(),
+        ),
+        "verifier-only-count" => Some(
+            "Run `search --verify` for exact match counts, or rewrite the rule to avoid `#` count constraints."
+                .to_owned(),
+        ),
+        "verifier-only-range" => Some(
+            "Run `search --verify` for exact range checks, or rewrite the rule to avoid `in (...)` range constraints."
+                .to_owned(),
+        ),
+        "verifier-only-loop" => Some(
+            "Run `search --verify` for exact `for any` or `for all` evaluation, or rewrite the iterator into directly searchable anchored literals."
+                .to_owned(),
+        ),
         "ignored-module-predicate" => Some(
             "Use `search --verify` if these module predicates matter, or rewrite the rule to rely on indexed literals or metadata that sspry can evaluate directly."
                 .to_owned(),
@@ -4116,16 +4193,14 @@ fn build_rule_check_report(
             let verifier_only_kinds = verifier_only_kinds.into_iter().collect::<Vec<_>>();
             let mut issues = Vec::<RuleCheckIssue>::new();
             for kind in &verifier_only_kinds {
+                let code = verifier_only_issue_code(kind);
                 issues.push(rule_check_issue(
                     rule_name,
-                    "verifier-only-constraint",
+                    code,
                     RuleCheckSeverity::Warning,
-                    format!(
-                        "This rule uses {}. sspry can anchor it for candidate search, but exact evaluation requires local verification with --verify.",
-                        verifier_only_kind_label(kind)
-                    ),
+                    verifier_only_issue_message(kind),
                     verifier_only_kind_match(rule_text, kind),
-                    remediation_for_issue_code("verifier-only-constraint"),
+                    remediation_for_issue_code(code),
                 ));
             }
             for module_call in &ignored_module_calls {
@@ -6501,6 +6576,20 @@ rule numeric_only_unanchorable {
             Some("count:$a:gt:2")
         );
 
+        let mut parser =
+            ConditionParser::new("#a > 0", HashSet::from(["$a".to_owned()]), None).expect("parser");
+        let count_exists = parser.parse().expect("count exists parse");
+        assert_eq!(count_exists.kind, "pattern");
+        assert_eq!(count_exists.pattern_id.as_deref(), Some("$a"));
+
+        let mut parser = ConditionParser::new("#a == 0", HashSet::from(["$a".to_owned()]), None)
+            .expect("parser");
+        let count_zero = parser.parse().expect("count zero parse");
+        assert_eq!(count_zero.kind, "not");
+        assert_eq!(count_zero.children.len(), 1);
+        assert_eq!(count_zero.children[0].kind, "pattern");
+        assert_eq!(count_zero.children[0].pattern_id.as_deref(), Some("$a"));
+
         let mut parser = ConditionParser::new(
             "$a in (filesize - 256 .. filesize)",
             HashSet::from(["$a".to_owned()]),
@@ -7310,15 +7399,12 @@ rule verifier_rule {
             vec!["verifier_only_at".to_owned()]
         );
         assert!(report.issues.iter().any(|issue| {
-            issue.code == "verifier-only-constraint"
-                && issue
-                    .message
-                    .contains("exact evaluation requires local verification")
+            issue.code == "verifier-only-offset" && issue.message.contains("specific offset")
         }));
         let issue = report
             .issues
             .iter()
-            .find(|issue| issue.code == "verifier-only-constraint")
+            .find(|issue| issue.code == "verifier-only-offset")
             .expect("verifier issue");
         assert_eq!(issue.rule.as_deref(), Some("verifier_rule"));
         assert_eq!(issue.line, Some(6));
@@ -7399,10 +7485,189 @@ rule verifier_numeric_rule {
         let issue = report
             .issues
             .iter()
-            .find(|issue| issue.code == "verifier-only-constraint")
+            .find(|issue| issue.code == "verifier-only-byte-equality")
             .expect("verifier issue");
         assert_eq!(issue.rule.as_deref(), Some("verifier_numeric_rule"));
         assert_eq!(issue.snippet.as_deref(), Some("uint32(5) == 16909060"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("8-byte file prefix")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_count_constraints_with_specific_issue_details() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule count_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a > 1
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        assert_eq!(
+            report.verifier_only_kinds,
+            vec!["verifier_only_count".to_owned()]
+        );
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "verifier-only-count")
+            .expect("count issue");
+        assert_eq!(issue.rule.as_deref(), Some("count_rule"));
+        assert_eq!(issue.snippet.as_deref(), Some("#a > 1"));
+        assert!(issue.message.contains("number of string matches"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("count constraints")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_trivial_positive_count_constraints_as_searchable() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule trivial_count_exists_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a > 0
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.verifier_only_kinds.is_empty());
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_marks_trivial_zero_count_constraints_as_searchable() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule trivial_count_zero_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a == 0
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::Searchable);
+        assert!(report.verifier_only_kinds.is_empty());
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_marks_range_constraints_with_specific_issue_details() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule range_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a in (filesize-64..filesize)
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        assert_eq!(
+            report.verifier_only_kinds,
+            vec!["verifier_only_in_range".to_owned()]
+        );
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "verifier-only-range")
+            .expect("range issue");
+        assert_eq!(issue.rule.as_deref(), Some("range_rule"));
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("$a in (filesize-64..filesize)")
+        );
+        assert!(issue.message.contains("byte range"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("range constraints")
+        );
+    }
+
+    #[test]
+    fn rule_check_marks_loop_constraints_with_specific_issue_details() {
+        let report = rule_check_with_gram_sizes_and_identity_source(
+            r#"
+rule loop_rule {
+  strings:
+    $a = { 41 42 43 44 }
+  condition:
+    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
+        assert_eq!(
+            report.verifier_only_kinds,
+            vec!["verifier_only_loop".to_owned()]
+        );
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "verifier-only-loop")
+            .expect("loop issue");
+        assert_eq!(issue.rule.as_deref(), Some("loop_rule"));
+        assert_eq!(
+            issue.snippet.as_deref(),
+            Some("for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))")
+        );
+        assert!(issue.message.contains("for-any or for-all iterator"));
+        assert!(
+            issue
+                .remediation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("for any")
+        );
     }
 
     #[test]

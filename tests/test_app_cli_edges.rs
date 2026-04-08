@@ -488,6 +488,96 @@ rule in_prefix_numeric_rule {
 }
 
 #[test]
+fn rule_check_plain_text_reports_specific_count_constraint_details() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("count-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule count_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a > 1
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should warn rather than fail for count constraints"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: searchable-needs-verify"));
+    assert!(stdout.contains("warning in count_rule"));
+    assert!(stdout.contains("number of string matches"));
+    assert!(stdout.contains("source: #a > 1"));
+    assert!(stdout.contains("count constraints"));
+}
+
+#[test]
+fn rule_check_plain_text_omits_warning_for_trivial_positive_count_rule() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("count-exists-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule trivial_count_exists_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a > 0
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should accept trivial positive count rules"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: searchable"));
+    assert!(!stdout.contains("warning"));
+}
+
+#[test]
+fn rule_check_plain_text_omits_warning_for_trivial_zero_count_rule() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("count-zero-rule.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule trivial_count_zero_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    #a == 0
+}
+"#,
+    )
+    .expect("write rule");
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        output.status.success(),
+        "rule-check should accept trivial zero count rules"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: searchable"));
+    assert!(!stdout.contains("warning"));
+}
+
+#[test]
 fn serve_persists_candidate_shards() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
