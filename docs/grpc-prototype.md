@@ -1,51 +1,43 @@
-## gRPC Prototype
+# gRPC Transport Notes
 
-This branch carries a parallel gRPC prototype surface.
+The public remote transport is now gRPC.
 
-Current status:
+Current public remote commands:
 
-- the existing custom framed RPC remains the active implementation
-- protobuf generation is wired in through `build.rs`
-- generated Rust types live under `sspry::grpc::v1`
-- `grpc-serve` provides a parallel TCP-only tonic server prototype
-- implemented gRPC methods:
-  - `Ping`
-  - `Stats`
-  - `Status`
-  - `Publish`
-  - `SearchStream`
-  - `InsertStream`
-  - `Delete`
-  - `Shutdown`
-
-Prototype CLI surface:
-
-- `grpc-serve`
-- `grpc-index`
-- `grpc-delete`
-- `grpc-search`
-- `grpc-info`
-- `grpc-shutdown`
+- `serve`
+- `index`
+- `delete`
+- `search`
+- `info`
+- `shutdown`
 
 Current request model:
 
-- gRPC search sends validated YARA source to the server rather than a serialized compiled-plan JSON payload.
-- gRPC ingest streams row-framed binary insert messages incrementally rather than the old manual upload begin/chunk/commit flow or a single whole-batch payload.
-- `grpc-index` publishes automatically after ingest when the target server is running in workspace mode so newly indexed documents become visible to `grpc-search`.
-- `grpc-serve` bounds per-message size with `--grpc-max-message-bytes`; large documents still stream incrementally and are not treated as one capped request.
+- search sends validated YARA source to the server instead of a serialized compiled-plan payload
+- ingest streams row-framed binary insert messages incrementally over gRPC
+- large documents are chunked across multiple gRPC messages instead of requiring one whole-request payload
+- `index` publishes automatically after ingest when the target server is running in workspace mode so newly indexed documents become searchable
 
-Design constraints to keep in mind during the migration:
+Operational behavior:
 
-1. The current custom search RPC sends a dynamic compiled query plan.
-   - A direct protobuf port of that JSON shape would be weak.
-   - The prototype now leans toward server-validated YARA source for search requests instead.
+- `serve --max-message-bytes` bounds per-message size
+- `index --insert-chunk-bytes` controls client-side insert frame chunking
+- only one active indexing session is allowed per server at a time
+- only one top-level search runs at a time per server; later searches queue
+- delete targets `current/` only
+- background compaction reclaims deleted docs from `current/`
 
-2. The current insert path mixes JSON requests with large binary uploads.
-   - gRPC client streaming should replace the manual begin/chunk/commit upload flow.
+What was validated on this branch:
 
-3. The current transport supports both TCP and Unix sockets.
-   - The prototype currently supports TCP only.
-   - Keep Unix-socket support as an explicit follow-up decision instead of an accidental regression.
+- small and large files
+- default FP and very low FP
+- interrupted ingest recovery
+- interrupted search recovery
+- delete plus background reclaim
+- fresh 10k low-FP end-to-end run
+- fresh 50k end-to-end run
+- warm 50k search parity checks against the older remote path
 
-4. The current custom RPC is the correctness baseline.
-   - New gRPC handlers should be introduced in parallel and compared against the existing path before cutover.
+Remaining migration note:
+
+- legacy framed-RPC code still exists internally in the tree for compatibility and test scaffolding, but it is no longer the public remote interface

@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
+#[cfg(test)]
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-#[cfg(unix)]
+use std::net::ToSocketAddrs;
+#[cfg(test)]
+use std::net::{TcpListener, TcpStream};
+#[cfg(all(test, unix))]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use base64::Engine;
+#[cfg(test)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -21,6 +25,7 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio_stream::StreamExt;
 use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status as GrpcStatus};
 
+#[cfg(test)]
 use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
 use crate::candidate::store::{
     CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
@@ -31,11 +36,14 @@ use crate::candidate::store::{
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
-    CandidateStore, CompiledQueryPlan, GramSizes, PatternPlan, QueryNode, candidate_shard_index,
+    CandidateStore, CompiledQueryPlan, GramSizes, QueryNode, candidate_shard_index,
     candidate_shard_root, compile_query_plan_with_gram_sizes_and_identity_source,
-    metadata_field_is_boolean, metadata_field_is_float, metadata_field_is_integer,
-    normalize_max_candidates, normalize_query_metadata_field, read_candidate_shard_count,
-    resolve_max_candidates, write_candidate_shard_count,
+    read_candidate_shard_count, resolve_max_candidates, write_candidate_shard_count,
+};
+#[cfg(test)]
+use crate::candidate::{
+    PatternPlan, metadata_field_is_boolean, metadata_field_is_float, metadata_field_is_integer,
+    normalize_max_candidates, normalize_query_metadata_field,
 };
 use crate::grpc::v1::{
     AdaptivePublishSummary, DeleteRequest as GrpcDeleteRequest,
@@ -44,9 +52,10 @@ use crate::grpc::v1::{
     IndexSessionProgressRequest, IndexSessionResponse, IndexSessionSummary,
     InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
     PingRequest, PingResponse, PreparedQueryProfileSummary, PublishRequest,
-    PublishResponse as GrpcPublishResponse, PublishSummary, QueryProfileSummary, SearchFrame,
-    SearchRequest, ShutdownRequest, ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary,
-    StartupSummary, StatsRequest, StatsResponse, StatusRequest, StatusResponse, StoreSummary,
+    PublishResponse as GrpcPublishResponse, PublishSummary, PublishedTier2SnapshotSealSummary,
+    QueryProfileSummary, SearchFrame, SearchRequest, ShutdownRequest,
+    ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary, StartupSummary, StatsRequest,
+    StatsResponse, StatusRequest, StatusResponse, StoreSummary,
     sspry_server::{Sspry as GrpcSspry, SspryServer},
 };
 use crate::perf::{record_counter, scope};
@@ -57,40 +66,67 @@ pub const DEFAULT_RPC_PORT: u16 = 17653;
 pub const DEFAULT_RPC_TIMEOUT: f64 = 30.0;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
+#[cfg(test)]
 const PROTOCOL_VERSION: u8 = 1;
+#[cfg(test)]
 const STATUS_OK: u8 = 0;
+#[cfg(test)]
 const STATUS_ERROR: u8 = 1;
+#[cfg(test)]
 const HEADER_LEN: usize = 6;
 
+#[cfg(test)]
 const ACTION_PING: u8 = 1;
+#[cfg(test)]
 const ACTION_CANDIDATE_DELETE: u8 = 4;
+#[cfg(test)]
 const ACTION_CANDIDATE_QUERY: u8 = 5;
+#[cfg(test)]
 const ACTION_CANDIDATE_STATS: u8 = 6;
+#[cfg(test)]
 const ACTION_SHUTDOWN: u8 = 8;
+#[cfg(test)]
 const ACTION_PUBLISH: u8 = 9;
+#[cfg(test)]
 const ACTION_INDEX_SESSION_BEGIN: u8 = 10;
+#[cfg(test)]
 const ACTION_INDEX_SESSION_END: u8 = 11;
+#[cfg(test)]
 const ACTION_INDEX_SESSION_PROGRESS: u8 = 12;
+#[cfg(test)]
 const ACTION_CANDIDATE_STATUS: u8 = 13;
+#[cfg(test)]
 const ACTION_INDEX_CLIENT_BEGIN: u8 = 14;
+#[cfg(test)]
 const ACTION_INDEX_CLIENT_END: u8 = 15;
+#[cfg(test)]
 const ACTION_INDEX_CLIENT_HEARTBEAT: u8 = 16;
+#[cfg(test)]
 const ACTION_CANDIDATE_INSERT_BATCH_BINARY: u8 = 17;
+#[cfg(test)]
 const ACTION_CANDIDATE_INSERT_UPLOAD_BEGIN: u8 = 18;
+#[cfg(test)]
 const ACTION_CANDIDATE_INSERT_UPLOAD_CHUNK: u8 = 19;
+#[cfg(test)]
 const ACTION_CANDIDATE_INSERT_UPLOAD_COMMIT: u8 = 20;
+#[cfg(test)]
 const ACTION_CANDIDATE_QUERY_STREAM: u8 = 21;
+#[cfg(test)]
 const TEMPORARY_PUBLISH_RETRY_LIMIT: usize = 400;
+#[cfg(test)]
 const TEMPORARY_PUBLISH_RETRY_SLEEP_MS: u64 = 50;
 const INDEX_CLIENT_LEASE_MULTIPLIER: u64 = 3;
+#[cfg(test)]
 const CANDIDATE_INSERT_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const GRPC_STREAM_INSERT_BATCH_MAX_ROWS: usize = 32;
 const GRPC_STREAM_INSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
+#[cfg(test)]
 const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
 const PREPARED_PLAN_CACHE_CAPACITY: usize = 4;
 const PREPARED_PLAN_CACHE_MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(test)]
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
 const CANDIDATE_SHARD_LOCK_POLL_INTERVAL_MS: u64 = 10;
@@ -107,6 +143,7 @@ fn search_trace_log(message: impl AsRef<str>) {
     }
 }
 
+#[cfg(test)]
 fn resolve_tree_query_workers(configured_workers: usize, tree_count: usize) -> usize {
     configured_workers.max(1).min(tree_count.max(1))
 }
@@ -167,6 +204,7 @@ fn current_process_memory_kb() -> (usize, usize) {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
@@ -264,17 +302,20 @@ pub struct CandidateDocumentWire {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg(test)]
 struct CandidateDeleteRequest {
     sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg(test)]
 struct CandidateInsertUploadBeginRequest {
     upload_id: u64,
     total_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg(test)]
 struct CandidateInsertUploadCommitRequest {
     upload_id: u64,
 }
@@ -339,6 +380,7 @@ type ParsedCandidateInsertDocument = (
     Option<String>,
 );
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct PendingCandidateInsertUpload {
     total_bytes: usize,
@@ -355,9 +397,11 @@ struct IndexClientLease {
 struct StoreSet {
     root: Mutex<PathBuf>,
     stores: Vec<Mutex<CandidateStore>>,
+    #[cfg(test)]
     stats_cache: Mutex<Option<CachedStoreSetStats>>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct CachedStoreSetStats {
     stats: Map<String, Value>,
@@ -369,6 +413,7 @@ impl StoreSet {
         Self {
             root: Mutex::new(root),
             stores: stores.into_iter().map(Mutex::new).collect(),
+            #[cfg(test)]
             stats_cache: Mutex::new(None),
         }
     }
@@ -408,14 +453,10 @@ impl StoreSet {
             )?;
             store.retarget_root(candidate_shard_root(root, shard_count, shard_idx));
         }
-        let mut cache = self
-            .stats_cache
-            .lock()
-            .map_err(|_| SspryError::from("Store set stats cache lock poisoned."))?;
-        *cache = None;
-        Ok(())
+        self.invalidate_stats_cache()
     }
 
+    #[cfg(test)]
     fn cached_stats(&self) -> Result<Option<(Map<String, Value>, u64)>> {
         let cache = self
             .stats_cache
@@ -426,6 +467,7 @@ impl StoreSet {
             .map(|entry| (entry.stats.clone(), entry.deleted_storage_bytes)))
     }
 
+    #[cfg(test)]
     fn set_cached_stats(
         &self,
         stats: Map<String, Value>,
@@ -442,12 +484,18 @@ impl StoreSet {
         Ok(())
     }
 
+    #[cfg(test)]
     fn invalidate_stats_cache(&self) -> Result<()> {
         let mut cache = self
             .stats_cache
             .lock()
             .map_err(|_| SspryError::from("Store set stats cache lock poisoned."))?;
         *cache = None;
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn invalidate_stats_cache(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -458,7 +506,7 @@ enum StoreMode {
         stores: Arc<StoreSet>,
     },
     Forest {
-        root: PathBuf,
+        _root: PathBuf,
         trees: Vec<Arc<StoreSet>>,
     },
     Workspace {
@@ -483,7 +531,6 @@ struct ServerState {
     index_client_leases: Mutex<HashMap<u64, IndexClientLease>>,
     publish_after_index_clients: AtomicBool,
     active_index_sessions: AtomicUsize,
-    candidate_insert_uploads: Mutex<HashMap<u64, PendingCandidateInsertUpload>>,
     work_dirty: AtomicBool,
     work_active_estimated_documents: AtomicU64,
     work_active_estimated_input_bytes: AtomicU64,
@@ -556,8 +603,12 @@ struct ServerState {
     last_published_tier2_snapshot_seal_failures: AtomicU64,
     last_published_tier2_snapshot_seal_completed_unix_ms: AtomicU64,
     adaptive_publish: Mutex<AdaptivePublishState>,
+    #[cfg(test)]
+    candidate_insert_uploads: Mutex<HashMap<u64, PendingCandidateInsertUpload>>,
+    #[cfg(test)]
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
     prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
+    #[cfg(test)]
     query_cache: Mutex<BoundedCache<String, Arc<CachedCandidateQuery>>>,
     search_admission: Mutex<SearchAdmissionState>,
     search_admission_cv: Condvar,
@@ -594,6 +645,7 @@ impl Drop for ActiveSearchRequestGuard<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct CachedCandidateQuery {
     ordered_hashes: Vec<String>,
@@ -604,6 +656,7 @@ struct CachedCandidateQuery {
     prepared_query_profile: CandidatePreparedQueryProfile,
 }
 
+#[cfg(test)]
 fn cached_candidate_query_memory_bytes(query: &CachedCandidateQuery) -> u64 {
     (std::mem::size_of::<CachedCandidateQuery>() as u64)
         .saturating_add(query.tier_used.capacity() as u64)
@@ -980,18 +1033,22 @@ impl Drop for ActiveMutationGuard<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct SspryClient {
     config: ClientConfig,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct PersistentSspryClient {
     stream: ClientStream,
 }
 
+#[cfg(test)]
 static NEXT_CANDIDATE_INSERT_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
 impl ClientConfig {
     pub fn new(host: String, port: u16, timeout: Duration, socket_path: Option<PathBuf>) -> Self {
         Self {
@@ -1003,6 +1060,7 @@ impl ClientConfig {
     }
 }
 
+#[cfg(test)]
 impl SspryClient {
     pub fn new(config: ClientConfig) -> Self {
         Self { config }
@@ -1085,58 +1143,6 @@ impl SspryClient {
             payload.insert("include_external_ids".to_owned(), Value::Bool(true));
         }
         self.request_typed_json(ACTION_CANDIDATE_QUERY, &Value::Object(payload))
-    }
-
-    pub(crate) fn candidate_query_plan_stream_with_options<F>(
-        &self,
-        plan: &CompiledQueryPlan,
-        chunk_size: Option<usize>,
-        include_external_ids: bool,
-        mut on_frame: F,
-    ) -> Result<()>
-    where
-        F: FnMut(CandidateQueryStreamFrame) -> Result<()>,
-    {
-        let mut payload = Map::new();
-        payload.insert("plan".to_owned(), compiled_query_plan_to_wire(plan));
-        if let Some(value) = chunk_size {
-            payload.insert("chunk_size".to_owned(), Value::from(value));
-        }
-        if include_external_ids {
-            payload.insert("include_external_ids".to_owned(), Value::Bool(true));
-        }
-
-        let mut stream = self.connect()?;
-        let payload_bytes = serde_json::to_vec(&Value::Object(payload))?;
-        write_frame(
-            &mut stream,
-            PROTOCOL_VERSION,
-            ACTION_CANDIDATE_QUERY_STREAM,
-            &payload_bytes,
-        )?;
-
-        loop {
-            let (version, status, response_payload) = read_frame(&mut stream)?;
-            if version != PROTOCOL_VERSION {
-                return Err(SspryError::from(format!(
-                    "Unsupported protocol version from server: {version}"
-                )));
-            }
-            if status != STATUS_OK {
-                let value: Value = serde_json::from_slice(&response_payload)?;
-                let message = value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Server returned an error.");
-                return Err(SspryError::from(message.to_owned()));
-            }
-            let frame: CandidateQueryStreamFrame = serde_json::from_slice(&response_payload)?;
-            let done = frame.stream_complete;
-            on_frame(frame)?;
-            if done {
-                return Ok(());
-            }
-        }
     }
 
     pub fn candidate_stats(&self) -> Result<Map<String, Value>> {
@@ -1296,28 +1302,12 @@ impl SspryClient {
     }
 }
 
+#[cfg(test)]
 impl PersistentSspryClient {
     pub(crate) fn begin_index_session(&mut self) -> Result<String> {
         let response: CandidateIndexSessionResponse =
             self.request_typed_json_with_publish_retry(ACTION_INDEX_SESSION_BEGIN, &json!({}))?;
         Ok(response.message)
-    }
-
-    pub(crate) fn update_index_session_progress(
-        &mut self,
-        total_documents: Option<usize>,
-        submitted_documents: usize,
-        processed_documents: usize,
-    ) -> Result<()> {
-        let _: CandidateIndexSessionResponse = self.request_typed_json(
-            ACTION_INDEX_SESSION_PROGRESS,
-            &CandidateIndexSessionProgressRequest {
-                total_documents: total_documents.map(|value| value as u64),
-                submitted_documents: submitted_documents as u64,
-                processed_documents: processed_documents as u64,
-            },
-        )?;
-        Ok(())
     }
 
     pub(crate) fn end_index_session(&mut self) -> Result<String> {
@@ -1463,16 +1453,19 @@ impl PersistentSspryClient {
     }
 }
 
+#[cfg(test)]
 fn is_payload_too_large_error(err: &SspryError) -> bool {
     let text = err.to_string();
     text.contains("Request payload is too large") || text.contains("Payload is too large")
 }
 
+#[cfg(test)]
 fn is_temporary_publish_retry_error(err: &SspryError) -> bool {
     let text = err.to_string();
     text.contains("server is publishing") && text.contains("retry later")
 }
 
+#[cfg(test)]
 pub fn serve(
     host: &str,
     port: u16,
@@ -1490,6 +1483,7 @@ pub fn serve(
     )
 }
 
+#[cfg(test)]
 pub fn serve_with_signal_flags(
     host: &str,
     port: u16,
@@ -1595,6 +1589,7 @@ pub fn serve_grpc_with_signal_flags(
     serve_result.map_err(|err| SspryError::from(err.to_string()))
 }
 
+#[cfg(test)]
 pub fn serve_with_shutdown(
     host: &str,
     port: u16,
@@ -1774,6 +1769,7 @@ fn candidate_stats_json_from_parts(
     candidate_stats_json_from_parts_with_disk_usage(stats_rows, disk_usage_under(root))
 }
 
+#[cfg(test)]
 fn empty_candidate_stats_json_for_config(
     config: &ServerConfig,
     root: &Path,
@@ -1822,6 +1818,7 @@ fn empty_candidate_stats_json_for_config(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct CandidateStatsBuildProfile {
     collect_store_stats_ms: u64,
     disk_usage_ms: u64,
@@ -1923,7 +1920,7 @@ fn start_status_dump_worker(
         let mut maintenance_epoch = state.current_maintenance_epoch();
         while !state.is_shutting_down() {
             if status_dump.swap(false, Ordering::SeqCst) {
-                match state.current_stats_json() {
+                match state.grpc_stats_response() {
                     Ok(stats) => match serde_json::to_string_pretty(&stats) {
                         Ok(text) => eprintln!("{text}"),
                         Err(err) => eprintln!("failed to serialize status snapshot: {err}"),
@@ -1956,7 +1953,7 @@ fn start_server_runtime(
 fn drain_server_runtime(state: Arc<ServerState>, workers: ServerWorkers) {
     if state.is_shutting_down() {
         eprintln!("sspry: shutdown requested, draining");
-        if let Ok(stats) = state.current_stats_json() {
+        if let Ok(stats) = state.grpc_stats_response() {
             if let Ok(text) = serde_json::to_string_pretty(&stats) {
                 eprintln!("{text}");
             }
@@ -2011,446 +2008,325 @@ fn grpc_optional_string(value: Option<String>) -> OptionalString {
     }
 }
 
-fn grpc_store_summary_from_stats_map(stats: &Map<String, Value>) -> StoreSummary {
+fn grpc_store_summary_from_candidate_stats(
+    stats_rows: &[crate::candidate::CandidateStats],
+    disk_usage_bytes: u64,
+    deleted_storage_bytes: u64,
+    candidate_shards: usize,
+) -> StoreSummary {
+    let stats = stats_rows
+        .first()
+        .cloned()
+        .expect("candidate stats rows must not be empty");
+    let active_doc_count = stats_rows.iter().map(|item| item.doc_count).sum::<usize>();
+    let deleted_doc_count = stats_rows
+        .iter()
+        .map(|item| item.deleted_doc_count)
+        .sum::<usize>();
+    let compaction_generation = stats_rows
+        .iter()
+        .map(|item| item.compaction_generation)
+        .max()
+        .unwrap_or(1);
+    let retired_generation_count = stats_rows
+        .iter()
+        .map(|item| item.retired_generation_count)
+        .sum::<usize>();
     StoreSummary {
-        active_doc_count: stats
-            .get("active_doc_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        candidate_shards: stats
-            .get("candidate_shards")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        id_source: stats
-            .get("id_source")
-            .and_then(Value::as_str)
-            .unwrap_or("sha256")
-            .to_owned(),
-        store_path: stats
-            .get("store_path")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        deleted_doc_count: stats
-            .get("deleted_doc_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        disk_usage_bytes: stats
-            .get("disk_usage_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        doc_count: stats.get("doc_count").and_then(Value::as_u64).unwrap_or(0),
-        compaction_generation: stats
-            .get("compaction_generation")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        tier1_filter_target_fp: stats
-            .get("tier1_filter_target_fp")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0),
-        tier2_filter_target_fp: stats
-            .get("tier2_filter_target_fp")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0),
-        tier2_gram_size: stats
-            .get("tier2_gram_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        tier1_gram_size: stats
-            .get("tier1_gram_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        query_count: stats
-            .get("query_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        retired_generation_count: stats
-            .get("retired_generation_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        tier2_docs_matched_total: stats
-            .get("tier2_docs_matched_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        tier2_match_ratio: stats
-            .get("tier2_match_ratio")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0),
-        tier2_scanned_docs_total: stats
-            .get("tier2_scanned_docs_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        version: stats.get("version").and_then(Value::as_u64).unwrap_or(0),
-        deleted_storage_bytes: stats
-            .get("deleted_storage_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        active_doc_count: active_doc_count as u64,
+        candidate_shards: candidate_shards.max(1) as u64,
+        id_source: stats.id_source,
+        store_path: stats.store_path,
+        deleted_doc_count: deleted_doc_count as u64,
+        disk_usage_bytes,
+        doc_count: active_doc_count.saturating_add(deleted_doc_count) as u64,
+        compaction_generation,
+        tier1_filter_target_fp: stats.tier1_filter_target_fp.unwrap_or(0.0),
+        tier2_filter_target_fp: stats.tier2_filter_target_fp.unwrap_or(0.0),
+        tier2_gram_size: stats.tier2_gram_size as u64,
+        tier1_gram_size: stats.tier1_gram_size as u64,
+        query_count: stats.query_count,
+        retired_generation_count: retired_generation_count as u64,
+        tier2_docs_matched_total: stats.tier2_docs_matched_total,
+        tier2_match_ratio: stats.tier2_match_ratio,
+        tier2_scanned_docs_total: stats.tier2_scanned_docs_total,
+        version: 1,
+        deleted_storage_bytes,
     }
 }
 
-fn grpc_adaptive_publish_summary_from_status_map(
-    stats: &Map<String, Value>,
+fn grpc_empty_store_summary_for_config(
+    config: &ServerConfig,
+    root: &Path,
+    shard_count: usize,
+) -> StoreSummary {
+    let stats = crate::candidate::CandidateStats {
+        doc_count: 0,
+        deleted_doc_count: 0,
+        id_source: config.candidate_config.id_source.clone(),
+        store_path: config.candidate_config.store_path,
+        tier1_filter_target_fp: config.candidate_config.tier1_filter_target_fp,
+        tier2_filter_target_fp: config.candidate_config.tier2_filter_target_fp,
+        tier2_gram_size: config.candidate_config.tier2_gram_size,
+        tier1_gram_size: config.candidate_config.tier1_gram_size,
+        compaction_idle_cooldown_s: config.candidate_config.compaction_idle_cooldown_s,
+        compaction_cooldown_remaining_s: 0.0,
+        compaction_waiting_for_cooldown: false,
+        compaction_generation: 1,
+        retired_generation_count: 0,
+        query_count: 0,
+        tier2_scanned_docs_total: 0,
+        tier2_docs_matched_total: 0,
+        tier2_match_ratio: 0.0,
+        docs_vector_bytes: 0,
+        doc_rows_bytes: 0,
+        tier2_doc_rows_bytes: 0,
+        sha_index_bytes: 0,
+        special_doc_positions_bytes: 0,
+        prepared_query_cache_entries: 0,
+        prepared_query_cache_bytes: 0,
+        mapped_bloom_bytes: 0,
+        mapped_tier2_bloom_bytes: 0,
+        mapped_metadata_bytes: 0,
+        mapped_external_id_bytes: 0,
+    };
+    let disk_usage_bytes = if root.exists() {
+        disk_usage_under(root)
+    } else {
+        0
+    };
+    grpc_store_summary_from_candidate_stats(&[stats], disk_usage_bytes, 0, shard_count)
+}
+
+fn grpc_adaptive_publish_summary_from_snapshot(
+    adaptive: &AdaptivePublishSnapshot,
 ) -> AdaptivePublishSummary {
-    let adaptive = stats
-        .get("adaptive_publish")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
     AdaptivePublishSummary {
-        storage_class: adaptive
-            .get("storage_class")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        current_idle_ms: adaptive
-            .get("current_idle_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        mode: adaptive
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        reason: adaptive
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        recent_publish_p95_ms: adaptive
-            .get("recent_publish_p95_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        recent_submit_p95_ms: adaptive
-            .get("recent_submit_p95_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        recent_store_p95_ms: adaptive
-            .get("recent_store_p95_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        recent_publishes_in_window: adaptive
-            .get("recent_publishes_in_window")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        tier2_pending_shards: adaptive
-            .get("tier2_pending_shards")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        healthy_cycles: adaptive
-            .get("healthy_cycles")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        storage_class: adaptive.storage_class.clone(),
+        current_idle_ms: adaptive.current_idle_ms,
+        mode: adaptive.mode.to_owned(),
+        reason: adaptive.reason.to_owned(),
+        recent_publish_p95_ms: adaptive.recent_publish_p95_ms,
+        recent_submit_p95_ms: adaptive.recent_submit_p95_ms,
+        recent_store_p95_ms: adaptive.recent_store_p95_ms,
+        recent_publishes_in_window: adaptive.recent_publishes_in_window,
+        tier2_pending_shards: adaptive.tier2_pending_shards,
+        healthy_cycles: adaptive.healthy_cycles,
     }
 }
 
-fn grpc_insert_batch_profile_summary_from_value(
-    value: Option<&Value>,
-) -> InsertBatchProfileSummary {
-    let summary = value
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+fn grpc_insert_batch_profile_summary_from_state(state: &ServerState) -> InsertBatchProfileSummary {
     InsertBatchProfileSummary {
-        batches: summary.get("batches").and_then(Value::as_u64).unwrap_or(0),
-        documents: summary
-            .get("documents")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        shards_touched_total: summary
-            .get("shards_touched_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        total_us: summary.get("total_us").and_then(Value::as_u64).unwrap_or(0),
-        parse_us: summary.get("parse_us").and_then(Value::as_u64).unwrap_or(0),
-        group_us: summary.get("group_us").and_then(Value::as_u64).unwrap_or(0),
-        build_us: summary.get("build_us").and_then(Value::as_u64).unwrap_or(0),
-        store_us: summary.get("store_us").and_then(Value::as_u64).unwrap_or(0),
-        finalize_us: summary
-            .get("finalize_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_resolve_doc_state_us: summary
-            .get("store_resolve_doc_state_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_sidecars_us: summary
-            .get("store_append_sidecars_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_sidecar_payloads_us: summary
-            .get("store_append_sidecar_payloads_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_bloom_payload_assemble_us: summary
-            .get("store_append_bloom_payload_assemble_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_bloom_payload_us: summary
-            .get("store_append_bloom_payload_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_metadata_payload_us: summary
-            .get("store_append_metadata_payload_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_external_id_payload_us: summary
-            .get("store_append_external_id_payload_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_tier2_bloom_payload_us: summary
-            .get("store_append_tier2_bloom_payload_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_doc_row_build_us: summary
-            .get("store_append_doc_row_build_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_bloom_payload_bytes: summary
-            .get("store_append_bloom_payload_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_metadata_payload_bytes: summary
-            .get("store_append_metadata_payload_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_external_id_payload_bytes: summary
-            .get("store_append_external_id_payload_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_tier2_bloom_payload_bytes: summary
-            .get("store_append_tier2_bloom_payload_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_append_doc_records_us: summary
-            .get("store_append_doc_records_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_write_existing_us: summary
-            .get("store_write_existing_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_install_docs_us: summary
-            .get("store_install_docs_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_tier2_update_us: summary
-            .get("store_tier2_update_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_persist_meta_us: summary
-            .get("store_persist_meta_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        store_rebalance_tier2_us: summary
-            .get("store_rebalance_tier2_us")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        batches: state
+            .index_session_server_insert_batch_count
+            .load(Ordering::Acquire),
+        documents: state
+            .index_session_server_insert_batch_documents
+            .load(Ordering::Acquire),
+        shards_touched_total: state
+            .index_session_server_insert_batch_shards_touched
+            .load(Ordering::Acquire),
+        total_us: state
+            .index_session_server_insert_batch_total_us
+            .load(Ordering::Acquire),
+        parse_us: state
+            .index_session_server_insert_batch_parse_us
+            .load(Ordering::Acquire),
+        group_us: state
+            .index_session_server_insert_batch_group_us
+            .load(Ordering::Acquire),
+        build_us: state
+            .index_session_server_insert_batch_build_us
+            .load(Ordering::Acquire),
+        store_us: state
+            .index_session_server_insert_batch_store_us
+            .load(Ordering::Acquire),
+        finalize_us: state
+            .index_session_server_insert_batch_finalize_us
+            .load(Ordering::Acquire),
+        store_resolve_doc_state_us: state
+            .index_session_server_insert_batch_store_resolve_doc_state_us
+            .load(Ordering::Acquire),
+        store_append_sidecars_us: state
+            .index_session_server_insert_batch_store_append_sidecars_us
+            .load(Ordering::Acquire),
+        store_append_sidecar_payloads_us: state
+            .index_session_server_insert_batch_store_append_sidecar_payloads_us
+            .load(Ordering::Acquire),
+        store_append_bloom_payload_assemble_us: state
+            .index_session_server_insert_batch_store_append_bloom_payload_assemble_us
+            .load(Ordering::Acquire),
+        store_append_bloom_payload_us: state
+            .index_session_server_insert_batch_store_append_bloom_payload_us
+            .load(Ordering::Acquire),
+        store_append_metadata_payload_us: state
+            .index_session_server_insert_batch_store_append_metadata_payload_us
+            .load(Ordering::Acquire),
+        store_append_external_id_payload_us: state
+            .index_session_server_insert_batch_store_append_external_id_payload_us
+            .load(Ordering::Acquire),
+        store_append_tier2_bloom_payload_us: state
+            .index_session_server_insert_batch_store_append_tier2_bloom_payload_us
+            .load(Ordering::Acquire),
+        store_append_doc_row_build_us: state
+            .index_session_server_insert_batch_store_append_doc_row_build_us
+            .load(Ordering::Acquire),
+        store_append_bloom_payload_bytes: state
+            .index_session_server_insert_batch_store_append_bloom_payload_bytes
+            .load(Ordering::Acquire),
+        store_append_metadata_payload_bytes: state
+            .index_session_server_insert_batch_store_append_metadata_payload_bytes
+            .load(Ordering::Acquire),
+        store_append_external_id_payload_bytes: state
+            .index_session_server_insert_batch_store_append_external_id_payload_bytes
+            .load(Ordering::Acquire),
+        store_append_tier2_bloom_payload_bytes: state
+            .index_session_server_insert_batch_store_append_tier2_bloom_payload_bytes
+            .load(Ordering::Acquire),
+        store_append_doc_records_us: state
+            .index_session_server_insert_batch_store_append_doc_records_us
+            .load(Ordering::Acquire),
+        store_write_existing_us: state
+            .index_session_server_insert_batch_store_write_existing_us
+            .load(Ordering::Acquire),
+        store_install_docs_us: state
+            .index_session_server_insert_batch_store_install_docs_us
+            .load(Ordering::Acquire),
+        store_tier2_update_us: state
+            .index_session_server_insert_batch_store_tier2_update_us
+            .load(Ordering::Acquire),
+        store_persist_meta_us: state
+            .index_session_server_insert_batch_store_persist_meta_us
+            .load(Ordering::Acquire),
+        store_rebalance_tier2_us: state
+            .index_session_server_insert_batch_store_rebalance_tier2_us
+            .load(Ordering::Acquire),
     }
 }
 
-fn grpc_index_session_summary_from_status_map(stats: &Map<String, Value>) -> IndexSessionSummary {
-    let session = stats
-        .get("index_session")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+fn grpc_index_session_summary_from_state(state: &ServerState) -> IndexSessionSummary {
+    let total_documents = state.index_session_total_documents.load(Ordering::Acquire);
+    let processed_documents = state
+        .index_session_processed_documents
+        .load(Ordering::Acquire);
+    let submitted_documents = state
+        .index_session_submitted_documents
+        .load(Ordering::Acquire);
+    let remaining_documents = total_documents.saturating_sub(processed_documents);
+    let progress_percent = if total_documents == 0 {
+        0.0
+    } else {
+        (processed_documents as f64 / total_documents as f64) * 100.0
+    };
     IndexSessionSummary {
-        active: session
-            .get("active")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        client_active: session
-            .get("client_active")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        total_documents: session
-            .get("total_documents")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        submitted_documents: session
-            .get("submitted_documents")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        processed_documents: session
-            .get("processed_documents")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        remaining_documents: session
-            .get("remaining_documents")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        progress_percent: session
-            .get("progress_percent")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0),
-        started_unix_ms: session
-            .get("started_unix_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_update_unix_ms: session
-            .get("last_update_unix_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        server_insert_batch_profile: Some(grpc_insert_batch_profile_summary_from_value(
-            session.get("server_insert_batch_profile"),
-        )),
+        active: state.active_index_sessions.load(Ordering::Acquire) > 0,
+        client_active: state.active_index_clients.load(Ordering::Acquire) > 0,
+        total_documents,
+        submitted_documents,
+        processed_documents,
+        remaining_documents,
+        progress_percent,
+        started_unix_ms: state.index_session_started_unix_ms.load(Ordering::Acquire),
+        last_update_unix_ms: state
+            .index_session_last_update_unix_ms
+            .load(Ordering::Acquire),
+        server_insert_batch_profile: Some(grpc_insert_batch_profile_summary_from_state(state)),
     }
 }
 
-fn grpc_startup_store_summary_from_value(value: Option<&Value>) -> StartupStoreSummary {
-    let summary = value
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+fn grpc_startup_store_summary_from_profile(
+    profile: &StoreRootStartupProfile,
+) -> StartupStoreSummary {
     StartupStoreSummary {
-        total_ms: summary.get("total_ms").and_then(Value::as_u64).unwrap_or(0),
-        opened_existing_shards: summary
-            .get("opened_existing_shards")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        initialized_new_shards: summary
-            .get("initialized_new_shards")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        doc_count: summary
-            .get("doc_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        total_ms: profile.total_ms,
+        opened_existing_shards: profile.opened_existing_shards,
+        initialized_new_shards: profile.initialized_new_shards,
+        doc_count: profile.doc_count,
     }
 }
 
-fn grpc_startup_summary_from_status_map(stats: &Map<String, Value>) -> StartupSummary {
-    let startup = stats
-        .get("startup")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+fn grpc_startup_summary_from_profile(
+    startup: &StartupProfile,
+    startup_cleanup_removed_roots: u64,
+) -> StartupSummary {
     StartupSummary {
-        total_ms: startup.get("total_ms").and_then(Value::as_u64).unwrap_or(0),
-        startup_cleanup_removed_roots: startup
-            .get("startup_cleanup_removed_roots")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        current: Some(grpc_startup_store_summary_from_value(
-            startup.get("current"),
-        )),
-        work: Some(grpc_startup_store_summary_from_value(startup.get("work"))),
+        total_ms: startup.total_ms,
+        startup_cleanup_removed_roots,
+        current: Some(grpc_startup_store_summary_from_profile(&startup.current)),
+        work: Some(grpc_startup_store_summary_from_profile(&startup.work)),
     }
 }
 
-fn grpc_publish_summary_from_status_map(stats: &Map<String, Value>) -> PublishSummary {
-    let publish = stats
-        .get("publish")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+fn grpc_publish_summary_from_state(
+    state: &ServerState,
+    readiness: PublishReadiness,
+) -> PublishSummary {
     PublishSummary {
-        pending: publish
-            .get("pending")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        eligible: publish
-            .get("eligible")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        blocked_reason: publish
-            .get("blocked_reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        trigger_mode: publish
-            .get("trigger_mode")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        trigger_reason: publish
-            .get("trigger_reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        idle_elapsed_ms: publish
-            .get("idle_elapsed_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        idle_remaining_ms: publish
-            .get("idle_remaining_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        work_buffer_estimated_documents: publish
-            .get("work_buffer_estimated_documents")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        work_buffer_estimated_input_bytes: publish
-            .get("work_buffer_estimated_input_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        work_buffer_document_threshold: publish
-            .get("work_buffer_document_threshold")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        work_buffer_input_bytes_threshold: publish
-            .get("work_buffer_input_bytes_threshold")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        work_buffer_rss_threshold_bytes: publish
-            .get("work_buffer_rss_threshold_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        current_rss_bytes: publish
-            .get("current_rss_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        pending_tier2_snapshot_shards: publish
-            .get("pending_tier2_snapshot_shards")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        index_backpressure_delay_ms: publish
-            .get("index_backpressure_delay_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        index_backpressure_events_total: publish
-            .get("index_backpressure_events_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        index_backpressure_sleep_ms_total: publish
-            .get("index_backpressure_sleep_ms_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_started_unix_ms: publish
-            .get("last_publish_started_unix_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_completed_unix_ms: publish
-            .get("last_publish_completed_unix_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_duration_ms: publish
-            .get("last_publish_duration_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_lock_wait_ms: publish
-            .get("last_publish_lock_wait_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_promote_work_ms: publish
-            .get("last_publish_promote_work_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_init_work_ms: publish
-            .get("last_publish_init_work_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_persisted_snapshot_shards: publish
-            .get("last_publish_persisted_snapshot_shards")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        last_publish_reused_work_stores: publish
-            .get("last_publish_reused_work_stores")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        publish_runs_total: publish
-            .get("publish_runs_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        pending: state.work_dirty.load(Ordering::Acquire),
+        eligible: readiness.eligible,
+        blocked_reason: readiness.blocked_reason.to_owned(),
+        trigger_mode: readiness.trigger_mode.to_owned(),
+        trigger_reason: readiness.trigger_reason.to_owned(),
+        idle_elapsed_ms: readiness.idle_elapsed_ms,
+        idle_remaining_ms: readiness.idle_remaining_ms,
+        work_buffer_estimated_documents: readiness.work_buffer_estimated_documents,
+        work_buffer_estimated_input_bytes: readiness.work_buffer_estimated_input_bytes,
+        work_buffer_document_threshold: readiness.work_buffer_document_threshold,
+        work_buffer_input_bytes_threshold: readiness.work_buffer_input_bytes_threshold,
+        work_buffer_rss_threshold_bytes: readiness.work_buffer_rss_threshold_bytes,
+        current_rss_bytes: readiness.current_rss_bytes,
+        pending_tier2_snapshot_shards: readiness.pending_tier2_snapshot_shards,
+        index_backpressure_delay_ms: readiness.index_backpressure_delay_ms,
+        index_backpressure_events_total: state
+            .index_backpressure_events_total
+            .load(Ordering::Acquire),
+        index_backpressure_sleep_ms_total: state
+            .index_backpressure_sleep_ms_total
+            .load(Ordering::Acquire),
+        last_publish_started_unix_ms: state.last_publish_started_unix_ms.load(Ordering::Acquire),
+        last_publish_completed_unix_ms: state
+            .last_publish_completed_unix_ms
+            .load(Ordering::Acquire),
+        last_publish_duration_ms: state.last_publish_duration_ms.load(Ordering::Acquire),
+        last_publish_lock_wait_ms: state.last_publish_lock_wait_ms.load(Ordering::Acquire),
+        last_publish_promote_work_ms: state.last_publish_promote_work_ms.load(Ordering::Acquire),
+        last_publish_init_work_ms: state.last_publish_init_work_ms.load(Ordering::Acquire),
+        last_publish_persisted_snapshot_shards: state
+            .last_publish_persisted_snapshot_shards
+            .load(Ordering::Acquire),
+        last_publish_reused_work_stores: state
+            .last_publish_reused_work_stores
+            .load(Ordering::Acquire),
+        publish_runs_total: state.publish_runs_total.load(Ordering::Acquire),
+        adaptive_idle_ms: readiness.idle_threshold_ms,
+    }
+}
+
+fn grpc_published_tier2_snapshot_seal_summary_from_state(
+    state: &ServerState,
+) -> PublishedTier2SnapshotSealSummary {
+    PublishedTier2SnapshotSealSummary {
+        pending_shards: state
+            .pending_published_tier2_snapshot_shard_count()
+            .unwrap_or(0) as u64,
+        in_progress: state
+            .published_tier2_snapshot_seal_in_progress
+            .load(Ordering::Acquire),
+        runs_total: state
+            .published_tier2_snapshot_seal_runs_total
+            .load(Ordering::Acquire),
+        last_duration_ms: state
+            .last_published_tier2_snapshot_seal_duration_ms
+            .load(Ordering::Acquire),
+        last_persisted_shards: state
+            .last_published_tier2_snapshot_seal_persisted_shards
+            .load(Ordering::Acquire),
+        last_failures: state
+            .last_published_tier2_snapshot_seal_failures
+            .load(Ordering::Acquire),
+        last_completed_unix_ms: state
+            .last_published_tier2_snapshot_seal_completed_unix_ms
+            .load(Ordering::Acquire),
     }
 }
 
@@ -2545,35 +2421,10 @@ impl GrpcSspry for GrpcServerService {
         _request: GrpcRequest<StatsRequest>,
     ) -> std::result::Result<GrpcResponse<StatsResponse>, GrpcStatus> {
         let state = self.state.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            let stats = state.current_stats_json()?;
-            Ok::<StatsResponse, SspryError>(StatsResponse {
-                stats: Some(grpc_store_summary_from_stats_map(&stats)),
-                memory_budget_bytes: stats
-                    .get("memory_budget_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                workspace_mode: stats
-                    .get("workspace_mode")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                search_workers: stats
-                    .get("search_workers")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                current_rss_kb: stats
-                    .get("current_rss_kb")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                peak_rss_kb: stats
-                    .get("peak_rss_kb")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            })
-        })
-        .await
-        .map_err(grpc_join_error_status)?
-        .map_err(grpc_internal_status)?;
+        let response = tokio::task::spawn_blocking(move || state.grpc_stats_response())
+            .await
+            .map_err(grpc_join_error_status)?
+            .map_err(grpc_internal_status)?;
         Ok(GrpcResponse::new(response))
     }
 
@@ -2582,88 +2433,10 @@ impl GrpcSspry for GrpcServerService {
         _request: GrpcRequest<StatusRequest>,
     ) -> std::result::Result<GrpcResponse<StatusResponse>, GrpcStatus> {
         let state = self.state.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            let stats = state.status_json()?;
-            let published_stats = state.current_stats_json()?;
-            Ok::<StatusResponse, SspryError>(StatusResponse {
-                draining: stats
-                    .get("draining")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                active_connections: stats
-                    .get("active_connections")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                active_mutations: stats
-                    .get("active_mutations")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                publish_requested: stats
-                    .get("publish_requested")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                mutations_paused: stats
-                    .get("mutations_paused")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                publish_in_progress: stats
-                    .get("publish_in_progress")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                active_index_clients: stats
-                    .get("active_index_clients")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                active_index_sessions: stats
-                    .get("active_index_sessions")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                search_workers: stats
-                    .get("search_workers")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                memory_budget_bytes: stats
-                    .get("memory_budget_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                current_rss_kb: stats
-                    .get("current_rss_kb")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                peak_rss_kb: stats
-                    .get("peak_rss_kb")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                adaptive_publish: Some(grpc_adaptive_publish_summary_from_status_map(&stats)),
-                index_session: Some(grpc_index_session_summary_from_status_map(&stats)),
-                startup: Some(grpc_startup_summary_from_status_map(&stats)),
-                workspace_mode: stats
-                    .get("workspace_mode")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                published_root: stats
-                    .get("published_root")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                work_root: stats
-                    .get("work_root")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                has_work: stats.get("work").and_then(Value::as_object).is_some(),
-                work: stats
-                    .get("work")
-                    .and_then(Value::as_object)
-                    .map(grpc_store_summary_from_stats_map),
-                has_published: true,
-                published: Some(grpc_store_summary_from_stats_map(&published_stats)),
-                publish: Some(grpc_publish_summary_from_status_map(&stats)),
-            })
-        })
-        .await
-        .map_err(grpc_join_error_status)?
-        .map_err(grpc_internal_status)?;
+        let response = tokio::task::spawn_blocking(move || state.grpc_status_response())
+            .await
+            .map_err(grpc_join_error_status)?
+            .map_err(grpc_internal_status)?;
         Ok(GrpcResponse::new(response))
     }
 
@@ -3040,6 +2813,7 @@ impl GrpcSspry for GrpcServerService {
     }
 }
 
+#[cfg(test)]
 fn signed_delta_i64(current: u64, baseline: u64) -> i64 {
     if current >= baseline {
         let delta = current.saturating_sub(baseline);
@@ -3051,12 +2825,14 @@ fn signed_delta_i64(current: u64, baseline: u64) -> i64 {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum ClientStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
 }
 
+#[cfg(test)]
 impl Read for ClientStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -3067,6 +2843,7 @@ impl Read for ClientStream {
     }
 }
 
+#[cfg(test)]
 impl Write for ClientStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
@@ -3112,7 +2889,6 @@ impl ServerState {
             index_client_leases: Mutex::new(HashMap::new()),
             publish_after_index_clients: AtomicBool::new(false),
             active_index_sessions: AtomicUsize::new(0),
-            candidate_insert_uploads: Mutex::new(HashMap::new()),
             work_dirty: AtomicBool::new(false),
             work_active_estimated_documents: AtomicU64::new(startup_work_documents),
             work_active_estimated_input_bytes: AtomicU64::new(0),
@@ -3198,8 +2974,12 @@ impl ServerState {
                 auto_publish_initial_idle_ms,
                 candidate_shards,
             )),
+            #[cfg(test)]
+            candidate_insert_uploads: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             normalized_plan_cache: Mutex::new(BoundedCache::new(NORMALIZED_PLAN_CACHE_CAPACITY)),
             prepared_plan_cache: Mutex::new(BoundedCache::new(PREPARED_PLAN_CACHE_CAPACITY)),
+            #[cfg(test)]
             query_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             search_admission: Mutex::new(SearchAdmissionState::default()),
             search_admission_cv: Condvar::new(),
@@ -3426,13 +3206,14 @@ impl ServerState {
         )
     }
 
+    #[cfg(test)]
     fn forest_mode_info(&self) -> Result<Option<(PathBuf, usize)>> {
         let mode = self
             .store_mode
             .lock()
             .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
-            StoreMode::Forest { root, trees } => Some((root.clone(), trees.len())),
+            StoreMode::Forest { _root, trees } => Some((_root.clone(), trees.len())),
             _ => None,
         })
     }
@@ -4202,6 +3983,7 @@ impl ServerState {
         })
     }
 
+    #[cfg(test)]
     fn index_server_insert_batch_profile_json(&self) -> Value {
         let mut out = Map::new();
         for (key, value) in [
@@ -4485,6 +4267,7 @@ impl ServerState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn candidate_stats_json_for_store_set_profiled(
         &self,
         store_set: &StoreSet,
@@ -4537,6 +4320,7 @@ impl ServerState {
         ))
     }
 
+    #[cfg(test)]
     fn candidate_stats_json_for_query_store_sets_profiled(
         &self,
         operation: &str,
@@ -4595,6 +4379,138 @@ impl ServerState {
         ))
     }
 
+    fn grpc_store_summary_for_store_set(
+        &self,
+        store_set: &StoreSet,
+        operation: &str,
+        candidate_shards: usize,
+    ) -> Result<StoreSummary> {
+        let mut stats_rows = Vec::with_capacity(store_set.stores.len());
+        let mut deleted_storage_bytes = 0u64;
+        for (shard_idx, store_lock) in store_set.stores.iter().enumerate() {
+            let store = lock_candidate_store_with_timeout(store_lock, shard_idx, operation)?;
+            stats_rows.push(store.stats());
+            deleted_storage_bytes =
+                deleted_storage_bytes.saturating_add(store.deleted_storage_bytes());
+        }
+        let disk_usage_bytes = disk_usage_under(&store_set.root()?);
+        Ok(grpc_store_summary_from_candidate_stats(
+            &stats_rows,
+            disk_usage_bytes,
+            deleted_storage_bytes,
+            candidate_shards,
+        ))
+    }
+
+    fn grpc_store_summary_for_query_store_sets(&self, operation: &str) -> Result<StoreSummary> {
+        let store_sets = self.published_query_store_sets()?;
+        if store_sets.len() == 1 {
+            let shard_count = store_sets[0].stores.len().max(1);
+            return self.grpc_store_summary_for_store_set(&store_sets[0], operation, shard_count);
+        }
+        let mut stats_rows = Vec::new();
+        let mut deleted_storage_bytes = 0u64;
+        for store_set in &store_sets {
+            for (shard_idx, store_lock) in store_set.stores.iter().enumerate() {
+                let store = lock_candidate_store_with_timeout(store_lock, shard_idx, operation)?;
+                stats_rows.push(store.stats());
+                deleted_storage_bytes =
+                    deleted_storage_bytes.saturating_add(store.deleted_storage_bytes());
+            }
+        }
+        let mut disk_usage_bytes = 0u64;
+        for store_set in &store_sets {
+            disk_usage_bytes =
+                disk_usage_bytes.saturating_add(disk_usage_under(&store_set.root()?));
+        }
+        Ok(grpc_store_summary_from_candidate_stats(
+            &stats_rows,
+            disk_usage_bytes,
+            deleted_storage_bytes,
+            self.candidate_shard_count(),
+        ))
+    }
+
+    fn grpc_stats_response(&self) -> Result<StatsResponse> {
+        let stats = self.grpc_store_summary_for_query_store_sets("grpc stats")?;
+        let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
+        Ok(StatsResponse {
+            stats: Some(stats),
+            memory_budget_bytes: self.config.memory_budget_bytes,
+            workspace_mode: self.workspace_roots()?.is_some(),
+            search_workers: self.config.search_workers as u64,
+            current_rss_kb: current_rss_kb as u64,
+            peak_rss_kb: peak_rss_kb as u64,
+        })
+    }
+
+    fn grpc_status_response(&self) -> Result<StatusResponse> {
+        let now_unix_ms = current_unix_ms();
+        let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
+        let readiness = self.publish_readiness(now_unix_ms);
+        let published =
+            self.grpc_store_summary_for_query_store_sets("grpc status published stats")?;
+        let workspace_roots = self.workspace_roots()?;
+        let workspace_mode = workspace_roots.is_some();
+        let (published_root, work_root, has_work, work) =
+            if let Some((published_root, work_root)) = workspace_roots {
+                let work = if let Some(store_set) = self.work_store_set_if_present()? {
+                    self.grpc_store_summary_for_store_set(
+                        &store_set,
+                        "grpc status work stats",
+                        self.candidate_shard_count(),
+                    )?
+                } else {
+                    grpc_empty_store_summary_for_config(
+                        &self.config,
+                        &work_root,
+                        self.candidate_shard_count(),
+                    )
+                };
+                (
+                    published_root.display().to_string(),
+                    work_root.display().to_string(),
+                    true,
+                    Some(work),
+                )
+            } else {
+                (String::new(), String::new(), false, None)
+            };
+        let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
+        Ok(StatusResponse {
+            draining: self.is_shutting_down(),
+            active_connections: self.active_connections.load(Ordering::Acquire) as u64,
+            active_mutations: self.active_mutations.load(Ordering::Acquire) as u64,
+            publish_requested: self.publish_requested.load(Ordering::Acquire),
+            mutations_paused: self.mutations_paused.load(Ordering::Acquire),
+            publish_in_progress: self.publish_in_progress.load(Ordering::Acquire),
+            active_index_clients: self.active_index_clients.load(Ordering::Acquire) as u64,
+            active_index_sessions: self.active_index_sessions.load(Ordering::Acquire) as u64,
+            search_workers: self.config.search_workers as u64,
+            memory_budget_bytes: self.config.memory_budget_bytes,
+            current_rss_kb: current_rss_kb as u64,
+            peak_rss_kb: peak_rss_kb as u64,
+            adaptive_publish: Some(grpc_adaptive_publish_summary_from_snapshot(&adaptive)),
+            index_session: Some(grpc_index_session_summary_from_state(self)),
+            startup: Some(grpc_startup_summary_from_profile(
+                &self.startup_profile,
+                self.startup_cleanup_removed_roots as u64,
+            )),
+            workspace_mode,
+            published_root,
+            work_root,
+            has_work,
+            work,
+            has_published: true,
+            published: Some(published),
+            publish: Some(grpc_publish_summary_from_state(self, readiness)),
+            published_tier2_snapshot_seal: Some(
+                grpc_published_tier2_snapshot_seal_summary_from_state(self),
+            ),
+        })
+    }
+
+    #[cfg(test)]
     fn normalized_plan_cache_stats(&self) -> (usize, u64) {
         self.normalized_plan_cache
             .lock()
@@ -4612,6 +4528,7 @@ impl ServerState {
             .unwrap_or((0, 0))
     }
 
+    #[cfg(test)]
     fn prepared_plan_cache_stats(&self) -> (usize, u64) {
         self.prepared_plan_cache
             .lock()
@@ -4629,6 +4546,7 @@ impl ServerState {
             .unwrap_or((0, 0))
     }
 
+    #[cfg(test)]
     fn query_cache_stats(&self) -> (usize, u64) {
         self.query_cache
             .lock()
@@ -4646,6 +4564,7 @@ impl ServerState {
             .unwrap_or((0, 0))
     }
 
+    #[cfg(test)]
     fn current_stats_json(&self) -> Result<Map<String, Value>> {
         let started_total = Instant::now();
         let now_unix_ms = current_unix_ms();
@@ -5285,6 +5204,7 @@ impl ServerState {
         Ok(stats)
     }
 
+    #[cfg(test)]
     fn status_json(&self) -> Result<Map<String, Value>> {
         let now_unix_ms = current_unix_ms();
         let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
@@ -5757,12 +5677,14 @@ impl ServerState {
     }
 
     fn invalidate_search_caches(&self) {
+        #[cfg(test)]
         if let Ok(mut cache) = self.normalized_plan_cache.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.prepared_plan_cache.lock() {
             cache.clear();
         }
+        #[cfg(test)]
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.clear();
         }
@@ -5903,6 +5825,7 @@ impl ServerState {
         serde_json::to_string(&compiled_query_plan_to_wire(plan)).map_err(SspryError::from)
     }
 
+    #[cfg(test)]
     fn normalized_plan_from_wire(&self, value: &Value) -> Result<Arc<CompiledQueryPlan>> {
         let key = serde_json::to_string(value).map_err(SspryError::from)?;
         if let Some(entry) = self
@@ -5986,6 +5909,7 @@ impl ServerState {
         Ok((hits, vec![tier_used], query_profile))
     }
 
+    #[cfg(test)]
     fn collect_query_matches_store_set(
         stores: &Arc<StoreSet>,
         plan: &CompiledQueryPlan,
@@ -6005,6 +5929,7 @@ impl ServerState {
         Ok((hits, tier_used, query_profile))
     }
 
+    #[cfg(test)]
     fn collect_query_matches_all_shards(
         &self,
         plan: &CompiledQueryPlan,
@@ -6133,10 +6058,12 @@ impl ServerState {
         })
     }
 
+    #[cfg(test)]
     fn dispatch(&self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
         self.dispatch_inner(action, payload)
     }
 
+    #[cfg(test)]
     fn dispatch_inner(&self, action: u8, payload: &[u8]) -> Result<Vec<u8>> {
         if self.is_shutting_down()
             && matches!(
@@ -6303,6 +6230,7 @@ impl ServerState {
         }
     }
 
+    #[cfg(test)]
     fn handle_candidate_insert_parsed(
         &self,
         parsed: ParsedCandidateInsertDocument,
@@ -6634,6 +6562,7 @@ impl ServerState {
         )
     }
 
+    #[cfg(test)]
     fn handle_candidate_insert_batch_binary(
         &self,
         payload: &[u8],
@@ -6651,6 +6580,7 @@ impl ServerState {
         )
     }
 
+    #[cfg(test)]
     fn handle_candidate_insert_upload_begin(
         &self,
         request: &CandidateInsertUploadBeginRequest,
@@ -6673,6 +6603,7 @@ impl ServerState {
         })
     }
 
+    #[cfg(test)]
     fn handle_candidate_insert_upload_chunk(
         &self,
         payload: &[u8],
@@ -6704,6 +6635,7 @@ impl ServerState {
         })
     }
 
+    #[cfg(test)]
     fn handle_candidate_insert_upload_commit(
         &self,
         request: &CandidateInsertUploadCommitRequest,
@@ -6758,6 +6690,7 @@ impl ServerState {
         })
     }
 
+    #[cfg(test)]
     fn handle_candidate_query(
         &self,
         request: CandidateQueryRequest,
@@ -6773,7 +6706,7 @@ impl ServerState {
             .chunk_size
             .unwrap_or(DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE)
             .max(1);
-        let cache_key = Self::query_cache_key(&plan)?;
+        let cache_key = Self::query_cache_key(plan)?;
         let cached = {
             let mut cache = self
                 .query_cache
@@ -6786,7 +6719,7 @@ impl ServerState {
             entry
         } else {
             record_counter("rpc.handle_candidate_query_cache_misses_total", 1);
-            let entry = Arc::new(self.collect_query_matches_all_shards(&plan)?);
+            let entry = Arc::new(self.collect_query_matches_all_shards(plan)?);
             let mut cache = self
                 .query_cache
                 .lock()
@@ -6866,6 +6799,7 @@ impl ServerState {
         })
     }
 
+    #[cfg(test)]
     fn stream_candidate_query<W: Write>(
         &self,
         request: CandidateQueryRequest,
@@ -7475,6 +7409,7 @@ impl ServerState {
 }
 
 #[cfg(unix)]
+#[cfg(all(test, unix))]
 fn accept_unix(
     listener: UnixListener,
     state: Arc<ServerState>,
@@ -7502,6 +7437,7 @@ fn accept_unix(
     }
 }
 
+#[cfg(test)]
 fn accept_tcp(
     listener: TcpListener,
     state: Arc<ServerState>,
@@ -7530,22 +7466,26 @@ fn accept_tcp(
     }
 }
 
+#[cfg(test)]
 struct ActiveConnectionGuard {
     state: Arc<ServerState>,
 }
 
+#[cfg(test)]
 impl ActiveConnectionGuard {
     fn new(state: Arc<ServerState>) -> Self {
         Self { state }
     }
 }
 
+#[cfg(test)]
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
+#[cfg(test)]
 fn serve_connection<S>(
     mut stream: S,
     state: Arc<ServerState>,
@@ -7590,6 +7530,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn write_frame<W: Write>(
     writer: &mut W,
     version: u8,
@@ -7610,6 +7551,7 @@ fn write_frame<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_error_frame<W: Write>(writer: &mut W, message: &str) -> Result<()> {
     let payload = json!({ "type": "Error", "message": message });
     write_frame(
@@ -7620,6 +7562,7 @@ fn write_error_frame<W: Write>(writer: &mut W, message: &str) -> Result<()> {
     )
 }
 
+#[cfg(test)]
 fn read_frame<R: Read>(reader: &mut R) -> Result<(u8, u8, Vec<u8>)> {
     let mut header = [0u8; HEADER_LEN];
     read_exact(reader, &mut header)?;
@@ -7633,6 +7576,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<(u8, u8, Vec<u8>)> {
     Ok((version, status_or_action, payload))
 }
 
+#[cfg(test)]
 fn read_frame_optional<R: Read>(reader: &mut R) -> Result<Option<(u8, u8, Vec<u8>)>> {
     let mut header = [0u8; HEADER_LEN];
     let first = match reader.read(&mut header[..1])? {
@@ -7655,6 +7599,7 @@ fn read_frame_optional<R: Read>(reader: &mut R) -> Result<Option<(u8, u8, Vec<u8
     Ok(Some((version, status_or_action, payload)))
 }
 
+#[cfg(test)]
 fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
     let mut offset = 0usize;
     while offset < buf.len() {
@@ -7677,6 +7622,7 @@ fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(SspryError::from)
 }
@@ -7935,6 +7881,7 @@ pub(crate) fn parse_candidate_insert_binary_row_for_test(
     parse_candidate_insert_binary_row(payload, "test.row")
 }
 
+#[cfg(test)]
 fn parse_candidate_insert_binary_batch_payload(
     payload: &[u8],
 ) -> Result<Vec<ParsedCandidateInsertDocument>> {
@@ -7964,6 +7911,7 @@ pub(crate) fn serialized_candidate_insert_binary_batch_payload(rows: &[Vec<u8>])
     payload
 }
 
+#[cfg(test)]
 fn json_from_bytes<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
     if payload.is_empty() {
         return serde_json::from_slice(b"{}").map_err(SspryError::from);
@@ -7996,6 +7944,7 @@ fn compiled_query_plan_to_wire(plan: &CompiledQueryPlan) -> Value {
     })
 }
 
+#[cfg(test)]
 fn compiled_query_plan_from_wire(value: &Value) -> Result<CompiledQueryPlan> {
     if !value.is_object() {
         return Err(SspryError::from("query plan payload must be an object"));
@@ -8211,6 +8160,7 @@ fn query_node_to_wire(node: &QueryNode) -> Value {
     Value::Object(out)
 }
 
+#[cfg(test)]
 fn query_node_from_wire(value: &Value) -> Result<QueryNode> {
     let object = value
         .as_object()
@@ -8517,6 +8467,7 @@ fn workspace_retired_roots(root: &Path) -> Vec<PathBuf> {
     retired
 }
 
+#[cfg(test)]
 fn workspace_retired_stats(root: &Path) -> (u64, u64) {
     let retired = workspace_retired_roots(root);
     let bytes = retired.iter().map(|path| disk_usage_under(path)).sum();
@@ -8692,7 +8643,7 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
             }
             return Ok((
                 StoreMode::Forest {
-                    root: root.clone(),
+                    _root: root.clone(),
                     trees,
                 },
                 removed_roots,

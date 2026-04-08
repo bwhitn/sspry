@@ -414,28 +414,28 @@ fn help_surface_has_only_public_commands() {
     let out = run_ok(&["--help"]);
     assert!(out.contains("Scalable Screening and Prefiltering of Rules for YARA"));
     assert!(out.contains("serve"));
-    assert!(out.contains("grpc-serve"));
     assert!(out.contains("index"));
-    assert!(out.contains("grpc-index"));
     assert!(out.contains("local-index"));
     assert!(out.contains("delete"));
-    assert!(out.contains("grpc-delete"));
     assert!(out.contains("local-delete"));
     assert!(out.contains("search"));
-    assert!(out.contains("grpc-search"));
     assert!(out.contains("local-search"));
     assert!(out.contains("search-batch"));
     assert!(out.contains("info"));
-    assert!(out.contains("grpc-info"));
     assert!(out.contains("local-info"));
     assert!(out.contains("shutdown"));
-    assert!(out.contains("grpc-shutdown"));
     assert!(out.contains("yara"));
     assert!(!out.contains("publish"));
     assert!(!out.contains("candidate-init"));
     assert!(!out.contains("candidate-ingest"));
     assert!(!out.contains("candidate-query"));
     assert!(!out.contains("candidate-stats"));
+    assert!(!out.contains("grpc-serve"));
+    assert!(!out.contains("grpc-index"));
+    assert!(!out.contains("grpc-delete"));
+    assert!(!out.contains("grpc-search"));
+    assert!(!out.contains("grpc-info"));
+    assert!(!out.contains("grpc-shutdown"));
     assert!(!out.contains("init\n"));
 }
 

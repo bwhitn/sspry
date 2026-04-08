@@ -207,6 +207,17 @@ message PublishSummary {
   uint64 last_publish_persisted_snapshot_shards = 24;
   bool last_publish_reused_work_stores = 25;
   uint64 publish_runs_total = 26;
+  uint64 adaptive_idle_ms = 27;
+}
+
+message PublishedTier2SnapshotSealSummary {
+  uint64 pending_shards = 1;
+  bool in_progress = 2;
+  uint64 runs_total = 3;
+  uint64 last_duration_ms = 4;
+  uint64 last_persisted_shards = 5;
+  uint64 last_failures = 6;
+  uint64 last_completed_unix_ms = 7;
 }
 
 message StatsResponse {
@@ -242,6 +253,7 @@ message StatusResponse {
   bool has_published = 21;
   StoreSummary published = 22;
   PublishSummary publish = 23;
+  PublishedTier2SnapshotSealSummary published_tier2_snapshot_seal = 24;
 }
 
 message SearchRequest {

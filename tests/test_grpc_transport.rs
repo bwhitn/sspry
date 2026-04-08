@@ -37,7 +37,7 @@ fn reserve_port() -> u16 {
 fn spawn_grpc_serve(port: u16, candidate_root: &Path) -> ChildGuard {
     let addr = format!("127.0.0.1:{port}");
     let child = Command::new(bin_path())
-        .arg("grpc-serve")
+        .arg("serve")
         .arg("--addr")
         .arg(&addr)
         .arg("--root")
@@ -168,7 +168,7 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
     });
 
     let ingest = run_ok(&[
-        "grpc-index",
+        "index",
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
@@ -179,7 +179,7 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
     assert!(ingest.contains("processed_documents: 2"));
 
     let search = run_ok(&[
-        "grpc-search",
+        "search",
         "--addr",
         &addr,
         "--rule",
@@ -191,19 +191,19 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
     assert!(search.contains("candidates: 2"));
 
     let deleted = run_ok(&[
-        "grpc-delete",
+        "delete",
         "--addr",
         &addr,
         sample_a.to_str().expect("sample a"),
     ]);
     assert!(deleted.contains("status: deleted"));
 
-    let info = run_ok(&["grpc-info", "--addr", &addr]);
+    let info = run_ok(&["info", "--addr", &addr]);
     assert!(info.contains("\"doc_count\": 2"));
     assert!(info.contains("\"active_doc_count\": 1"));
     assert!(info.contains("\"deleted_doc_count\": 1"));
 
-    let shutdown = run_ok(&["grpc-shutdown", "--addr", &addr]);
+    let shutdown = run_ok(&["shutdown", "--addr", &addr]);
     assert!(shutdown.contains("shutdown requested"));
 
     let deadline = Instant::now() + Duration::from_secs(10);
