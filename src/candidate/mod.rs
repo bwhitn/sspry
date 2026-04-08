@@ -25,11 +25,14 @@ pub use metadata::{
     normalize_query_metadata_field,
 };
 pub use query_plan::{
-    CompiledQueryPlan, PatternPlan, QueryNode, RuleCheckIssue, RuleCheckReport, RuleCheckSeverity,
-    RuleCheckStatus, compile_query_plan_from_file_with_gram_sizes,
+    CompiledQueryPlan, PatternPlan, QueryNode, RuleCheckFileReport, RuleCheckIssue,
+    RuleCheckReport, RuleCheckRuleReport, RuleCheckSeverity, RuleCheckStatus,
+    compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     compile_query_plan_with_gram_sizes, compile_query_plan_with_gram_sizes_and_identity_source,
-    normalize_max_candidates, resolve_max_candidates, rule_check_from_file_with_gram_sizes,
+    normalize_max_candidates, resolve_max_candidates, rule_check_all_from_file_with_gram_sizes,
+    rule_check_all_from_file_with_gram_sizes_and_identity_source, rule_check_all_with_gram_sizes,
+    rule_check_all_with_gram_sizes_and_identity_source, rule_check_from_file_with_gram_sizes,
     rule_check_from_file_with_gram_sizes_and_identity_source, rule_check_with_gram_sizes,
     rule_check_with_gram_sizes_and_identity_source,
 };

@@ -62,6 +62,16 @@ impl RuleCheckStatus {
             Self::Unsupported => "unsupported",
         }
     }
+
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unsupported, _) | (_, Self::Unsupported) => Self::Unsupported,
+            (Self::SearchableNeedsVerify, _) | (_, Self::SearchableNeedsVerify) => {
+                Self::SearchableNeedsVerify
+            }
+            _ => Self::Searchable,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +116,32 @@ pub struct RuleCheckReport {
     pub verifier_only_kinds: Vec<String>,
     #[serde(default)]
     pub ignored_module_calls: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCheckRuleReport {
+    pub rule: String,
+    pub is_private: bool,
+    pub status: RuleCheckStatus,
+    #[serde(default)]
+    pub issues: Vec<RuleCheckIssue>,
+    #[serde(default)]
+    pub verifier_only_kinds: Vec<String>,
+    #[serde(default)]
+    pub ignored_module_calls: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCheckFileReport {
+    pub status: RuleCheckStatus,
+    #[serde(default)]
+    pub issues: Vec<RuleCheckIssue>,
+    #[serde(default)]
+    pub verifier_only_kinds: Vec<String>,
+    #[serde(default)]
+    pub ignored_module_calls: Vec<String>,
+    #[serde(default)]
+    pub rules: Vec<RuleCheckRuleReport>,
 }
 
 #[cfg(test)]
@@ -348,6 +384,8 @@ struct ConditionParser {
 struct ParsedRuleBlock {
     name: String,
     is_private: bool,
+    block_start_offset: usize,
+    block_text: String,
     strings_lines: Vec<String>,
     raw_condition_text: String,
     condition_text: String,
@@ -366,14 +404,6 @@ struct RulePlanFragment {
 
 fn normalize_rule_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
-}
-
-fn active_rule_name_from_blocks(blocks: &[ParsedRuleBlock]) -> Option<String> {
-    blocks
-        .iter()
-        .find(|rule| !rule.is_private)
-        .or_else(|| blocks.first())
-        .map(|rule| rule.name.clone())
 }
 
 fn comparison_op_from_token(token: &Token) -> Option<ComparisonOp> {
@@ -1923,6 +1953,8 @@ fn parse_rule_blocks(rule_text: &str) -> Result<Vec<ParsedRuleBlock>> {
         blocks.push(ParsedRuleBlock {
             name,
             is_private: tokens[..rule_idx].contains(&"private"),
+            block_start_offset: line_start,
+            block_text: block_text.to_owned(),
             strings_lines,
             raw_condition_text,
             condition_text,
@@ -4006,6 +4038,12 @@ struct RuleSourceMatch {
     snippet: String,
 }
 
+struct RuleSourceContext<'a> {
+    full_text: &'a str,
+    block_text: &'a str,
+    block_start_offset: usize,
+}
+
 fn source_location_for_offset(rule_text: &str, offset: usize) -> RuleSourceLocation {
     let mut line = 1usize;
     let mut column = 1usize;
@@ -4033,67 +4071,77 @@ fn source_snippet_for_offset(rule_text: &str, offset: usize) -> String {
     rule_text[line_start..line_end].trim().to_owned()
 }
 
-fn source_match_for_offset(rule_text: &str, offset: usize) -> RuleSourceMatch {
+fn source_match_for_offset(context: &RuleSourceContext<'_>, offset: usize) -> RuleSourceMatch {
     RuleSourceMatch {
-        location: source_location_for_offset(rule_text, offset),
-        snippet: source_snippet_for_offset(rule_text, offset),
+        location: source_location_for_offset(
+            context.full_text,
+            context.block_start_offset.saturating_add(offset),
+        ),
+        snippet: source_snippet_for_offset(context.block_text, offset),
     }
 }
 
-fn source_match_for_literal(rule_text: &str, literal: &str) -> Option<RuleSourceMatch> {
-    rule_text
+fn source_match_for_literal(
+    context: &RuleSourceContext<'_>,
+    literal: &str,
+) -> Option<RuleSourceMatch> {
+    context
+        .block_text
         .find(literal)
-        .map(|offset| source_match_for_offset(rule_text, offset))
+        .map(|offset| source_match_for_offset(context, offset))
 }
 
-fn source_match_for_condition_literal(rule_text: &str, literal: &str) -> Option<RuleSourceMatch> {
-    if let Some(condition_offset) = rule_text.find("condition:")
-        && let Some(relative_offset) = rule_text[condition_offset..].find(literal)
+fn source_match_for_condition_literal(
+    context: &RuleSourceContext<'_>,
+    literal: &str,
+) -> Option<RuleSourceMatch> {
+    if let Some(condition_offset) = context.block_text.find("condition:")
+        && let Some(relative_offset) = context.block_text[condition_offset..].find(literal)
     {
         return Some(source_match_for_offset(
-            rule_text,
+            context,
             condition_offset + relative_offset,
         ));
     }
-    source_match_for_literal(rule_text, literal)
+    source_match_for_literal(context, literal)
 }
 
 fn source_match_for_condition_pattern_id(
-    rule_text: &str,
+    context: &RuleSourceContext<'_>,
     pattern_id: &str,
 ) -> Option<RuleSourceMatch> {
-    source_match_for_condition_literal(rule_text, pattern_id)
+    source_match_for_condition_literal(context, pattern_id)
 }
 
-fn source_match_for_strings_literal(rule_text: &str, literal: &str) -> Option<RuleSourceMatch> {
-    let strings_offset = rule_text.find("strings:")?;
-    let section_end = rule_text[strings_offset..]
+fn source_match_for_strings_literal(
+    context: &RuleSourceContext<'_>,
+    literal: &str,
+) -> Option<RuleSourceMatch> {
+    let strings_offset = context.block_text.find("strings:")?;
+    let section_end = context.block_text[strings_offset..]
         .find("condition:")
         .map(|offset| strings_offset + offset)
-        .unwrap_or(rule_text.len());
-    let strings_section = &rule_text[strings_offset..section_end];
-    strings_section.find(literal).map(|relative_offset| {
-        source_match_for_offset(rule_text, strings_offset + relative_offset)
-    })
+        .unwrap_or(context.block_text.len());
+    let strings_section = &context.block_text[strings_offset..section_end];
+    strings_section
+        .find(literal)
+        .map(|relative_offset| source_match_for_offset(context, strings_offset + relative_offset))
 }
 
-fn source_match_for_first_strings_line(rule_text: &str) -> Option<RuleSourceMatch> {
-    let strings_offset = rule_text.find("strings:")?;
-    let tail = &rule_text[strings_offset..];
+fn source_match_for_first_strings_line(context: &RuleSourceContext<'_>) -> Option<RuleSourceMatch> {
+    let strings_offset = context.block_text.find("strings:")?;
+    let tail = &context.block_text[strings_offset..];
     let newline_offset = tail.find('\n')?;
     let body_start = strings_offset + newline_offset + 1;
-    let section_end = rule_text[body_start..]
+    let section_end = context.block_text[body_start..]
         .find("condition:")
         .map(|offset| body_start + offset)
-        .unwrap_or(rule_text.len());
-    let remaining = &rule_text[body_start..section_end];
+        .unwrap_or(context.block_text.len());
+    let remaining = &context.block_text[body_start..section_end];
     let first_non_ws = remaining
         .char_indices()
         .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))?;
-    Some(source_match_for_offset(
-        rule_text,
-        body_start + first_non_ws,
-    ))
+    Some(source_match_for_offset(context, body_start + first_non_ws))
 }
 
 fn extract_message_fragment(message: &str, prefix: &str) -> Option<String> {
@@ -4102,34 +4150,38 @@ fn extract_message_fragment(message: &str, prefix: &str) -> Option<String> {
     Some(quoted.to_owned())
 }
 
-fn source_match_for_anchorless_verifier_only_condition(rule_text: &str) -> Option<RuleSourceMatch> {
+fn source_match_for_anchorless_verifier_only_condition(
+    context: &RuleSourceContext<'_>,
+) -> Option<RuleSourceMatch> {
     for candidate in [
         "uint8(", "uint16(", "uint32(", "uint64(", "int8(", "int16(", "int32(", "int64(",
         "float32(", "float64(", " at ", " in (", "#", "for any", "for all",
     ] {
-        if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+        if let Some(found) = source_match_for_condition_literal(context, candidate) {
             return Some(found);
         }
     }
-    source_match_for_first_condition_line(rule_text)
+    source_match_for_first_condition_line(context)
 }
 
-fn source_match_for_first_condition_line(rule_text: &str) -> Option<RuleSourceMatch> {
-    let condition_offset = rule_text.find("condition:")?;
-    let tail = &rule_text[condition_offset..];
+fn source_match_for_first_condition_line(
+    context: &RuleSourceContext<'_>,
+) -> Option<RuleSourceMatch> {
+    let condition_offset = context.block_text.find("condition:")?;
+    let tail = &context.block_text[condition_offset..];
     let newline_offset = tail.find('\n')?;
     let body_start = condition_offset + newline_offset + 1;
-    let remaining = &rule_text[body_start..];
+    let remaining = &context.block_text[body_start..];
     let first_non_ws = remaining
         .char_indices()
         .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))?;
-    Some(source_match_for_offset(
-        rule_text,
-        body_start + first_non_ws,
-    ))
+    Some(source_match_for_offset(context, body_start + first_non_ws))
 }
 
-fn verifier_only_kind_match(rule_text: &str, kind: &str) -> Option<RuleSourceMatch> {
+fn verifier_only_kind_match(
+    context: &RuleSourceContext<'_>,
+    kind: &str,
+) -> Option<RuleSourceMatch> {
     let candidates: &[&str] = match kind {
         "verifier_only_at" => &[" at ", " at\t", " at\r", " at\n"],
         "verifier_only_count" => &["#", " of ("],
@@ -4142,7 +4194,7 @@ fn verifier_only_kind_match(rule_text: &str, kind: &str) -> Option<RuleSourceMat
     };
     candidates
         .iter()
-        .find_map(|candidate| source_match_for_literal(rule_text, candidate))
+        .find_map(|candidate| source_match_for_literal(context, candidate))
 }
 
 fn rule_check_issue(
@@ -4359,7 +4411,9 @@ fn classify_unsupported_issue_code(message: &str) -> &'static str {
         || message == "Unsupported regex group extension in searchable regex."
     {
         "unsupported-regex-syntax"
-    } else if message == "nocase literal does not contain an anchorable window for the active gram sizes" {
+    } else if message
+        == "nocase literal does not contain an anchorable window for the active gram sizes"
+    {
         "nocase-no-anchorable-window"
     } else if message.starts_with("Unsupported strings declaration: ") {
         "unsupported-strings-declaration"
@@ -4416,123 +4470,126 @@ fn classify_unsupported_issue_code(message: &str) -> &'static str {
     }
 }
 
-fn unsupported_issue_match(rule_text: &str, message: &str) -> Option<RuleSourceMatch> {
+fn unsupported_issue_match(
+    context: &RuleSourceContext<'_>,
+    message: &str,
+) -> Option<RuleSourceMatch> {
     let code = classify_unsupported_issue_code(message);
     if let Some(hash_start) = message.find("hash.") {
         let suffix = &message[hash_start..];
         let end = suffix.find('(').unwrap_or(suffix.len());
         let literal = &suffix[..end];
         if !literal.is_empty() {
-            return source_match_for_literal(rule_text, literal);
+            return source_match_for_literal(context, literal);
         }
     }
     if message.contains("math.entropy") {
-        return source_match_for_literal(rule_text, "math.entropy(");
+        return source_match_for_literal(context, "math.entropy(");
     }
     match code {
-        "no-condition-section" => source_match_for_literal(rule_text, "strings:")
-            .or_else(|| source_match_for_first_strings_line(rule_text)),
+        "no-condition-section" => source_match_for_literal(context, "strings:")
+            .or_else(|| source_match_for_first_strings_line(context)),
         "ignored-module-no-anchor" => {
             for candidate in ["androguard.", "console.", "cuckoo."] {
-                if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+                if let Some(found) = source_match_for_condition_literal(context, candidate) {
                     return Some(found);
                 }
             }
-            source_match_for_first_condition_line(rule_text)
+            source_match_for_first_condition_line(context)
         }
         "unsupported-regex-flags" | "unsupported-literal-flags" => message
             .split_once(" for ")
             .and_then(|(_, suffix)| suffix.split_once(':'))
-            .and_then(|(pattern_id, _)| source_match_for_strings_literal(rule_text, pattern_id))
-            .or_else(|| source_match_for_first_strings_line(rule_text)),
+            .and_then(|(pattern_id, _)| source_match_for_strings_literal(context, pattern_id))
+            .or_else(|| source_match_for_first_strings_line(context)),
         "unsupported-hex-syntax" => message
             .split_once(" for ")
             .and_then(|(_, suffix)| suffix.split_once(':'))
-            .and_then(|(pattern_id, _)| source_match_for_strings_literal(rule_text, pattern_id))
-            .or_else(|| source_match_for_first_strings_line(rule_text)),
-        "regex-no-mandatory-literal" => source_match_for_first_strings_line(rule_text),
+            .and_then(|(pattern_id, _)| source_match_for_strings_literal(context, pattern_id))
+            .or_else(|| source_match_for_first_strings_line(context)),
+        "regex-no-mandatory-literal" => source_match_for_first_strings_line(context),
         "unsupported-regex-syntax" | "nocase-no-anchorable-window" => {
-            source_match_for_first_strings_line(rule_text)
+            source_match_for_first_strings_line(context)
         }
         "unsupported-strings-declaration" => {
             extract_message_fragment(message, "Unsupported strings declaration: ")
-                .and_then(|fragment| source_match_for_strings_literal(rule_text, &fragment))
-                .or_else(|| source_match_for_first_strings_line(rule_text))
+                .and_then(|fragment| source_match_for_strings_literal(context, &fragment))
+                .or_else(|| source_match_for_first_strings_line(context))
         }
         "unsupported-condition-field" => message
             .strip_prefix("Unsupported condition field: ")
-            .and_then(|field| source_match_for_condition_literal(rule_text, field))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
+            .and_then(|field| source_match_for_condition_literal(context, field))
+            .or_else(|| source_match_for_first_condition_line(context)),
         "nonliteral-byte-offset" => message
             .strip_suffix(" requires an integer byte offset.")
-            .and_then(|name| source_match_for_condition_literal(rule_text, &format!("{name}(")))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
-        "count-requires-integer-literal" => source_match_for_condition_literal(rule_text, "#")
-            .or_else(|| source_match_for_condition_literal(rule_text, " of ("))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
+            .and_then(|name| source_match_for_condition_literal(context, &format!("{name}(")))
+            .or_else(|| source_match_for_first_condition_line(context)),
+        "count-requires-integer-literal" => source_match_for_condition_literal(context, "#")
+            .or_else(|| source_match_for_condition_literal(context, " of ("))
+            .or_else(|| source_match_for_first_condition_line(context)),
         "numeric-read-literal-out-of-range" => message
             .strip_prefix("Numeric read literal is out of range for ")
             .and_then(|suffix| suffix.split_once(':').map(|(name, _)| name))
-            .and_then(|name| source_match_for_condition_literal(rule_text, &format!("{name}(")))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
-        "invalid-literal-string" => source_match_for_first_strings_line(rule_text),
+            .and_then(|name| source_match_for_condition_literal(context, &format!("{name}(")))
+            .or_else(|| source_match_for_first_condition_line(context)),
+        "invalid-literal-string" => source_match_for_first_strings_line(context),
         "unknown-rule-reference" => message
             .strip_prefix("Condition references unknown rule: ")
-            .and_then(|rule_name| source_match_for_condition_literal(rule_text, rule_name))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
+            .and_then(|rule_name| source_match_for_condition_literal(context, rule_name))
+            .or_else(|| source_match_for_first_condition_line(context)),
         "unsupported-condition-syntax" => {
             extract_message_fragment(message, "Unsupported token in condition near: ")
-                .and_then(|fragment| source_match_for_condition_literal(rule_text, &fragment))
-                .or_else(|| source_match_for_first_condition_line(rule_text))
+                .and_then(|fragment| source_match_for_condition_literal(context, &fragment))
+                .or_else(|| source_match_for_first_condition_line(context))
         }
-        "unsupported-comparison-operator" => source_match_for_condition_literal(rule_text, "!=")
-            .or_else(|| source_match_for_condition_literal(rule_text, "#"))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
+        "unsupported-comparison-operator" => source_match_for_condition_literal(context, "!=")
+            .or_else(|| source_match_for_condition_literal(context, "#"))
+            .or_else(|| source_match_for_first_condition_line(context)),
         "overbroad-union" => {
             for candidate in ["any of", "or", "1 of", "2 of"] {
-                if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+                if let Some(found) = source_match_for_condition_literal(context, candidate) {
                     return Some(found);
                 }
             }
-            source_match_for_first_condition_line(rule_text)
+            source_match_for_first_condition_line(context)
         }
         "low-information-entrypoint-stub" => {
-            source_match_for_condition_literal(rule_text, "at pe.entry_point")
+            source_match_for_condition_literal(context, "at pe.entry_point")
         }
-        "low-information-range-rule" => source_match_for_condition_literal(rule_text, " in ("),
-        "low-information-single-pattern" => source_match_for_first_condition_line(rule_text),
+        "low-information-range-rule" => source_match_for_condition_literal(context, " in ("),
+        "low-information-single-pattern" => source_match_for_first_condition_line(context),
         "requires-anchorable-literal-direct" => extract_pattern_id_from_anchor_error(message)
-            .and_then(|pattern_id| source_match_for_condition_pattern_id(rule_text, &pattern_id))
-            .or_else(|| source_match_for_first_condition_line(rule_text)),
+            .and_then(|pattern_id| source_match_for_condition_pattern_id(context, &pattern_id))
+            .or_else(|| source_match_for_first_condition_line(context)),
         "requires-anchorable-literal-at-in" => extract_pattern_id_from_anchor_error(message)
             .and_then(|pattern_id| {
-                source_match_for_condition_literal(rule_text, &format!("{pattern_id} at"))
+                source_match_for_condition_literal(context, &format!("{pattern_id} at"))
                     .or_else(|| {
-                        source_match_for_condition_literal(rule_text, &format!("{pattern_id} in"))
+                        source_match_for_condition_literal(context, &format!("{pattern_id} in"))
                     })
-                    .or_else(|| source_match_for_condition_pattern_id(rule_text, &pattern_id))
+                    .or_else(|| source_match_for_condition_pattern_id(context, &pattern_id))
             })
-            .or_else(|| source_match_for_condition_literal(rule_text, " at "))
-            .or_else(|| source_match_for_condition_literal(rule_text, " in (")),
+            .or_else(|| source_match_for_condition_literal(context, " at "))
+            .or_else(|| source_match_for_condition_literal(context, " in (")),
         "requires-anchorable-literal-loop" => {
-            source_match_for_condition_literal(rule_text, "verifierloop(")
-                .or_else(|| source_match_for_condition_literal(rule_text, "for any"))
-                .or_else(|| source_match_for_condition_literal(rule_text, "for all"))
+            source_match_for_condition_literal(context, "verifierloop(")
+                .or_else(|| source_match_for_condition_literal(context, "for any"))
+                .or_else(|| source_match_for_condition_literal(context, "for all"))
         }
         "requires-anchorable-literal-n-of" => {
             if let Some(pattern_id) = extract_pattern_id_from_anchor_error(message)
-                && let Some(found) = source_match_for_condition_pattern_id(rule_text, &pattern_id)
+                && let Some(found) = source_match_for_condition_pattern_id(context, &pattern_id)
             {
                 return Some(found);
             }
             for candidate in ["any of", "all of", "1 of", "2 of"] {
-                if let Some(found) = source_match_for_condition_literal(rule_text, candidate) {
+                if let Some(found) = source_match_for_condition_literal(context, candidate) {
                     return Some(found);
                 }
             }
-            source_match_for_first_condition_line(rule_text)
+            source_match_for_first_condition_line(context)
         }
-        "verifier-only-no-anchor" => source_match_for_anchorless_verifier_only_condition(rule_text),
+        "verifier-only-no-anchor" => source_match_for_anchorless_verifier_only_condition(context),
         _ => None,
     }
 }
@@ -4544,7 +4601,7 @@ fn extract_pattern_id_from_anchor_error(message: &str) -> Option<String> {
 }
 
 fn build_rule_check_report(
-    rule_text: &str,
+    source_context: &RuleSourceContext<'_>,
     rule_name: Option<&str>,
     plan_result: Result<CompiledQueryPlan>,
     ignored_module_calls: Vec<String>,
@@ -4564,7 +4621,8 @@ fn build_rule_check_report(
             );
             let verifier_only_kinds = verifier_only_kinds.into_iter().collect::<Vec<_>>();
             let mut issues = Vec::<RuleCheckIssue>::new();
-            let negated_search_match = first_negated_search_condition_match(&plan.root, rule_text);
+            let negated_search_match =
+                first_negated_search_condition_match(&plan.root, source_context);
             let negated_search_unbounded =
                 negated_search_condition_makes_candidate_branch_unbounded(&plan.root);
             for kind in &verifier_only_kinds {
@@ -4574,7 +4632,7 @@ fn build_rule_check_report(
                     code,
                     RuleCheckSeverity::Warning,
                     verifier_only_issue_message(kind),
-                    verifier_only_kind_match(rule_text, kind),
+                    verifier_only_kind_match(source_context, kind),
                     remediation_for_issue_code(code),
                 ));
             }
@@ -4605,7 +4663,7 @@ fn build_rule_check_report(
                     format!(
                         "Indexed candidate search prunes the module predicate `{module_call}`. Use --verify if you need exact module-aware results."
                     ),
-                    source_match_for_literal(rule_text, module_call),
+                    source_match_for_literal(source_context, module_call),
                     remediation_for_issue_code("ignored-module-predicate"),
                 ));
             }
@@ -4630,7 +4688,7 @@ fn build_rule_check_report(
                 error_code,
                 RuleCheckSeverity::Error,
                 error_message.clone(),
-                unsupported_issue_match(rule_text, &error_message),
+                unsupported_issue_match(source_context, &error_message),
                 remediation_for_issue_code(error_code),
             )];
             for module_call in &ignored_module_calls {
@@ -4641,7 +4699,7 @@ fn build_rule_check_report(
                     format!(
                         "The rule also references the ignored module predicate `{module_call}`."
                     ),
-                    source_match_for_literal(rule_text, module_call),
+                    source_match_for_literal(source_context, module_call),
                     remediation_for_issue_code("ignored-module-predicate"),
                 ));
             }
@@ -4669,7 +4727,7 @@ fn contains_pattern_or_verifier_only_node(node: &QueryNode) -> bool {
 
 fn first_negated_search_condition_match(
     node: &QueryNode,
-    rule_text: &str,
+    context: &RuleSourceContext<'_>,
 ) -> Option<RuleSourceMatch> {
     if node.kind == "not"
         && node
@@ -4677,12 +4735,32 @@ fn first_negated_search_condition_match(
             .first()
             .is_some_and(contains_pattern_or_verifier_only_node)
     {
-        return source_match_for_condition_literal(rule_text, "not ")
-            .or_else(|| source_match_for_first_condition_line(rule_text));
+        return source_match_for_condition_literal(context, "not ")
+            .or_else(|| source_match_for_first_condition_line(context));
     }
     node.children
         .iter()
-        .find_map(|child| first_negated_search_condition_match(child, rule_text))
+        .find_map(|child| first_negated_search_condition_match(child, context))
+}
+
+fn summarize_rule_check_rules(rules: Vec<RuleCheckRuleReport>) -> RuleCheckFileReport {
+    let mut status = RuleCheckStatus::Searchable;
+    let mut issues = Vec::<RuleCheckIssue>::new();
+    let mut verifier_only_kinds = BTreeSet::<String>::new();
+    let mut ignored_module_calls = BTreeSet::<String>::new();
+    for rule in &rules {
+        status = status.combine(rule.status);
+        issues.extend(rule.issues.iter().cloned());
+        verifier_only_kinds.extend(rule.verifier_only_kinds.iter().cloned());
+        ignored_module_calls.extend(rule.ignored_module_calls.iter().cloned());
+    }
+    RuleCheckFileReport {
+        status,
+        issues,
+        verifier_only_kinds: verifier_only_kinds.into_iter().collect(),
+        ignored_module_calls: ignored_module_calls.into_iter().collect(),
+        rules,
+    }
 }
 
 fn negated_search_condition_makes_candidate_branch_unbounded(node: &QueryNode) -> bool {
@@ -6115,6 +6193,110 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     })
 }
 
+fn compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+    rule_blocks: &[ParsedRuleBlock],
+    root_rule_name: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> Result<CompiledQueryPlan> {
+    let max_candidates = normalize_max_candidates(max_candidates.into());
+    let normalized_root_rule_name = normalize_rule_name(root_rule_name);
+    let rules = rule_blocks
+        .iter()
+        .cloned()
+        .map(|rule| (normalize_rule_name(&rule.name), rule))
+        .collect::<HashMap<_, _>>();
+    if !rules.contains_key(&normalized_root_rule_name) {
+        return Err(SspryError::from(format!(
+            "Condition references unknown rule: {root_rule_name}"
+        )));
+    }
+    let mut cache = HashMap::<String, RulePlanFragment>::new();
+    let mut visiting = HashSet::<String>::new();
+    let fragment = compile_rule_fragment(
+        &normalized_root_rule_name,
+        &rules,
+        &mut cache,
+        &mut visiting,
+        &normalized_root_rule_name,
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )?;
+    let root = fragment
+        .root
+        .clone()
+        .ok_or_else(|| SspryError::from("Compiled rule fragment is missing a root."))?;
+    let mut pattern_ids = fragment
+        .pattern_alternatives
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    pattern_ids.sort();
+    let mut patterns = Vec::with_capacity(pattern_ids.len());
+    for pattern_id in pattern_ids {
+        let alternatives = fragment
+            .pattern_alternatives
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_default();
+        let tier2_alternatives = fragment
+            .pattern_tier2_alternatives
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let anchor_literals = fragment
+            .pattern_anchor_literals
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let fixed_literals = fragment
+            .pattern_fixed_literals
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
+        let fixed_literal_wide = fragment
+            .pattern_fixed_literal_wide
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![false; alternatives.len()]);
+        let fixed_literal_fullword = fragment
+            .pattern_fixed_literal_fullword
+            .get(&pattern_id)
+            .cloned()
+            .unwrap_or_else(|| vec![false; alternatives.len()]);
+        patterns.push(PatternPlan {
+            pattern_id,
+            alternatives,
+            tier2_alternatives,
+            anchor_literals,
+            fixed_literals,
+            fixed_literal_wide,
+            fixed_literal_fullword,
+        });
+    }
+    reject_overbroad_pattern_union(&root, &patterns)?;
+    reject_low_information_entrypoint_stub(&root, &patterns)?;
+    reject_low_information_range_rule(&root, &patterns)?;
+    reject_low_information_single_pattern(&root, &patterns)?;
+    Ok(CompiledQueryPlan {
+        patterns,
+        root,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+        tier2_gram_size: gram_sizes.tier2,
+        tier1_gram_size: gram_sizes.tier1,
+    })
+}
+
 pub fn compile_query_plan_with_gram_sizes(
     rule_text: &str,
     gram_sizes: GramSizes,
@@ -6183,35 +6365,34 @@ pub fn rule_check_with_gram_sizes_and_identity_source(
     allow_tier2_fallback: bool,
     max_candidates: impl Into<f64>,
 ) -> RuleCheckReport {
-    let parsed_blocks = parse_rule_blocks(rule_text).ok();
-    let rule_name = parsed_blocks
-        .as_deref()
-        .and_then(active_rule_name_from_blocks);
-    let ignored_module_calls = parsed_blocks
-        .as_ref()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .flat_map(|block| collect_ignored_module_call_names(&block.raw_condition_text))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    build_rule_check_report(
+    let report = rule_check_all_with_gram_sizes_and_identity_source(
         rule_text,
-        rule_name.as_deref(),
-        compile_query_plan_with_gram_sizes_and_identity_source(
-            rule_text,
-            gram_sizes,
-            active_identity_source,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates,
-        ),
-        ignored_module_calls,
-    )
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    );
+    if let Some(active_rule) = report
+        .rules
+        .iter()
+        .find(|rule| !rule.is_private)
+        .or_else(|| report.rules.first())
+    {
+        return RuleCheckReport {
+            status: active_rule.status,
+            issues: active_rule.issues.clone(),
+            verifier_only_kinds: active_rule.verifier_only_kinds.clone(),
+            ignored_module_calls: active_rule.ignored_module_calls.clone(),
+        };
+    }
+    RuleCheckReport {
+        status: report.status,
+        issues: report.issues,
+        verifier_only_kinds: report.verifier_only_kinds,
+        ignored_module_calls: report.ignored_module_calls,
+    }
 }
 
 pub fn rule_check_with_gram_sizes(
@@ -6223,6 +6404,92 @@ pub fn rule_check_with_gram_sizes(
     max_candidates: impl Into<f64>,
 ) -> RuleCheckReport {
     rule_check_with_gram_sizes_and_identity_source(
+        rule_text,
+        gram_sizes,
+        None,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
+pub fn rule_check_all_with_gram_sizes_and_identity_source(
+    rule_text: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> RuleCheckFileReport {
+    let max_candidates = max_candidates.into();
+    match parse_rule_blocks(rule_text) {
+        Ok(rule_blocks) => {
+            let mut rules = Vec::<RuleCheckRuleReport>::with_capacity(rule_blocks.len());
+            for block in &rule_blocks {
+                let source_context = RuleSourceContext {
+                    full_text: rule_text,
+                    block_text: &block.block_text,
+                    block_start_offset: block.block_start_offset,
+                };
+                let ignored_module_calls =
+                    collect_ignored_module_call_names(&block.raw_condition_text)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                let report = build_rule_check_report(
+                    &source_context,
+                    Some(&block.name),
+                    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                        &rule_blocks,
+                        &block.name,
+                        gram_sizes,
+                        active_identity_source,
+                        max_anchors_per_alt,
+                        force_tier1_only,
+                        allow_tier2_fallback,
+                        max_candidates,
+                    ),
+                    ignored_module_calls,
+                );
+                rules.push(RuleCheckRuleReport {
+                    rule: block.name.clone(),
+                    is_private: block.is_private,
+                    status: report.status,
+                    issues: report.issues,
+                    verifier_only_kinds: report.verifier_only_kinds,
+                    ignored_module_calls: report.ignored_module_calls,
+                });
+            }
+            summarize_rule_check_rules(rules)
+        }
+        Err(err) => {
+            let source_context = RuleSourceContext {
+                full_text: rule_text,
+                block_text: rule_text,
+                block_start_offset: 0,
+            };
+            let report = build_rule_check_report(&source_context, None, Err(err), Vec::new());
+            RuleCheckFileReport {
+                status: report.status,
+                issues: report.issues,
+                verifier_only_kinds: report.verifier_only_kinds,
+                ignored_module_calls: report.ignored_module_calls,
+                rules: Vec::new(),
+            }
+        }
+    }
+}
+
+pub fn rule_check_all_with_gram_sizes(
+    rule_text: &str,
+    gram_sizes: GramSizes,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> RuleCheckFileReport {
+    rule_check_all_with_gram_sizes_and_identity_source(
         rule_text,
         gram_sizes,
         None,
@@ -6263,6 +6530,46 @@ pub fn rule_check_from_file_with_gram_sizes(
     max_candidates: impl Into<f64>,
 ) -> Result<RuleCheckReport> {
     rule_check_from_file_with_gram_sizes_and_identity_source(
+        rule_path,
+        gram_sizes,
+        None,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
+pub fn rule_check_all_from_file_with_gram_sizes_and_identity_source(
+    rule_path: impl AsRef<Path>,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> Result<RuleCheckFileReport> {
+    let text = fs::read_to_string(rule_path)?;
+    Ok(rule_check_all_with_gram_sizes_and_identity_source(
+        &text,
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    ))
+}
+
+pub fn rule_check_all_from_file_with_gram_sizes(
+    rule_path: impl AsRef<Path>,
+    gram_sizes: GramSizes,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> Result<RuleCheckFileReport> {
+    rule_check_all_from_file_with_gram_sizes_and_identity_source(
         rule_path,
         gram_sizes,
         None,
@@ -7797,6 +8104,47 @@ rule simple_rule {
         );
         assert_eq!(report.status, RuleCheckStatus::Searchable);
         assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn rule_check_all_reports_each_rule_in_multi_rule_file() {
+        let report = rule_check_all_with_gram_sizes_and_identity_source(
+            r#"
+rule searchable_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+
+rule unsupported_rule {
+  strings:
+    $b = "WXYZ"
+  condition:
+    not $b
+}
+"#,
+            default_gram_sizes(),
+            Some("sha256"),
+            8,
+            false,
+            true,
+            7.5,
+        );
+
+        assert_eq!(report.status, RuleCheckStatus::Unsupported);
+        assert_eq!(report.rules.len(), 2);
+        assert_eq!(report.rules[0].rule, "searchable_rule");
+        assert_eq!(report.rules[0].status, RuleCheckStatus::Searchable);
+        assert_eq!(report.rules[1].rule, "unsupported_rule");
+        assert_eq!(report.rules[1].status, RuleCheckStatus::Unsupported);
+        assert_eq!(
+            report.rules[1]
+                .issues
+                .first()
+                .and_then(|issue| issue.snippet.as_deref()),
+            Some("not $b")
+        );
     }
 
     #[test]

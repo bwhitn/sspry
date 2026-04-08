@@ -31,7 +31,7 @@ use crate::candidate::{
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
-    resolve_max_candidates, rule_check_from_file_with_gram_sizes_and_identity_source,
+    resolve_max_candidates, rule_check_all_from_file_with_gram_sizes_and_identity_source,
     scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::grpc::{self, BlockingGrpcClient};
@@ -967,6 +967,7 @@ struct RuleCheckOutput {
     issues: Vec<crate::candidate::RuleCheckIssue>,
     verifier_only_kinds: Vec<String>,
     ignored_module_calls: Vec<String>,
+    rules: Vec<crate::candidate::RuleCheckRuleReport>,
 }
 
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
@@ -2514,7 +2515,7 @@ fn rule_check_policy(args: &RuleCheckArgs) -> Result<RuleCheckPolicy> {
 
 fn rule_check_output(
     policy: RuleCheckPolicy,
-    report: crate::candidate::RuleCheckReport,
+    report: crate::candidate::RuleCheckFileReport,
 ) -> RuleCheckOutput {
     RuleCheckOutput {
         status: report.status,
@@ -2526,19 +2527,12 @@ fn rule_check_output(
         issues: report.issues,
         verifier_only_kinds: report.verifier_only_kinds,
         ignored_module_calls: report.ignored_module_calls,
+        rules: report.rules,
     }
 }
 
-fn print_rule_check_output(output: &RuleCheckOutput) {
-    println!("status: {}", output.status.as_str());
-    println!("policy_source: {}", output.policy.source);
-    println!("id_source: {}", output.policy.id_source);
-    println!("gram_sizes: {}", output.policy.gram_sizes);
-    if output.issues.is_empty() {
-        println!("summary: rule is compatible with sspry candidate search under this policy.");
-        return;
-    }
-    for issue in &output.issues {
+fn print_rule_check_issues(issues: &[crate::candidate::RuleCheckIssue]) {
+    for issue in issues {
         match (&issue.rule, issue.line, issue.column) {
             (Some(rule), Some(line), Some(column)) => {
                 println!(
@@ -2573,6 +2567,37 @@ fn print_rule_check_output(output: &RuleCheckOutput) {
             println!("remediation: {remediation}");
         }
     }
+}
+
+fn print_rule_check_output(output: &RuleCheckOutput) {
+    println!("status: {}", output.status.as_str());
+    println!("policy_source: {}", output.policy.source);
+    println!("id_source: {}", output.policy.id_source);
+    println!("gram_sizes: {}", output.policy.gram_sizes);
+    if output.rules.len() > 1 {
+        println!("rules: {}", output.rules.len());
+        for rule in &output.rules {
+            println!();
+            println!("rule: {}", rule.rule);
+            if rule.is_private {
+                println!("private: true");
+            }
+            println!("status: {}", rule.status.as_str());
+            if rule.issues.is_empty() {
+                println!(
+                    "summary: rule is compatible with sspry candidate search under this policy."
+                );
+            } else {
+                print_rule_check_issues(&rule.issues);
+            }
+        }
+        return;
+    }
+    if output.issues.is_empty() {
+        println!("summary: rule is compatible with sspry candidate search under this policy.");
+        return;
+    }
+    print_rule_check_issues(&output.issues);
 }
 
 fn forest_prepared_query_profile(
@@ -4728,7 +4753,7 @@ fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
 fn cmd_rule_check(args: &RuleCheckArgs) -> i32 {
     match (|| -> Result<i32> {
         let policy = rule_check_policy(args)?;
-        let report = rule_check_from_file_with_gram_sizes_and_identity_source(
+        let report = rule_check_all_from_file_with_gram_sizes_and_identity_source(
             &args.rule,
             policy.gram_sizes,
             Some(policy.id_source.as_str()),

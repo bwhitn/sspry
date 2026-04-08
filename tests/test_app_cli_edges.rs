@@ -709,6 +709,122 @@ rule negated_only_rule {
 }
 
 #[test]
+fn rule_check_json_reports_each_rule_in_multi_rule_file() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("multi.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule searchable_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+
+rule unsupported_rule {
+  strings:
+    $b = "WXYZ"
+  condition:
+    not $b
+}
+"#,
+    )
+    .expect("write rule");
+
+    let output = Command::new(bin_path())
+        .args([
+            "rule-check",
+            "--rule",
+            rule_path.to_str().expect("rule"),
+            "--json",
+        ])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail when any rule in the file is unsupported"
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("rule-check json");
+    assert_eq!(
+        parsed.get("status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    let rules = parsed
+        .get("rules")
+        .and_then(Value::as_array)
+        .expect("rules array");
+    assert_eq!(rules.len(), 2);
+    assert_eq!(
+        rules[0].get("rule").and_then(Value::as_str),
+        Some("searchable_rule")
+    );
+    assert_eq!(
+        rules[0].get("status").and_then(Value::as_str),
+        Some("searchable")
+    );
+    assert_eq!(
+        rules[1].get("rule").and_then(Value::as_str),
+        Some("unsupported_rule")
+    );
+    assert_eq!(
+        rules[1].get("status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        rules[1]
+            .get("issues")
+            .and_then(Value::as_array)
+            .and_then(|issues| issues.first())
+            .and_then(|issue| issue.get("snippet"))
+            .and_then(Value::as_str),
+        Some("not $b")
+    );
+}
+
+#[test]
+fn rule_check_plain_text_reports_each_rule_in_multi_rule_file() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("multi.txt.yar");
+    fs::write(
+        &rule_path,
+        r#"
+rule searchable_rule {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+
+rule unsupported_rule {
+  strings:
+    $b = "WXYZ"
+  condition:
+    not $b
+}
+"#,
+    )
+    .expect("write rule");
+
+    let output = Command::new(bin_path())
+        .args(["rule-check", "--rule", rule_path.to_str().expect("rule")])
+        .output()
+        .expect("run rule-check");
+    assert!(
+        !output.status.success(),
+        "rule-check should fail when any rule in the file is unsupported"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("status: unsupported"));
+    assert!(stdout.contains("rules: 2"));
+    assert!(stdout.contains("rule: searchable_rule"));
+    assert!(stdout.contains("rule: unsupported_rule"));
+    assert!(stdout.contains("status: searchable"));
+    assert!(stdout.contains("status: unsupported"));
+    assert!(stdout.contains("source: not $b"));
+}
+
+#[test]
 fn serve_persists_candidate_shards() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
