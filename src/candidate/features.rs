@@ -3,11 +3,13 @@ use std::io::Read;
 use std::path::Path;
 
 use hyperloglockless::HyperLogLogPlus;
-use sha2::{Digest, Sha256};
+use md5::Md5;
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::candidate::BloomFilter;
 use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
-use crate::candidate::grams::{GramSizes, pack_exact_gram};
+use crate::candidate::grams::GramSizes;
 use crate::perf::{record_counter, record_max, scope};
 use crate::{Result, SspryError};
 
@@ -21,10 +23,62 @@ const SPECIAL_POPULATION_MIN_ENTROPY_BITS_PER_BYTE: f64 = 7.75;
 #[derive(Clone, Debug)]
 pub struct DocumentFeatures {
     pub sha256: [u8; 32],
+    pub alternate_identity: Option<[u8; 32]>,
+    pub entropy_bits_per_byte: f32,
     pub file_size: u64,
     pub bloom_filter: Vec<u8>,
     pub tier2_bloom_filter: Vec<u8>,
     pub special_population: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdditionalDigestKind {
+    Md5,
+    Sha1,
+    Sha512,
+}
+
+enum AdditionalDigestState {
+    Md5(Md5),
+    Sha1(Sha1),
+    Sha512(Sha512),
+}
+
+impl AdditionalDigestState {
+    fn new(kind: AdditionalDigestKind) -> Self {
+        match kind {
+            AdditionalDigestKind::Md5 => Self::Md5(Md5::new()),
+            AdditionalDigestKind::Sha1 => Self::Sha1(Sha1::new()),
+            AdditionalDigestKind::Sha512 => Self::Sha512(Sha512::new()),
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) {
+        match self {
+            Self::Md5(digest) => digest.update(chunk),
+            Self::Sha1(digest) => digest.update(chunk),
+            Self::Sha512(digest) => digest.update(chunk),
+        }
+    }
+
+    fn finalize_normalized(self) -> [u8; 32] {
+        match self {
+            Self::Md5(digest) => normalize_identity_digest("md5", &digest.finalize()),
+            Self::Sha1(digest) => normalize_identity_digest("sha1", &digest.finalize()),
+            Self::Sha512(digest) => normalize_identity_digest("sha512", &digest.finalize()),
+        }
+    }
+}
+
+fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"sspry-identity\0");
+    digest.update(kind.as_bytes());
+    digest.update(b"\0");
+    digest.update(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest.finalize());
+    out
 }
 
 fn sampled_entropy_bits_per_byte(sample_counts: &[u32; 256], sampled_bytes: u64) -> f64 {
@@ -43,6 +97,22 @@ fn sampled_entropy_bits_per_byte(sample_counts: &[u32; 256], sampled_bytes: u64)
     entropy
 }
 
+fn entropy_bits_per_byte(counts: &[u64; 256], total_bytes: u64) -> f32 {
+    if total_bytes == 0 {
+        return 0.0;
+    }
+    let total = total_bytes as f64;
+    let mut entropy = 0.0f64;
+    for count in counts {
+        if *count == 0 {
+            continue;
+        }
+        let probability = *count as f64 / total;
+        entropy -= probability * probability.log2();
+    }
+    entropy as f32
+}
+
 fn classify_special_population(file_size: u64, sampled_entropy_bits_per_byte: f64) -> bool {
     file_size >= SPECIAL_POPULATION_MIN_FILE_BYTES
         && sampled_entropy_bits_per_byte >= SPECIAL_POPULATION_MIN_ENTROPY_BITS_PER_BYTE
@@ -54,7 +124,7 @@ fn iter_grams_from_bytes_exact_u64(data: &[u8], gram_size: usize) -> Vec<u64> {
         return Vec::new();
     }
     (0..=(data.len() - gram_size))
-        .map(|idx| pack_exact_gram(&data[idx..idx + gram_size]))
+        .map(|idx| crate::candidate::grams::pack_exact_gram(&data[idx..idx + gram_size]))
         .collect()
 }
 
@@ -64,6 +134,50 @@ fn mix_u64_to_u64(value: u64) -> u64 {
     x = ((x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9)) & U64_MASK;
     x = ((x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB)) & U64_MASK;
     (x ^ (x >> 31)) & U64_MASK
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RollingGramState {
+    gram_size: usize,
+    filled: usize,
+    value: u64,
+}
+
+impl RollingGramState {
+    fn new(gram_size: usize) -> Self {
+        Self {
+            gram_size,
+            filled: 0,
+            value: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> Option<u64> {
+        if self.filled < self.gram_size {
+            self.value |= u64::from(byte) << (self.filled * 8);
+            self.filled += 1;
+            if self.filled == self.gram_size {
+                Some(self.value)
+            } else {
+                None
+            }
+        } else {
+            self.value = slide_exact_gram(self.value, byte, self.gram_size);
+            Some(self.value)
+        }
+    }
+}
+
+#[inline]
+fn slide_exact_gram(value: u64, next_byte: u8, gram_size: usize) -> u64 {
+    debug_assert!((1..=8).contains(&gram_size));
+    (value >> 8) | (u64::from(next_byte) << ((gram_size - 1) * 8))
+}
+
+#[inline]
+fn bloom_lane_for_start(start_offset: u64) -> usize {
+    debug_assert!(DEFAULT_BLOOM_POSITION_LANES.is_power_of_two());
+    (start_offset as usize) & (DEFAULT_BLOOM_POSITION_LANES - 1)
 }
 
 fn estimate_unique_grams_hll(
@@ -83,7 +197,7 @@ fn estimate_unique_grams_hll(
     }
 
     let mut hll = HyperLogLogPlus::new(precision);
-    let mut trailing = Vec::<u8>::new();
+    let mut rolling = RollingGramState::new(gram_size);
     let mut saw_gram = false;
     let mut file = File::open(path)?;
     let mut buf = vec![0u8; chunk_size];
@@ -92,17 +206,11 @@ fn estimate_unique_grams_hll(
         if read_len == 0 {
             break;
         }
-        let mut data = trailing;
-        data.extend_from_slice(&buf[..read_len]);
-        let limit = data.len().saturating_sub(gram_size).saturating_add(1);
-        if limit > 0 && data.len() >= gram_size {
-            saw_gram = true;
-            for idx in 0..limit {
-                hll.insert_hash(mix_u64_to_u64(pack_exact_gram(&data[idx..idx + gram_size])));
+        for byte in &buf[..read_len] {
+            if let Some(gram) = rolling.push(*byte) {
+                hll.insert_hash(mix_u64_to_u64(gram));
+                saw_gram = true;
             }
-            trailing = data[data.len() - (gram_size - 1)..].to_vec();
-        } else {
-            trailing = data;
         }
     }
 
@@ -135,9 +243,8 @@ pub fn estimate_unique_grams_pair_hll(
 
     let mut first_hll = HyperLogLogPlus::new(precision);
     let mut second_hll = HyperLogLogPlus::new(precision);
-    let max_gram_size = first_gram_size.max(second_gram_size);
-    let trailing_len = max_gram_size - 1;
-    let mut trailing = Vec::<u8>::new();
+    let mut first_state = RollingGramState::new(first_gram_size);
+    let mut second_state = RollingGramState::new(second_gram_size);
     let mut saw_first = false;
     let mut saw_second = false;
     let mut file = File::open(path)?;
@@ -147,29 +254,16 @@ pub fn estimate_unique_grams_pair_hll(
         if read_len == 0 {
             break;
         }
-        let mut data = trailing;
-        data.extend_from_slice(&buf[..read_len]);
-        if data.len() >= first_gram_size {
-            saw_first = true;
-            for idx in 0..=(data.len() - first_gram_size) {
-                first_hll.insert_hash(mix_u64_to_u64(pack_exact_gram(
-                    &data[idx..idx + first_gram_size],
-                )));
+        for byte in &buf[..read_len] {
+            if let Some(gram) = first_state.push(*byte) {
+                first_hll.insert_hash(mix_u64_to_u64(gram));
+                saw_first = true;
+            }
+            if let Some(gram) = second_state.push(*byte) {
+                second_hll.insert_hash(mix_u64_to_u64(gram));
+                saw_second = true;
             }
         }
-        if data.len() >= second_gram_size {
-            saw_second = true;
-            for idx in 0..=(data.len() - second_gram_size) {
-                second_hll.insert_hash(mix_u64_to_u64(pack_exact_gram(
-                    &data[idx..idx + second_gram_size],
-                )));
-            }
-        }
-        trailing = if data.len() >= max_gram_size {
-            data[data.len() - trailing_len..].to_vec()
-        } else {
-            data
-        };
     }
 
     Ok((
@@ -247,6 +341,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     tier2_filter_bytes: usize,
     tier2_bloom_hashes: usize,
     chunk_size: usize,
+    additional_digest: Option<AdditionalDigestKind>,
 ) -> Result<DocumentFeatures> {
     let mut total_scope = scope("candidate.scan_file_features");
     if chunk_size == 0 {
@@ -257,6 +352,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     let mut file = File::open(file_path)?;
     let declared_file_size = file.metadata()?.len();
     let mut digest = Sha256::new();
+    let mut alternate_identity = additional_digest.map(AdditionalDigestState::new);
     let mut bloom = Some(BloomFilter::new(filter_bytes, bloom_hashes)?);
     let mut tier2_bloom = if tier2_filter_bytes > 0 && tier2_bloom_hashes > 0 {
         Some(BloomFilter::new(tier2_filter_bytes, tier2_bloom_hashes)?)
@@ -271,13 +367,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
         .as_ref()
         .map(|bloom_ref| bloom_ref.lane_geometry(DEFAULT_BLOOM_POSITION_LANES))
         .transpose()?;
-    let trailing_bytes = if tier2_bloom.is_some() {
-        gram_sizes.tier2 - 1
-    } else {
-        gram_sizes.tier1 - 1
-    };
     let mut file_size = 0u64;
-    let mut trailing = Vec::<u8>::new();
     let mut buf = vec![0u8; chunk_size];
     let mut gram_windows = 0u64;
     let mut processed_bytes = 0u64;
@@ -288,6 +378,11 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
     let mut sample_counts = [0u32; 256];
     let mut sampled_bytes = 0u64;
     let mut next_sample_offset = 0u64;
+    let mut exact_byte_counts = [0u64; 256];
+    let mut tier1_state = RollingGramState::new(gram_sizes.tier1);
+    let mut tier2_state = tier2_bloom
+        .as_ref()
+        .map(|_| RollingGramState::new(gram_sizes.tier2));
 
     loop {
         let read_len = file.read(&mut buf)?;
@@ -295,6 +390,9 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
             break;
         }
         let chunk = &buf[..read_len];
+        for byte in chunk {
+            exact_byte_counts[*byte as usize] = exact_byte_counts[*byte as usize].saturating_add(1);
+        }
         while sampled_bytes < SPECIAL_POPULATION_MAX_SAMPLE_BYTES
             && next_sample_offset < processed_bytes.saturating_add(read_len as u64)
         {
@@ -309,49 +407,43 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
         }
         file_size = file_size.saturating_add(read_len as u64);
         digest.update(chunk);
-        let mut data = trailing.clone();
-        data.extend_from_slice(chunk);
-        let data_start_offset = processed_bytes.saturating_sub(trailing.len() as u64);
-        let min_gram_size = if tier2_bloom.is_some() {
-            gram_sizes.tier1.min(gram_sizes.tier2)
-        } else {
-            gram_sizes.tier1
-        };
-        if data.len() < min_gram_size {
-            trailing = data;
-            processed_bytes = processed_bytes.saturating_add(read_len as u64);
-            continue;
+        if let Some(alternate_identity_ref) = alternate_identity.as_mut() {
+            alternate_identity_ref.update(chunk);
         }
-        if let Some(bloom_ref) = bloom.as_mut() {
-            let (lane_bytes, lane_bits) =
-                tier1_lane_geometry.expect("tier1 lane geometry when tier1 bloom exists");
-            for idx in 0..=(data.len() - gram_sizes.tier1) {
-                let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier1]);
-                let lane =
-                    ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
-                bloom_ref.add_in_lane_prevalidated(gram, lane * lane_bytes, lane_bits);
-                gram_windows = gram_windows.saturating_add(1);
+        let (tier1_lane_bytes, tier1_lane_bits) =
+            tier1_lane_geometry.expect("tier1 lane geometry when tier1 bloom exists");
+        let tier2_lane = tier2_lane_geometry;
+        for (idx, byte) in chunk.iter().enumerate() {
+            let absolute_end = processed_bytes.saturating_add(idx as u64);
+            if let Some(gram) = tier1_state.push(*byte) {
+                if let Some(bloom_ref) = bloom.as_mut() {
+                    let start = absolute_end.saturating_add(1) - gram_sizes.tier1 as u64;
+                    let lane = bloom_lane_for_start(start);
+                    bloom_ref.add_in_lane_prevalidated(
+                        gram,
+                        lane * tier1_lane_bytes,
+                        tier1_lane_bits,
+                    );
+                    gram_windows = gram_windows.saturating_add(1);
+                }
             }
-        }
-        if let Some(tier2_bloom_ref) = tier2_bloom.as_mut() {
-            if data.len() >= gram_sizes.tier2 {
-                let (lane_bytes, lane_bits) =
-                    tier2_lane_geometry.expect("tier2 lane geometry when tier2 bloom exists");
-                for idx in 0..=(data.len() - gram_sizes.tier2) {
-                    let gram = pack_exact_gram(&data[idx..idx + gram_sizes.tier2]);
-                    let lane =
-                        ((data_start_offset + idx as u64) as usize) % DEFAULT_BLOOM_POSITION_LANES;
+            if let (Some(state), Some(tier2_bloom_ref), Some((lane_bytes, lane_bits))) =
+                (tier2_state.as_mut(), tier2_bloom.as_mut(), tier2_lane)
+            {
+                if let Some(gram) = state.push(*byte) {
+                    let start = absolute_end.saturating_add(1) - gram_sizes.tier2 as u64;
+                    let lane = bloom_lane_for_start(start);
                     tier2_bloom_ref.add_in_lane_prevalidated(gram, lane * lane_bytes, lane_bits);
                 }
             }
         }
-        trailing = data[data.len() - trailing_bytes..].to_vec();
         processed_bytes = processed_bytes.saturating_add(read_len as u64);
     }
 
     let digest_bytes = digest.finalize();
     let mut sha256 = [0u8; 32];
     sha256.copy_from_slice(&digest_bytes);
+    let exact_entropy = entropy_bits_per_byte(&exact_byte_counts, file_size);
     let sampled_entropy = if sampled_bytes >= SPECIAL_POPULATION_MIN_SAMPLED_BYTES {
         sampled_entropy_bits_per_byte(&sample_counts, sampled_bytes)
     } else {
@@ -366,6 +458,8 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
 
     Ok(DocumentFeatures {
         sha256,
+        alternate_identity: alternate_identity.map(AdditionalDigestState::finalize_normalized),
+        entropy_bits_per_byte: exact_entropy,
         file_size,
         bloom_filter: bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
         tier2_bloom_filter: tier2_bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
@@ -377,6 +471,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
 mod tests {
     use std::fs;
 
+    use md5::Digest as _;
     use std::collections::HashSet;
     use tempfile::tempdir;
 
@@ -406,6 +501,7 @@ mod tests {
             tier2_filter_bytes,
             tier2_bloom_hashes,
             chunk_size,
+            None,
         )
     }
 
@@ -420,6 +516,8 @@ mod tests {
     fn document_features_sha256_hex_formats_hash() {
         let features = super::DocumentFeatures {
             sha256: [0xAB; 32],
+            alternate_identity: None,
+            entropy_bits_per_byte: 0.0,
             file_size: 0,
             bloom_filter: Vec::new(),
             tier2_bloom_filter: Vec::new(),
@@ -458,6 +556,7 @@ mod tests {
             64,
             4,
             8,
+            None,
         )
         .expect("features");
         assert_eq!(features.file_size, 16);
@@ -566,9 +665,37 @@ mod tests {
             64,
             4,
             16,
+            None,
         )
         .expect("features");
         assert_eq!(features.file_size, 4);
         assert!(!features.tier2_bloom_filter.is_empty());
+    }
+
+    #[test]
+    fn bloom_only_scan_can_compute_alternate_identity_during_feature_pass() {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("digest.bin");
+        fs::write(&path, b"identity-check-bytes").expect("write");
+
+        let features = scan_file_features_bloom_only_with_gram_sizes(
+            &path,
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE).expect("sizes"),
+            64,
+            4,
+            64,
+            4,
+            8,
+            Some(super::AdditionalDigestKind::Md5),
+        )
+        .expect("features");
+
+        assert_eq!(
+            features.alternate_identity,
+            Some(crate::app::normalize_identity_digest(
+                "md5",
+                &md5::Md5::digest(b"identity-check-bytes"),
+            ))
+        );
     }
 }

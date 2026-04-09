@@ -3,7 +3,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::{Result, SspryError};
-use yara_x::mods::{self, pe::OptionalMagic};
 
 const METADATA_VERSION: u8 = 1;
 const MAX_MACHO_ARCHES: usize = 32;
@@ -264,133 +263,6 @@ fn initialize_known_bool_metadata(builder: &mut MetadataBuilder) {
     builder.set_bool(BoolField::MachoIsMacho, false);
 }
 
-fn extract_yarax_module_metadata(bytes: &[u8], builder: &mut MetadataBuilder) {
-    initialize_known_bool_metadata(builder);
-
-    let modules = mods::invoke_all(bytes);
-
-    if let Some(crx) = modules.crx.as_ref() {
-        builder.set_bool(BoolField::CrxIsCrx, crx.is_crx());
-    }
-
-    if let Some(dex) = modules.dex.as_ref() {
-        builder.set_bool(BoolField::DexIsDex, dex.is_dex());
-        if let Some(header) = dex.header.as_ref() {
-            if header.has_version() {
-                builder.push_int(IntField::DexVersion, u64::from(header.version()));
-            }
-        }
-    }
-
-    if let Some(lnk) = modules.lnk.as_ref() {
-        builder.set_bool(BoolField::LnkIsLnk, lnk.is_lnk());
-        if lnk.has_creation_time() {
-            builder.push_int(IntField::LnkCreationTime, lnk.creation_time());
-        }
-        if lnk.has_access_time() {
-            builder.push_int(IntField::LnkAccessTime, lnk.access_time());
-        }
-        if lnk.has_write_time() {
-            builder.push_int(IntField::LnkWriteTime, lnk.write_time());
-        }
-    }
-
-    if let Some(elf) = modules.elf.as_ref() {
-        let is_elf = elf.has_type()
-            || elf.has_machine()
-            || elf.has_osabi()
-            || elf.has_entry_point()
-            || elf.has_number_of_sections()
-            || elf.has_number_of_segments();
-        builder.set_bool(BoolField::ElfIsElf, is_elf);
-        if elf.has_type() {
-            builder.push_int(IntField::ElfType, elf.type_() as u64);
-        }
-        if elf.has_osabi() {
-            builder.push_int(IntField::ElfOsAbi, elf.osabi() as u64);
-        }
-        if elf.has_machine() {
-            builder.push_int(IntField::ElfMachine, elf.machine() as u64);
-        }
-    }
-
-    if let Some(pe) = modules.pe.as_ref() {
-        builder.set_bool(BoolField::PeIsPe, pe.is_pe());
-        if pe.has_machine() {
-            builder.push_int(IntField::PeMachine, pe.machine() as u64);
-        }
-        if pe.has_subsystem() {
-            builder.push_int(IntField::PeSubsystem, pe.subsystem() as u64);
-        }
-        if pe.has_timestamp() {
-            builder.push_int(IntField::PeTimestamp, u64::from(pe.timestamp()));
-        }
-        if pe.has_characteristics() {
-            let characteristics = pe.characteristics();
-            builder.push_int(IntField::PeCharacteristics, u64::from(characteristics));
-            builder.set_bool(BoolField::PeIsDll, (characteristics & 0x2000) != 0);
-        }
-        if pe.has_opthdr_magic() {
-            match pe.opthdr_magic() {
-                OptionalMagic::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
-                    builder.set_bool(BoolField::PeIs32Bit, true);
-                }
-                OptionalMagic::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
-                    builder.set_bool(BoolField::PeIs64Bit, true);
-                }
-                OptionalMagic::IMAGE_ROM_OPTIONAL_HDR_MAGIC => {}
-            }
-        }
-        if pe.has_is_signed() {
-            builder.set_bool(BoolField::PeIsSigned, pe.is_signed());
-        }
-        if pe.has_entry_point() {
-            let entry_point = pe.entry_point() as usize;
-            if entry_point < bytes.len() {
-                let end = bytes
-                    .len()
-                    .min(entry_point.saturating_add(PE_ENTRY_POINT_PREFIX_BYTES));
-                builder.set_bytes(BytesField::PeEntryPointPrefix, &bytes[entry_point..end]);
-            }
-        }
-    }
-
-    if let Some(dotnet) = modules.dotnet.as_ref() {
-        builder.set_bool(BoolField::DotnetIsDotnet, dotnet.is_dotnet());
-    }
-
-    if let Some(macho) = modules.macho.as_ref() {
-        if macho.has_cputype() {
-            builder.push_int(IntField::MachoCpuType, u64::from(macho.cputype()));
-        }
-        if macho.has_cpusubtype() {
-            builder.push_int(IntField::MachoCpuSubtype, u64::from(macho.cpusubtype()));
-        }
-        if macho.has_filetype() {
-            builder.push_int(IntField::MachoFileType, u64::from(macho.filetype()));
-        }
-        for file in &macho.file {
-            if file.has_cputype() {
-                builder.push_int(IntField::MachoCpuType, u64::from(file.cputype()));
-            }
-            if file.has_cpusubtype() {
-                builder.push_int(IntField::MachoCpuSubtype, u64::from(file.cpusubtype()));
-            }
-            if file.has_filetype() {
-                builder.push_int(IntField::MachoFileType, u64::from(file.filetype()));
-            }
-        }
-        for arch in &macho.fat_arch {
-            if arch.has_cputype() {
-                builder.push_int(IntField::MachoCpuType, u64::from(arch.cputype()));
-            }
-            if arch.has_cpusubtype() {
-                builder.push_int(IntField::MachoCpuSubtype, u64::from(arch.cpusubtype()));
-            }
-        }
-    }
-}
-
 fn read_at(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
     let total_len = file.metadata()?.len();
     if offset > total_len || total_len - offset < len as u64 {
@@ -400,6 +272,28 @@ fn read_at(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> 
     let mut bytes = vec![0u8; len];
     file.read_exact(&mut bytes)?;
     Ok(Some(bytes))
+}
+
+fn read_up_to(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
+    let total_len = file.metadata()?.len();
+    if offset >= total_len {
+        return Ok(None);
+    }
+    let available = (total_len - offset).min(len as u64) as usize;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; available];
+    if available > 0 {
+        file.read_exact(&mut bytes)?;
+    }
+    Ok(Some(bytes))
+}
+
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().expect("u16"))
+}
+
+fn be_u16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes(bytes.try_into().expect("u16"))
 }
 
 fn le_u32(bytes: &[u8]) -> u32 {
@@ -423,6 +317,208 @@ fn read_u32(bytes: &[u8], order: ByteOrder) -> u32 {
         ByteOrder::Little => le_u32(bytes),
         ByteOrder::Big => be_u32(bytes),
     }
+}
+
+fn filetime_to_unix_timestamp(filetime: u64) -> Option<u64> {
+    (filetime / 10_000_000).checked_sub(11_644_473_600)
+}
+
+fn extract_crx_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
+    builder.set_bool(BoolField::CrxIsCrx, prefix.starts_with(b"Cr24"));
+}
+
+fn extract_dex_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
+    let is_dex = prefix.len() >= 8
+        && &prefix[..4] == b"dex\n"
+        && prefix[4].is_ascii_digit()
+        && prefix[5].is_ascii_digit()
+        && prefix[6].is_ascii_digit()
+        && prefix[7] == 0;
+    builder.set_bool(BoolField::DexIsDex, is_dex);
+    if is_dex {
+        let version = std::str::from_utf8(&prefix[4..7])
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0);
+        builder.push_int(IntField::DexVersion, version);
+    }
+}
+
+fn extract_lnk_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
+    let is_lnk = prefix.len() >= 76
+        && le_u32(&prefix[0..4]) == 0x4c
+        && le_u64(&prefix[4..12]) == 0x0000_0000_0002_1401
+        && le_u64(&prefix[12..20]) == 0x4600_0000_0000_00c0;
+    builder.set_bool(BoolField::LnkIsLnk, is_lnk);
+    if !is_lnk {
+        return;
+    }
+    if let Some(value) = filetime_to_unix_timestamp(le_u64(&prefix[28..36])) {
+        builder.push_int(IntField::LnkCreationTime, value);
+    }
+    if let Some(value) = filetime_to_unix_timestamp(le_u64(&prefix[36..44])) {
+        builder.push_int(IntField::LnkAccessTime, value);
+    }
+    if let Some(value) = filetime_to_unix_timestamp(le_u64(&prefix[44..52])) {
+        builder.push_int(IntField::LnkWriteTime, value);
+    }
+}
+
+fn extract_elf_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
+    let is_elf = prefix.len() >= 20 && &prefix[..4] == b"\x7fELF";
+    builder.set_bool(BoolField::ElfIsElf, is_elf);
+    if !is_elf {
+        return;
+    }
+    let order = match prefix.get(5).copied() {
+        Some(1) => ByteOrder::Little,
+        Some(2) => ByteOrder::Big,
+        _ => return,
+    };
+    builder.push_int(IntField::ElfOsAbi, u64::from(prefix[7]));
+    let elf_type = match order {
+        ByteOrder::Little => le_u16(&prefix[16..18]),
+        ByteOrder::Big => be_u16(&prefix[16..18]),
+    };
+    let machine = match order {
+        ByteOrder::Little => le_u16(&prefix[18..20]),
+        ByteOrder::Big => be_u16(&prefix[18..20]),
+    };
+    builder.push_int(IntField::ElfType, u64::from(elf_type));
+    builder.push_int(IntField::ElfMachine, u64::from(machine));
+}
+
+fn extract_pe_metadata(
+    file: &mut File,
+    prefix: &[u8],
+    builder: &mut MetadataBuilder,
+) -> Result<()> {
+    if prefix.len() < 64 || &prefix[..2] != b"MZ" {
+        return Ok(());
+    }
+    let pe_offset = u64::from(le_u32(&prefix[0x3c..0x40]));
+    let Some(file_header) = read_at(file, pe_offset, 24)? else {
+        return Ok(());
+    };
+    if &file_header[..4] != b"PE\0\0" {
+        return Ok(());
+    }
+    let machine = le_u16(&file_header[4..6]);
+    let number_of_sections = usize::from(le_u16(&file_header[6..8]));
+    let timestamp = le_u32(&file_header[8..12]);
+    let size_of_optional_header = usize::from(le_u16(&file_header[20..22]));
+    let characteristics = le_u16(&file_header[22..24]);
+    let Some(optional) = read_at(file, pe_offset + 24, size_of_optional_header)? else {
+        return Ok(());
+    };
+    if optional.len() < 72 {
+        return Ok(());
+    }
+    let magic = le_u16(&optional[0..2]);
+    let (is_32bit, is_64bit, data_dir_base) = match magic {
+        0x10b => (true, false, 96usize),
+        0x20b => (false, true, 112usize),
+        _ => return Ok(()),
+    };
+    let address_of_entry_point = le_u32(&optional[16..20]);
+    let size_of_headers = if optional.len() >= 64 {
+        le_u32(&optional[60..64])
+    } else {
+        0
+    };
+    builder.set_bool(BoolField::PeIsPe, true);
+    builder.set_bool(BoolField::PeIs32Bit, is_32bit);
+    builder.set_bool(BoolField::PeIs64Bit, is_64bit);
+    builder.set_bool(BoolField::PeIsDll, (characteristics & 0x2000) != 0);
+    builder.push_int(IntField::PeMachine, u64::from(machine));
+    builder.push_int(IntField::PeTimestamp, u64::from(timestamp));
+    builder.push_int(IntField::PeCharacteristics, u64::from(characteristics));
+    if optional.len() >= 70 {
+        builder.push_int(IntField::PeSubsystem, u64::from(le_u16(&optional[68..70])));
+    }
+    if optional.len() >= data_dir_base + (15 * 8) {
+        let total_len = file.metadata()?.len();
+        let security_offset = data_dir_base + (4 * 8);
+        let security_dir = le_u32(&optional[security_offset..security_offset + 4]);
+        let security_size = le_u32(&optional[security_offset + 4..security_offset + 8]);
+        builder.set_bool(
+            BoolField::PeIsSigned,
+            security_dir != 0
+                && security_size != 0
+                && security_dir >= size_of_headers
+                && total_len.saturating_sub(u64::from(security_dir)) >= u64::from(security_size),
+        );
+        let com_offset = data_dir_base + (14 * 8);
+        let com_rva = le_u32(&optional[com_offset..com_offset + 4]);
+        let com_size = le_u32(&optional[com_offset + 4..com_offset + 8]);
+        let dotnet_offset = pe_rva_to_file_offset(
+            file,
+            pe_offset,
+            number_of_sections,
+            size_of_optional_header,
+            com_rva,
+            size_of_headers,
+            false,
+        )?;
+        builder.set_bool(
+            BoolField::DotnetIsDotnet,
+            com_rva != 0
+                && com_size != 0
+                && dotnet_offset
+                    .map(|offset| total_len.saturating_sub(offset) >= u64::from(com_size))
+                    .unwrap_or(false),
+        );
+    }
+    if let Some(entry_offset) = pe_rva_to_file_offset(
+        file,
+        pe_offset,
+        number_of_sections,
+        size_of_optional_header,
+        address_of_entry_point,
+        size_of_headers,
+        true,
+    )? && let Some(entry_prefix) = read_up_to(file, entry_offset, PE_ENTRY_POINT_PREFIX_BYTES)?
+    {
+        builder.set_bytes(BytesField::PeEntryPointPrefix, &entry_prefix);
+    }
+    Ok(())
+}
+
+fn pe_rva_to_file_offset(
+    file: &mut File,
+    pe_offset: u64,
+    number_of_sections: usize,
+    size_of_optional_header: usize,
+    rva: u32,
+    size_of_headers: u32,
+    allow_header_mapping: bool,
+) -> Result<Option<u64>> {
+    if rva == 0 {
+        return Ok(None);
+    }
+    if allow_header_mapping && size_of_headers != 0 && rva < size_of_headers {
+        return Ok(Some(u64::from(rva)));
+    }
+    let table_offset = pe_offset + 24 + size_of_optional_header as u64;
+    let table_len = number_of_sections.saturating_mul(40);
+    let Some(section_table) = read_at(file, table_offset, table_len)? else {
+        return Ok(None);
+    };
+    for entry in section_table.chunks_exact(40) {
+        let virtual_size = le_u32(&entry[8..12]);
+        let virtual_address = le_u32(&entry[12..16]);
+        let size_of_raw_data = le_u32(&entry[16..20]);
+        let pointer_to_raw_data = le_u32(&entry[20..24]);
+        let mapped_size = virtual_size.max(size_of_raw_data);
+        if mapped_size == 0 {
+            continue;
+        }
+        if rva >= virtual_address && rva < virtual_address.saturating_add(mapped_size) {
+            let delta = rva - virtual_address;
+            return Ok(Some(u64::from(pointer_to_raw_data) + u64::from(delta)));
+        }
+    }
+    Ok(None)
 }
 
 fn thin_macho_order(magic: [u8; 4]) -> Option<ByteOrder> {
@@ -526,44 +622,76 @@ fn read_u64(bytes: &[u8], order: ByteOrder) -> u64 {
     }
 }
 
-fn entropy_bits_per_byte(bytes: &[u8]) -> f32 {
-    if bytes.is_empty() {
+fn entropy_bits_per_byte_from_counts(counts: &[u64; 256], total_bytes: u64) -> f32 {
+    if total_bytes == 0 {
         return 0.0;
     }
-    let mut counts = [0u32; 256];
-    for byte in bytes {
-        counts[*byte as usize] += 1;
-    }
-    let total = bytes.len() as f64;
+    let total = total_bytes as f64;
     let mut entropy = 0.0f64;
     for count in counts {
-        if count == 0 {
+        if *count == 0 {
             continue;
         }
-        let probability = count as f64 / total;
+        let probability = *count as f64 / total;
         entropy -= probability * probability.log2();
     }
     entropy as f32
 }
 
+fn compute_file_entropy_bits_per_byte(file: &mut File, chunk_size: usize) -> Result<f32> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut counts = [0u64; 256];
+    let mut total_bytes = 0u64;
+    let mut buf = vec![0u8; chunk_size];
+    loop {
+        let read_len = file.read(&mut buf)?;
+        if read_len == 0 {
+            break;
+        }
+        let chunk = &buf[..read_len];
+        for byte in chunk {
+            counts[*byte as usize] = counts[*byte as usize].saturating_add(1);
+        }
+        total_bytes = total_bytes.saturating_add(read_len as u64);
+    }
+    Ok(entropy_bits_per_byte_from_counts(&counts, total_bytes))
+}
+
+fn build_compact_document_metadata(
+    file: &mut File,
+    prefix: &[u8],
+    entropy_bits_per_byte: f32,
+) -> Result<Vec<u8>> {
+    let mut builder = MetadataBuilder::default();
+    initialize_known_bool_metadata(&mut builder);
+    builder.set_bytes(BytesField::FilePrefix8, &prefix[..prefix.len().min(8)]);
+    builder.push_int(
+        IntField::MathEntropy,
+        u64::from(entropy_bits_per_byte.to_bits()),
+    );
+    extract_crx_metadata(prefix, &mut builder);
+    extract_dex_metadata(prefix, &mut builder);
+    extract_lnk_metadata(prefix, &mut builder);
+    extract_elf_metadata(prefix, &mut builder);
+    extract_pe_metadata(file, prefix, &mut builder)?;
+    extract_macho_metadata(file, prefix, &mut builder)?;
+    Ok(builder.encode())
+}
+
 pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let prefix = read_prefix(&mut file, 4096)?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut file_bytes = Vec::new();
-    file.read_to_end(&mut file_bytes)?;
-    let mut builder = MetadataBuilder::default();
-    builder.set_bytes(
-        BytesField::FilePrefix8,
-        &file_bytes[..file_bytes.len().min(8)],
-    );
-    builder.push_int(
-        IntField::MathEntropy,
-        u64::from(entropy_bits_per_byte(&file_bytes).to_bits()),
-    );
-    extract_yarax_module_metadata(&file_bytes, &mut builder);
-    extract_macho_metadata(&mut file, &prefix, &mut builder)?;
-    Ok(builder.encode())
+    let entropy_bits_per_byte = compute_file_entropy_bits_per_byte(&mut file, 1024 * 1024)?;
+    build_compact_document_metadata(&mut file, &prefix, entropy_bits_per_byte)
+}
+
+pub fn extract_compact_document_metadata_with_entropy(
+    path: &Path,
+    entropy_bits_per_byte: f32,
+) -> Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let prefix = read_prefix(&mut file, 4096)?;
+    build_compact_document_metadata(&mut file, &prefix, entropy_bits_per_byte)
 }
 
 fn normalize_field(raw: &str) -> Option<&'static str> {
@@ -888,6 +1016,8 @@ mod tests {
     use yara_x::{Compiler as YaraCompiler, Scanner as YaraScanner};
 
     use super::*;
+    use crate::candidate::scan_file_features_bloom_only_with_gram_sizes;
+    use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
 
     fn yara_condition_matches_file(imports: &[&str], condition: &str, path: &Path) -> bool {
         let mut source = String::new();
@@ -1501,5 +1631,46 @@ mod tests {
             metadata_field_matches_eq(&macho_bytes, "elf.machine", 62).expect("other module"),
             Some(false)
         );
+    }
+
+    #[test]
+    fn precomputed_entropy_metadata_matches_streamed_metadata() {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("sample.bin");
+        let mut bytes = vec![0u8; 528];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        bytes[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[0x98 + 16..0x98 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        let text_section = 0x80 + 24 + 0xf0;
+        bytes[text_section + 8..text_section + 12].copy_from_slice(&0x20u32.to_le_bytes());
+        bytes[text_section + 12..text_section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[text_section + 16..text_section + 20].copy_from_slice(&0x20u32.to_le_bytes());
+        bytes[text_section + 20..text_section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[0x200..0x208].copy_from_slice(b"ENTROPY!");
+        fs::write(&path, &bytes).expect("write");
+
+        let features = scan_file_features_bloom_only_with_gram_sizes(
+            &path,
+            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE).expect("sizes"),
+            1024,
+            7,
+            0,
+            0,
+            1024,
+            None,
+        )
+        .expect("features");
+
+        let streamed = extract_compact_document_metadata(&path).expect("streamed");
+        let precomputed =
+            extract_compact_document_metadata_with_entropy(&path, features.entropy_bits_per_byte)
+                .expect("precomputed");
+
+        assert_eq!(precomputed, streamed);
     }
 }

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256, Sha512};
 use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanner};
 
+use crate::candidate::features::AdditionalDigestKind;
 use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
     FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
@@ -30,8 +31,9 @@ use crate::candidate::{
     compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams_pair_hll, extract_compact_document_metadata, read_candidate_shard_count,
-    resolve_max_candidates, rule_check_all_from_file_with_gram_sizes_and_identity_source,
+    estimate_unique_grams_pair_hll, extract_compact_document_metadata_with_entropy,
+    read_candidate_shard_count, resolve_max_candidates,
+    rule_check_all_from_file_with_gram_sizes_and_identity_source,
     scan_file_features_bloom_only_with_gram_sizes,
 };
 use crate::grpc::{self, BlockingGrpcClient};
@@ -2913,6 +2915,15 @@ impl CandidateIdSource {
             ))),
         }
     }
+
+    fn additional_digest_kind(self) -> Option<AdditionalDigestKind> {
+        match self {
+            CandidateIdSource::Sha256 => None,
+            CandidateIdSource::Md5 => Some(AdditionalDigestKind::Md5),
+            CandidateIdSource::Sha1 => Some(AdditionalDigestKind::Sha1),
+            CandidateIdSource::Sha512 => Some(AdditionalDigestKind::Sha512),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2934,8 +2945,15 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     };
     let scan_path = resolved_path.as_deref().unwrap_or(file_path);
     let file_size = scan_path.metadata()?.len();
+    let mut total_scope = perf::scope("candidate.scan_index_batch_row");
+    total_scope.add_bytes(file_size);
+    total_scope.add_items(1);
     let (bloom_item_estimate, tier2_bloom_item_estimate) =
         if policy.tier1_filter_target_fp.is_some() || policy.tier2_filter_target_fp.is_some() {
+            let mut estimate_scope =
+                perf::scope("candidate.scan_index_batch_row.estimate_unique_grams");
+            estimate_scope.add_bytes(file_size);
+            estimate_scope.add_items(1);
             if policy.gram_sizes.tier1 == policy.gram_sizes.tier2 {
                 let estimate = estimate_unique_grams_for_size_hll(
                     scan_path,
@@ -2957,37 +2975,50 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         } else {
             (None, None)
         };
-    let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
-        align_filter_bytes(value)
-    } else {
-        choose_filter_bytes_for_file_size(
-            file_size,
-            INTERNAL_FILTER_BYTES,
-            Some(INTERNAL_FILTER_MIN_BYTES),
-            Some(INTERNAL_FILTER_MAX_BYTES),
-            policy.tier1_filter_target_fp,
+    let (filter_bytes, tier2_filter_bytes, bloom_hashes, tier2_bloom_hashes) = {
+        let mut filter_scope = perf::scope("candidate.scan_index_batch_row.filter_sizing");
+        filter_scope.add_items(1);
+        let filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
+            align_filter_bytes(value)
+        } else {
+            choose_filter_bytes_for_file_size(
+                file_size,
+                INTERNAL_FILTER_BYTES,
+                Some(INTERNAL_FILTER_MIN_BYTES),
+                Some(INTERNAL_FILTER_MAX_BYTES),
+                policy.tier1_filter_target_fp,
+                bloom_item_estimate,
+            )?
+        };
+        let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
+            align_filter_bytes(value)
+        } else {
+            choose_filter_bytes_for_file_size(
+                file_size,
+                INTERNAL_FILTER_BYTES,
+                Some(INTERNAL_FILTER_MIN_BYTES),
+                Some(INTERNAL_FILTER_MAX_BYTES),
+                policy.tier2_filter_target_fp,
+                tier2_bloom_item_estimate,
+            )?
+        };
+        let bloom_hashes = derive_document_bloom_hash_count(
+            filter_bytes,
             bloom_item_estimate,
-        )?
-    };
-    let tier2_filter_bytes = if let Some(value) = policy.fixed_filter_bytes {
-        align_filter_bytes(value)
-    } else {
-        choose_filter_bytes_for_file_size(
-            file_size,
-            INTERNAL_FILTER_BYTES,
-            Some(INTERNAL_FILTER_MIN_BYTES),
-            Some(INTERNAL_FILTER_MAX_BYTES),
-            policy.tier2_filter_target_fp,
+            INTERNAL_BLOOM_HASHES,
+        );
+        let tier2_bloom_hashes = derive_document_bloom_hash_count(
+            tier2_filter_bytes,
             tier2_bloom_item_estimate,
-        )?
+            INTERNAL_BLOOM_HASHES,
+        );
+        (
+            filter_bytes,
+            tier2_filter_bytes,
+            bloom_hashes,
+            tier2_bloom_hashes,
+        )
     };
-    let bloom_hashes =
-        derive_document_bloom_hash_count(filter_bytes, bloom_item_estimate, INTERNAL_BLOOM_HASHES);
-    let tier2_bloom_hashes = derive_document_bloom_hash_count(
-        tier2_filter_bytes,
-        tier2_bloom_item_estimate,
-        INTERNAL_BLOOM_HASHES,
-    );
     let started = Instant::now();
     let features = scan_file_features_bloom_only_with_gram_sizes(
         scan_path,
@@ -2997,6 +3028,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         tier2_filter_bytes,
         tier2_bloom_hashes,
         policy.chunk_size,
+        policy.id_source.additional_digest_kind(),
     )?;
     perf::record_sample(
         "candidate.scan_file_features.file",
@@ -3005,25 +3037,36 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         file_size,
         0,
     );
-    let metadata = extract_compact_document_metadata(scan_path)?;
+    let metadata = {
+        let mut metadata_scope = perf::scope("candidate.scan_index_batch_row.metadata");
+        metadata_scope.add_items(1);
+        extract_compact_document_metadata_with_entropy(scan_path, features.entropy_bits_per_byte)?
+    };
     let sha256 = if policy.id_source == CandidateIdSource::Sha256 {
         features.sha256
     } else {
-        identity_from_file(scan_path, policy.chunk_size, policy.id_source)?
+        features
+            .alternate_identity
+            .expect("alternate identity when non-sha256 source requested")
     };
-    Ok(IndexBatchRow {
-        sha256,
-        file_size: features.file_size,
-        filter_bytes,
-        bloom_item_estimate,
-        bloom_filter: features.bloom_filter,
-        tier2_filter_bytes,
-        tier2_bloom_item_estimate,
-        tier2_bloom_filter: features.tier2_bloom_filter,
-        special_population: features.special_population,
-        metadata,
-        external_id: resolved_path.map(|path| path.display().to_string()),
-    })
+    let row = {
+        let mut row_build_scope = perf::scope("candidate.scan_index_batch_row.row_build");
+        row_build_scope.add_items(1);
+        IndexBatchRow {
+            sha256,
+            file_size: features.file_size,
+            filter_bytes,
+            bloom_item_estimate,
+            bloom_filter: features.bloom_filter,
+            tier2_filter_bytes,
+            tier2_bloom_item_estimate,
+            tier2_bloom_filter: features.tier2_bloom_filter,
+            special_population: features.special_population,
+            metadata,
+            external_id: resolved_path.map(|path| path.display().to_string()),
+        }
+    };
+    Ok(row)
 }
 
 fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
@@ -6740,6 +6783,58 @@ mod tests {
             !verify_fixed_literal_plan_on_file(&fullword_path, &fullword_plan)
                 .expect("fullword miss")
         );
+    }
+
+    #[test]
+    fn scan_index_batch_row_perf_report_includes_stage_breakdown() {
+        let _guard = crate::perf::test_lock().lock().expect("perf lock");
+        let tmp = tempdir().expect("tmp");
+        let sample = tmp.path().join("sample.bin");
+        let perf_path = tmp.path().join("perf.json");
+        fs::write(
+            &sample,
+            b"MZthis file is long enough to exercise hll and metadata extraction",
+        )
+        .expect("sample");
+        crate::perf::configure(Some(perf_path), false);
+
+        let _row = scan_index_batch_row(
+            &sample,
+            ScanPolicy {
+                fixed_filter_bytes: None,
+                tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
+                tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
+                gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
+                chunk_size: 8,
+                store_path: false,
+                id_source: CandidateIdSource::Sha256,
+            },
+        )
+        .expect("scan row");
+
+        let report = crate::perf::report_value(0).expect("perf report");
+        let stages = report
+            .get("stages")
+            .and_then(serde_json::Value::as_object)
+            .expect("stages");
+        for stage in [
+            "candidate.scan_index_batch_row",
+            "candidate.scan_index_batch_row.estimate_unique_grams",
+            "candidate.scan_index_batch_row.filter_sizing",
+            "candidate.scan_index_batch_row.metadata",
+            "candidate.scan_index_batch_row.row_build",
+            "candidate.scan_file_features",
+        ] {
+            let stats = stages
+                .get(stage)
+                .unwrap_or_else(|| panic!("missing stage {stage}"));
+            assert_eq!(
+                stats.get("calls").and_then(serde_json::Value::as_u64),
+                Some(1),
+                "stage {stage}"
+            );
+        }
+        crate::perf::configure(None, false);
     }
 
     #[test]

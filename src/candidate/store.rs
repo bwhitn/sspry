@@ -5909,6 +5909,7 @@ mod tests {
             tier2_filter_bytes,
             tier2_bloom_hashes,
             64 * 1024,
+            None,
         )?;
         let patterns = plan
             .patterns
