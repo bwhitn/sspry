@@ -454,7 +454,7 @@ fn info_uses_sspry_addr_env() {
     let parsed: Value = serde_json::from_str(&info).expect("info json");
     assert_eq!(
         parsed.get("candidate_shards").and_then(Value::as_u64),
-        Some(256)
+        Some(8)
     );
 
     let _ = child.kill();

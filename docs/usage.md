@@ -49,8 +49,8 @@ Options:
   - forest-root servers are read-only and intended for search/info
 - `--layout-profile <standard|incremental>`
   - shard-layout preset
-  - `standard` defaults to 256 shards
-  - `incremental` defaults to 32 shards
+  - `standard` defaults to 8 shards
+  - `incremental` defaults to 8 shards
 - `--shards <n>`
   - explicit shard count override for a new DB
 - `--tier1-set-fp <p>`
@@ -243,7 +243,7 @@ Options:
 - `--max-message-bytes <bytes>`
 - `--rule <path>`
 - `--max-anchors-per-pattern <n>`
-- `--max-candidates <p>` default `7.5`; `0` means unlimited
+- `--max-candidates <p>` default `10`; `0` means unlimited
   - percentage of searchable documents
 - `--verify`
 - `--verbose`
@@ -275,7 +275,7 @@ Options:
   - forest-level tree concurrency
   - `0` means auto up to the tree count
 - `--max-anchors-per-pattern <n>`
-- `--max-candidates <p>` default `7.5`; `0` means unlimited
+- `--max-candidates <p>` default `10`; `0` means unlimited
   - percentage of searchable documents
 - `--verify`
 - `--verbose`
@@ -343,7 +343,7 @@ Options:
 - `--tree-search-workers <n>`
   - forest-level tree concurrency
 - `--max-anchors-per-pattern <n>`
-- `--max-candidates <p>` default `7.5`
+- `--max-candidates <p>` default `10`
   - percentage of searchable documents
 - `--verify`
 

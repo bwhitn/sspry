@@ -54,8 +54,8 @@ pub const DEFAULT_SEARCH_RESULT_CHUNK_SIZE: usize = 1024;
 pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
-pub const DEFAULT_STANDARD_SHARDS: usize = 256;
-pub const DEFAULT_INCREMENTAL_SHARDS: usize = 32;
+pub const DEFAULT_STANDARD_SHARDS: usize = 8;
+pub const DEFAULT_INCREMENTAL_SHARDS: usize = 8;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
@@ -4803,7 +4803,7 @@ fn cmd_rule_check(args: &RuleCheckArgs) -> i32 {
             args.max_anchors_per_pattern,
             false,
             true,
-            7.5,
+            10.0,
         )?;
         let exit_code = if report.status == crate::candidate::RuleCheckStatus::Unsupported {
             1
@@ -5844,7 +5844,7 @@ struct SearchCommandArgs {
     max_anchors_per_pattern: usize,
     #[arg(
         long = "max-candidates",
-        default_value_t = 7.5,
+        default_value_t = 10.0,
         value_parser = parse_max_candidates_percent,
         help = "Server-side candidate cap as a percentage of searchable documents; 0 means unlimited."
     )]
@@ -5884,7 +5884,7 @@ struct LocalSearchArgs {
     max_anchors_per_pattern: usize,
     #[arg(
         long = "max-candidates",
-        default_value_t = 7.5,
+        default_value_t = 10.0,
         value_parser = parse_max_candidates_percent,
         help = "Candidate cap as a percentage of searchable documents; 0 means unlimited."
     )]
@@ -5940,7 +5940,7 @@ struct SearchBatchArgs {
     max_anchors_per_pattern: usize,
     #[arg(
         long = "max-candidates",
-        default_value_t = 7.5,
+        default_value_t = 10.0,
         value_parser = parse_max_candidates_percent,
         help = "Candidate cap per rule as a percentage of searchable documents; 0 means unlimited."
     )]
@@ -6026,7 +6026,7 @@ struct ServeCommonArgs {
         long = "layout-profile",
         value_enum,
         default_value_t = ServeLayoutProfile::Standard,
-        help = "Shard-layout profile. `standard` defaults to 256 shards; `incremental` defaults to 32 shards for denser ingest batches and lower publish fanout."
+        help = "Shard-layout profile. `standard` defaults to 8 shards; `incremental` defaults to 8 shards for denser ingest batches and lower publish fanout."
     )]
     layout_profile: ServeLayoutProfile,
     #[arg(
@@ -6190,7 +6190,7 @@ struct InternalQueryArgs {
     no_tier2_fallback: bool,
     #[arg(
         long = "max-candidates",
-        default_value_t = 7.5,
+        default_value_t = 10.0,
         value_parser = parse_max_candidates_percent,
         help = "Maximum candidate percentage returned before paging; 0 means unlimited."
     )]
@@ -6383,6 +6383,44 @@ mod tests {
         args.layout_profile = ServeLayoutProfile::Incremental;
         args.shards = Some(17);
         assert_eq!(serve_candidate_shard_count(&args), 17);
+    }
+
+    #[test]
+    fn search_related_commands_default_max_candidates_to_ten_percent() {
+        let cli =
+            Cli::try_parse_from(["sspry", "search", "--rule", "rule.yar"]).expect("parse search");
+        match cli.command {
+            Commands::Search(args) => assert_eq!(args.max_candidates, 10.0),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "sspry",
+            "local-search",
+            "--root",
+            "db",
+            "--rule",
+            "rule.yar",
+        ])
+        .expect("parse local-search");
+        match cli.command {
+            Commands::LocalSearch(args) => assert_eq!(args.max_candidates, 10.0),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "sspry",
+            "search-batch",
+            "--root",
+            "db",
+            "--json-out",
+            "out.json",
+        ])
+        .expect("parse search-batch");
+        match cli.command {
+            Commands::SearchBatch(args) => assert_eq!(args.max_candidates, 10.0),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .map(|value| value.parse::<f64>())
         .transpose()?
-        .unwrap_or(7.5);
+        .unwrap_or(10.0);
     let rule = fs::read_to_string(&rule_path)?;
     let plan = compile_query_plan_with_gram_sizes_and_identity_source(
         &rule,

@@ -78,6 +78,19 @@ def shutdown_server(sspry: Path, addr: str, proc: subprocess.Popen, run_dir: Pat
         proc.wait(timeout=10)
 
 
+def enumerate_rule_files(rules_dir: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted(rules_dir.iterdir())
+        if path.name.endswith('.yar') and (path.is_file() or path.is_symlink())
+    ]
+
+
+def write_rule_manifest(rule_files: list[Path], out_path: Path) -> Path:
+    out_path.write_text(''.join(f'{path}\n' for path in rule_files))
+    return out_path
+
+
 def dir_stats(root: Path) -> dict:
     out = {}
     for name in ('current', 'work_a', 'work_b', 'retired', '.'):
@@ -294,6 +307,12 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
     m = re.search(r'^tier_used: (.+)$', proc.stdout or '', re.M)
     if m:
         record['tier_used'] = m.group(1).strip()
+    m = re.search(r'^truncated: (true|false)$', proc.stdout or '', re.M)
+    if m:
+        record['truncated'] = m.group(1).strip().lower() == 'true'
+    m = re.search(r'^truncated_limit: (\d+)$', proc.stdout or '', re.M)
+    if m:
+        record['truncated_limit'] = int(m.group(1))
     for key in (
         'verbose.search.total_ms',
         'verbose.search.plan_ms',
@@ -626,7 +645,7 @@ def run_search_one_local_forest(
 def run_search_batch_local_forest(
     sspry: Path,
     db_root: Path,
-    rules_dir: Path,
+    rule_manifest: Path,
     json_out: Path,
     timeout_s: int,
     tree_search_workers: int,
@@ -640,8 +659,8 @@ def run_search_batch_local_forest(
                 'search-batch',
                 '--root',
                 str(db_root),
-                '--rules-dir',
-                str(rules_dir),
+                '--rule-manifest',
+                str(rule_manifest),
                 '--json-out',
                 str(json_out),
                 '--tree-search-workers',
@@ -1105,13 +1124,18 @@ def main() -> int:
             f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s} mode={args.search_mode}',
             flush=True,
         )
-        rule_files = sorted(rules_dir.glob('*.yar'))
+        rule_files = enumerate_rule_files(rules_dir)
+        if not rule_files:
+            raise SystemExit(f'no .yar rules found in {rules_dir}')
+        rule_manifest = write_rule_manifest(rule_files, run_dir / 'rules.manifest')
+        forest_summary['rule_count'] = len(rule_files)
+        forest_summary['rules_manifest'] = str(rule_manifest)
         if args.search_mode == 'local-forest':
             batch_json = run_dir / 'search_summary.json'
             proc, elapsed_ms = run_search_batch_local_forest(
                 sspry,
                 db_base,
-                rules_dir,
+                rule_manifest,
                 batch_json,
                 effective_search_timeout_s * max(1, len(rule_files)),
                 tree_search_workers,

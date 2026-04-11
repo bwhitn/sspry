@@ -164,7 +164,7 @@ Remote search options:
 - `--max-message-bytes <BYTES>`
 - `--rule <RULE>`
 - `--max-anchors-per-pattern <N>` default `16`
-- `--max-candidates <PERCENT>` default `7.5`
+- `--max-candidates <PERCENT>` default `10`
 - `--verify`
 - `--verbose`
 
@@ -187,7 +187,7 @@ Local forest search options:
 - `--rule <RULE>`
 - `--tree-search-workers <N>` default `0`
 - `--max-anchors-per-pattern <N>` default `16`
-- `--max-candidates <PERCENT>` default `7.5`
+- `--max-candidates <PERCENT>` default `10`
 - `--verify`
 - `--verbose`
 
@@ -202,7 +202,7 @@ Usage: sspry search-batch --root <ROOT> --json-out <JSON_OUT> [OPTIONS]
 - `--json-out <FILE>`
 - `--tree-search-workers <N>` default `0`
 - `--max-anchors-per-pattern <N>` default `16`
-- `--max-candidates <PERCENT>` default `7.5`
+- `--max-candidates <PERCENT>` default `10`
 - `--verify`
 
 ## `info`

@@ -400,7 +400,7 @@ mod tests {
             yara_rule_source: "rule test { condition: true }".to_owned(),
             chunk_size: 128,
             include_external_ids: false,
-            max_candidates_percent: 7.5,
+            max_candidates_percent: 10.0,
             max_anchors_per_pattern: 16,
             force_tier1_only: false,
             allow_tier2_fallback: true,

@@ -48,7 +48,7 @@ Unverified candidate search:
   --rule ./rule.yar
 ```
 
-By default, `search` caps returned candidates at `7.5%` of searchable documents. Set `--max-candidates 0` to disable that cap.
+By default, `search` caps returned candidates at `10%` of searchable documents. Set `--max-candidates 0` to disable that cap.
 
 Verified search:
 
@@ -101,5 +101,5 @@ Signals:
 - Change `--gram-sizes` if you want a different recall/precision/storage tradeoff.
 - Change `--tier1-set-fp` and `--tier2-set-fp` if you want smaller or larger bloom filters.
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
-- Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with a lower shard count than `256` reduces open and publish fanout.
-- If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 32-shard layout.
+- Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with the default `8` keeps open and publish fanout low.
+- If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 8-shard layout.
