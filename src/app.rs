@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use crossbeam_channel::bounded;
@@ -28,13 +29,14 @@ use crate::candidate::{
     CandidateStore, CompiledQueryPlan, DEFAULT_TIER1_FILTER_TARGET_FP,
     DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index,
     candidate_shard_root, choose_filter_bytes_for_file_size,
+    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata_with_entropy,
-    read_candidate_shard_count, resolve_max_candidates,
+    load_rule_file_with_includes, read_candidate_shard_count, resolve_max_candidates,
     rule_check_all_from_file_with_gram_sizes_and_identity_source,
-    scan_file_features_bloom_only_with_gram_sizes,
+    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names,
 };
 use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
@@ -1921,6 +1923,60 @@ struct SearchVerificationResult {
     verified_skipped: usize,
 }
 
+struct RemoteSearchContext {
+    client: BlockingGrpcClient,
+    server_policy: ServerScanPolicy,
+}
+
+impl RemoteSearchContext {
+    /// Opens one reusable remote search client and loads the server policy that
+    /// applies to every rule in the current CLI invocation.
+    fn connect(connection: &ClientConnectionArgs) -> Result<Self> {
+        let mut client = search_grpc_client(connection)?;
+        let stats = client.stats()?;
+        let server_policy = server_scan_policy_from_grpc_stats(&stats)?;
+        Ok(Self {
+            client,
+            server_policy,
+        })
+    }
+}
+
+struct LocalSearchContext {
+    tree_groups: Vec<TreeStoreGroup>,
+    tree_count: usize,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<String>,
+    summary_cap_bytes: usize,
+    tree_search_workers: usize,
+}
+
+impl LocalSearchContext {
+    /// Opens the local forest once, validates shared policy, and resolves the
+    /// effective tree-level worker count for a multi-rule search run.
+    fn open(args: &LocalSearchArgs) -> Result<Self> {
+        let tree_groups = open_forest_tree_groups(Path::new(&args.root))?;
+        let tree_count = tree_groups.len();
+        let (gram_sizes, active_identity_source, summary_cap_bytes) =
+            validate_forest_search_policy(&tree_groups)?;
+        let tree_search_workers = args.tree_search_workers.max(1).min(tree_count.max(1));
+        Ok(Self {
+            tree_groups,
+            tree_count,
+            gram_sizes,
+            active_identity_source,
+            summary_cap_bytes,
+            tree_search_workers,
+        })
+    }
+
+    /// Drops all per-store prepared-query caches so multi-rule local search
+    /// does not accumulate avoidable state between rules.
+    fn clear_search_caches(&mut self) {
+        clear_local_forest_search_caches(&mut self.tree_groups);
+    }
+}
+
 struct BatchSearchRecordStream {
     json_out: PathBuf,
     partial_json_out: PathBuf,
@@ -2262,6 +2318,7 @@ fn clear_local_forest_search_caches(tree_groups: &mut [TreeStoreGroup]) {
 /// verification is enabled.
 fn verify_search_candidates(
     rule_path: &Path,
+    target_rule_name: Option<&str>,
     plan: &crate::candidate::CompiledQueryPlan,
     rows: Vec<String>,
     mut external_ids: Vec<Option<String>>,
@@ -2316,27 +2373,22 @@ fn verify_search_candidates(
                     if yara_rules.is_none() {
                         yara_rules = Some(compile_yara_verifier_cached(rule_path)?);
                     }
-                    let mut scanner =
-                        YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
-                    scanner
-                        .scan_file(&candidate_path)
-                        .map_err(|err| SspryError::from(err.to_string()))?
-                        .matching_rules()
-                        .len()
-                        > 0
+                    scan_candidate_matches_rule(
+                        yara_rules.as_ref().expect("cached YARA rules"),
+                        &candidate_path,
+                        target_rule_name,
+                    )?
                 }
             }
         } else {
             if yara_rules.is_none() {
                 yara_rules = Some(compile_yara_verifier_cached(rule_path)?);
             }
-            let mut scanner = YaraScanner::new(yara_rules.as_ref().expect("cached YARA rules"));
-            scanner
-                .scan_file(&candidate_path)
-                .map_err(|err| SspryError::from(err.to_string()))?
-                .matching_rules()
-                .len()
-                > 0
+            scan_candidate_matches_rule(
+                yara_rules.as_ref().expect("cached YARA rules"),
+                &candidate_path,
+                target_rule_name,
+            )?
         };
         page_results[index] = Some(matched);
     }
@@ -2570,7 +2622,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
 
 /// Compiles the supplied rule file into a YARA verifier ruleset.
 fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
-    let source = fs::read_to_string(rule_path)?;
+    let source = load_rule_file_with_includes(rule_path)?;
     let mut compiler = YaraCompiler::new();
     compiler
         .add_source(source.as_str())
@@ -2582,18 +2634,10 @@ fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
 /// repeated checks of the same file.
 fn yara_rule_cache_key(rule_path: &Path) -> Result<String> {
     let canonical = fs::canonicalize(rule_path).unwrap_or_else(|_| rule_path.to_path_buf());
-    let metadata = fs::metadata(rule_path)?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_nanos())
-        .unwrap_or(0);
-    Ok(format!(
-        "{}:{}:{modified}",
-        canonical.display(),
-        metadata.len()
-    ))
+    let source = load_rule_file_with_includes(rule_path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    Ok(format!("{}:{:016x}", canonical.display(), hasher.finish()))
 }
 
 /// Returns a cached compiled YARA verifier ruleset for the requested rule file.
@@ -2614,6 +2658,25 @@ fn compile_yara_verifier_cached(rule_path: &Path) -> Result<Arc<YaraRules>> {
         .map_err(|_| SspryError::from("YARA verifier cache lock poisoned."))?;
     guard.insert(key, rules.clone());
     Ok(rules)
+}
+
+/// Scans one candidate file with the compiled verifier rules and reports
+/// whether either any rule matched or one specific rule identifier matched.
+fn scan_candidate_matches_rule(
+    rules: &YaraRules,
+    candidate_path: &Path,
+    target_rule_name: Option<&str>,
+) -> Result<bool> {
+    let mut scanner = YaraScanner::new(rules);
+    let scan = scanner
+        .scan_file(candidate_path)
+        .map_err(|err| SspryError::from(err.to_string()))?;
+    Ok(match target_rule_name {
+        Some(rule_name) => scan
+            .matching_rules()
+            .any(|rule| rule.identifier() == rule_name),
+        None => scan.matching_rules().next().is_some(),
+    })
 }
 
 /// Returns whether a rule file contains exactly one `rule` declaration.
@@ -4469,17 +4532,71 @@ fn grpc_search_frame_to_internal(frame: grpc::GrpcSearchFrame) -> rpc::Candidate
     }
 }
 
-/// Executes a remote search by compiling the rule against the server policy and
-/// draining the streamed result frames.
-fn execute_grpc_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
+/// Loads one top-level rule file, expands `include` directives, and returns
+/// the searchable rule identifiers in source order.
+fn load_search_rule_bundle(rule_path: &Path) -> Result<(String, Vec<String>)> {
+    let rule_text = load_rule_file_with_includes(rule_path)?;
+    let rule_names = search_target_rule_names(&rule_text)?;
+    if rule_names.is_empty() {
+        return Err(SspryError::from(format!(
+            "Rule file does not contain a searchable rule: {}",
+            rule_path.display()
+        )));
+    }
+    Ok((rule_text, rule_names))
+}
+
+/// Prints the common prefix used by each multi-rule search result block.
+fn print_search_block_prefix(
+    rule_path: &Path,
+    rule_name: &str,
+    exit_code: i32,
+    multi_rule: bool,
+    first_rule: bool,
+) {
+    if !multi_rule {
+        return;
+    }
+    if !first_rule {
+        println!();
+    }
+    println!("rule: {rule_name}");
+    println!("rule_path: {}", rule_path.display());
+    println!("exit_code: {exit_code}");
+}
+
+/// Prints one search error, preserving the existing single-rule behavior while
+/// labeling failures in multi-rule runs.
+fn print_search_error(
+    rule_path: &Path,
+    rule_name: &str,
+    err: &SspryError,
+    multi_rule: bool,
+    first_rule: bool,
+) {
+    if multi_rule {
+        print_search_block_prefix(rule_path, rule_name, 1, true, first_rule);
+        println!("error: {err}");
+    } else {
+        println!("{err}");
+    }
+}
+
+/// Executes a remote search by compiling the rule against the cached server
+/// policy and draining the streamed result frames.
+fn execute_grpc_search_rule(
+    args: &SearchCommandArgs,
+    _rule_path: &Path,
+    rule_text: &str,
+    rule_name: &str,
+    context: &mut RemoteSearchContext,
+) -> Result<SearchExecution> {
     let started_plan = Instant::now();
-    let mut client = search_grpc_client(&args.connection)?;
-    let server_policy = server_scan_policy(&args.connection)?;
-    let rule_text = fs::read_to_string(&args.rule)?;
-    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-        &args.rule,
-        server_policy.gram_sizes,
-        Some(server_policy.id_source.as_str()),
+    let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+        rule_text,
+        rule_name,
+        context.server_policy.gram_sizes,
+        Some(context.server_policy.id_source.as_str()),
         args.max_anchors_per_pattern,
         false,
         true,
@@ -4487,9 +4604,10 @@ fn execute_grpc_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
     )?;
     let plan_time = started_plan.elapsed();
     collect_streamed_search_execution(args, plan, plan_time, None, |on_frame| {
-        client.search_stream(
+        context.client.search_stream(
             grpc::v1::SearchRequest {
-                yara_rule_source: rule_text.clone(),
+                yara_rule_source: rule_text.to_owned(),
+                target_rule_name: rule_name.to_owned(),
                 chunk_size: DEFAULT_SEARCH_RESULT_CHUNK_SIZE as u32,
                 include_external_ids: args.verify_yara_files,
                 max_candidates_percent: args.max_candidates,
@@ -4502,22 +4620,21 @@ fn execute_grpc_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
     })
 }
 
-/// Executes a local forest search by compiling once, preparing the shared plan
-/// artifacts, and scanning every tree group.
-fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
+/// Executes one local forest search against a reusable opened forest and shared
+/// policy context.
+fn execute_local_search_rule(
+    args: &LocalSearchArgs,
+    _rule_path: &Path,
+    rule_text: &str,
+    rule_name: &str,
+    context: &mut LocalSearchContext,
+) -> Result<SearchExecution> {
     let started_plan = Instant::now();
-    let mut tree_groups = open_forest_tree_groups(Path::new(&args.root))?;
-    let tree_count = tree_groups.len();
-    let (gram_sizes, active_identity_source, summary_cap_bytes) =
-        validate_forest_search_policy(&tree_groups)?;
-    let worker_count = args
-        .tree_search_workers
-        .max(1)
-        .min(tree_groups.len().max(1));
-    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-        &args.rule,
-        gram_sizes,
-        active_identity_source.as_deref(),
+    let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+        rule_text,
+        rule_name,
+        context.gram_sizes,
+        context.active_identity_source.as_deref(),
         args.max_anchors_per_pattern,
         false,
         true,
@@ -4526,12 +4643,12 @@ fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
     let plan_time = started_plan.elapsed();
     let started_query = Instant::now();
     let prepared_query_profile =
-        forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
+        forest_prepared_query_profile(&context.tree_groups, &plan, context.summary_cap_bytes)?;
     let local = query_local_forest_all_candidates(
-        &mut tree_groups,
+        &mut context.tree_groups,
         &plan,
         args.verify_yara_files,
-        worker_count,
+        context.tree_search_workers,
     )?;
     let query_time = started_query.elapsed();
     Ok(SearchExecution {
@@ -4544,8 +4661,8 @@ fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
         query_profile: local.query_profile,
         prepared_query_profile,
         external_ids: local.external_ids.unwrap_or_default(),
-        tree_count: Some(tree_count),
-        tree_search_workers: Some(worker_count),
+        tree_count: Some(context.tree_count),
+        tree_search_workers: Some(context.tree_search_workers),
         server_rss_kb: None,
         plan_time,
         query_time,
@@ -4555,17 +4672,21 @@ fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
 /// Finalizes a search execution by optionally verifying candidates, printing
 /// the result rows, and emitting verbose timing and memory diagnostics.
 fn finish_search_execution(
-    rule: &str,
+    rule_path: &Path,
+    rule_name: &str,
     verify_yara_files: bool,
     verbose: bool,
     max_candidates: f64,
     max_anchors_per_pattern: usize,
     started_total: Instant,
     execution: SearchExecution,
-) -> Result<i32> {
+    multi_rule: bool,
+    first_rule: bool,
+) -> Result<()> {
     let started_verify = Instant::now();
     let verification = verify_search_candidates(
-        Path::new(rule),
+        rule_path,
+        Some(rule_name),
         &execution.plan,
         execution.rows,
         execution.external_ids,
@@ -4579,6 +4700,7 @@ fn finish_search_execution(
         verified_skipped,
     } = verification;
 
+    print_search_block_prefix(rule_path, rule_name, 0, multi_rule, first_rule);
     println!("tier_used: {}", execution.tier_used);
     println!("candidates: {}", execution.total_candidates);
     println!("truncated: {}", execution.truncated);
@@ -4594,6 +4716,10 @@ fn finish_search_execution(
         println!("{row}");
     }
     if verbose {
+        if multi_rule {
+            eprintln!("verbose.search.rule: {rule_name}");
+            eprintln!("verbose.search.rule_path: {}", rule_path.display());
+        }
         let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
         let plan_ms = execution.plan_time.as_secs_f64() * 1000.0;
         let query_ms = execution.query_time.as_secs_f64() * 1000.0;
@@ -4753,7 +4879,7 @@ fn finish_search_execution(
             eprintln!("verbose.search.verified_skipped: {verified_skipped}");
         }
     }
-    Ok(0)
+    Ok(())
 }
 
 /// Default `search` entrypoint, currently routed through the gRPC client path.
@@ -4764,17 +4890,35 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
 /// Runs the remote `search` command and prints any resulting candidates.
 fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
-        let started_total = Instant::now();
-        let execution = execute_grpc_search(args)?;
-        finish_search_execution(
-            &args.rule,
-            args.verify_yara_files,
-            args.verbose,
-            args.max_candidates,
-            args.max_anchors_per_pattern,
-            started_total,
-            execution,
-        )
+        let rule_path = Path::new(&args.rule);
+        let (rule_text, rule_names) = load_search_rule_bundle(rule_path)?;
+        let multi_rule = rule_names.len() > 1;
+        let mut context = RemoteSearchContext::connect(&args.connection)?;
+        let mut exit_code = 0;
+        for (index, rule_name) in rule_names.iter().enumerate() {
+            let started_total = Instant::now();
+            let result =
+                execute_grpc_search_rule(args, rule_path, &rule_text, rule_name, &mut context)
+                    .and_then(|execution| {
+                        finish_search_execution(
+                            rule_path,
+                            rule_name,
+                            args.verify_yara_files,
+                            args.verbose,
+                            args.max_candidates,
+                            args.max_anchors_per_pattern,
+                            started_total,
+                            execution,
+                            multi_rule,
+                            index == 0,
+                        )
+                    });
+            if let Err(err) = result {
+                print_search_error(rule_path, rule_name, &err, multi_rule, index == 0);
+                exit_code = 1;
+            }
+        }
+        Ok(exit_code)
     })() {
         Ok(code) => code,
         Err(err) => {
@@ -4787,17 +4931,36 @@ fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
 /// Runs the local forest `search` command and prints any resulting candidates.
 fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
     match (|| -> Result<i32> {
-        let started_total = Instant::now();
-        let execution = execute_local_search(args)?;
-        finish_search_execution(
-            &args.rule,
-            args.verify_yara_files,
-            args.verbose,
-            args.max_candidates,
-            args.max_anchors_per_pattern,
-            started_total,
-            execution,
-        )
+        let rule_path = Path::new(&args.rule);
+        let (rule_text, rule_names) = load_search_rule_bundle(rule_path)?;
+        let multi_rule = rule_names.len() > 1;
+        let mut context = LocalSearchContext::open(args)?;
+        let mut exit_code = 0;
+        for (index, rule_name) in rule_names.iter().enumerate() {
+            let started_total = Instant::now();
+            let result =
+                execute_local_search_rule(args, rule_path, &rule_text, rule_name, &mut context)
+                    .and_then(|execution| {
+                        finish_search_execution(
+                            rule_path,
+                            rule_name,
+                            args.verify_yara_files,
+                            args.verbose,
+                            args.max_candidates,
+                            args.max_anchors_per_pattern,
+                            started_total,
+                            execution,
+                            multi_rule,
+                            index == 0,
+                        )
+                    });
+            context.clear_search_caches();
+            if let Err(err) = result {
+                print_search_error(rule_path, rule_name, &err, multi_rule, index == 0);
+                exit_code = 1;
+            }
+        }
+        Ok(exit_code)
     })() {
         Ok(code) => code,
         Err(err) => {
@@ -4896,6 +5059,7 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                 let started_verify = Instant::now();
                 let verification = verify_search_candidates(
                     &rule,
+                    None,
                     &plan,
                     local.hashes,
                     local.external_ids.unwrap_or_default(),

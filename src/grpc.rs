@@ -435,6 +435,7 @@ mod tests {
         let _ping = PingRequest {};
         let request = SearchRequest {
             yara_rule_source: "rule test { condition: true }".to_owned(),
+            target_rule_name: "test".to_owned(),
             chunk_size: 128,
             include_external_ids: false,
             max_candidates_percent: 10.0,

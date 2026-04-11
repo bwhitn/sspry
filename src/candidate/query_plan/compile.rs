@@ -844,6 +844,95 @@ fn compile_rule_fragment(
     Ok(fragment)
 }
 
+fn parse_include_directive(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("include")?;
+    if !rest
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let include_path = &rest[..end];
+    let trailing = rest[end + 1..].trim();
+    if !trailing.is_empty() && !trailing.starts_with("//") && !trailing.starts_with("/*") {
+        return None;
+    }
+    Some(include_path)
+}
+
+fn load_rule_file_with_includes_recursive(
+    rule_path: &Path,
+    stack: &mut Vec<PathBuf>,
+) -> Result<String> {
+    let canonical = fs::canonicalize(rule_path).unwrap_or_else(|_| rule_path.to_path_buf());
+    if let Some(index) = stack.iter().position(|path| path == &canonical) {
+        let mut cycle = stack[index..]
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        cycle.push(canonical.display().to_string());
+        return Err(SspryError::from(format!(
+            "Recursive YARA include detected: {}",
+            cycle.join(" -> ")
+        )));
+    }
+    stack.push(canonical);
+
+    let text = fs::read_to_string(rule_path)?;
+    let parent = rule_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut expanded = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if let Some(include_path) = parse_include_directive(line) {
+            let include_file = parent.join(include_path);
+            let include_text = load_rule_file_with_includes_recursive(&include_file, stack)?;
+            expanded.push_str(&include_text);
+            if !include_text.ends_with('\n') {
+                expanded.push('\n');
+            }
+        } else {
+            expanded.push_str(line);
+        }
+    }
+    if !text.ends_with('\n') && !expanded.ends_with('\n') {
+        expanded.push('\n');
+    }
+
+    stack.pop();
+    Ok(expanded)
+}
+
+/// Reads a YARA rule file and recursively expands `include "..."` directives
+/// relative to each including file.
+pub fn load_rule_file_with_includes(rule_path: impl AsRef<Path>) -> Result<String> {
+    load_rule_file_with_includes_recursive(rule_path.as_ref(), &mut Vec::new())
+}
+
+/// Returns the top-level searchable rule names from a YARA source, preserving
+/// source order and skipping private helper rules unless no public rules exist.
+pub fn search_target_rule_names(rule_text: &str) -> Result<Vec<String>> {
+    let rule_blocks = parse_rule_blocks(rule_text)?;
+    let public = rule_blocks
+        .iter()
+        .filter(|rule| !rule.is_private)
+        .map(|rule| rule.name.clone())
+        .collect::<Vec<_>>();
+    if !public.is_empty() {
+        return Ok(public);
+    }
+    Ok(rule_blocks
+        .first()
+        .map(|rule| vec![rule.name.clone()])
+        .unwrap_or_default())
+}
+
 /// Compiles the active rule from a rule file into the query plan used for
 /// candidate search.
 ///
@@ -959,9 +1048,34 @@ pub fn compile_query_plan_with_gram_sizes_and_identity_source(
     })
 }
 
+/// Compiles a specific named rule from a multi-rule source into the query plan
+/// used for candidate search.
+pub fn compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+    rule_text: &str,
+    root_rule_name: &str,
+    gram_sizes: GramSizes,
+    active_identity_source: Option<&str>,
+    max_anchors_per_alt: usize,
+    force_tier1_only: bool,
+    allow_tier2_fallback: bool,
+    max_candidates: impl Into<f64>,
+) -> Result<CompiledQueryPlan> {
+    let rule_blocks = parse_rule_blocks(rule_text)?;
+    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source_impl(
+        &rule_blocks,
+        root_rule_name,
+        gram_sizes,
+        active_identity_source,
+        max_anchors_per_alt,
+        force_tier1_only,
+        allow_tier2_fallback,
+        max_candidates,
+    )
+}
+
 /// Compiles a specific named rule out of a multi-rule file into the query plan
 /// used for candidate search.
-fn compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+fn compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source_impl(
     rule_blocks: &[ParsedRuleBlock],
     root_rule_name: &str,
     gram_sizes: GramSizes,
@@ -1097,7 +1211,7 @@ pub fn compile_query_plan_from_file_with_gram_sizes_and_identity_source(
     allow_tier2_fallback: bool,
     max_candidates: impl Into<f64>,
 ) -> Result<CompiledQueryPlan> {
-    let text = fs::read_to_string(rule_path)?;
+    let text = load_rule_file_with_includes(rule_path)?;
     compile_query_plan_with_gram_sizes_and_identity_source(
         &text,
         gram_sizes,
@@ -1220,7 +1334,7 @@ pub fn rule_check_all_with_gram_sizes_and_identity_source(
                 let report = build_rule_check_report(
                     &source_context,
                     Some(&block.name),
-                    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source_impl(
                         &rule_blocks,
                         &block.name,
                         gram_sizes,
@@ -1293,7 +1407,7 @@ pub fn rule_check_from_file_with_gram_sizes_and_identity_source(
     allow_tier2_fallback: bool,
     max_candidates: impl Into<f64>,
 ) -> Result<RuleCheckReport> {
-    let text = fs::read_to_string(rule_path)?;
+    let text = load_rule_file_with_includes(rule_path)?;
     Ok(rule_check_with_gram_sizes_and_identity_source(
         &text,
         gram_sizes,
@@ -1337,7 +1451,7 @@ pub fn rule_check_all_from_file_with_gram_sizes_and_identity_source(
     allow_tier2_fallback: bool,
     max_candidates: impl Into<f64>,
 ) -> Result<RuleCheckFileReport> {
-    let text = fs::read_to_string(rule_path)?;
+    let text = load_rule_file_with_includes(rule_path)?;
     Ok(rule_check_all_with_gram_sizes_and_identity_source(
         &text,
         gram_sizes,

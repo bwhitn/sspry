@@ -169,6 +169,8 @@ Remote search options:
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
 - `--rule <RULE>`
+  - path to one top-level YARA file
+  - normal YARA `include "..."` directives are expanded before search
 - `--max-anchors-per-pattern <N>` default `16`
 - `--max-candidates <PERCENT>` default `10`
 - `--verify`
@@ -180,6 +182,10 @@ Behavior:
 - server compiles and executes the search plan
 - server serializes top-level searches and queues later requests
 - client deduplicates across the forest and applies the final percentage cap
+- if the expanded source contains multiple searchable rules, the command runs one search per rule identifier in source order
+- single-rule output stays unchanged
+- multi-rule output is emitted as one labeled block per rule identifier from the expanded source
+- the command returns nonzero if any rule in the expanded source fails
 
 ## `local-search`
 
@@ -191,6 +197,8 @@ Local forest search options:
 
 - `--root <ROOT>`
 - `--rule <RULE>`
+  - path to one top-level YARA file
+  - normal YARA `include "..."` directives are expanded before search
 - `--tree-search-workers <N>` default `0`
 - `--max-anchors-per-pattern <N>` default `16`
 - `--max-candidates <PERCENT>` default `10`
@@ -201,6 +209,10 @@ Behavior:
 
 - opens `tree_*/current` directly and searches the forest in-process
 - `--tree-search-workers 0` means auto up to the tree count
+- if the expanded source contains multiple searchable rules, the command runs one search per rule identifier in source order
+- single-rule output stays unchanged
+- multi-rule output is emitted as one labeled block per rule identifier from the expanded source
+- the command returns nonzero if any rule in the expanded source fails
 
 ## `search-batch`
 

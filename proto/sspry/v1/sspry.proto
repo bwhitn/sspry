@@ -261,6 +261,7 @@ message StatusResponse {
 
 message SearchRequest {
   string yara_rule_source = 1;
+  string target_rule_name = 2;
   uint32 chunk_size = 3;
   bool include_external_ids = 4;
   double max_candidates_percent = 5;

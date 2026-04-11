@@ -247,6 +247,8 @@ Options:
 - `--timeout <seconds>`
 - `--max-message-bytes <bytes>`
 - `--rule <path>`
+  - path to one top-level YARA file
+  - normal YARA `include "..."` directives are expanded before search
 - `--max-anchors-per-pattern <n>`
 - `--max-candidates <p>` default `10`; `0` means unlimited
   - percentage of searchable documents
@@ -264,6 +266,8 @@ Behavior:
 - `--verify` reopens candidate file paths and runs local `yara-x` verification
 - verified search requires stored file paths to still exist on disk
 - candidate order is not guaranteed; search returns an unordered match set
+- if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
+- the command exits nonzero if any rule in the expanded source fails to compile or execute
 
 ## local-search
 
@@ -276,6 +280,8 @@ Options:
 - `--root <path>`
   - in-process forest search root
 - `--rule <path>`
+  - path to one top-level YARA file
+  - normal YARA `include "..."` directives are expanded before search
 - `--tree-search-workers <n>`
   - forest-level tree concurrency
   - `0` means auto up to the tree count
@@ -289,6 +295,8 @@ Behavior:
 
 - `local-search` opens `tree_*/current` directly and searches the forest in-process
 - `--tree-search-workers` is the local forest concurrency knob shared by `local-search` and `search-batch`
+- if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
+- the command exits nonzero if any rule in the expanded source fails to compile or execute
 
 Indexed search currently supports these searchable categories:
 

@@ -355,15 +355,28 @@ impl ServerState {
             ));
         }
         let (gram_sizes, id_source) = self.active_query_compile_policy()?;
-        compile_query_plan_with_gram_sizes_and_identity_source(
-            &request.yara_rule_source,
-            gram_sizes,
-            Some(id_source.as_str()),
-            (request.max_anchors_per_pattern as usize).max(1),
-            request.force_tier1_only,
-            request.allow_tier2_fallback,
-            request.max_candidates_percent,
-        )
+        if request.target_rule_name.trim().is_empty() {
+            compile_query_plan_with_gram_sizes_and_identity_source(
+                &request.yara_rule_source,
+                gram_sizes,
+                Some(id_source.as_str()),
+                (request.max_anchors_per_pattern as usize).max(1),
+                request.force_tier1_only,
+                request.allow_tier2_fallback,
+                request.max_candidates_percent,
+            )
+        } else {
+            compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                &request.yara_rule_source,
+                &request.target_rule_name,
+                gram_sizes,
+                Some(id_source.as_str()),
+                (request.max_anchors_per_pattern as usize).max(1),
+                request.force_tier1_only,
+                request.allow_tier2_fallback,
+                request.max_candidates_percent,
+            )
+        }
     }
 
     #[cfg(test)]

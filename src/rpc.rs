@@ -29,6 +29,7 @@ use crate::candidate::store::{
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
     CandidateStore, CompiledQueryPlan, GramSizes, candidate_shard_index, candidate_shard_root,
+    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     compile_query_plan_with_gram_sizes_and_identity_source, read_candidate_shard_count,
     resolve_max_candidates, write_candidate_shard_count,
 };
@@ -1272,13 +1273,14 @@ impl GrpcSspry for GrpcServerService {
         tokio::task::spawn_blocking(move || {
             let grpc_started = Instant::now();
             search_trace_log(format!(
-                "grpc.start chunk_size={} include_external_ids={} max_candidates_percent={} max_anchors_per_pattern={} force_tier1_only={} allow_tier2_fallback={}",
+                "grpc.start chunk_size={} include_external_ids={} max_candidates_percent={} max_anchors_per_pattern={} force_tier1_only={} allow_tier2_fallback={} target_rule_name={}",
                 request.chunk_size,
                 request.include_external_ids,
                 request.max_candidates_percent,
                 request.max_anchors_per_pattern,
                 request.force_tier1_only,
-                request.allow_tier2_fallback
+                request.allow_tier2_fallback,
+                request.target_rule_name
             ));
             let plan = match state.compile_search_plan_from_yara_source(&request) {
                 Ok(plan) => plan,

@@ -77,6 +77,15 @@ fn wait_for_verified_matches(
     );
 }
 
+fn split_search_blocks(output: &str) -> Vec<&str> {
+    output
+        .trim()
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .collect()
+}
+
 mod common;
 
 use common::*;
@@ -284,6 +293,197 @@ rule q {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn search_handles_rule_files_with_includes() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule_a = base.join("0001_abcd.yar");
+    let rule_b = base.join("0002_miss.yar");
+    let rule_c = base.join("0003_prefix.yar");
+    let bundle = base.join("bundle.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("a.bin"), b"xxABCDyy").expect("write a");
+    fs::write(sample_dir.join("b.bin"), b"qqPREFIXzz").expect("write b");
+    fs::write(
+        &rule_a,
+        r#"
+rule rule_a {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule a");
+    fs::write(
+        &rule_b,
+        r#"
+rule rule_b {
+  strings:
+    $a = "WXYZ"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule b");
+    fs::write(
+        &rule_c,
+        r#"
+rule rule_c {
+  strings:
+    $a = "PREFIX"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule c");
+    fs::write(
+        &bundle,
+        concat!(
+            "include \"0001_abcd.yar\"\n",
+            "include \"0002_miss.yar\"\n",
+            "include \"0003_prefix.yar\"\n",
+        ),
+    )
+    .expect("write bundle");
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("submitted_documents: 2"));
+    wait_for_search_candidates(&addr, &rule_a, 1);
+
+    let output = Command::new(bin_path())
+        .args([
+            "search",
+            "--addr",
+            &addr,
+            "--rule",
+            bundle.to_str().expect("bundle"),
+            "--max-candidates",
+            "100",
+        ])
+        .output()
+        .expect("run multi search");
+    assert!(
+        output.status.success(),
+        "multi search failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let blocks = split_search_blocks(&stdout);
+    assert_eq!(blocks.len(), 3, "{stdout}");
+    assert!(blocks[0].contains("rule: rule_a"), "{stdout}");
+    assert!(blocks[0].contains("exit_code: 0"), "{stdout}");
+    assert!(blocks[0].contains("candidates: 1"), "{stdout}");
+    assert!(blocks[1].contains("rule: rule_b"), "{stdout}");
+    assert!(blocks[1].contains("candidates: 0"), "{stdout}");
+    assert!(blocks[2].contains("rule: rule_c"), "{stdout}");
+    assert!(blocks[2].contains("candidates: 1"), "{stdout}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn local_search_handles_rule_files_with_includes() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let candidate_root = base.join("candidate_db");
+    let sample_dir = base.join("samples");
+    let rule_a = base.join("0001_abcd.yar");
+    let rule_b = base.join("0002_miss.yar");
+    let bundle = base.join("bundle.yar");
+    fs::create_dir_all(&sample_dir).expect("mkdir samples");
+
+    fs::write(sample_dir.join("a.bin"), b"xxABCDyy").expect("write a");
+    fs::write(sample_dir.join("b.bin"), b"plain-text").expect("write b");
+    fs::write(
+        &rule_a,
+        r#"
+rule rule_a {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule a");
+    fs::write(
+        &rule_b,
+        r#"
+rule rule_b {
+  strings:
+    $a = "WXYZ"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule b");
+    fs::write(
+        &bundle,
+        concat!("include \"0001_abcd.yar\"\n", "include \"0002_miss.yar\"\n",),
+    )
+    .expect("write bundle");
+
+    let ingest = run_ok(&[
+        "local-index",
+        "--root",
+        candidate_root.to_str().expect("candidate root"),
+        "--batch-size",
+        "1",
+        "--workers",
+        "1",
+        sample_dir.to_str().expect("sample dir"),
+    ]);
+    assert!(ingest.contains("submitted_documents: 2"), "{ingest}");
+
+    let output = Command::new(bin_path())
+        .args([
+            "local-search",
+            "--root",
+            candidate_root.to_str().expect("candidate root"),
+            "--rule",
+            bundle.to_str().expect("bundle"),
+            "--max-candidates",
+            "100",
+        ])
+        .output()
+        .expect("run local multi search");
+    assert!(
+        output.status.success(),
+        "local multi search failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let blocks = split_search_blocks(&stdout);
+    assert_eq!(blocks.len(), 2, "{stdout}");
+    assert!(blocks[0].contains("rule: rule_a"), "{stdout}");
+    assert!(blocks[0].contains("candidates: 1"), "{stdout}");
+    assert!(blocks[1].contains("rule: rule_b"), "{stdout}");
+    assert!(blocks[1].contains("candidates: 0"), "{stdout}");
 }
 
 #[test]

@@ -146,7 +146,10 @@ fn serve_candidate_shard_count_explicit_override_wins() {
 fn search_related_commands_default_max_candidates_to_ten_percent() {
     let cli = Cli::try_parse_from(["sspry", "search", "--rule", "rule.yar"]).expect("parse search");
     match cli.command {
-        Commands::Search(args) => assert_eq!(args.max_candidates, 10.0),
+        Commands::Search(args) => {
+            assert_eq!(args.rule, "rule.yar".to_owned());
+            assert_eq!(args.max_candidates, 10.0);
+        }
         other => panic!("unexpected command: {other:?}"),
     }
 
@@ -160,7 +163,10 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
     ])
     .expect("parse local-search");
     match cli.command {
-        Commands::LocalSearch(args) => assert_eq!(args.max_candidates, 10.0),
+        Commands::LocalSearch(args) => {
+            assert_eq!(args.rule, "rule.yar".to_owned());
+            assert_eq!(args.max_candidates, 10.0);
+        }
         other => panic!("unexpected command: {other:?}"),
     }
 
@@ -177,6 +183,56 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
         Commands::SearchBatch(args) => assert_eq!(args.max_candidates, 10.0),
         other => panic!("unexpected command: {other:?}"),
     }
+}
+
+#[test]
+fn load_search_rule_bundle_expands_includes_and_returns_searchable_rules() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let root = base.join("root.yar");
+    let first = base.join("first.yar");
+    let second = base.join("second.yar");
+    fs::write(
+        &first,
+        r#"
+private rule helper_one {
+  condition:
+    false
+}
+
+rule first_rule {
+  condition:
+    true
+}
+"#,
+    )
+    .expect("first");
+    fs::write(
+        &second,
+        r#"
+rule second_rule {
+  condition:
+    true
+}
+"#,
+    )
+    .expect("second");
+    fs::write(
+        &root,
+        r#"
+include "first.yar"
+include "second.yar"
+"#,
+    )
+    .expect("root");
+
+    let (expanded, rules) = load_search_rule_bundle(&root).expect("bundle");
+    assert!(expanded.contains("rule first_rule"));
+    assert!(expanded.contains("rule second_rule"));
+    assert_eq!(
+        rules,
+        vec!["first_rule".to_owned(), "second_rule".to_owned()]
+    );
 }
 
 #[test]
@@ -495,6 +551,30 @@ fn scan_candidate_batch_helpers_work() {
     let bad_rule_path = tmp.path().join("bad_rule.yar");
     fs::write(&bad_rule_path, "rule {").expect("bad rule");
     assert!(compile_yara_verifier(&bad_rule_path).is_err());
+
+    let multi_rule_verify_path = tmp.path().join("multi_verify.yar");
+    fs::write(
+        &multi_rule_verify_path,
+        concat!(
+            "rule first_rule { strings: $a = \"ABCD\" condition: $a }\n",
+            "rule second_rule { strings: $a = \"WXYZ\" condition: $a }\n",
+        ),
+    )
+    .expect("multi verify rule");
+    let second_match_path = tmp.path().join("second_match.bin");
+    fs::write(&second_match_path, b"--WXYZ--").expect("second match");
+    let multi_rules = compile_yara_verifier(&multi_rule_verify_path).expect("multi rules");
+    assert!(
+        !scan_candidate_matches_rule(&multi_rules, &second_match_path, Some("first_rule"))
+            .expect("first verify")
+    );
+    assert!(
+        scan_candidate_matches_rule(&multi_rules, &second_match_path, Some("second_rule"))
+            .expect("second verify")
+    );
+    assert!(
+        scan_candidate_matches_rule(&multi_rules, &second_match_path, None).expect("any verify")
+    );
 
     let single_rule_path = tmp.path().join("single_rule.yar");
     fs::write(
