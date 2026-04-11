@@ -73,6 +73,23 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.prepared_query_cache_bytes)
         .sum::<u64>();
+    let compaction_idle_cooldown_s = stats_rows
+        .iter()
+        .map(|item| item.compaction_idle_cooldown_s)
+        .fold(0.0_f64, f64::max);
+    let compaction_cooldown_remaining_s = if stats_rows.iter().any(|item| {
+        item.deleted_doc_count > 0 && item.compaction_cooldown_remaining_s <= 0.0
+    }) {
+        0.0
+    } else {
+        stats_rows
+            .iter()
+            .filter(|item| item.deleted_doc_count > 0)
+            .map(|item| item.compaction_cooldown_remaining_s)
+            .reduce(f64::min)
+            .unwrap_or(0.0)
+    };
+    let compaction_waiting_for_cooldown = compaction_cooldown_remaining_s > 0.0;
     let mut out = Map::<String, Value>::new();
     out.insert("active_doc_count".to_owned(), json!(active_doc_count));
     out.insert(
@@ -122,6 +139,18 @@ fn candidate_stats_json_from_parts_with_disk_usage(
     out.insert(
         "compaction_generation".to_owned(),
         json!(compaction_generation),
+    );
+    out.insert(
+        "compaction_idle_cooldown_s".to_owned(),
+        json!(compaction_idle_cooldown_s),
+    );
+    out.insert(
+        "compaction_cooldown_remaining_s".to_owned(),
+        json!(compaction_cooldown_remaining_s),
+    );
+    out.insert(
+        "compaction_waiting_for_cooldown".to_owned(),
+        json!(compaction_waiting_for_cooldown),
     );
     out.insert(
         "tier1_filter_target_fp".to_owned(),
@@ -548,6 +577,23 @@ fn grpc_store_summary_from_candidate_stats(
         .iter()
         .map(|item| item.retired_generation_count)
         .sum::<usize>();
+    let compaction_idle_cooldown_s = stats_rows
+        .iter()
+        .map(|item| item.compaction_idle_cooldown_s)
+        .fold(0.0_f64, f64::max);
+    let compaction_cooldown_remaining_s = if stats_rows.iter().any(|item| {
+        item.deleted_doc_count > 0 && item.compaction_cooldown_remaining_s <= 0.0
+    }) {
+        0.0
+    } else {
+        stats_rows
+            .iter()
+            .filter(|item| item.deleted_doc_count > 0)
+            .map(|item| item.compaction_cooldown_remaining_s)
+            .reduce(f64::min)
+            .unwrap_or(0.0)
+    };
+    let compaction_waiting_for_cooldown = compaction_cooldown_remaining_s > 0.0;
     StoreSummary {
         active_doc_count: active_doc_count as u64,
         candidate_shards: candidate_shards.max(1) as u64,
@@ -568,6 +614,9 @@ fn grpc_store_summary_from_candidate_stats(
         tier2_scanned_docs_total: stats.tier2_scanned_docs_total,
         version: 1,
         deleted_storage_bytes,
+        compaction_idle_cooldown_s,
+        compaction_cooldown_remaining_s,
+        compaction_waiting_for_cooldown,
     }
 }
 

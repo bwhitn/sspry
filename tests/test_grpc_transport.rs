@@ -107,6 +107,9 @@ fn grpc_transport_covers_ping_stats_status_and_shutdown() {
         let store = stats.stats.expect("store summary");
         assert_eq!(store.active_doc_count, 0);
         assert!(store.candidate_shards >= 1);
+        assert_eq!(store.compaction_idle_cooldown_s, 5.0);
+        assert_eq!(store.compaction_cooldown_remaining_s, 0.0);
+        assert!(!store.compaction_waiting_for_cooldown);
 
         let shutdown = client.shutdown(ShutdownRequest {}).await.expect("shutdown");
         assert_eq!(shutdown.into_inner().message, "shutdown requested");

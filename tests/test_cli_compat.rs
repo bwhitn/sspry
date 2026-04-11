@@ -376,6 +376,41 @@ fn info_light_exposes_adaptive_publish_status() {
 }
 
 #[test]
+fn info_exposes_compaction_cooldown_fields() {
+    let tmp = tempdir().expect("tmp");
+    let candidate_root = tmp.path().join("candidate_db");
+    let port = reserve_tcp_port();
+    let addr = tcp_addr(port);
+
+    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    wait_for_info(&addr);
+
+    let info = run_ok(&["info", "--addr", &addr]);
+    let parsed: Value = serde_json::from_str(&info).expect("info json");
+    assert_eq!(
+        parsed
+            .get("compaction_idle_cooldown_s")
+            .and_then(Value::as_f64),
+        Some(5.0)
+    );
+    assert_eq!(
+        parsed
+            .get("compaction_cooldown_remaining_s")
+            .and_then(Value::as_f64),
+        Some(0.0)
+    );
+    assert_eq!(
+        parsed
+            .get("compaction_waiting_for_cooldown")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn search_verify_uses_stored_paths_when_available() {
     let tmp = tempdir().expect("tmp");
     let base = tmp.path();

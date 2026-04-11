@@ -2061,6 +2061,24 @@ fn candidate_stats_json_reports_compaction_generation_fields() {
     );
     assert_eq!(
         stats
+            .get("compaction_idle_cooldown_s")
+            .and_then(Value::as_f64),
+        Some(0.0)
+    );
+    assert_eq!(
+        stats
+            .get("compaction_cooldown_remaining_s")
+            .and_then(Value::as_f64),
+        Some(0.0)
+    );
+    assert_eq!(
+        stats
+            .get("compaction_waiting_for_cooldown")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        stats
             .get("retired_generation_count")
             .and_then(Value::as_u64),
         Some(1)
@@ -2820,6 +2838,28 @@ fn next_compaction_wait_timeout_tracks_pending_delete_cooldown() {
     state
         .handle_candidate_delete(&hex::encode([0x22; 32]))
         .expect("delete doc");
+
+    let stats = state.current_stats_json().expect("stats after delete");
+    assert_eq!(
+        stats
+            .get("compaction_idle_cooldown_s")
+            .and_then(Value::as_f64),
+        Some(5.0)
+    );
+    let remaining = stats
+        .get("compaction_cooldown_remaining_s")
+        .and_then(Value::as_f64)
+        .expect("remaining cooldown");
+    assert!(
+        remaining <= 5.0 && remaining > 4.0,
+        "expected cooldown remaining near 5s after delete, got {remaining}"
+    );
+    assert_eq!(
+        stats
+            .get("compaction_waiting_for_cooldown")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
     let timeout = state.next_compaction_wait_timeout();
     assert!(

@@ -34,6 +34,18 @@ fn grpc_store_summary_json_map(
         serde_json::json!(store.compaction_generation),
     );
     map.insert(
+        "compaction_idle_cooldown_s".to_owned(),
+        serde_json::json!(store.compaction_idle_cooldown_s),
+    );
+    map.insert(
+        "compaction_cooldown_remaining_s".to_owned(),
+        serde_json::json!(store.compaction_cooldown_remaining_s),
+    );
+    map.insert(
+        "compaction_waiting_for_cooldown".to_owned(),
+        serde_json::json!(store.compaction_waiting_for_cooldown),
+    );
+    map.insert(
         "tier1_filter_target_fp".to_owned(),
         serde_json::json!(store.tier1_filter_target_fp),
     );

@@ -107,6 +107,9 @@ message StoreSummary {
   uint64 tier2_scanned_docs_total = 17;
   uint64 version = 18;
   uint64 deleted_storage_bytes = 19;
+  double compaction_idle_cooldown_s = 20;
+  double compaction_cooldown_remaining_s = 21;
+  bool compaction_waiting_for_cooldown = 22;
 }
 
 message AdaptivePublishSummary {
