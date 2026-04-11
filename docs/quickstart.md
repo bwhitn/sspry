@@ -99,6 +99,7 @@ Signals:
 ## When To Change Defaults
 
 - Change `--gram-sizes` if you want a different recall/precision/storage tradeoff.
+- Supported gram-size pairs are `3,4`, `4,5`, `5,6`, and `7,8`.
 - Change `--tier1-set-fp` and `--tier2-set-fp` if you want smaller or larger bloom filters.
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
 - Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with the default `8` keeps open and publish fanout low.

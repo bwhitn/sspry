@@ -73,7 +73,7 @@ In practice:
 - on slower or saturated storage:
   - if `submit_ms` stays high and seal backlog keeps growing, bias toward batching more work before the next publish
 
-## Proposed Policy
+## Current Policy Shape
 
 Use a small internal idle window with bounded adaptation:
 
@@ -123,12 +123,12 @@ The public fixed knob is already gone. Keep only internal stats/debug output for
 - recent publish p50/p95
 - current seal backlog
 
-## Next Implementation Step
+## Implementation Status
 
-Implement an internal `AdaptivePublishState` on the server that updates after:
+The server now maintains an internal `AdaptivePublishState` that updates after:
 
 - every publish
 - every seal-worker completion
 - every completed index session
 
-Then have `publish_readiness()` consume that state instead of the fixed idle constant.
+`publish_readiness()` consumes that state instead of any fixed idle constant, and `info` / `info --light` expose the current adaptive summary (`current_idle_ms`, mode, reason, storage class).

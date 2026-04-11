@@ -38,7 +38,7 @@ Current pushed baseline:
 
 - search tuning should use preserved DB roots plus `--reuse-existing-db`
 - per-rule prepared-query profiling is available in verbose search output
-- direct in-process forest search is available through `sspry search --root ... --tree-search-workers ...`
+- direct in-process forest search is available through `sspry local-search --root ... --tree-search-workers ...`
 - long-lived direct-forest sweeps are now available through `sspry search-batch`
 - persistent server mode is still useful for comparison, but direct-forest benchmarking no longer requires per-rule reopen cost
 - current caveat:

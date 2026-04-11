@@ -40,6 +40,7 @@ Options:
   - server-side tree query workers per search
   - one top-level search runs at a time; later searches queue
   - the active search fans out across at most this many trees concurrently
+  - default is `max(1, cpus/4)`
 - `--root <path>`
   - root path to open
   - auto-detected as one of:
@@ -53,6 +54,7 @@ Options:
   - `incremental` defaults to 8 shards
 - `--shards <n>`
   - explicit shard count override for a new DB
+  - both layout profiles currently default new DBs to `8` shards
 - `--tier1-set-fp <p>`
   - Tier1 false-positive rate override for a new DB
 - `--tier2-set-fp <p>`
@@ -63,6 +65,7 @@ Options:
   - store canonical path as `external_id` for a new DB
 - `--gram-sizes <tier1,tier2>`
   - DB-wide gram-size pair for a new DB
+  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 
 Behavior:
 
@@ -121,6 +124,7 @@ Notes:
 - remote ingest streams row-framed inserts incrementally over gRPC
 - large documents are chunked across multiple frames; they are not treated as one capped request
 - only one active indexing session is allowed per server at a time
+- when the target server is running in workspace mode, `index` auto-publishes after ingest so newly indexed documents become searchable
 - use `local-index` for direct local ingest without a running server
 
 ## local-index
@@ -143,6 +147,7 @@ Options:
   - Tier2 false-positive rate for a newly created local store
 - `--gram-sizes <tier1,tier2>`
   - DB-wide gram-size pair for a newly created local store
+  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 - `--compaction-idle-cooldown-s <seconds>`
   - minimum idle time before shard-local compaction is allowed to run for a newly created local store
 - `--path-list`
@@ -283,7 +288,7 @@ Options:
 Behavior:
 
 - `local-search` opens `tree_*/current` directly and searches the forest in-process
-- `--tree-search-workers` only applies to `local-search`
+- `--tree-search-workers` is the local forest concurrency knob shared by `local-search` and `search-batch`
 
 Indexed search currently supports these searchable categories:
 
@@ -342,6 +347,7 @@ Options:
   - required output JSON path
 - `--tree-search-workers <n>`
   - forest-level tree concurrency
+  - `0` means auto up to the tree count
 - `--max-anchors-per-pattern <n>`
 - `--max-candidates <p>` default `10`
   - percentage of searchable documents
@@ -374,6 +380,10 @@ Returns JSON describing:
 - search worker count
 - drain state and active connections
 - adaptive publish state
+- compaction cooldown state:
+  - `compaction_idle_cooldown_s`
+  - `compaction_cooldown_remaining_s`
+  - `compaction_waiting_for_cooldown`
 - document counts and filter-bucket counts
 - startup cleanup counts for abandoned compaction roots
 - compaction runtime counters and reclaimed bytes
@@ -384,7 +394,7 @@ Returns JSON describing:
 ./target/release/sspry local-info --root <path>
 ```
 
-Returns JSON describing a direct local store, or aggregated stats for a local forest root.
+Returns JSON describing a direct local store or aggregated stats for a local forest root.
 
 ## shutdown
 

@@ -27,7 +27,7 @@ Operational behavior:
 - delete targets `current/` only
 - background compaction reclaims deleted docs from `current/`
 
-What was validated on this branch:
+Validated coverage:
 
 - small and large files
 - default FP and very low FP

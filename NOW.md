@@ -51,7 +51,7 @@ Current state:
   - `100s` per-tree search timeout before tree-batch scaling
 - preserved `25k` and `50k` DB roots are now part of the normal profiling workflow
 - per-rule prepared-query memory profiling is available in verbose search output
-- `search --root` plus `--tree-search-workers` now exists for in-process forest search and tree-level concurrency checks
+- `local-search --root` plus `--tree-search-workers` now exists for in-process forest search and tree-level concurrency checks
 - `search-batch` now exists for long-lived in-process forest sweeps without per-rule reopen overhead
 - early `50k` batch checkpoints show the control-flow is correct, but resident memory still climbs too much for this to replace the persistent server path as the default tuning loop yet
 - clearing local prepared-query caches between batch rules materially reduced search-batch anon on the preserved `50k` slice
@@ -64,7 +64,7 @@ Work:
 - keep search tuning on reused DBs, not fresh rebuilds
 - keep emitting per-rule prepared-query memory fields during profiling
 - use `search-batch` for direct-forest repeated sweeps
-- keep one-shot `search --root` for correctness / threading spot checks
+- keep one-shot `local-search --root` for correctness / threading spot checks
 - keep the persistent server path as the default large-slice tuning loop until `search-batch` resident memory is lower
 - treat the remaining `search-batch` memory problem as mostly file-backed residency driven by scan breadth, not retained anon cache growth
 - update docs whenever the searchable/scaling-safe boundary changes

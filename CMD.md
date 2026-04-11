@@ -49,15 +49,19 @@ Key options:
 - `--search-workers <N>`
   - one active top-level search per server
   - the active search runs across at most this many trees at once
+  - default is `max(1, cpus/4)`
 - `--root <ROOT>`
   - workspace root, direct store root, or forest root
+  - default `candidate_db`
 - `--layout-profile <standard|incremental>`
 - `--shards <N>`
+  - both layout profiles currently default new DBs to `8` shards
 - `--tier1-set-fp <P>` default `0.38`
 - `--tier2-set-fp <P>` default `0.18`
 - `--id-source <sha256|md5|sha1|sha512>`
 - `--store-path`
 - `--gram-sizes <tier1,tier2>` default `3,4`
+  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 
 ## `index`
 
@@ -82,6 +86,7 @@ Behavior:
 - streams row-framed inserts over gRPC
 - large documents are chunked across frames
 - only one active indexing session is allowed per server at a time
+- when the target server is in workspace mode, `index` auto-publishes after ingest so new documents become searchable
 
 ## `local-index`
 
@@ -97,6 +102,7 @@ Local ingest options:
 - `--tier1-set-fp <P>` default `0.38`
 - `--tier2-set-fp <P>` default `0.18`
 - `--gram-sizes <tier1,tier2>` default `3,4`
+- supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 - `--compaction-idle-cooldown-s <SECONDS>` default `5`
 - `--path-list`
 - `--batch-size <N>`
@@ -191,6 +197,11 @@ Local forest search options:
 - `--verify`
 - `--verbose`
 
+Behavior:
+
+- opens `tree_*/current` directly and searches the forest in-process
+- `--tree-search-workers 0` means auto up to the tree count
+
 ## `search-batch`
 
 ```text
@@ -204,6 +215,11 @@ Usage: sspry search-batch --root <ROOT> --json-out <JSON_OUT> [OPTIONS]
 - `--max-anchors-per-pattern <N>` default `16`
 - `--max-candidates <PERCENT>` default `10`
 - `--verify`
+
+Behavior:
+
+- opens the forest once and reuses it across the whole rule sweep
+- `--tree-search-workers 0` means auto up to the tree count
 
 ## `info`
 
@@ -221,6 +237,9 @@ Usage: sspry info [OPTIONS]
 ```text
 Usage: sspry local-info --root <ROOT>
 ```
+
+- `--root <ROOT>`
+  - direct local store root or forest root
 
 ## `shutdown`
 
