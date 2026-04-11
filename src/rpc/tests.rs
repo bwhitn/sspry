@@ -1,6 +1,7 @@
 use super::*;
 
 use std::fs;
+use std::time::Duration;
 
 use crate::candidate::BloomFilter;
 use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
@@ -2763,6 +2764,71 @@ fn compaction_cycle_scans_all_shards_for_pending_work() {
     assert_eq!(
         runtime.get("compaction_runs_total").and_then(Value::as_u64),
         Some(1)
+    );
+}
+
+#[test]
+fn next_compaction_wait_timeout_tracks_pending_delete_cooldown() {
+    let tmp = tempdir().expect("tmp");
+    let state = Arc::new(
+        ServerState::new(
+            ServerConfig {
+                candidate_config: CandidateConfig {
+                    root: tmp.path().join("candidate_db"),
+                    filter_target_fp: None,
+                    tier1_filter_target_fp: None,
+                    tier2_filter_target_fp: None,
+                    compaction_idle_cooldown_s: 5.0,
+                    ..CandidateConfig::default()
+                },
+                candidate_shards: 1,
+                search_workers: 1,
+                memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+                auto_publish_initial_idle_ms: 500,
+                auto_publish_storage_class: "unknown".to_owned(),
+                workspace_mode: false,
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("server state"),
+    );
+    let gram = pack_exact_gram(b"ABC");
+    let bloom_filter_b64 =
+        base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(32, 7, &[gram]));
+
+    for byte in [0x11u8, 0x22u8] {
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode([byte; 32]),
+                file_size: 32,
+                bloom_filter_b64: bloom_filter_b64.clone(),
+                bloom_item_estimate: None,
+                tier2_bloom_filter_b64: None,
+                tier2_bloom_item_estimate: None,
+                special_population: false,
+                metadata_b64: None,
+                external_id: Some(format!("doc-{byte:02x}")),
+            })
+            .expect("insert doc");
+    }
+
+    assert_eq!(
+        state.next_compaction_wait_timeout(),
+        Duration::from_secs(30)
+    );
+
+    state
+        .handle_candidate_delete(&hex::encode([0x22; 32]))
+        .expect("delete doc");
+
+    let timeout = state.next_compaction_wait_timeout();
+    assert!(
+        timeout <= Duration::from_secs(5),
+        "expected timeout <= cooldown after delete, got {timeout:?}"
+    );
+    assert!(
+        timeout > Duration::from_secs(4),
+        "expected timeout to reflect remaining cooldown, got {timeout:?}"
     );
 }
 

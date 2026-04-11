@@ -8,7 +8,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapOptions};
 use rustc_hash::FxHashMap;
@@ -1720,6 +1720,19 @@ impl CandidateStore {
             )?;
         }
         Ok(removed)
+    }
+
+    /// Reports whether background compaction has pending work for this store
+    /// and, if so, how long the worker should wait before trying again.
+    pub(crate) fn pending_compaction_wait(&self) -> Option<Duration> {
+        if !self.docs.iter().any(|doc| doc.deleted) {
+            return None;
+        }
+        let remaining_s = self.compaction_cooldown_remaining_s();
+        if remaining_s <= 0.0 {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_secs_f64(remaining_s))
     }
 
     /// Reports how much longer automatic compaction should wait for the store

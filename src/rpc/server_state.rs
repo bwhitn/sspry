@@ -2974,6 +2974,38 @@ impl ServerState {
         store.apply_compaction_snapshot(snapshot, compacted_root)
     }
 
+    /// Chooses how long the background compaction worker should sleep before
+    /// re-checking published shards for newly eligible delete reclamation.
+    fn next_compaction_wait_timeout(&self) -> Duration {
+        const DEFAULT_WAIT: Duration = Duration::from_secs(30);
+        const READY_RETRY_WAIT: Duration = Duration::from_millis(100);
+
+        let Ok(stores) = self.published_store_set() else {
+            return DEFAULT_WAIT;
+        };
+
+        let mut min_wait = None::<Duration>;
+        for store in &stores.stores {
+            let Ok(store) = store.lock() else {
+                return DEFAULT_WAIT;
+            };
+            let Some(wait) = store.pending_compaction_wait() else {
+                continue;
+            };
+            if wait.is_zero() {
+                return READY_RETRY_WAIT;
+            }
+            min_wait = Some(match min_wait {
+                Some(current) => current.min(wait),
+                None => wait,
+            });
+        }
+
+        min_wait
+            .map(|wait| wait.min(DEFAULT_WAIT))
+            .unwrap_or(DEFAULT_WAIT)
+    }
+
     /// Runs one background compaction cycle, covering snapshot selection,
     /// snapshot writing, and install/retry bookkeeping.
     fn run_compaction_cycle_once(&self) -> Result<CompactionCycleOutcome> {

@@ -286,7 +286,8 @@ fn start_compaction_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
             if state.is_shutting_down() {
                 break;
             }
-            state.wait_for_maintenance_event(&mut maintenance_epoch, Some(Duration::from_secs(30)));
+            let timeout = state.next_compaction_wait_timeout();
+            state.wait_for_maintenance_event(&mut maintenance_epoch, Some(timeout));
             if state.is_shutting_down() {
                 break;
             }
