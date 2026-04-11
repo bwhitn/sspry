@@ -1,15 +1,15 @@
-use std::hash::BuildHasher;
+use std::hash::Hasher;
 
-use fastbloom::DefaultHasher as FastBloomDefaultHasher;
+use rustc_hash::FxHasher;
 
 use crate::{Result, SspryError};
 
 pub const DEFAULT_BLOOM_POSITION_LANES: usize = 4;
-const FASTBLOOM_SEED: u128 = 0;
 
 fn source_hash(value: u64) -> u64 {
-    let hasher = FastBloomDefaultHasher::seeded(&FASTBLOOM_SEED.to_be_bytes());
-    hasher.hash_one(value)
+    let mut hasher = FxHasher::default();
+    hasher.write_u64(value);
+    hasher.finish()
 }
 
 fn next_hash(h1: &mut u64, h2: u64) -> u64 {
@@ -277,11 +277,9 @@ impl BloomFilter {
 
 #[cfg(test)]
 mod tests {
-    use fastbloom::BloomFilter as FastBloomFilter;
-
     use super::{
-        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, FASTBLOOM_SEED, bloom_byte_masks,
-        bloom_positions, bloom_word_masks, bloom_word_masks_in_lane, raw_filter_matches_masks,
+        BloomFilter, DEFAULT_BLOOM_POSITION_LANES, bloom_byte_masks, bloom_positions,
+        bloom_word_masks, bloom_word_masks_in_lane, raw_filter_matches_masks,
         raw_filter_matches_word_masks,
     };
 
@@ -296,16 +294,16 @@ mod tests {
     fn bloom_positions_are_stable() {
         assert_eq!(
             bloom_positions(0x0102_0304, 512, 4).expect("positions"),
-            bloom_positions(0x0102_0304, 512, 4).expect("positions again")
+            vec![279, 78, 277, 5]
         );
         assert_eq!(
             bloom_positions(0xAABB_CCDD_1020_3040, 1024, 7).expect("positions"),
-            bloom_positions(0xAABB_CCDD_1020_3040, 1024, 7).expect("positions again")
+            vec![10, 672, 376, 98, 417, 413, 272]
         );
     }
 
     #[test]
-    fn bloom_layout_matches_fastbloom_for_non_lane_filter() {
+    fn bloom_layout_matches_internal_byte_masks_for_non_lane_filter() {
         let size_bytes = 128usize;
         let hash_count = 7usize;
         let values = [
@@ -319,19 +317,12 @@ mod tests {
             ours.add(value).expect("ours add");
         }
 
-        let mut theirs = FastBloomFilter::with_num_bits(size_bytes * 8)
-            .seed(&FASTBLOOM_SEED)
-            .hashes(hash_count as u32);
-        for value in values {
-            theirs.insert(&value);
+        let mut expected = vec![0u8; size_bytes];
+        for (byte_idx, mask) in bloom_byte_masks(&values, size_bytes, hash_count).expect("masks") {
+            expected[byte_idx] |= mask;
         }
-        let mut expected = Vec::with_capacity(size_bytes);
-        for word in theirs.as_slice() {
-            expected.extend_from_slice(&word.to_le_bytes());
-        }
-        expected.truncate(size_bytes);
 
-        assert_eq!(ours.as_bytes(), &expected);
+        assert_eq!(ours.as_bytes(), expected.as_slice());
     }
 
     #[test]
