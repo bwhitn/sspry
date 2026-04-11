@@ -1,92 +1,11 @@
 use std::fs;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tempfile::tempdir;
-
-fn bin_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_sspry"))
-}
-
-fn run_ok(args: &[&str]) -> String {
-    let output = Command::new(bin_path())
-        .args(args)
-        .output()
-        .expect("run command");
-    assert!(
-        output.status.success(),
-        "command failed: {:?}\nstdout={}\nstderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("utf8 stdout")
-}
-
-fn run_ok_capture(args: &[&str]) -> (String, String) {
-    let output = Command::new(bin_path())
-        .args(args)
-        .output()
-        .expect("run command");
-    assert!(
-        output.status.success(),
-        "command failed: {:?}\nstdout={}\nstderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    (
-        String::from_utf8(output.stdout).expect("utf8 stdout"),
-        String::from_utf8(output.stderr).expect("utf8 stderr"),
-    )
-}
-
-fn run_ok_env(args: &[&str], envs: &[(&str, &str)]) -> String {
-    let mut command = Command::new(bin_path());
-    command.args(args);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command.output().expect("run command");
-    assert!(
-        output.status.success(),
-        "command failed: {:?}\nstdout={}\nstderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("utf8 stdout")
-}
-
-fn reserve_tcp_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
-}
-
-fn tcp_addr(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
-fn wait_for_info(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        let output = Command::new(bin_path())
-            .args(["info", "--addr", addr])
-            .output()
-            .expect("run info");
-        if output.status.success() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("server did not become ready on {addr}");
-}
 
 fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -112,37 +31,6 @@ fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
         thread::sleep(Duration::from_millis(100));
     }
     panic!("search did not reach {expected} candidates on {addr}");
-}
-
-fn wait_for_published_doc_count(addr: &str, expected_docs: u64, min_publish_runs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        let output = Command::new(bin_path())
-            .args(["info", "--addr", addr])
-            .output()
-            .expect("run info");
-        if output.status.success() {
-            let parsed: Value =
-                serde_json::from_slice(&output.stdout).expect("stats json from info");
-            let publish_runs_total = parsed
-                .get("publish")
-                .and_then(|value| value.get("publish_runs_total"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let doc_count = parsed.get("doc_count").and_then(Value::as_u64).unwrap_or(0);
-            let work_dirty = parsed
-                .get("work_dirty")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if publish_runs_total >= min_publish_runs && doc_count == expected_docs && !work_dirty {
-                return;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "server did not publish {expected_docs} docs with at least {min_publish_runs} publish runs on {addr}"
-    );
 }
 
 fn wait_for_verified_matches(
@@ -189,20 +77,9 @@ fn wait_for_verified_matches(
     );
 }
 
-fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
-    let addr = tcp_addr(port);
-    let mut command = Command::new(bin_path());
-    command
-        .arg("serve")
-        .arg("--addr")
-        .arg(&addr)
-        .arg("--root")
-        .arg(candidate_root)
-        .args(extra_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command.spawn().expect("spawn serve")
-}
+mod common;
+
+use common::*;
 
 fn write_minimal_pe64_dotnet(path: &Path, anchor: &[u8]) {
     write_minimal_pe(

@@ -41,6 +41,8 @@ struct PerfState {
 }
 
 impl Default for PerfState {
+    /// Builds the initial in-memory perf state with fresh timestamps and empty
+    /// aggregates.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -64,16 +66,22 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// Adds processed-byte accounting to the active scope so the final report
+    /// can include total data volume for this stage.
     pub fn add_bytes(&mut self, value: u64) {
         self.bytes = self.bytes.saturating_add(value);
     }
 
+    /// Adds processed-item accounting to the active scope for the current
+    /// measured stage.
     pub fn add_items(&mut self, value: u64) {
         self.items = self.items.saturating_add(value);
     }
 }
 
 impl Drop for Scope {
+    /// Finalizes the scope by recording elapsed time and any accumulated byte
+    /// or item counters into the shared perf state.
     fn drop(&mut self) {
         let Some(started_at) = self.started_at.take() else {
             return;
@@ -94,6 +102,7 @@ impl Drop for Scope {
     }
 }
 
+/// Interprets a process environment variable as a permissive boolean flag.
 fn truthy_env(name: &str) -> bool {
     env::var(name)
         .map(|value| {
@@ -105,6 +114,7 @@ fn truthy_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns the current wall-clock time as milliseconds since the Unix epoch.
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -112,6 +122,8 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Seeds the perf subsystem from environment variables before any explicit
+/// runtime configuration is applied.
 fn initial_state() -> PerfState {
     let report_path = env::var_os("TGSDB_PERF_REPORT").map(PathBuf::from);
     let stdout = truthy_env("TGSDB_PERF_STDOUT");
@@ -124,17 +136,22 @@ fn initial_state() -> PerfState {
     }
 }
 
+/// Returns the singleton perf state mutex shared by the whole process.
 fn state() -> &'static Mutex<PerfState> {
     static STATE: OnceLock<Mutex<PerfState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(initial_state()))
 }
 
 #[cfg(test)]
+/// Returns a global test-only lock so perf tests can mutate shared state
+/// without interfering with one another.
 pub(crate) fn test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Resets the perf subsystem and optionally enables file and/or stdout
+/// reporting for subsequent scopes and counters.
 pub fn configure(report_path: Option<PathBuf>, stdout: bool) {
     let mut state = state().lock().expect("perf lock poisoned");
     state.report_path = report_path;
@@ -148,10 +165,12 @@ pub fn configure(report_path: Option<PathBuf>, stdout: bool) {
     state.samples.clear();
 }
 
+/// Reports whether perf collection is currently enabled.
 pub fn is_enabled() -> bool {
     state().lock().map(|value| value.enabled).unwrap_or(false)
 }
 
+/// Starts a named timing scope and returns a guard that records itself on drop.
 pub fn scope(name: &'static str) -> Scope {
     if !is_enabled() {
         return Scope {
@@ -169,6 +188,7 @@ pub fn scope(name: &'static str) -> Scope {
     }
 }
 
+/// Adds a delta to a named counter when perf collection is enabled.
 pub fn record_counter(name: &'static str, delta: u64) {
     let Ok(mut state) = state().lock() else {
         return;
@@ -184,6 +204,8 @@ pub fn record_counter(name: &'static str, delta: u64) {
         .saturating_add(delta);
 }
 
+/// Updates a named maximum with the provided value when perf collection is
+/// enabled.
 pub fn record_max(name: &'static str, value: u64) {
     let Ok(mut state) = state().lock() else {
         return;
@@ -195,6 +217,7 @@ pub fn record_max(name: &'static str, value: u64) {
     *entry = (*entry).max(value);
 }
 
+/// Appends an arbitrary sample row to the perf report for one stage label.
 pub fn record_sample(
     stage: &'static str,
     label: impl Into<String>,
@@ -217,6 +240,8 @@ pub fn record_sample(
     });
 }
 
+/// Converts the current in-memory perf aggregates into the JSON report schema
+/// emitted by the CLI.
 fn build_report_value(state: &PerfState, exit_code: i32) -> Value {
     let finished_unix_ms = now_unix_ms();
     let elapsed_ms = state.started_at.elapsed().as_secs_f64() * 1000.0;
@@ -260,6 +285,7 @@ fn build_report_value(state: &PerfState, exit_code: i32) -> Value {
     })
 }
 
+/// Returns the current perf report as JSON when collection is enabled.
 pub fn report_value(exit_code: i32) -> Option<Value> {
     let Ok(state) = state().lock() else {
         return None;
@@ -270,6 +296,8 @@ pub fn report_value(exit_code: i32) -> Option<Value> {
     Some(build_report_value(&state, exit_code))
 }
 
+/// Materializes the current perf report to disk and/or stdout based on the
+/// active configuration.
 pub fn write_report(exit_code: i32) -> Result<()> {
     let (report_path, stdout, value) = {
         let state = state()

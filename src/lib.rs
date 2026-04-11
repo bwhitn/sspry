@@ -22,12 +22,14 @@ pub enum SspryError {
     Hex(#[from] hex::FromHexError),
 }
 
+/// Converts a borrowed string slice into the project's generic error wrapper.
 impl From<&str> for SspryError {
     fn from(value: &str) -> Self {
         Self::Message(value.to_owned())
     }
 }
 
+/// Converts an owned string into the project's generic error wrapper.
 impl From<String> for SspryError {
     fn from(value: String) -> Self {
         Self::Message(value)

@@ -6,22 +6,29 @@ use crate::{Result, SspryError};
 
 pub const DEFAULT_BLOOM_POSITION_LANES: usize = 4;
 
+/// Hashes one packed gram into the initial 64-bit value used by the bloom
+/// probe sequence.
 fn source_hash(value: u64) -> u64 {
     let mut hasher = FxHasher::default();
     hasher.write_u64(value);
     hasher.finish()
 }
 
+/// Advances the double-hashing sequence used to derive subsequent bloom probe
+/// positions from the initial hash.
 fn next_hash(h1: &mut u64, h2: u64) -> u64 {
     *h1 = h1.rotate_left(5).wrapping_add(h2);
     *h1
 }
 
+/// Maps a 64-bit hash into a bloom bit index using multiplicative reduction
+/// instead of integer modulo.
 fn bloom_index(bits: usize, hash: u64) -> usize {
     ((hash as u128 * bits as u128) >> 64) as usize
 }
 
 #[inline]
+/// Invokes `f` once for each bloom bit position generated for `value`.
 fn for_each_bloom_position(
     mut value: u64,
     bits: usize,
@@ -37,6 +44,7 @@ fn for_each_bloom_position(
     }
 }
 
+/// Returns the ordered bloom bit positions for one packed gram value.
 pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec<usize>> {
     if bits == 0 {
         return Err(SspryError::from("bits must be > 0"));
@@ -49,6 +57,7 @@ pub fn bloom_positions(value: u64, bits: usize, hash_count: usize) -> Result<Vec
     Ok(positions)
 }
 
+/// Builds merged byte masks for all bloom positions required by `values`.
 pub fn bloom_byte_masks(
     values: &[u64],
     size_bytes: usize,
@@ -72,6 +81,8 @@ pub fn bloom_byte_masks(
     Ok(masks.into_iter().collect())
 }
 
+/// Builds merged 64-bit word masks for all bloom positions required by
+/// `values`.
 pub fn bloom_word_masks(
     values: &[u64],
     size_bytes: usize,
@@ -95,6 +106,8 @@ pub fn bloom_word_masks(
     Ok(masks.into_iter().collect())
 }
 
+/// Validates that a lane-partitioned bloom layout can be split evenly and
+/// returns the bytes assigned to each lane.
 fn validate_lane_layout(size_bytes: usize, lane_count: usize) -> Result<usize> {
     if size_bytes == 0 {
         return Err(SspryError::from("size_bytes must be > 0"));
@@ -110,6 +123,8 @@ fn validate_lane_layout(size_bytes: usize, lane_count: usize) -> Result<usize> {
     Ok(size_bytes / lane_count)
 }
 
+/// Builds merged word masks for the positions that `values` occupy within a
+/// single bloom lane.
 pub fn bloom_word_masks_in_lane(
     values: &[u64],
     size_bytes: usize,
@@ -137,6 +152,7 @@ pub fn bloom_word_masks_in_lane(
     Ok(masks.into_iter().collect())
 }
 
+/// Checks whether every required byte mask is present in a raw bloom payload.
 pub fn raw_filter_matches_masks(raw_filter: &[u8], required_masks: &[(usize, u8)]) -> bool {
     for (byte_idx, mask) in required_masks {
         if *byte_idx >= raw_filter.len() {
@@ -149,6 +165,7 @@ pub fn raw_filter_matches_masks(raw_filter: &[u8], required_masks: &[(usize, u8)
     true
 }
 
+/// Checks whether every required word mask is present in a raw bloom payload.
 pub fn raw_filter_matches_word_masks(raw_filter: &[u8], required_masks: &[(usize, u64)]) -> bool {
     for (word_idx, mask) in required_masks {
         let start = word_idx.saturating_mul(8);
@@ -175,6 +192,8 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
+    /// Allocates an empty bloom filter with the requested byte size and hash
+    /// count.
     pub fn new(size_bytes: usize, hash_count: usize) -> Result<Self> {
         if size_bytes == 0 {
             return Err(SspryError::from("size_bytes must be > 0"));
@@ -188,6 +207,8 @@ impl BloomFilter {
         })
     }
 
+    /// Wraps an existing serialized bloom payload with the supplied hash-count
+    /// configuration.
     pub fn from_bytes(data: &[u8], hash_count: usize) -> Result<Self> {
         if data.is_empty() {
             return Err(SspryError::from("bloom payload must not be empty"));
@@ -201,10 +222,12 @@ impl BloomFilter {
         })
     }
 
+    /// Returns the total bloom payload size in bytes.
     pub fn size_bytes(&self) -> usize {
         self.data.len()
     }
 
+    /// Inserts one packed gram into the bloom filter.
     pub fn add(&mut self, value: u64) -> Result<()> {
         let bits = self.data.len() * 8;
         for_each_bloom_position(value, bits, self.hash_count, |pos| {
@@ -215,12 +238,16 @@ impl BloomFilter {
         Ok(())
     }
 
+    /// Returns the per-lane byte width and bit width for a lane-partitioned
+    /// view of this bloom filter.
     pub fn lane_geometry(&self, lane_count: usize) -> Result<(usize, usize)> {
         let lane_bytes = validate_lane_layout(self.data.len(), lane_count)?;
         Ok((lane_bytes, lane_bytes * 8))
     }
 
     #[inline]
+    /// Inserts one packed gram into a caller-selected lane when the lane layout
+    /// has already been validated by the caller.
     pub fn add_in_lane_prevalidated(
         &mut self,
         value: u64,
@@ -234,6 +261,8 @@ impl BloomFilter {
         });
     }
 
+    /// Inserts one packed gram into the specified bloom lane after validating
+    /// the lane geometry.
     pub fn add_in_lane(&mut self, value: u64, lane_idx: usize, lane_count: usize) -> Result<()> {
         let (lane_bytes, lane_bits) = self.lane_geometry(lane_count)?;
         if lane_idx >= lane_count {
@@ -244,6 +273,7 @@ impl BloomFilter {
         Ok(())
     }
 
+    /// Returns whether the bloom filter may contain the supplied packed gram.
     pub fn maybe_contains(&self, value: u64) -> Result<bool> {
         let bits = self.data.len() * 8;
         let mut matched = true;
@@ -257,6 +287,7 @@ impl BloomFilter {
         Ok(matched)
     }
 
+    /// Returns whether the bloom filter may contain every gram in `values`.
     pub fn maybe_contains_all(&self, values: &[u64]) -> Result<bool> {
         for value in values {
             if !self.maybe_contains(*value)? {
@@ -266,10 +297,12 @@ impl BloomFilter {
         Ok(true)
     }
 
+    /// Returns the serialized bloom payload by reference.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
+    /// Consumes the bloom filter and returns its serialized payload.
     pub fn into_bytes(self) -> Vec<u8> {
         self.data
     }

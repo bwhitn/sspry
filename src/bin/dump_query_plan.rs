@@ -24,6 +24,8 @@ struct Dump {
     patterns: Vec<PatternSummary>,
 }
 
+/// Loads a rule file, compiles its query plan with the requested candidate
+/// limit, and prints a JSON summary of the resulting search patterns.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let rule_path = PathBuf::from(args.next().ok_or("missing rule path")?);

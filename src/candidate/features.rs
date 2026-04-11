@@ -45,6 +45,8 @@ enum AdditionalDigestState {
 }
 
 impl AdditionalDigestState {
+    /// Creates the streaming digest state for the requested alternate identity
+    /// algorithm.
     fn new(kind: AdditionalDigestKind) -> Self {
         match kind {
             AdditionalDigestKind::Md5 => Self::Md5(Md5::new()),
@@ -53,6 +55,7 @@ impl AdditionalDigestState {
         }
     }
 
+    /// Feeds one file chunk into the alternate identity digest state.
     fn update(&mut self, chunk: &[u8]) {
         match self {
             Self::Md5(digest) => digest.update(chunk),
@@ -61,6 +64,8 @@ impl AdditionalDigestState {
         }
     }
 
+    /// Finalizes the alternate digest and folds it into the normalized
+    /// 32-byte identity namespace used by the index.
     fn finalize_normalized(self) -> [u8; 32] {
         match self {
             Self::Md5(digest) => normalize_identity_digest("md5", &digest.finalize()),
@@ -70,6 +75,8 @@ impl AdditionalDigestState {
     }
 }
 
+/// Namespaces an arbitrary digest into the project's canonical 32-byte
+/// identity representation.
 fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"sspry-identity\0");
@@ -81,6 +88,8 @@ fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Computes sampled Shannon entropy from the sparse byte histogram collected
+/// during the feature pass.
 fn sampled_entropy_bits_per_byte(sample_counts: &[u32; 256], sampled_bytes: u64) -> f64 {
     if sampled_bytes == 0 {
         return 0.0;
@@ -97,6 +106,7 @@ fn sampled_entropy_bits_per_byte(sample_counts: &[u32; 256], sampled_bytes: u64)
     entropy
 }
 
+/// Computes exact Shannon entropy for the full-file byte histogram.
 fn entropy_bits_per_byte(counts: &[u64; 256], total_bytes: u64) -> f32 {
     if total_bytes == 0 {
         return 0.0;
@@ -113,6 +123,8 @@ fn entropy_bits_per_byte(counts: &[u64; 256], total_bytes: u64) -> f32 {
     entropy as f32
 }
 
+/// Classifies a file as special-population content when it is both large and
+/// sufficiently high entropy.
 fn classify_special_population(file_size: u64, sampled_entropy_bits_per_byte: f64) -> bool {
     file_size >= SPECIAL_POPULATION_MIN_FILE_BYTES
         && sampled_entropy_bits_per_byte >= SPECIAL_POPULATION_MIN_ENTROPY_BITS_PER_BYTE
@@ -128,6 +140,7 @@ fn iter_grams_from_bytes_exact_u64(data: &[u8], gram_size: usize) -> Vec<u64> {
         .collect()
 }
 
+/// Mixes a packed gram into the hash domain expected by HyperLogLog.
 fn mix_u64_to_u64(value: u64) -> u64 {
     let mut x = value;
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -144,6 +157,7 @@ struct RollingGramState {
 }
 
 impl RollingGramState {
+    /// Creates an empty sliding gram window for the requested gram size.
     fn new(gram_size: usize) -> Self {
         Self {
             gram_size,
@@ -152,6 +166,8 @@ impl RollingGramState {
         }
     }
 
+    /// Pushes one byte into the sliding window and returns the packed gram once
+    /// enough bytes have been seen.
     fn push(&mut self, byte: u8) -> Option<u64> {
         if self.filled < self.gram_size {
             self.value |= u64::from(byte) << (self.filled * 8);
@@ -169,17 +185,22 @@ impl RollingGramState {
 }
 
 #[inline]
+/// Slides a packed exact gram forward by one byte and returns the new packed
+/// window.
 fn slide_exact_gram(value: u64, next_byte: u8, gram_size: usize) -> u64 {
     debug_assert!((1..=8).contains(&gram_size));
     (value >> 8) | (u64::from(next_byte) << ((gram_size - 1) * 8))
 }
 
 #[inline]
+/// Assigns a gram start offset to one of the fixed bloom-position lanes.
 fn bloom_lane_for_start(start_offset: u64) -> usize {
     debug_assert!(DEFAULT_BLOOM_POSITION_LANES.is_power_of_two());
     (start_offset as usize) & (DEFAULT_BLOOM_POSITION_LANES - 1)
 }
 
+/// Estimates the number of unique exact grams in a file by streaming it once
+/// through a HyperLogLog sketch.
 fn estimate_unique_grams_hll(
     path: impl AsRef<Path>,
     gram_size: usize,
@@ -220,6 +241,8 @@ fn estimate_unique_grams_hll(
     Ok(hll.count().max(1))
 }
 
+/// Estimates unique-gram counts for two gram sizes in a single streaming pass
+/// over the file.
 pub fn estimate_unique_grams_pair_hll(
     path: impl AsRef<Path>,
     first_gram_size: usize,
@@ -280,6 +303,7 @@ pub fn estimate_unique_grams_pair_hll(
     ))
 }
 
+/// Convenience wrapper that estimates unique grams for one explicit gram size.
 pub fn estimate_unique_grams_for_size_hll(
     path: impl AsRef<Path>,
     gram_size: usize,
@@ -333,6 +357,8 @@ fn iter_tier2_grams_from_bytes(data: &[u8], tier2_gram_size: usize) -> Vec<u64> 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scans one file once to compute content hashes, bloom filters, entropy, and
+/// special-population classification for the configured gram sizes.
 pub fn scan_file_features_bloom_only_with_gram_sizes(
     path: impl AsRef<Path>,
     gram_sizes: GramSizes,

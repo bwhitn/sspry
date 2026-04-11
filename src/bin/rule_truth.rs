@@ -39,6 +39,8 @@ struct OutputRuleFile {
     matches: BTreeMap<String, Vec<String>>,
 }
 
+/// Chooses a bounded worker count for manifest scans from the machine's
+/// available parallelism.
 fn default_workers() -> usize {
     thread::available_parallelism()
         .map(|value| value.get())
@@ -47,6 +49,8 @@ fn default_workers() -> usize {
         .min(8)
 }
 
+/// Extracts the first contiguous 64-character hexadecimal token from a file
+/// name so content-addressed samples can reuse that identity without hashing.
 fn first_64_hex(name: &str) -> Option<String> {
     let mut current = String::new();
     for ch in name.chars() {
@@ -62,6 +66,7 @@ fn first_64_hex(name: &str) -> Option<String> {
     None
 }
 
+/// Streams a file through SHA-256 and returns the digest as lowercase hex.
 fn sha256_file_hex(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -78,6 +83,8 @@ fn sha256_file_hex(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Resolves the identity string for a manifest file by preferring an embedded
+/// hexadecimal name and falling back to hashing the file contents.
 fn file_identity_hex(path: &Path) -> Result<String, String> {
     if let Some(hex) = path
         .file_name()
@@ -89,6 +96,8 @@ fn file_identity_hex(path: &Path) -> Result<String, String> {
     sha256_file_hex(path)
 }
 
+/// Reads a newline-delimited manifest into `(path, identity)` tuples, skipping
+/// blank lines and normalizing identities for downstream matching.
 fn load_manifest(path: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     let text = fs::read_to_string(path)
         .map_err(|err| format!("read manifest {}: {err}", path.display()))?;
@@ -105,6 +114,8 @@ fn load_manifest(path: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     Ok(out)
 }
 
+/// Compiles each YARA rule file into a shared ruleset while preserving a
+/// per-input output slot and any compile error for that file.
 fn compile_rule_files(
     files: &[InputRuleFile],
 ) -> (
@@ -161,6 +172,8 @@ struct WorkerAccum {
     scan_errors: Vec<String>,
 }
 
+/// Scans one manifest slice against the compiled ruleset and accumulates
+/// per-rule-file matches plus any scan errors for later merging.
 fn scan_manifest_chunk(
     manifest: &[(PathBuf, String)],
     rules: &yara_x::Rules,
@@ -205,6 +218,8 @@ fn scan_manifest_chunk(
     }
 }
 
+/// Sorts and deduplicates the matched identities recorded for each rule in one
+/// output entry.
 fn dedup_output_matches(output: &mut OutputRuleFile) {
     for values in output.matches.values_mut() {
         values.sort();
@@ -212,6 +227,8 @@ fn dedup_output_matches(output: &mut OutputRuleFile) {
     }
 }
 
+/// Compiles the requested rule files, scans the manifest with a small worker
+/// pool, and writes a per-rule ground-truth JSON report.
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let inputs: Vec<InputRuleFile> = serde_json::from_str(

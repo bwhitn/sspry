@@ -4,10 +4,14 @@ const LN_2: f64 = std::f64::consts::LN_2;
 const LN_2_SQ: f64 = LN_2 * LN_2;
 const BLOOM_WORD_BYTES: usize = 8;
 
+/// Rounds a bloom payload size up to the nearest whole machine word so mask
+/// operations can stay word-aligned.
 pub(crate) fn align_filter_bytes(value: usize) -> usize {
     value.max(1).div_ceil(BLOOM_WORD_BYTES) * BLOOM_WORD_BYTES
 }
 
+/// Rounds a positive size up to the next power of two, clamping tiny values to
+/// one byte.
 fn round_up_power_of_two(value: usize) -> usize {
     if value <= 1 {
         return 1;
@@ -15,6 +19,8 @@ fn round_up_power_of_two(value: usize) -> usize {
     value.next_power_of_two()
 }
 
+/// Rounds a theoretical bloom size to the nearest KiB while enforcing a 1 KiB
+/// minimum for very small filters.
 fn round_to_nearest_kib(value: usize) -> usize {
     if value == 0 {
         return 1024;
@@ -25,6 +31,8 @@ fn round_to_nearest_kib(value: usize) -> usize {
     ((value + 512) / 1024) * 1024
 }
 
+/// Normalizes the caller's bloom sizing policy into aligned minimum and
+/// maximum bounds plus an optional target false-positive rate.
 fn normalize_filter_policy(
     base_filter_bytes: usize,
     filter_min_bytes: Option<usize>,
@@ -52,6 +60,8 @@ fn normalize_filter_policy(
     Ok((minimum, maximum, filter_target_fp))
 }
 
+/// Derives an overall bloom hash count from a target false-positive rate, or
+/// falls back to the configured default when no target is set.
 pub fn derive_bloom_hash_count(target_fp: Option<f64>, fallback_hashes: usize) -> Result<usize> {
     let fallback = fallback_hashes.max(1);
     let Some(fp) = target_fp else {
@@ -64,6 +74,8 @@ pub fn derive_bloom_hash_count(target_fp: Option<f64>, fallback_hashes: usize) -
     Ok(estimate.clamp(1, 16))
 }
 
+/// Estimates a per-document bloom hash count from the filter density implied
+/// by the current item estimate.
 pub fn derive_document_bloom_hash_count(
     filter_bytes: usize,
     bloom_item_estimate: Option<usize>,
@@ -79,6 +91,8 @@ pub fn derive_document_bloom_hash_count(
     estimate.clamp(1, 16)
 }
 
+/// Chooses the filter size for one document by combining file-size heuristics,
+/// optional bounds, and optional false-positive-rate targeting.
 pub fn choose_filter_bytes_for_file_size(
     file_size: u64,
     base_filter_bytes: usize,

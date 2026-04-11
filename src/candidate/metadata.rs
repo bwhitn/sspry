@@ -78,6 +78,7 @@ enum ByteOrder {
 }
 
 impl MetadataBuilder {
+    /// Marks a boolean metadata field as known and stores its value.
     fn set_bool(&mut self, field: BoolField, value: bool) {
         let bit = 1u16 << (field as u16);
         self.bool_known |= bit;
@@ -88,6 +89,8 @@ impl MetadataBuilder {
         }
     }
 
+    /// Adds one integer metadata value to a field while keeping the stored set
+    /// unique.
     fn push_int(&mut self, field: IntField, value: u64) {
         let slot = &mut self.ints[field as usize];
         if !slot.contains(&value) {
@@ -95,11 +98,14 @@ impl MetadataBuilder {
         }
     }
 
+    /// Replaces the byte payload stored for one bytes field.
     fn set_bytes(&mut self, field: BytesField, value: &[u8]) {
         self.bytes[field as usize].clear();
         self.bytes[field as usize].extend_from_slice(value);
     }
 
+    /// Serializes the accumulated metadata into the compact on-disk wire
+    /// format used by candidate documents.
     fn encode(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32);
         out.push(METADATA_VERSION);
@@ -139,6 +145,8 @@ impl MetadataBuilder {
     }
 }
 
+/// Decodes one compact metadata blob into a structured representation suitable
+/// for field comparisons.
 fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
     if bytes.is_empty() {
         return Ok(DecodedMetadata::default());
@@ -204,6 +212,7 @@ fn decode(bytes: &[u8]) -> Result<DecodedMetadata> {
     })
 }
 
+/// Encodes an unsigned integer as a compact varint and appends it to `out`.
 fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -218,6 +227,8 @@ fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Decodes one varint from `bytes`, advancing `offset` past the consumed
+/// payload.
 fn decode_varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
     let mut shift = 0u32;
     let mut value = 0u64;
@@ -239,6 +250,8 @@ fn decode_varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
     }
 }
 
+/// Reads up to `len` bytes from the start of the file and returns the available
+/// prefix.
 fn read_prefix(file: &mut File, len: usize) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(0))?;
     let available = file.metadata()?.len().min(len as u64) as usize;
@@ -249,6 +262,8 @@ fn read_prefix(file: &mut File, len: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Pre-seeds all known boolean metadata fields as explicitly false so missing
+/// module-specific data can still be distinguished from unknown values.
 fn initialize_known_bool_metadata(builder: &mut MetadataBuilder) {
     builder.set_bool(BoolField::CrxIsCrx, false);
     builder.set_bool(BoolField::PeIsPe, false);
@@ -263,6 +278,8 @@ fn initialize_known_bool_metadata(builder: &mut MetadataBuilder) {
     builder.set_bool(BoolField::MachoIsMacho, false);
 }
 
+/// Reads exactly `len` bytes at `offset`, returning `None` when the requested
+/// range extends past EOF.
 fn read_at(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
     let total_len = file.metadata()?.len();
     if offset > total_len || total_len - offset < len as u64 {
@@ -274,6 +291,8 @@ fn read_at(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
+/// Reads up to `len` bytes starting at `offset`, returning the truncated tail
+/// when the file ends before the requested length.
 fn read_up_to(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
     let total_len = file.metadata()?.len();
     if offset >= total_len {
@@ -288,30 +307,37 @@ fn read_up_to(file: &mut File, offset: u64, len: usize) -> Result<Option<Vec<u8>
     Ok(Some(bytes))
 }
 
+/// Decodes a little-endian `u16` from a fixed-size slice.
 fn le_u16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes(bytes.try_into().expect("u16"))
 }
 
+/// Decodes a big-endian `u16` from a fixed-size slice.
 fn be_u16(bytes: &[u8]) -> u16 {
     u16::from_be_bytes(bytes.try_into().expect("u16"))
 }
 
+/// Decodes a little-endian `u32` from a fixed-size slice.
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().expect("u32"))
 }
 
+/// Decodes a big-endian `u32` from a fixed-size slice.
 fn be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(bytes.try_into().expect("u32"))
 }
 
+/// Decodes a little-endian `u64` from a fixed-size slice.
 fn le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().expect("u64"))
 }
 
+/// Decodes a big-endian `u64` from a fixed-size slice.
 fn be_u64(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(bytes.try_into().expect("u64"))
 }
 
+/// Decodes a `u32` using the supplied byte order.
 fn read_u32(bytes: &[u8], order: ByteOrder) -> u32 {
     match order {
         ByteOrder::Little => le_u32(bytes),
@@ -319,14 +345,17 @@ fn read_u32(bytes: &[u8], order: ByteOrder) -> u32 {
     }
 }
 
+/// Converts a Windows FILETIME value into a Unix timestamp in seconds.
 fn filetime_to_unix_timestamp(filetime: u64) -> Option<u64> {
     (filetime / 10_000_000).checked_sub(11_644_473_600)
 }
 
+/// Extracts CRX header metadata from the file prefix.
 fn extract_crx_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     builder.set_bool(BoolField::CrxIsCrx, prefix.starts_with(b"Cr24"));
 }
 
+/// Extracts DEX header metadata and version information from the file prefix.
 fn extract_dex_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     let is_dex = prefix.len() >= 8
         && &prefix[..4] == b"dex\n"
@@ -344,6 +373,7 @@ fn extract_dex_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     }
 }
 
+/// Extracts Windows shortcut metadata, including available FILETIME values.
 fn extract_lnk_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     let is_lnk = prefix.len() >= 76
         && le_u32(&prefix[0..4]) == 0x4c
@@ -364,6 +394,7 @@ fn extract_lnk_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     }
 }
 
+/// Extracts ELF header metadata, including type, OS ABI, and machine values.
 fn extract_elf_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     let is_elf = prefix.len() >= 20 && &prefix[..4] == b"\x7fELF";
     builder.set_bool(BoolField::ElfIsElf, is_elf);
@@ -388,6 +419,8 @@ fn extract_elf_metadata(prefix: &[u8], builder: &mut MetadataBuilder) {
     builder.push_int(IntField::ElfMachine, u64::from(machine));
 }
 
+/// Extracts Portable Executable metadata, including architecture, subsystem,
+/// signing hints, .NET presence, and entry-point bytes.
 fn extract_pe_metadata(
     file: &mut File,
     prefix: &[u8],
@@ -484,6 +517,7 @@ fn extract_pe_metadata(
     Ok(())
 }
 
+/// Maps a PE RVA into a file offset by walking the section table.
 fn pe_rva_to_file_offset(
     file: &mut File,
     pe_offset: u64,
@@ -521,6 +555,8 @@ fn pe_rva_to_file_offset(
     Ok(None)
 }
 
+/// Detects whether a Mach-O magic value describes a thin binary and which byte
+/// order it uses.
 fn thin_macho_order(magic: [u8; 4]) -> Option<ByteOrder> {
     match magic {
         [0xfe, 0xed, 0xfa, 0xce] => Some(ByteOrder::Big),
@@ -531,6 +567,8 @@ fn thin_macho_order(magic: [u8; 4]) -> Option<ByteOrder> {
     }
 }
 
+/// Detects whether a Mach-O magic value describes a fat binary and whether its
+/// arch table uses 64-bit offsets.
 fn fat_macho_order_and_is_64(magic: [u8; 4]) -> Option<(ByteOrder, bool)> {
     match magic {
         [0xca, 0xfe, 0xba, 0xbe] => Some((ByteOrder::Big, false)),
@@ -541,6 +579,8 @@ fn fat_macho_order_and_is_64(magic: [u8; 4]) -> Option<(ByteOrder, bool)> {
     }
 }
 
+/// Extracts CPU and file-type metadata from one thin Mach-O header located at
+/// `offset`.
 fn extract_thin_macho_metadata(
     file: &mut File,
     offset: u64,
@@ -567,6 +607,8 @@ fn extract_thin_macho_metadata(
     Ok(true)
 }
 
+/// Extracts Mach-O metadata from either a thin binary or each architecture in
+/// a fat binary.
 fn extract_macho_metadata(
     file: &mut File,
     prefix: &[u8],
@@ -615,6 +657,7 @@ fn extract_macho_metadata(
     Ok(())
 }
 
+/// Decodes a `u64` using the supplied byte order.
 fn read_u64(bytes: &[u8], order: ByteOrder) -> u64 {
     match order {
         ByteOrder::Little => le_u64(bytes),
@@ -622,6 +665,7 @@ fn read_u64(bytes: &[u8], order: ByteOrder) -> u64 {
     }
 }
 
+/// Computes exact Shannon entropy from a full byte-frequency histogram.
 fn entropy_bits_per_byte_from_counts(counts: &[u64; 256], total_bytes: u64) -> f32 {
     if total_bytes == 0 {
         return 0.0;
@@ -638,6 +682,7 @@ fn entropy_bits_per_byte_from_counts(counts: &[u64; 256], total_bytes: u64) -> f
     entropy as f32
 }
 
+/// Streams the file once to compute exact byte entropy.
 fn compute_file_entropy_bits_per_byte(file: &mut File, chunk_size: usize) -> Result<f32> {
     file.seek(SeekFrom::Start(0))?;
     let mut counts = [0u64; 256];
@@ -657,6 +702,8 @@ fn compute_file_entropy_bits_per_byte(file: &mut File, chunk_size: usize) -> Res
     Ok(entropy_bits_per_byte_from_counts(&counts, total_bytes))
 }
 
+/// Builds the compact metadata payload by combining file-prefix parsers with
+/// the caller-provided entropy value.
 fn build_compact_document_metadata(
     file: &mut File,
     prefix: &[u8],
@@ -678,6 +725,8 @@ fn build_compact_document_metadata(
     Ok(builder.encode())
 }
 
+/// Extracts a compact metadata blob from a file, computing exact entropy as
+/// part of the process.
 pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let prefix = read_prefix(&mut file, 4096)?;
@@ -685,6 +734,8 @@ pub fn extract_compact_document_metadata(path: &Path) -> Result<Vec<u8>> {
     build_compact_document_metadata(&mut file, &prefix, entropy_bits_per_byte)
 }
 
+/// Extracts a compact metadata blob from a file using a caller-supplied entropy
+/// value.
 pub fn extract_compact_document_metadata_with_entropy(
     path: &Path,
     entropy_bits_per_byte: f32,
@@ -694,6 +745,8 @@ pub fn extract_compact_document_metadata_with_entropy(
     build_compact_document_metadata(&mut file, &prefix, entropy_bits_per_byte)
 }
 
+/// Normalizes accepted metadata field aliases into the canonical field names
+/// understood by the query engine.
 fn normalize_field(raw: &str) -> Option<&'static str> {
     match raw.to_ascii_lowercase().as_str() {
         "crx.is_crx" => Some("crx.is_crx"),
@@ -726,10 +779,12 @@ fn normalize_field(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Public wrapper that normalizes a metadata field name for query parsing.
 pub fn normalize_query_metadata_field(raw: &str) -> Option<&'static str> {
     normalize_field(raw)
 }
 
+/// Returns whether the normalized metadata field has boolean semantics.
 pub fn metadata_field_is_boolean(raw: &str) -> bool {
     matches!(
         normalize_field(raw),
@@ -748,6 +803,7 @@ pub fn metadata_field_is_boolean(raw: &str) -> bool {
     )
 }
 
+/// Returns whether the normalized metadata field has integer semantics.
 pub fn metadata_field_is_integer(raw: &str) -> bool {
     matches!(
         normalize_field(raw),
@@ -771,10 +827,12 @@ pub fn metadata_field_is_integer(raw: &str) -> bool {
     )
 }
 
+/// Returns whether the normalized metadata field has floating-point semantics.
 pub fn metadata_field_is_float(raw: &str) -> bool {
     matches!(normalize_field(raw), Some("math.entropy"))
 }
 
+/// Maps a canonical boolean field name to its compact-storage enum value.
 fn bool_field_for_name(field: &str) -> Option<BoolField> {
     match field {
         "crx.is_crx" => Some(BoolField::CrxIsCrx),
@@ -791,6 +849,8 @@ fn bool_field_for_name(field: &str) -> Option<BoolField> {
     }
 }
 
+/// Maps a canonical integer or float field name to its compact-storage enum
+/// value.
 fn int_field_for_name(field: &str) -> Option<IntField> {
     match field {
         "pe.machine" => Some(IntField::PeMachine),
@@ -812,6 +872,8 @@ fn int_field_for_name(field: &str) -> Option<IntField> {
     }
 }
 
+/// Returns the boolean module guard that must be true before a dependent field
+/// can produce meaningful values.
 fn module_guard_for_field(field: &str) -> Option<BoolField> {
     match field {
         "pe.machine" | "pe.subsystem" | "pe.timestamp" | "pe.characteristics" => {
@@ -825,6 +887,8 @@ fn module_guard_for_field(field: &str) -> Option<BoolField> {
     }
 }
 
+/// Returns the stored boolean value for `field`, or `None` when the field is
+/// not known in this metadata blob.
 fn bool_value(decoded: &DecodedMetadata, field: BoolField) -> Option<bool> {
     let bit = 1u16 << (field as u16);
     if (decoded.bool_known & bit) == 0 {
@@ -844,6 +908,7 @@ pub enum MetadataCompareOp {
     Ge,
 }
 
+/// Applies an integer comparison operator.
 fn compare_u64(lhs: u64, rhs: u64, op: MetadataCompareOp) -> bool {
     match op {
         MetadataCompareOp::Eq => lhs == rhs,
@@ -855,6 +920,7 @@ fn compare_u64(lhs: u64, rhs: u64, op: MetadataCompareOp) -> bool {
     }
 }
 
+/// Applies a floating-point comparison operator.
 fn compare_f32(lhs: f32, rhs: f32, op: MetadataCompareOp) -> bool {
     match op {
         MetadataCompareOp::Eq => lhs == rhs,
@@ -866,6 +932,8 @@ fn compare_f32(lhs: f32, rhs: f32, op: MetadataCompareOp) -> bool {
     }
 }
 
+/// Resolves the stored numeric values for one canonical field, accounting for
+/// unsupported fields and module guards.
 fn decoded_field_values<'a>(
     decoded: &'a DecodedMetadata,
     field: &str,
@@ -891,6 +959,8 @@ fn decoded_field_values<'a>(
     }
 }
 
+/// Convenience wrapper for equality checks against a numeric or boolean
+/// metadata field.
 pub fn metadata_field_matches_eq(
     bytes: &[u8],
     raw_field: &str,
@@ -899,6 +969,7 @@ pub fn metadata_field_matches_eq(
     metadata_field_matches_compare(bytes, raw_field, MetadataCompareOp::Eq, expected)
 }
 
+/// Evaluates one metadata field comparison against a compact metadata blob.
 pub fn metadata_field_matches_compare(
     bytes: &[u8],
     raw_field: &str,
@@ -931,6 +1002,8 @@ pub fn metadata_field_matches_compare(
     ))
 }
 
+/// Evaluates one floating-point metadata field comparison against a compact
+/// metadata blob.
 pub fn metadata_field_matches_compare_f32(
     bytes: &[u8],
     raw_field: &str,
@@ -956,6 +1029,8 @@ pub fn metadata_field_matches_compare_f32(
     })))
 }
 
+/// Compares every value from one metadata field against every value from
+/// another field until one pair satisfies `op`.
 pub fn metadata_fields_compare(
     bytes: &[u8],
     raw_lhs_field: &str,
@@ -987,6 +1062,7 @@ pub fn metadata_fields_compare(
     })))
 }
 
+/// Returns the stored PE entry-point prefix bytes when present.
 pub fn metadata_pe_entry_point_prefix(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let decoded = decode(bytes)?;
     let value = &decoded.bytes[BytesField::PeEntryPointPrefix as usize];
@@ -997,6 +1073,7 @@ pub fn metadata_pe_entry_point_prefix(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Returns the stored eight-byte file prefix when present.
 pub fn metadata_file_prefix_8(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let decoded = decode(bytes)?;
     let value = &decoded.bytes[BytesField::FilePrefix8 as usize];

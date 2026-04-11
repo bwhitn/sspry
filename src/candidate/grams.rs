@@ -10,6 +10,7 @@ pub struct GramSizes {
 }
 
 impl Default for GramSizes {
+    /// Returns the default `(tier1, tier2)` gram pair used by the index.
     fn default() -> Self {
         Self {
             tier1: DEFAULT_TIER1_GRAM_SIZE,
@@ -19,6 +20,8 @@ impl Default for GramSizes {
 }
 
 impl GramSizes {
+    /// Parses a CLI gram-size pair in `<tier1>,<tier2>` form and validates the
+    /// resulting sizes.
     pub fn parse(text: &str) -> Result<Self> {
         let raw = text.trim();
         let Some((left, right)) = raw.split_once(',') else {
@@ -37,6 +40,8 @@ impl GramSizes {
         Self::new(left, right)
     }
 
+    /// Validates and constructs a gram-size pair used by tier-1 and tier-2
+    /// candidate extraction.
     pub fn new(tier1: usize, tier2: usize) -> Result<Self> {
         if tier1 < 3 || tier2 < 4 || tier1 >= tier2 || tier2 > 8 {
             return Err(SspryError::from(
@@ -46,15 +51,18 @@ impl GramSizes {
         Ok(Self { tier1, tier2 })
     }
 
+    /// Formats the gram-size pair back into the CLI string representation.
     pub fn as_cli_value(self) -> String {
         format!("{},{}", self.tier1, self.tier2)
     }
 
+    /// Returns the encoded key width used to store tier-1 grams for this size.
     pub fn tier1_key_bytes(self) -> usize {
         if self.tier1 <= 4 { 4 } else { 8 }
     }
 }
 
+/// Packs an exact gram window into the low bytes of a little-endian `u64`.
 pub fn pack_exact_gram(window: &[u8]) -> u64 {
     debug_assert!((1..=8).contains(&window.len()));
     let mut bytes = [0u8; 8];
@@ -63,6 +71,8 @@ pub fn pack_exact_gram(window: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
+/// Expands a packed gram back into its original little-endian byte window for
+/// test assertions.
 pub fn exact_gram_to_le_bytes(value: u64, gram_size: usize) -> Vec<u8> {
     value.to_le_bytes()[..gram_size].to_vec()
 }

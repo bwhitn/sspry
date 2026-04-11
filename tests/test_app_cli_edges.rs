@@ -1,138 +1,13 @@
 use std::fs;
-use std::net::TcpListener;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-fn bin_path() -> String {
-    env!("CARGO_BIN_EXE_sspry").to_owned()
-}
+mod common;
 
-fn run_ok(args: &[&str]) -> String {
-    let output = Command::new(bin_path())
-        .args(args)
-        .output()
-        .expect("run command");
-    assert!(
-        output.status.success(),
-        "command failed: {:?}\nstdout={}\nstderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("utf8 stdout")
-}
-
-fn run_fail(args: &[&str]) -> String {
-    let output = Command::new(bin_path())
-        .args(args)
-        .output()
-        .expect("run command");
-    assert!(
-        !output.status.success(),
-        "command unexpectedly succeeded: {:?}\nstdout={}\nstderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-fn reserve_tcp_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
-}
-
-fn tcp_addr(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
-fn wait_for_info(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let output = Command::new(bin_path())
-            .args(["info", "--addr", addr])
-            .output()
-            .expect("run info");
-        if output.status.success() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("server did not become ready on {addr}");
-}
-
-fn wait_for_published_doc_count(addr: &str, expected_docs: u64, min_publish_runs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let output = Command::new(bin_path())
-            .args(["info", "--addr", addr])
-            .output()
-            .expect("run info");
-        if output.status.success() {
-            let parsed: Value =
-                serde_json::from_slice(&output.stdout).expect("stats json from info");
-            let publish_runs_total = parsed
-                .get("publish")
-                .and_then(|value| value.get("publish_runs_total"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let doc_count = parsed.get("doc_count").and_then(Value::as_u64).unwrap_or(0);
-            let work_dirty = parsed
-                .get("work_dirty")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if publish_runs_total >= min_publish_runs && doc_count == expected_docs && !work_dirty {
-                return;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "server did not publish {expected_docs} docs with at least {min_publish_runs} publish runs on {addr}"
-    );
-}
-
-fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
-    let addr = tcp_addr(port);
-    let mut command = Command::new(bin_path());
-    command
-        .arg("serve")
-        .arg("--addr")
-        .arg(&addr)
-        .arg("--root")
-        .arg(candidate_root)
-        .args(extra_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command.spawn().expect("spawn serve")
-}
-
-fn spawn_serve_tcp_capture_stderr(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
-    let addr = tcp_addr(port);
-    let mut command = Command::new(bin_path());
-    command
-        .arg("serve")
-        .arg("--addr")
-        .arg(&addr)
-        .arg("--root")
-        .arg(candidate_root)
-        .args(extra_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    command.spawn().expect("spawn serve")
-}
+use common::*;
 
 #[test]
 fn serve_validation_errors_are_reported() {
@@ -159,7 +34,7 @@ fn info_over_tcp_returns_json_after_auto_init() {
 
     let mut child = spawn_serve_tcp(port, &root, &[]);
     let addr = tcp_addr(port);
-    wait_for_info(&addr);
+    wait_for_info_quick(&addr);
 
     let stats = run_ok(&["info", "--addr", &addr]);
     let parsed: Value = serde_json::from_str(&stats).expect("stats json");
@@ -260,7 +135,7 @@ fn rule_check_uses_server_policy_from_live_addr() {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
     let mut child = spawn_serve_tcp(port, &root, &["--id-source", "md5"]);
-    wait_for_info(&addr);
+    wait_for_info_quick(&addr);
 
     let rule_path = tmp.path().join("rule.yar");
     fs::write(
@@ -877,9 +752,18 @@ rule top {
         .and_then(Value::as_array)
         .expect("rules array");
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0].get("is_private").and_then(Value::as_bool), Some(true));
-    assert_eq!(rules[0].get("status").and_then(Value::as_str), Some("unsupported"));
-    assert_eq!(rules[1].get("status").and_then(Value::as_str), Some("searchable"));
+    assert_eq!(
+        rules[0].get("is_private").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        rules[0].get("status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        rules[1].get("status").and_then(Value::as_str),
+        Some("searchable")
+    );
 }
 
 #[test]
@@ -945,7 +829,7 @@ fn serve_persists_candidate_shards() {
 
     let mut child = spawn_serve_tcp(port, &root, &["--shards", "2"]);
     let addr = tcp_addr(port);
-    wait_for_info(&addr);
+    wait_for_info_quick(&addr);
 
     let stats = run_ok(&["info", "--addr", &addr]);
     let parsed: Value = serde_json::from_str(&stats).expect("stats json");
@@ -1000,7 +884,7 @@ fn serve_ignores_init_only_options_for_existing_db_with_warning() {
             "4,5",
         ],
     );
-    wait_for_info(&init_addr);
+    wait_for_info_quick(&init_addr);
     let _ = init_child.kill();
     let _ = init_child.wait();
 
@@ -1025,7 +909,7 @@ fn serve_ignores_init_only_options_for_existing_db_with_warning() {
             "5,6",
         ],
     );
-    wait_for_info(&restart_addr);
+    wait_for_info_quick(&restart_addr);
 
     let info = run_ok(&["info", "--addr", &restart_addr]);
     let parsed: Value = serde_json::from_str(&info).expect("stats json");
@@ -1093,7 +977,7 @@ fn serve_does_not_warn_when_explicit_existing_values_match() {
             "4,5",
         ],
     );
-    wait_for_info(&init_addr);
+    wait_for_info_quick(&init_addr);
     let _ = init_child.kill();
     let _ = init_child.wait();
 
@@ -1116,7 +1000,7 @@ fn serve_does_not_warn_when_explicit_existing_values_match() {
             "4,5",
         ],
     );
-    wait_for_info(&restart_addr);
+    wait_for_info_quick(&restart_addr);
 
     let _ = restart_child.kill();
     let output = restart_child.wait_with_output().expect("restart output");
@@ -1248,7 +1132,7 @@ rule q {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
     let mut child = spawn_serve_tcp(port, &root, &["--store-path"]);
-    wait_for_info(&addr);
+    wait_for_info_quick(&addr);
 
     let index_output = Command::new(bin_path())
         .args(["index", "--addr", &addr, dataset.to_str().expect("dataset")])
@@ -1261,7 +1145,7 @@ rule q {
         String::from_utf8_lossy(&index_output.stderr)
     );
 
-    wait_for_published_doc_count(&addr, 2, 1);
+    wait_for_published_doc_count_quick(&addr, 2, 1);
 
     let info = run_ok(&["info", "--addr", &addr]);
     let parsed: Value = serde_json::from_str(&info).expect("stats json");

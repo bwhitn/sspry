@@ -61,6 +61,8 @@ const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
 const INDEX_CLIENT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
+/// Parses the CLI `--max-candidates` value as a bounded percentage in the
+/// inclusive range `0..=100`.
 fn parse_max_candidates_percent(value: &str) -> std::result::Result<f64, String> {
     let parsed = value
         .parse::<f64>()
@@ -77,6 +79,8 @@ struct ServeSignalFlags {
     status_dump: Arc<AtomicBool>,
 }
 
+/// Returns process-wide shutdown and status-dump flags, installing the
+/// platform-specific signal handlers on first use.
 fn serve_signal_flags() -> Result<ServeSignalFlags> {
     static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     static STATUS_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -128,6 +132,7 @@ fn serve_signal_flags() -> Result<ServeSignalFlags> {
     })
 }
 
+/// Chooses a default ingest worker count from the available CPU count.
 fn default_ingest_workers_for(cpus: usize) -> usize {
     let cpus = cpus.max(1);
     if cpus < 8 {
@@ -137,6 +142,7 @@ fn default_ingest_workers_for(cpus: usize) -> usize {
     }
 }
 
+/// Chooses the process default ingest worker count from host parallelism.
 fn default_ingest_workers() -> usize {
     default_ingest_workers_for(
         std::thread::available_parallelism()
@@ -153,6 +159,8 @@ enum IngestStorageClass {
 }
 
 impl IngestStorageClass {
+    /// Returns the stable configuration/status label for the detected storage
+    /// class.
     fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -163,6 +171,7 @@ impl IngestStorageClass {
 }
 
 #[cfg(unix)]
+/// Splits a Unix device number into its major and minor components.
 fn dev_major_minor(dev: u64) -> (u64, u64) {
     let major = ((dev >> 8) & 0x0fff) | ((dev >> 32) & !0x0fff);
     let minor = (dev & 0x00ff) | ((dev >> 12) & !0x00ff);
@@ -170,6 +179,8 @@ fn dev_major_minor(dev: u64) -> (u64, u64) {
 }
 
 #[cfg(unix)]
+/// Walks up the filesystem until it finds an existing path that can be probed
+/// for storage characteristics.
 fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     loop {
@@ -183,6 +194,8 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
+/// Detects whether a path resolves to rotational or solid-state storage by
+/// inspecting Linux block-device metadata.
 fn detect_storage_class_for_path(path: &Path) -> IngestStorageClass {
     use std::os::unix::fs::MetadataExt;
 
@@ -209,10 +222,13 @@ fn detect_storage_class_for_path(path: &Path) -> IngestStorageClass {
 }
 
 #[cfg(not(unix))]
+/// Returns `Unknown` on platforms where block-device storage probing is not
+/// implemented.
 fn detect_storage_class_for_path(_path: &Path) -> IngestStorageClass {
     IngestStorageClass::Unknown
 }
 
+/// Samples input paths and returns the most restrictive detected storage class.
 fn detect_storage_class_for_paths(paths: &[PathBuf]) -> IngestStorageClass {
     let mut saw_solid_state = false;
     for path in paths.iter().take(STORAGE_CLASS_SAMPLE_LIMIT) {
@@ -229,6 +245,8 @@ fn detect_storage_class_for_paths(paths: &[PathBuf]) -> IngestStorageClass {
     }
 }
 
+/// Returns the adaptive-publish storage hint and initial idle bias for a store
+/// root.
 fn adaptive_publish_prior_for_root(root: &Path) -> (String, u64) {
     match detect_storage_class_for_path(root) {
         IngestStorageClass::SolidState => ("solid-state".to_owned(), 0),
@@ -245,6 +263,8 @@ struct ResolvedIngestWorkers {
     output_storage: IngestStorageClass,
 }
 
+/// Chooses an automatic ingest worker count using CPU limits, workload size,
+/// and detected storage constraints.
 fn auto_ingest_workers_for(
     cpus: usize,
     total_files: usize,
@@ -263,6 +283,8 @@ fn auto_ingest_workers_for(
     workload_cap.min(storage_cap).max(1)
 }
 
+/// Resolves the ingest worker policy, preserving an explicit user override or
+/// deriving an automatic value when `requested_workers` is zero.
 fn resolve_ingest_workers(
     requested_workers: usize,
     total_files: usize,
@@ -292,10 +314,12 @@ fn resolve_ingest_workers(
     }
 }
 
+/// Chooses a conservative default search worker count from the available CPUs.
 fn default_search_workers_for(cpus: usize) -> usize {
     (cpus.max(1) / 4).max(1)
 }
 
+/// Chooses the process default search worker count from host parallelism.
 fn default_search_workers() -> usize {
     default_search_workers_for(
         std::thread::available_parallelism()
@@ -321,6 +345,8 @@ struct ServeInitOptionSources {
     gram_sizes: bool,
 }
 
+/// Returns whether the CLI argv contains the requested long flag, including the
+/// `--flag=value` form.
 fn argv_has_long_flag(argv: &[String], flag: &str) -> bool {
     argv.iter().any(|arg| {
         arg == flag
@@ -330,6 +356,8 @@ fn argv_has_long_flag(argv: &[String], flag: &str) -> bool {
     })
 }
 
+/// Records which serve-time initialization options were explicitly supplied on
+/// the command line.
 fn serve_init_option_sources_from_argv(argv: &[String]) -> ServeInitOptionSources {
     ServeInitOptionSources {
         layout_profile: argv_has_long_flag(argv, "--layout-profile"),
@@ -342,6 +370,8 @@ fn serve_init_option_sources_from_argv(argv: &[String]) -> ServeInitOptionSource
     }
 }
 
+/// Returns the default shard count associated with the chosen serve layout
+/// profile.
 fn default_shards_for_profile(profile: ServeLayoutProfile) -> usize {
     match profile {
         ServeLayoutProfile::Standard => DEFAULT_STANDARD_SHARDS,
@@ -349,6 +379,7 @@ fn default_shards_for_profile(profile: ServeLayoutProfile) -> usize {
     }
 }
 
+/// Resolves the effective candidate shard count for a serve invocation.
 fn serve_candidate_shard_count(args: &ServeCommonArgs) -> usize {
     args.shards
         .unwrap_or_else(|| default_shards_for_profile(args.layout_profile))
@@ -374,6 +405,7 @@ struct ClientConnectionArgs {
     max_message_bytes: usize,
 }
 
+/// Parses a `host:port` or `[ipv6]:port` address string into its components.
 fn parse_host_port(value: &str) -> Result<(String, u16)> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -402,10 +434,13 @@ fn parse_host_port(value: &str) -> Result<(String, u16)> {
     Ok((host.to_owned(), port))
 }
 
+/// Canonicalizes a file path for stable downstream identity or display use.
 fn resolved_file_path(path: &Path) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(SspryError::from)
 }
 
+/// Reads current and peak resident memory usage for the CLI process from
+/// `/proc/self/status`.
 fn current_process_memory_kb() -> (usize, usize) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let mut current_rss_kb = 0usize;
@@ -437,6 +472,8 @@ struct ProcessSmapsRollupKb {
     shared_clean_kb: u64,
 }
 
+/// Reads detailed memory accounting for the CLI process from
+/// `/proc/self/smaps_rollup`.
 fn current_process_smaps_rollup_kb() -> ProcessSmapsRollupKb {
     let text = fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
     let mut out = ProcessSmapsRollupKb::default();
@@ -476,6 +513,7 @@ fn current_process_smaps_rollup_kb() -> ProcessSmapsRollupKb {
     out
 }
 
+/// Returns the kernel-reported available system memory in bytes when present.
 fn available_memory_bytes() -> Option<u64> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
@@ -490,6 +528,7 @@ fn available_memory_bytes() -> Option<u64> {
     None
 }
 
+/// Caps the configured memory budget against currently available system memory.
 fn effective_memory_budget_bytes(configured_budget_bytes: u64) -> u64 {
     if configured_budget_bytes == 0 {
         return 0;
@@ -502,6 +541,8 @@ fn effective_memory_budget_bytes(configured_budget_bytes: u64) -> u64 {
     }
 }
 
+/// Chooses the bounded ingest queue capacity implied by the effective memory
+/// budget and worker count.
 fn index_queue_capacity(memory_budget_bytes: u64, workers: usize) -> usize {
     let workers = workers.max(1);
     let worker_floor = workers.saturating_mul(2).max(4);
@@ -514,6 +555,7 @@ fn index_queue_capacity(memory_budget_bytes: u64, workers: usize) -> usize {
 }
 
 #[cfg(test)]
+/// Builds a stable test identity from the canonical file path.
 fn path_identity_sha256(path: &Path) -> Result<[u8; 32]> {
     let canonical = resolved_file_path(path)?;
     let mut digest = Sha256::new();
@@ -523,6 +565,8 @@ fn path_identity_sha256(path: &Path) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Folds an alternate digest into the canonical 32-byte candidate identity
+/// namespace.
 pub(crate) fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"sspry-identity\0");
@@ -534,6 +578,7 @@ pub(crate) fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Streams a file through SHA-256 and returns the raw digest bytes.
 fn sha256_file(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
     if chunk_size == 0 {
         return Err(SspryError::from("chunk_size must be a positive integer."));
@@ -554,6 +599,7 @@ fn sha256_file(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Streams a file through MD5 and returns the raw digest bytes.
 fn md5_file(path: &Path, chunk_size: usize) -> Result<[u8; 16]> {
     if chunk_size == 0 {
         return Err(SspryError::from("chunk_size must be a positive integer."));
@@ -574,6 +620,7 @@ fn md5_file(path: &Path, chunk_size: usize) -> Result<[u8; 16]> {
     Ok(out)
 }
 
+/// Streams a file through SHA-1 and returns the raw digest bytes.
 fn sha1_file(path: &Path, chunk_size: usize) -> Result<[u8; 20]> {
     if chunk_size == 0 {
         return Err(SspryError::from("chunk_size must be a positive integer."));
@@ -594,6 +641,7 @@ fn sha1_file(path: &Path, chunk_size: usize) -> Result<[u8; 20]> {
     Ok(out)
 }
 
+/// Streams a file through SHA-512 and returns the raw digest bytes.
 fn sha512_file(path: &Path, chunk_size: usize) -> Result<[u8; 64]> {
     if chunk_size == 0 {
         return Err(SspryError::from("chunk_size must be a positive integer."));
@@ -614,6 +662,7 @@ fn sha512_file(path: &Path, chunk_size: usize) -> Result<[u8; 64]> {
     Ok(out)
 }
 
+/// Decodes a canonical 64-character SHA-256 hex string.
 fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -626,6 +675,7 @@ fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Decodes a fixed-width hexadecimal digest and validates its exact size.
 fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != N * 2 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -639,6 +689,8 @@ fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]>
     Ok(out)
 }
 
+/// Computes the normalized candidate identity for a file using the configured
+/// identity source.
 fn identity_from_file(
     path: &Path,
     chunk_size: usize,
@@ -661,6 +713,8 @@ fn identity_from_file(
     }
 }
 
+/// Decodes a textual digest into the normalized candidate identity for the
+/// configured identity source.
 fn identity_from_hex(value: &str, id_source: CandidateIdSource) -> Result<[u8; 32]> {
     match id_source {
         CandidateIdSource::Sha256 => decode_exact_hex::<32>(value, "sha256"),
@@ -680,6 +734,8 @@ fn identity_from_hex(value: &str, id_source: CandidateIdSource) -> Result<[u8; 3
 }
 
 #[cfg(test)]
+/// Resolves exactly one delete target from explicit digests or a file path into
+/// the canonical SHA-256 hex identity stored by the index.
 fn resolve_delete_identity(
     sha256: Option<&str>,
     md5: Option<&str>,
@@ -718,6 +774,7 @@ fn resolve_delete_identity(
     Ok(hex::encode(chosen.expect("chosen identity")))
 }
 
+/// Returns the direct children of a directory in stable sorted order.
 fn sorted_directory_children(path: &Path) -> Result<Vec<PathBuf>> {
     let mut children = fs::read_dir(path)?
         .map(|entry| entry.map(|value| value.path()).map_err(SspryError::from))
@@ -726,6 +783,8 @@ fn sorted_directory_children(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(children)
 }
 
+/// Walks a file or directory tree depth-first and invokes `visit` for each
+/// file encountered.
 fn visit_files_recursive(path: &Path, visit: &mut impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
     if path.is_file() {
         visit(path.to_path_buf())?;
@@ -741,6 +800,7 @@ fn visit_files_recursive(path: &Path, visit: &mut impl FnMut(PathBuf) -> Result<
 }
 
 #[cfg(test)]
+/// Collects every file reachable from `path` into `out` for test assertions.
 fn collect_files_recursive(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     visit_files_recursive(path, &mut |child| {
         out.push(child);
@@ -748,6 +808,7 @@ fn collect_files_recursive(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     })
 }
 
+/// Counts the number of files reachable from the provided path.
 fn count_files_recursive(path: &Path) -> Result<usize> {
     if path.is_file() {
         return Ok(1);
@@ -762,6 +823,8 @@ fn count_files_recursive(path: &Path) -> Result<usize> {
     Ok(total)
 }
 
+/// Expands CLI input roots, optionally interpreting them as newline-delimited
+/// path-list files and discarding missing entries.
 fn expand_input_paths(paths: &[String], path_list: bool) -> Result<Vec<PathBuf>> {
     let mut candidates = Vec::new();
     if path_list {
@@ -808,6 +871,7 @@ fn expand_input_paths(paths: &[String], path_list: bool) -> Result<Vec<PathBuf>>
     Ok(roots)
 }
 
+/// Counts the total number of input files represented by the provided roots.
 fn count_input_files(paths: &[PathBuf]) -> Result<usize> {
     let mut total = 0usize;
     for path in paths {
@@ -816,10 +880,14 @@ fn count_input_files(paths: &[PathBuf]) -> Result<usize> {
     Ok(total)
 }
 
+/// Returns whether the provided inputs are already a flat list of files with no
+/// directory traversal required.
 fn input_paths_are_file_only(paths: &[PathBuf]) -> bool {
     !paths.is_empty() && paths.iter().all(|path| path.is_file())
 }
 
+/// Streams the selected input files, honoring the pre-expanded `path_list`
+/// behavior when paths already identify individual files.
 fn stream_selected_input_files(
     paths: &[PathBuf],
     path_list: bool,
@@ -835,6 +903,7 @@ fn stream_selected_input_files(
     }
 }
 
+/// Recursively streams every file rooted at the provided input paths.
 fn stream_input_files(
     paths: &[PathBuf],
     mut visit: impl FnMut(PathBuf) -> Result<()>,
@@ -845,6 +914,8 @@ fn stream_input_files(
     Ok(())
 }
 
+/// Emits periodic ingest progress updates based on processed-count and elapsed
+/// time thresholds.
 fn maybe_report_index_progress(
     enabled: bool,
     processed: usize,
@@ -868,10 +939,12 @@ fn maybe_report_index_progress(
     *last_report_at = now;
 }
 
+/// Creates a gRPC client using the connection's configured timeout.
 fn grpc_client(connection: &ClientConnectionArgs) -> Result<BlockingGrpcClient> {
     grpc_client_with_timeout(connection, connection.timeout)
 }
 
+/// Creates a gRPC client using an explicit timeout override.
 fn grpc_client_with_timeout(
     connection: &ClientConnectionArgs,
     timeout_secs: f64,
@@ -883,6 +956,8 @@ fn grpc_client_with_timeout(
     )
 }
 
+/// Creates a gRPC client for search workloads, ensuring the longer search
+/// timeout floor is respected.
 fn search_grpc_client(connection: &ClientConnectionArgs) -> Result<BlockingGrpcClient> {
     grpc_client_with_timeout(
         connection,
@@ -896,6 +971,7 @@ struct ScannedIndexBatchRow {
 }
 
 #[cfg(test)]
+/// Reads a `usize` value from a JSON stats map with a test default fallback.
 fn json_usize(
     stats: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -909,6 +985,7 @@ fn json_usize(
 }
 
 #[cfg(test)]
+/// Reads an optional `f64` from a JSON stats map for test assertions.
 fn json_f64_opt(stats: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
     stats.get(key).and_then(|value| value.as_f64())
 }
@@ -972,12 +1049,15 @@ struct RuleCheckOutput {
     rules: Vec<crate::candidate::RuleCheckRuleReport>,
 }
 
+/// Loads the current remote scan policy by querying server stats over gRPC.
 fn server_scan_policy(connection: &ClientConnectionArgs) -> Result<ServerScanPolicy> {
     let mut client = grpc_client(connection)?;
     let stats = client.stats()?;
     server_scan_policy_from_grpc_stats(&stats)
 }
 
+/// Extracts the scan policy fields used by the CLI from a raw gRPC stats
+/// response.
 fn server_scan_policy_from_grpc_stats(stats: &grpc::v1::StatsResponse) -> Result<ServerScanPolicy> {
     let store = stats
         .stats
@@ -998,562 +1078,16 @@ fn server_scan_policy_from_grpc_stats(stats: &grpc::v1::StatsResponse) -> Result
     })
 }
 
-fn grpc_store_summary_json_map(
-    store: &grpc::v1::StoreSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "active_doc_count".to_owned(),
-        serde_json::json!(store.active_doc_count),
-    );
-    map.insert(
-        "candidate_shards".to_owned(),
-        serde_json::json!(store.candidate_shards),
-    );
-    map.insert("id_source".to_owned(), serde_json::json!(store.id_source));
-    map.insert("store_path".to_owned(), serde_json::json!(store.store_path));
-    map.insert(
-        "deleted_doc_count".to_owned(),
-        serde_json::json!(store.deleted_doc_count),
-    );
-    map.insert(
-        "disk_usage_bytes".to_owned(),
-        serde_json::json!(store.disk_usage_bytes),
-    );
-    map.insert("doc_count".to_owned(), serde_json::json!(store.doc_count));
-    map.insert(
-        "compaction_generation".to_owned(),
-        serde_json::json!(store.compaction_generation),
-    );
-    map.insert(
-        "tier1_filter_target_fp".to_owned(),
-        serde_json::json!(store.tier1_filter_target_fp),
-    );
-    map.insert(
-        "tier2_filter_target_fp".to_owned(),
-        serde_json::json!(store.tier2_filter_target_fp),
-    );
-    map.insert(
-        "tier2_gram_size".to_owned(),
-        serde_json::json!(store.tier2_gram_size),
-    );
-    map.insert(
-        "tier1_gram_size".to_owned(),
-        serde_json::json!(store.tier1_gram_size),
-    );
-    map.insert(
-        "query_count".to_owned(),
-        serde_json::json!(store.query_count),
-    );
-    map.insert(
-        "retired_generation_count".to_owned(),
-        serde_json::json!(store.retired_generation_count),
-    );
-    map.insert(
-        "tier2_docs_matched_total".to_owned(),
-        serde_json::json!(store.tier2_docs_matched_total),
-    );
-    map.insert(
-        "tier2_match_ratio".to_owned(),
-        serde_json::json!(store.tier2_match_ratio),
-    );
-    map.insert(
-        "tier2_scanned_docs_total".to_owned(),
-        serde_json::json!(store.tier2_scanned_docs_total),
-    );
-    map.insert("version".to_owned(), serde_json::json!(store.version));
-    map.insert(
-        "deleted_storage_bytes".to_owned(),
-        serde_json::json!(store.deleted_storage_bytes),
-    );
-    map
-}
+// gRPC status and telemetry JSON shaping lives in a sibling file so the CLI
+// command handlers stay easier to scan.
+include!("app/status.rs");
 
-fn grpc_adaptive_publish_json_map(
-    adaptive: &grpc::v1::AdaptivePublishSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "storage_class".to_owned(),
-        serde_json::json!(adaptive.storage_class),
-    );
-    map.insert(
-        "current_idle_ms".to_owned(),
-        serde_json::json!(adaptive.current_idle_ms),
-    );
-    map.insert("mode".to_owned(), serde_json::json!(adaptive.mode));
-    map.insert("reason".to_owned(), serde_json::json!(adaptive.reason));
-    map.insert(
-        "recent_publish_p95_ms".to_owned(),
-        serde_json::json!(adaptive.recent_publish_p95_ms),
-    );
-    map.insert(
-        "recent_submit_p95_ms".to_owned(),
-        serde_json::json!(adaptive.recent_submit_p95_ms),
-    );
-    map.insert(
-        "recent_store_p95_ms".to_owned(),
-        serde_json::json!(adaptive.recent_store_p95_ms),
-    );
-    map.insert(
-        "recent_publishes_in_window".to_owned(),
-        serde_json::json!(adaptive.recent_publishes_in_window),
-    );
-    map.insert(
-        "tier2_pending_shards".to_owned(),
-        serde_json::json!(adaptive.tier2_pending_shards),
-    );
-    map.insert(
-        "healthy_cycles".to_owned(),
-        serde_json::json!(adaptive.healthy_cycles),
-    );
-    map
-}
-
-fn grpc_insert_batch_profile_json_map(
-    profile: &grpc::v1::InsertBatchProfileSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("batches".to_owned(), serde_json::json!(profile.batches));
-    map.insert("documents".to_owned(), serde_json::json!(profile.documents));
-    map.insert(
-        "shards_touched_total".to_owned(),
-        serde_json::json!(profile.shards_touched_total),
-    );
-    map.insert("total_us".to_owned(), serde_json::json!(profile.total_us));
-    map.insert("parse_us".to_owned(), serde_json::json!(profile.parse_us));
-    map.insert("group_us".to_owned(), serde_json::json!(profile.group_us));
-    map.insert("build_us".to_owned(), serde_json::json!(profile.build_us));
-    map.insert("store_us".to_owned(), serde_json::json!(profile.store_us));
-    map.insert(
-        "finalize_us".to_owned(),
-        serde_json::json!(profile.finalize_us),
-    );
-    map.insert(
-        "store_resolve_doc_state_us".to_owned(),
-        serde_json::json!(profile.store_resolve_doc_state_us),
-    );
-    map.insert(
-        "store_append_sidecars_us".to_owned(),
-        serde_json::json!(profile.store_append_sidecars_us),
-    );
-    map.insert(
-        "store_append_sidecar_payloads_us".to_owned(),
-        serde_json::json!(profile.store_append_sidecar_payloads_us),
-    );
-    map.insert(
-        "store_append_bloom_payload_assemble_us".to_owned(),
-        serde_json::json!(profile.store_append_bloom_payload_assemble_us),
-    );
-    map.insert(
-        "store_append_bloom_payload_us".to_owned(),
-        serde_json::json!(profile.store_append_bloom_payload_us),
-    );
-    map.insert(
-        "store_append_metadata_payload_us".to_owned(),
-        serde_json::json!(profile.store_append_metadata_payload_us),
-    );
-    map.insert(
-        "store_append_external_id_payload_us".to_owned(),
-        serde_json::json!(profile.store_append_external_id_payload_us),
-    );
-    map.insert(
-        "store_append_tier2_bloom_payload_us".to_owned(),
-        serde_json::json!(profile.store_append_tier2_bloom_payload_us),
-    );
-    map.insert(
-        "store_append_doc_row_build_us".to_owned(),
-        serde_json::json!(profile.store_append_doc_row_build_us),
-    );
-    map.insert(
-        "store_append_bloom_payload_bytes".to_owned(),
-        serde_json::json!(profile.store_append_bloom_payload_bytes),
-    );
-    map.insert(
-        "store_append_metadata_payload_bytes".to_owned(),
-        serde_json::json!(profile.store_append_metadata_payload_bytes),
-    );
-    map.insert(
-        "store_append_external_id_payload_bytes".to_owned(),
-        serde_json::json!(profile.store_append_external_id_payload_bytes),
-    );
-    map.insert(
-        "store_append_tier2_bloom_payload_bytes".to_owned(),
-        serde_json::json!(profile.store_append_tier2_bloom_payload_bytes),
-    );
-    map.insert(
-        "store_append_doc_records_us".to_owned(),
-        serde_json::json!(profile.store_append_doc_records_us),
-    );
-    map.insert(
-        "store_write_existing_us".to_owned(),
-        serde_json::json!(profile.store_write_existing_us),
-    );
-    map.insert(
-        "store_install_docs_us".to_owned(),
-        serde_json::json!(profile.store_install_docs_us),
-    );
-    map.insert(
-        "store_tier2_update_us".to_owned(),
-        serde_json::json!(profile.store_tier2_update_us),
-    );
-    map.insert(
-        "store_persist_meta_us".to_owned(),
-        serde_json::json!(profile.store_persist_meta_us),
-    );
-    map.insert(
-        "store_rebalance_tier2_us".to_owned(),
-        serde_json::json!(profile.store_rebalance_tier2_us),
-    );
-    map
-}
-
-fn grpc_index_session_json_map(
-    session: &grpc::v1::IndexSessionSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("active".to_owned(), serde_json::json!(session.active));
-    map.insert(
-        "client_active".to_owned(),
-        serde_json::json!(session.client_active),
-    );
-    map.insert(
-        "total_documents".to_owned(),
-        serde_json::json!(session.total_documents),
-    );
-    map.insert(
-        "submitted_documents".to_owned(),
-        serde_json::json!(session.submitted_documents),
-    );
-    map.insert(
-        "processed_documents".to_owned(),
-        serde_json::json!(session.processed_documents),
-    );
-    map.insert(
-        "remaining_documents".to_owned(),
-        serde_json::json!(session.remaining_documents),
-    );
-    map.insert(
-        "progress_percent".to_owned(),
-        serde_json::json!(session.progress_percent),
-    );
-    map.insert(
-        "started_unix_ms".to_owned(),
-        serde_json::json!(session.started_unix_ms),
-    );
-    map.insert(
-        "last_update_unix_ms".to_owned(),
-        serde_json::json!(session.last_update_unix_ms),
-    );
-    if let Some(profile) = &session.server_insert_batch_profile {
-        map.insert(
-            "server_insert_batch_profile".to_owned(),
-            serde_json::Value::Object(grpc_insert_batch_profile_json_map(profile)),
-        );
-    }
-    map
-}
-
-fn grpc_startup_store_json_map(
-    startup: &grpc::v1::StartupStoreSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("total_ms".to_owned(), serde_json::json!(startup.total_ms));
-    map.insert(
-        "opened_existing_shards".to_owned(),
-        serde_json::json!(startup.opened_existing_shards),
-    );
-    map.insert(
-        "initialized_new_shards".to_owned(),
-        serde_json::json!(startup.initialized_new_shards),
-    );
-    map.insert("doc_count".to_owned(), serde_json::json!(startup.doc_count));
-    map
-}
-
-fn grpc_startup_json_map(
-    startup: &grpc::v1::StartupSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("total_ms".to_owned(), serde_json::json!(startup.total_ms));
-    map.insert(
-        "startup_cleanup_removed_roots".to_owned(),
-        serde_json::json!(startup.startup_cleanup_removed_roots),
-    );
-    if let Some(current) = &startup.current {
-        map.insert(
-            "current".to_owned(),
-            serde_json::Value::Object(grpc_startup_store_json_map(current)),
-        );
-    }
-    if let Some(work) = &startup.work {
-        map.insert(
-            "work".to_owned(),
-            serde_json::Value::Object(grpc_startup_store_json_map(work)),
-        );
-    }
-    map
-}
-
-fn grpc_publish_json_map(
-    publish: &grpc::v1::PublishSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("pending".to_owned(), serde_json::json!(publish.pending));
-    map.insert("eligible".to_owned(), serde_json::json!(publish.eligible));
-    map.insert(
-        "blocked_reason".to_owned(),
-        serde_json::json!(publish.blocked_reason),
-    );
-    map.insert(
-        "trigger_mode".to_owned(),
-        serde_json::json!(publish.trigger_mode),
-    );
-    map.insert(
-        "trigger_reason".to_owned(),
-        serde_json::json!(publish.trigger_reason),
-    );
-    map.insert(
-        "idle_elapsed_ms".to_owned(),
-        serde_json::json!(publish.idle_elapsed_ms),
-    );
-    map.insert(
-        "idle_remaining_ms".to_owned(),
-        serde_json::json!(publish.idle_remaining_ms),
-    );
-    map.insert(
-        "adaptive_idle_ms".to_owned(),
-        serde_json::json!(publish.adaptive_idle_ms),
-    );
-    map.insert(
-        "work_buffer_estimated_documents".to_owned(),
-        serde_json::json!(publish.work_buffer_estimated_documents),
-    );
-    map.insert(
-        "work_buffer_estimated_input_bytes".to_owned(),
-        serde_json::json!(publish.work_buffer_estimated_input_bytes),
-    );
-    map.insert(
-        "work_buffer_document_threshold".to_owned(),
-        serde_json::json!(publish.work_buffer_document_threshold),
-    );
-    map.insert(
-        "work_buffer_input_bytes_threshold".to_owned(),
-        serde_json::json!(publish.work_buffer_input_bytes_threshold),
-    );
-    map.insert(
-        "work_buffer_rss_threshold_bytes".to_owned(),
-        serde_json::json!(publish.work_buffer_rss_threshold_bytes),
-    );
-    map.insert(
-        "current_rss_bytes".to_owned(),
-        serde_json::json!(publish.current_rss_bytes),
-    );
-    map.insert(
-        "pending_tier2_snapshot_shards".to_owned(),
-        serde_json::json!(publish.pending_tier2_snapshot_shards),
-    );
-    map.insert(
-        "index_backpressure_delay_ms".to_owned(),
-        serde_json::json!(publish.index_backpressure_delay_ms),
-    );
-    map.insert(
-        "index_backpressure_events_total".to_owned(),
-        serde_json::json!(publish.index_backpressure_events_total),
-    );
-    map.insert(
-        "index_backpressure_sleep_ms_total".to_owned(),
-        serde_json::json!(publish.index_backpressure_sleep_ms_total),
-    );
-    map.insert(
-        "last_publish_started_unix_ms".to_owned(),
-        serde_json::json!(publish.last_publish_started_unix_ms),
-    );
-    map.insert(
-        "last_publish_completed_unix_ms".to_owned(),
-        serde_json::json!(publish.last_publish_completed_unix_ms),
-    );
-    map.insert(
-        "last_publish_duration_ms".to_owned(),
-        serde_json::json!(publish.last_publish_duration_ms),
-    );
-    map.insert(
-        "last_publish_lock_wait_ms".to_owned(),
-        serde_json::json!(publish.last_publish_lock_wait_ms),
-    );
-    map.insert(
-        "last_publish_promote_work_ms".to_owned(),
-        serde_json::json!(publish.last_publish_promote_work_ms),
-    );
-    map.insert(
-        "last_publish_init_work_ms".to_owned(),
-        serde_json::json!(publish.last_publish_init_work_ms),
-    );
-    map.insert(
-        "last_publish_persisted_snapshot_shards".to_owned(),
-        serde_json::json!(publish.last_publish_persisted_snapshot_shards),
-    );
-    map.insert(
-        "last_publish_reused_work_stores".to_owned(),
-        serde_json::json!(publish.last_publish_reused_work_stores),
-    );
-    map.insert(
-        "publish_runs_total".to_owned(),
-        serde_json::json!(publish.publish_runs_total),
-    );
-    map
-}
-
-fn grpc_published_tier2_snapshot_seal_json_map(
-    seal: &grpc::v1::PublishedTier2SnapshotSealSummary,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "pending_shards".to_owned(),
-        serde_json::json!(seal.pending_shards),
-    );
-    map.insert(
-        "in_progress".to_owned(),
-        serde_json::json!(seal.in_progress),
-    );
-    map.insert("runs_total".to_owned(), serde_json::json!(seal.runs_total));
-    map.insert(
-        "last_duration_ms".to_owned(),
-        serde_json::json!(seal.last_duration_ms),
-    );
-    map.insert(
-        "last_persisted_shards".to_owned(),
-        serde_json::json!(seal.last_persisted_shards),
-    );
-    map.insert(
-        "last_failures".to_owned(),
-        serde_json::json!(seal.last_failures),
-    );
-    map.insert(
-        "last_completed_unix_ms".to_owned(),
-        serde_json::json!(seal.last_completed_unix_ms),
-    );
-    map
-}
-
-fn grpc_status_output_json(
-    status: &grpc::v1::StatusResponse,
-    include_store_details: bool,
-) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    map.insert("draining".to_owned(), serde_json::json!(status.draining));
-    map.insert(
-        "active_connections".to_owned(),
-        serde_json::json!(status.active_connections),
-    );
-    map.insert(
-        "active_mutations".to_owned(),
-        serde_json::json!(status.active_mutations),
-    );
-    map.insert(
-        "publish_requested".to_owned(),
-        serde_json::json!(status.publish_requested),
-    );
-    map.insert(
-        "mutations_paused".to_owned(),
-        serde_json::json!(status.mutations_paused),
-    );
-    map.insert(
-        "publish_in_progress".to_owned(),
-        serde_json::json!(status.publish_in_progress),
-    );
-    map.insert(
-        "active_index_clients".to_owned(),
-        serde_json::json!(status.active_index_clients),
-    );
-    map.insert(
-        "active_index_sessions".to_owned(),
-        serde_json::json!(status.active_index_sessions),
-    );
-    map.insert(
-        "search_workers".to_owned(),
-        serde_json::json!(status.search_workers),
-    );
-    map.insert(
-        "memory_budget_bytes".to_owned(),
-        serde_json::json!(status.memory_budget_bytes),
-    );
-    map.insert(
-        "current_rss_kb".to_owned(),
-        serde_json::json!(status.current_rss_kb),
-    );
-    map.insert(
-        "peak_rss_kb".to_owned(),
-        serde_json::json!(status.peak_rss_kb),
-    );
-    map.insert(
-        "workspace_mode".to_owned(),
-        serde_json::json!(status.workspace_mode),
-    );
-    if !status.published_root.is_empty() {
-        map.insert(
-            "published_root".to_owned(),
-            serde_json::json!(status.published_root),
-        );
-    }
-    if !status.work_root.is_empty() {
-        map.insert("work_root".to_owned(), serde_json::json!(status.work_root));
-    }
-    if let Some(adaptive) = &status.adaptive_publish {
-        map.insert(
-            "adaptive_publish".to_owned(),
-            serde_json::Value::Object(grpc_adaptive_publish_json_map(adaptive)),
-        );
-    }
-    if let Some(session) = &status.index_session {
-        map.insert(
-            "index_session".to_owned(),
-            serde_json::Value::Object(grpc_index_session_json_map(session)),
-        );
-    }
-    if let Some(startup) = &status.startup {
-        map.insert(
-            "startup".to_owned(),
-            serde_json::Value::Object(grpc_startup_json_map(startup)),
-        );
-    }
-    if let Some(publish) = &status.publish {
-        map.insert("work_dirty".to_owned(), serde_json::json!(publish.pending));
-        map.insert(
-            "publish".to_owned(),
-            serde_json::Value::Object(grpc_publish_json_map(publish)),
-        );
-    }
-    if let Some(seal) = &status.published_tier2_snapshot_seal {
-        map.insert(
-            "published_tier2_snapshot_seal".to_owned(),
-            serde_json::Value::Object(grpc_published_tier2_snapshot_seal_json_map(seal)),
-        );
-    }
-    if include_store_details {
-        if status.has_published {
-            if let Some(published) = &status.published {
-                for (key, value) in grpc_store_summary_json_map(published) {
-                    map.insert(key, value);
-                }
-            }
-        }
-        if status.has_work {
-            if let Some(work) = &status.work {
-                map.insert(
-                    "work".to_owned(),
-                    serde_json::Value::Object(grpc_store_summary_json_map(work)),
-                );
-            }
-        }
-    }
-    serde_json::Value::Object(map)
-}
-
+/// Returns just the configured identity source from the remote server.
 fn server_identity_source(connection: &ClientConnectionArgs) -> Result<CandidateIdSource> {
     Ok(server_scan_policy(connection)?.id_source)
 }
 
+/// Infers which digest algorithm produced a hex string from its length.
 fn detect_digest_identity_source(value: &str) -> Option<CandidateIdSource> {
     let text = value.trim();
     if !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -1568,6 +1102,8 @@ fn detect_digest_identity_source(value: &str) -> Option<CandidateIdSource> {
     }
 }
 
+/// Resolves a delete CLI value into the canonical candidate identity expected
+/// by the server.
 fn resolve_delete_value(
     value: &str,
     server_id_source: CandidateIdSource,
@@ -1599,6 +1135,8 @@ fn resolve_delete_value(
     Ok(hex::encode(identity_from_hex(value, detected)?))
 }
 
+/// Serializes one scanned index row into the binary insert format used by the
+/// RPC path.
 fn serialize_candidate_document_binary_row(row: &IndexBatchRow) -> Result<Vec<u8>> {
     rpc::serialize_candidate_insert_binary_row_parts(
         &row.sha256,
@@ -1630,6 +1168,8 @@ struct RemotePendingBatch {
 }
 
 trait RemoteBinaryInsertClient {
+    /// Sends a batch of pre-serialized insert rows and returns how many the
+    /// remote endpoint accepted.
     fn candidate_insert_binary_rows(&mut self, rows: Vec<Vec<u8>>) -> Result<usize>;
 }
 
@@ -1658,6 +1198,8 @@ struct RemoteUploadQueue {
 }
 
 impl RemoteUploadQueue {
+    /// Creates a bounded in-memory queue used to decouple scanning/encoding
+    /// from remote upload.
     fn new(byte_limit: usize) -> Self {
         Self {
             state: Mutex::new(RemoteUploadQueueState {
@@ -1671,6 +1213,8 @@ impl RemoteUploadQueue {
         }
     }
 
+    /// Enqueues one serialized row, blocking when the queue would exceed its
+    /// byte budget.
     fn push(&self, row: RemoteUploadRow) -> Result<()> {
         let row_bytes = row.row_bytes.len();
         if row_bytes > self.byte_limit && self.byte_limit > 0 {
@@ -1702,6 +1246,8 @@ impl RemoteUploadQueue {
         Ok(())
     }
 
+    /// Pops the next queued row, blocking until data arrives or the queue is
+    /// closed.
     fn pop(&self) -> Result<Option<RemoteUploadRow>> {
         let mut state = self
             .state
@@ -1723,6 +1269,7 @@ impl RemoteUploadQueue {
         }
     }
 
+    /// Closes the queue and wakes all waiting producers and consumers.
     fn close(&self) -> Result<()> {
         let mut state = self
             .state
@@ -1761,6 +1308,7 @@ fn remote_index_session_input_bytes_limit(effective_budget_bytes: u64) -> u64 {
     )
 }
 
+/// Chooses the maximum upload-queue byte budget for remote indexing.
 fn remote_upload_queue_byte_limit(
     effective_budget_bytes: u64,
     remote_batch_soft_limit_bytes: usize,
@@ -1774,14 +1322,18 @@ fn remote_upload_queue_byte_limit(
     derived.clamp(minimum, REMOTE_UPLOAD_QUEUE_MAX_BYTES)
 }
 
+/// Returns the serialized payload size of an empty remote insert batch.
 fn empty_remote_batch_payload_size() -> Result<usize> {
     Ok(rpc::serialized_candidate_insert_binary_batch_payload(&[]).len())
 }
 
+/// Clamps the effective gRPC remote batch row count.
 fn grpc_remote_batch_size(batch_size: usize) -> usize {
     batch_size.max(1).min(GRPC_REMOTE_BATCH_MAX_ROWS)
 }
 
+/// Clamps the effective remote batch payload limit to both the configured limit
+/// and the gRPC transport ceiling.
 fn grpc_remote_batch_soft_limit_bytes(
     configured_limit_bytes: usize,
     empty_payload_size: usize,
@@ -1791,6 +1343,8 @@ fn grpc_remote_batch_soft_limit_bytes(
         .min(GRPC_REMOTE_BATCH_SOFT_LIMIT_BYTES.max(empty_payload_size.saturating_add(1)))
 }
 
+/// Determines whether a pending remote batch must be flushed before a new row
+/// can be added.
 fn prepare_serialized_remote_batch_row(
     pending: &RemotePendingBatch,
     row_payload_size: usize,
@@ -1816,6 +1370,7 @@ fn prepare_serialized_remote_batch_row(
             > remote_batch_soft_limit_bytes)
 }
 
+/// Submits the current pending remote batch and resets the accumulation state.
 fn flush_remote_batch<C: RemoteBinaryInsertClient>(
     client: &mut C,
     pending: &mut RemotePendingBatch,
@@ -1845,6 +1400,8 @@ fn flush_remote_batch<C: RemoteBinaryInsertClient>(
     Ok(())
 }
 
+/// Adds one serialized row to the remote upload pipeline, flushing before or
+/// after the push when size or row-count limits require it.
 fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
     client: &mut C,
     pending: &mut RemotePendingBatch,
@@ -1910,6 +1467,8 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
     Ok(buffer_time)
 }
 
+/// Pushes one serialized row into the current remote batch and reports whether
+/// the caller should flush immediately afterward.
 fn push_serialized_remote_batch_row(
     pending: &mut RemotePendingBatch,
     row_bytes: Vec<u8>,
@@ -1938,6 +1497,8 @@ fn push_serialized_remote_batch_row(
     Ok(pending.rows.len() >= batch_size)
 }
 
+/// Flushes a local pending batch into the correct shard stores and updates
+/// progress accounting.
 fn flush_local_pending_rows(
     stores: &mut [CandidateStore],
     pending: &mut Vec<IndexBatchRow>,
@@ -1980,6 +1541,8 @@ fn flush_local_pending_rows(
     Ok(())
 }
 
+/// Flushes a pending remote batch, updates progress, and accumulates submit
+/// timing.
 fn flush_remote_pending_rows<C: RemoteBinaryInsertClient>(
     client: &mut C,
     pending: &mut RemotePendingBatch,
@@ -2007,6 +1570,8 @@ fn flush_remote_pending_rows<C: RemoteBinaryInsertClient>(
 }
 
 #[cfg(test)]
+/// Returns whether an RPC error represents a transient publish or session
+/// rotation conflict.
 fn is_retryable_remote_index_rotation_error(err: &SspryError) -> bool {
     let text = err.to_string();
     (text.contains("server is publishing") && text.contains("retry later"))
@@ -2015,6 +1580,8 @@ fn is_retryable_remote_index_rotation_error(err: &SspryError) -> bool {
         || text.contains("no active index session; cannot update progress")
 }
 
+/// Builds a `CandidateConfig` from the resolved CLI/runtime configuration
+/// pieces.
 fn store_config_from_parts(
     root: PathBuf,
     id_source: CandidateIdSource,
@@ -2043,6 +1610,8 @@ fn store_config_from_parts(
     }
 }
 
+/// Resolves effective tier-1 and tier-2 false-positive targets, applying
+/// defaults when the caller left them unset.
 fn resolve_filter_target_fps(
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
@@ -2053,6 +1622,8 @@ fn resolve_filter_target_fps(
     )
 }
 
+/// Converts serve arguments into the candidate-store configuration used at
+/// startup.
 fn store_config_from_serve_args(args: &ServeCommonArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible serve args");
@@ -2070,6 +1641,8 @@ fn store_config_from_serve_args(args: &ServeCommonArgs) -> CandidateConfig {
     )
 }
 
+/// Converts init arguments into the candidate-store configuration used for
+/// local initialization.
 fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible init args");
@@ -2087,6 +1660,8 @@ fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
     )
 }
 
+/// Returns whether a root already contains any files that identify it as an
+/// initialized store or shard tree.
 fn store_root_has_markers(root: &Path) -> bool {
     root.join("store_meta.json").exists()
         || root.join("meta.json").exists()
@@ -2098,6 +1673,8 @@ fn store_root_has_markers(root: &Path) -> bool {
         || root.join("shard_000").join("doc_meta.bin").exists()
 }
 
+/// Returns a placeholder connection used by local-only command wrappers that do
+/// not actually talk to a remote server.
 fn placeholder_connection() -> ClientConnectionArgs {
     ClientConnectionArgs {
         addr: DEFAULT_RPC_ADDR.to_owned(),
@@ -2106,6 +1683,8 @@ fn placeholder_connection() -> ClientConnectionArgs {
     }
 }
 
+/// Opens an existing store or initializes a new one when `force` or missing
+/// metadata requires it.
 fn ensure_store(config: CandidateConfig, force: bool) -> Result<CandidateStore> {
     let local_meta_path = config.root.join("store_meta.json");
     let legacy_meta_path = config.root.join("meta.json");
@@ -2115,10 +1694,13 @@ fn ensure_store(config: CandidateConfig, force: bool) -> Result<CandidateStore> 
     CandidateStore::open(config.root)
 }
 
+/// Reads the configured shard count for a store root, defaulting to one when
+/// no manifest exists yet.
 fn candidate_shard_count(root: &Path) -> Result<usize> {
     Ok(read_candidate_shard_count(root)?.unwrap_or(1).max(1))
 }
 
+/// Returns the concrete store roots for every shard under the requested root.
 fn store_roots(root: &Path) -> Result<Vec<PathBuf>> {
     let shard_count = candidate_shard_count(root)?;
     Ok((0..shard_count)
@@ -2126,6 +1708,7 @@ fn store_roots(root: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Opens every store shard under the requested root.
 fn open_stores(root: &Path) -> Result<Vec<CandidateStore>> {
     store_roots(root)?
         .into_iter()
@@ -2139,6 +1722,8 @@ struct LocalInitOutcome {
     stats: crate::candidate::CandidateStats,
 }
 
+/// Ensures the local root is initialized with the requested shard layout and
+/// returns the resulting shard count and initial stats.
 fn ensure_local_root_initialized(args: &InitArgs) -> Result<LocalInitOutcome> {
     let root = Path::new(&args.root);
     let shard_count = args.candidate_shards.max(1);
@@ -2196,6 +1781,7 @@ fn ensure_local_root_initialized(args: &InitArgs) -> Result<LocalInitOutcome> {
     })
 }
 
+/// Merges per-store tier labels into a single user-facing summary string.
 fn merge_tier_used<I>(values: I) -> String
 where
     I: IntoIterator<Item = String>,
@@ -2338,6 +1924,8 @@ struct BatchSearchRecordStream {
 }
 
 impl BatchSearchRecordStream {
+    /// Opens the JSON and JSONL outputs used by `search-batch`, writing JSON
+    /// records atomically via a temporary file.
     fn new(json_out: &Path) -> Result<Self> {
         if let Some(parent) = json_out.parent() {
             fs::create_dir_all(parent)?;
@@ -2358,6 +1946,7 @@ impl BatchSearchRecordStream {
         })
     }
 
+    /// Appends one completed batch-search record to both JSON outputs.
     fn push(&mut self, record: &BatchSearchRecord) -> Result<()> {
         if !self.first_record {
             self.json_writer.write_all(b",\n")?;
@@ -2375,6 +1964,8 @@ impl BatchSearchRecordStream {
         Ok(())
     }
 
+    /// Finalizes the JSON array output and atomically promotes the partial file
+    /// into place.
     fn finish(mut self) -> Result<usize> {
         self.json_writer.write_all(b"]\n")?;
         self.json_writer.flush()?;
@@ -2385,11 +1976,15 @@ impl BatchSearchRecordStream {
         Ok(self.count)
     }
 
+    /// Returns the sidecar JSONL path used for incremental batch-search
+    /// consumption.
     fn jsonl_out(&self) -> &Path {
         &self.jsonl_out
     }
 }
 
+/// Appends a suffix to the final path component while preserving the parent
+/// directory.
 fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     let file_name = path
         .file_name()
@@ -2398,6 +1993,8 @@ fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{file_name}{suffix}"))
 }
 
+/// Returns the searchable tree roots within a forest or falls back to the
+/// provided root for single-tree layouts.
 fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
     let direct_current = root.join("current");
     if direct_current.is_dir() {
@@ -2428,6 +2025,8 @@ fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// Opens each searchable tree in a forest as one grouped set of candidate
+/// stores.
 fn open_forest_tree_groups(root: &Path) -> Result<Vec<TreeStoreGroup>> {
     forest_tree_roots(root)?
         .into_iter()
@@ -2439,6 +2038,8 @@ fn open_forest_tree_groups(root: &Path) -> Result<Vec<TreeStoreGroup>> {
         .collect()
 }
 
+/// Verifies that every tree in the forest agrees on gram sizes and identity
+/// source before a shared search runs.
 fn validate_forest_search_policy(
     tree_groups: &[TreeStoreGroup],
 ) -> Result<(GramSizes, Option<String>, usize)> {
@@ -2472,136 +2073,12 @@ fn validate_forest_search_policy(
     Ok((gram_sizes.unwrap_or(GramSizes::new(3, 4)?), id_source, 0))
 }
 
-fn rule_check_policy_from_root(root: &Path) -> Result<RuleCheckPolicy> {
-    let tree_groups = open_forest_tree_groups(root)?;
-    let (gram_sizes, active_identity_source, _summary_cap_bytes) =
-        validate_forest_search_policy(&tree_groups)?;
-    let id_source =
-        CandidateIdSource::parse_config_value(active_identity_source.as_deref().ok_or_else(
-            || SspryError::from("candidate stores do not expose an identity source"),
-        )?)?;
-    Ok(RuleCheckPolicy {
-        source: RuleCheckPolicySource::LocalRoot,
-        id_source,
-        gram_sizes,
-    })
-}
+// Rule-check policy resolution and human-readable formatting live in a sibling
+// file so search/indexing code is easier to navigate.
+include!("app/rule_check.rs");
 
-fn rule_check_policy(args: &RuleCheckArgs) -> Result<RuleCheckPolicy> {
-    if let Some(root) = &args.root {
-        return rule_check_policy_from_root(Path::new(root));
-    }
-    if let Some(addr) = &args.addr {
-        let server_policy = server_scan_policy(&ClientConnectionArgs {
-            addr: addr.clone(),
-            timeout: args.timeout,
-            max_message_bytes: args.max_message_bytes,
-        })?;
-        return Ok(RuleCheckPolicy {
-            source: RuleCheckPolicySource::Server,
-            id_source: server_policy.id_source,
-            gram_sizes: server_policy.gram_sizes,
-        });
-    }
-    let source = if args.id_source.is_some() || args.gram_sizes.is_some() {
-        RuleCheckPolicySource::Explicit
-    } else {
-        RuleCheckPolicySource::Defaults
-    };
-    Ok(RuleCheckPolicy {
-        source,
-        id_source: args.id_source.unwrap_or(CandidateIdSource::Sha256),
-        gram_sizes: GramSizes::parse(args.gram_sizes.as_deref().unwrap_or("3,4"))?,
-    })
-}
-
-fn rule_check_output(
-    policy: RuleCheckPolicy,
-    report: crate::candidate::RuleCheckFileReport,
-) -> RuleCheckOutput {
-    RuleCheckOutput {
-        status: report.status,
-        policy: RuleCheckPolicyOutput {
-            source: policy.source.as_str().to_owned(),
-            id_source: policy.id_source.as_str().to_owned(),
-            gram_sizes: format!("{},{}", policy.gram_sizes.tier1, policy.gram_sizes.tier2),
-        },
-        issues: report.issues,
-        verifier_only_kinds: report.verifier_only_kinds,
-        ignored_module_calls: report.ignored_module_calls,
-        rules: report.rules,
-    }
-}
-
-fn print_rule_check_issues(issues: &[crate::candidate::RuleCheckIssue]) {
-    for issue in issues {
-        match (&issue.rule, issue.line, issue.column) {
-            (Some(rule), Some(line), Some(column)) => {
-                println!(
-                    "{} in {} at {}:{}: {}",
-                    issue.severity.as_str(),
-                    rule,
-                    line,
-                    column,
-                    issue.message
-                );
-            }
-            (Some(rule), _, _) => {
-                println!("{} in {}: {}", issue.severity.as_str(), rule, issue.message);
-            }
-            (_, Some(line), Some(column)) => {
-                println!(
-                    "{} at {}:{}: {}",
-                    issue.severity.as_str(),
-                    line,
-                    column,
-                    issue.message
-                );
-            }
-            _ => {
-                println!("{}: {}", issue.severity.as_str(), issue.message);
-            }
-        }
-        if let Some(snippet) = &issue.snippet {
-            println!("source: {snippet}");
-        }
-        if let Some(remediation) = &issue.remediation {
-            println!("remediation: {remediation}");
-        }
-    }
-}
-
-fn print_rule_check_output(output: &RuleCheckOutput) {
-    println!("status: {}", output.status.as_str());
-    println!("policy_source: {}", output.policy.source);
-    println!("id_source: {}", output.policy.id_source);
-    println!("gram_sizes: {}", output.policy.gram_sizes);
-    if output.rules.len() > 1 {
-        println!("rules: {}", output.rules.len());
-        for rule in &output.rules {
-            println!();
-            println!("rule: {}", rule.rule);
-            if rule.is_private {
-                println!("private: true");
-            }
-            println!("status: {}", rule.status.as_str());
-            if rule.issues.is_empty() {
-                println!(
-                    "summary: rule is compatible with sspry candidate search under this policy."
-                );
-            } else {
-                print_rule_check_issues(&rule.issues);
-            }
-        }
-        return;
-    }
-    if output.issues.is_empty() {
-        println!("summary: rule is compatible with sspry candidate search under this policy.");
-        return;
-    }
-    print_rule_check_issues(&output.issues);
-}
-
+/// Builds the prepared-query profile that reflects the union of filter layouts
+/// across all trees in the forest.
 fn forest_prepared_query_profile(
     tree_groups: &[TreeStoreGroup],
     plan: &crate::candidate::CompiledQueryPlan,
@@ -2629,6 +2106,8 @@ fn forest_prepared_query_profile(
     ))
 }
 
+/// Executes a full candidate scan across one tree group's stores and merges the
+/// resulting hashes, external IDs, and query profile counters.
 fn query_store_group_all_candidates(
     stores: &mut [CandidateStore],
     plan: &crate::candidate::CompiledQueryPlan,
@@ -2664,6 +2143,8 @@ fn query_store_group_all_candidates(
     Ok(out)
 }
 
+/// Executes a candidate search across all trees in the forest and combines the
+/// results into one local aggregate.
 fn query_local_forest_all_candidates(
     tree_groups: &mut Vec<TreeStoreGroup>,
     plan: &crate::candidate::CompiledQueryPlan,
@@ -2760,6 +2241,7 @@ fn query_local_forest_all_candidates(
     })
 }
 
+/// Clears all per-store search caches for the currently opened forest.
 fn clear_local_forest_search_caches(tree_groups: &mut [TreeStoreGroup]) {
     for group in tree_groups {
         for store in &mut group.stores {
@@ -2768,6 +2250,8 @@ fn clear_local_forest_search_caches(tree_groups: &mut [TreeStoreGroup]) {
     }
 }
 
+/// Rechecks candidate rows against the original rule file when file-backed
+/// verification is enabled.
 fn verify_search_candidates(
     rule_path: &Path,
     plan: &crate::candidate::CompiledQueryPlan,
@@ -2895,6 +2379,8 @@ enum CandidateIdSource {
 }
 
 impl CandidateIdSource {
+    /// Returns the stable configuration label for the selected document
+    /// identity source.
     fn as_str(self) -> &'static str {
         match self {
             CandidateIdSource::Sha256 => "sha256",
@@ -2904,6 +2390,7 @@ impl CandidateIdSource {
         }
     }
 
+    /// Parses the stored configuration value for candidate identity source.
     fn parse_config_value(value: &str) -> Result<Self> {
         match value {
             "sha256" => Ok(CandidateIdSource::Sha256),
@@ -2916,6 +2403,8 @@ impl CandidateIdSource {
         }
     }
 
+    /// Returns the auxiliary digest kind that must be computed during ingest
+    /// when the primary identity is not SHA-256.
     fn additional_digest_kind(self) -> Option<AdditionalDigestKind> {
         match self {
             CandidateIdSource::Sha256 => None,
@@ -2937,6 +2426,8 @@ struct ScanPolicy {
     id_source: CandidateIdSource,
 }
 
+/// Scans one file into the index row representation used by both local and
+/// remote ingestion paths.
 fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBatchRow> {
     let resolved_path = if policy.store_path {
         Some(resolved_file_path(file_path)?)
@@ -3069,6 +2560,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
     Ok(row)
 }
 
+/// Compiles the supplied rule file into a YARA verifier ruleset.
 fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
     let source = fs::read_to_string(rule_path)?;
     let mut compiler = YaraCompiler::new();
@@ -3078,6 +2570,8 @@ fn compile_yara_verifier(rule_path: &Path) -> Result<YaraRules> {
     Ok(compiler.build())
 }
 
+/// Builds the cache key used to reuse compiled YARA verifier rules across
+/// repeated checks of the same file.
 fn yara_rule_cache_key(rule_path: &Path) -> Result<String> {
     let canonical = fs::canonicalize(rule_path).unwrap_or_else(|_| rule_path.to_path_buf());
     let metadata = fs::metadata(rule_path)?;
@@ -3094,6 +2588,7 @@ fn yara_rule_cache_key(rule_path: &Path) -> Result<String> {
     ))
 }
 
+/// Returns a cached compiled YARA verifier ruleset for the requested rule file.
 fn compile_yara_verifier_cached(rule_path: &Path) -> Result<Arc<YaraRules>> {
     static CACHE: OnceLock<Mutex<BoundedCache<String, Arc<YaraRules>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BoundedCache::new(64)));
@@ -3113,6 +2608,7 @@ fn compile_yara_verifier_cached(rule_path: &Path) -> Result<Arc<YaraRules>> {
     Ok(rules)
 }
 
+/// Returns whether a rule file contains exactly one `rule` declaration.
 fn rule_file_has_single_rule(rule_path: &Path) -> Option<bool> {
     let content = fs::read_to_string(rule_path).ok()?;
     let mut count = 0usize;
@@ -3128,6 +2624,8 @@ fn rule_file_has_single_rule(rule_path: &Path) -> Option<bool> {
     Some(count == 1)
 }
 
+/// Attempts to derive a fixed-literal verification plan from a simple
+/// single-rule file.
 fn fixed_literal_plan_from_rule(rule_path: &Path) -> Option<FixedLiteralMatchPlan> {
     if !rule_file_has_single_rule(rule_path)? {
         return None;
@@ -3148,14 +2646,19 @@ fn fixed_literal_plan_from_rule(rule_path: &Path) -> Option<FixedLiteralMatchPla
     fixed_literal_match_plan(&plan)
 }
 
+/// Returns whether one byte counts as an ASCII word boundary character for
+/// fullword matching.
 fn is_ascii_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Returns whether a two-byte UTF-16LE unit encodes an ASCII word character.
 fn is_wide_word_unit(unit: &[u8]) -> bool {
     unit.len() == 2 && unit[1] == 0 && is_ascii_word_byte(unit[0])
 }
 
+/// Checks whether a file buffer contains a literal under the requested wide and
+/// fullword matching semantics.
 fn file_contains_literal_with_mode(
     haystack: &[u8],
     needle: &[u8],
@@ -3208,6 +2711,8 @@ fn file_contains_literal_with_mode(
     false
 }
 
+/// Verifies a fixed-literal plan directly against file bytes without invoking
+/// the YARA engine.
 fn verify_fixed_literal_plan_on_file(path: &Path, plan: &FixedLiteralMatchPlan) -> Result<bool> {
     let bytes = fs::read(path)?;
     let mut matches = HashMap::with_capacity(plan.literals.len());
@@ -3233,6 +2738,8 @@ fn verify_fixed_literal_plan_on_file(path: &Path, plan: &FixedLiteralMatchPlan) 
     evaluate_fixed_literal_match(&plan.root, &matches)
 }
 
+/// Implements the standalone `yara` command used to verify one rule file
+/// against one target file.
 fn cmd_yara(args: &YaraArgs) -> i32 {
     match (|| -> Result<i32> {
         let rule_path = Path::new(&args.rule);
@@ -3304,10 +2811,14 @@ fn cmd_yara(args: &YaraArgs) -> i32 {
 }
 
 #[cfg(test)]
+/// Test wrapper around `cmd_serve_with_sources` with no explicit init-option
+/// provenance.
 fn cmd_serve(args: &ServeArgs) -> i32 {
     cmd_serve_with_sources(args, ServeInitOptionSources::default())
 }
 
+/// Implements the `serve` command, resolving startup settings and running the
+/// gRPC server until shutdown.
 fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSources) -> i32 {
     match (|| -> Result<i32> {
         let (host, port) = parse_host_port(&args.common.addr)?;
@@ -3346,6 +2857,8 @@ fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSourc
     }
 }
 
+/// Infers whether the target root should run in workspace mode based on its
+/// current on-disk layout.
 fn serve_uses_workspace_mode(root: &Path) -> bool {
     if root.join("current").is_dir() || root.join("work_a").is_dir() || root.join("work_b").is_dir()
     {
@@ -3379,6 +2892,8 @@ struct ResolvedServeRuntimeSettings {
     warnings: Vec<String>,
 }
 
+/// Returns the existing store root that a serve command should reuse, if one is
+/// already initialized.
 fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option<PathBuf>> {
     if workspace_mode {
         let current_root = root.join("current");
@@ -3396,6 +2911,8 @@ fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option
         .find(|tree_root| tree_root != root && store_root_has_markers(tree_root)))
 }
 
+/// Resolves the effective serve-time runtime settings, reusing on-disk store
+/// configuration when the target root already exists.
 fn resolve_serve_runtime_settings(
     args: &ServeCommonArgs,
     option_sources: ServeInitOptionSources,
@@ -3527,6 +3044,7 @@ fn resolve_serve_runtime_settings(
 }
 
 #[cfg(test)]
+/// Implements the local-only `init` command used by tests and helper flows.
 fn cmd_init(args: &InitArgs) -> i32 {
     match (|| -> Result<i32> {
         let outcome = ensure_local_root_initialized(args)?;
@@ -3569,6 +3087,7 @@ fn cmd_init(args: &InitArgs) -> i32 {
 }
 
 #[cfg(test)]
+/// Implements the local-or-remote single-document indexing test command.
 fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
     match (|| -> Result<i32> {
         let result = if let Some(root) = &args.root {
@@ -3656,6 +3175,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
     }
 }
 
+/// Implements the local-or-remote delete command over one or more input values.
 fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
     match (|| -> Result<i32> {
         if args.values.is_empty() {
@@ -3717,6 +3237,7 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
 }
 
 #[cfg(test)]
+/// Implements the local-only internal query command used by tests and fixtures.
 fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
     match (|| -> Result<i32> {
         let Some(root) = &args.root else {
@@ -3858,6 +3379,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
 }
 
 #[cfg(test)]
+/// Implements the local-or-remote stats command used by tests and fixtures.
 fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
     match (|| -> Result<i32> {
         let stats = if let Some(root) = &args.root {
@@ -3908,6 +3430,8 @@ fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
     }
 }
 
+/// Implements the batch indexing command used by both local and remote ingest
+/// wrappers.
 fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
     match (|| -> Result<i32> {
         let root = args.root.as_deref().ok_or_else(|| {
@@ -4137,6 +3661,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
     }
 }
 
+/// Converts `local-index` arguments into the shared `init` argument shape used
+/// by store initialization helpers.
 fn init_args_from_local_index(args: &LocalIndexArgs) -> InitArgs {
     InitArgs {
         root: args.root.clone(),
@@ -4149,10 +3675,13 @@ fn init_args_from_local_index(args: &LocalIndexArgs) -> InitArgs {
     }
 }
 
+/// Default `index` entrypoint, currently routed through the gRPC client path.
 fn cmd_index(args: &IndexArgs) -> i32 {
     cmd_grpc_index(args)
 }
 
+/// Executes remote indexing by scanning files locally, batching encoded rows,
+/// and streaming them to the server.
 fn cmd_grpc_index(args: &IndexArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
@@ -4715,6 +4244,8 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
     }
 }
 
+/// Implements the high-level local indexing command by initializing the store
+/// and delegating to batch indexing.
 fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
     match ensure_local_root_initialized(&init_args_from_local_index(args)) {
         Ok(_) => cmd_internal_index_batch(&InternalIndexBatchArgs {
@@ -4733,10 +4264,12 @@ fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
     }
 }
 
+/// Top-level delete entrypoint, currently routed through the gRPC delete path.
 fn cmd_delete(args: &DeleteArgs) -> i32 {
     cmd_grpc_delete(args)
 }
 
+/// Implements the remote delete command against the running server.
 fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
     match (|| -> Result<i32> {
         let server_policy = server_scan_policy(&args.connection)?;
@@ -4785,6 +4318,8 @@ fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
     }
 }
 
+/// Implements the local delete wrapper by delegating to the internal delete
+/// path.
 fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
     cmd_internal_delete(&InternalDeleteArgs {
         connection: placeholder_connection(),
@@ -4793,6 +4328,8 @@ fn cmd_local_delete(args: &LocalDeleteArgs) -> i32 {
     })
 }
 
+/// Implements the rule-check command and renders either JSON or human-readable
+/// output.
 fn cmd_rule_check(args: &RuleCheckArgs) -> i32 {
     match (|| -> Result<i32> {
         let policy = rule_check_policy(args)?;
@@ -4826,6 +4363,8 @@ fn cmd_rule_check(args: &RuleCheckArgs) -> i32 {
     }
 }
 
+/// Drains a streaming search response into one deduplicated `SearchExecution`
+/// summary, optionally preserving external ids for verification.
 fn collect_streamed_search_execution<F>(
     args: &SearchCommandArgs,
     plan: CompiledQueryPlan,
@@ -4908,6 +4447,8 @@ where
     })
 }
 
+/// Converts the gRPC wire frame into the internal streaming frame used by the
+/// shared search-collection path.
 fn grpc_search_frame_to_internal(frame: grpc::GrpcSearchFrame) -> rpc::CandidateQueryStreamFrame {
     rpc::CandidateQueryStreamFrame {
         sha256: frame.sha256,
@@ -4920,6 +4461,8 @@ fn grpc_search_frame_to_internal(frame: grpc::GrpcSearchFrame) -> rpc::Candidate
     }
 }
 
+/// Executes a remote search by compiling the rule against the server policy and
+/// draining the streamed result frames.
 fn execute_grpc_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
     let started_plan = Instant::now();
     let mut client = search_grpc_client(&args.connection)?;
@@ -4951,6 +4494,8 @@ fn execute_grpc_search(args: &SearchCommandArgs) -> Result<SearchExecution> {
     })
 }
 
+/// Executes a local forest search by compiling once, preparing the shared plan
+/// artifacts, and scanning every tree group.
 fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
     let started_plan = Instant::now();
     let mut tree_groups = open_forest_tree_groups(Path::new(&args.root))?;
@@ -4999,6 +4544,8 @@ fn execute_local_search(args: &LocalSearchArgs) -> Result<SearchExecution> {
     })
 }
 
+/// Finalizes a search execution by optionally verifying candidates, printing
+/// the result rows, and emitting verbose timing and memory diagnostics.
 fn finish_search_execution(
     rule: &str,
     verify_yara_files: bool,
@@ -5201,10 +4748,12 @@ fn finish_search_execution(
     Ok(0)
 }
 
+/// Default `search` entrypoint, currently routed through the gRPC client path.
 fn cmd_search(args: &SearchCommandArgs) -> i32 {
     cmd_grpc_search(args)
 }
 
+/// Runs the remote `search` command and prints any resulting candidates.
 fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
@@ -5227,6 +4776,7 @@ fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
     }
 }
 
+/// Runs the local forest `search` command and prints any resulting candidates.
 fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
@@ -5249,6 +4799,8 @@ fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
     }
 }
 
+/// Resolves the search-batch rule list from either a directory scan or a
+/// manifest file.
 fn collect_rules_from_args(
     rules_dir: &Option<String>,
     rule_manifest: &Option<String>,
@@ -5280,6 +4832,8 @@ fn collect_rules_from_args(
     Ok(rules)
 }
 
+/// Executes `search-batch`, writing one JSON record per rule plus a JSONL
+/// stream for incremental consumption.
 fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
     match (|| -> Result<i32> {
         let root = Path::new(&args.root);
@@ -5519,10 +5073,12 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
     }
 }
 
+/// Default `info` entrypoint, currently routed through the gRPC client path.
 fn cmd_info(args: &InfoCommandArgs) -> i32 {
     cmd_grpc_info(args)
 }
 
+/// Queries a remote server for status and prints the response as JSON.
 fn cmd_grpc_info(args: &InfoCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let mut client = grpc_client(&args.connection)?;
@@ -5541,6 +5097,8 @@ fn cmd_grpc_info(args: &InfoCommandArgs) -> i32 {
     }
 }
 
+/// Loads local store or forest stats directly from disk and prints the result
+/// as JSON.
 fn cmd_local_info(args: &LocalInfoArgs) -> i32 {
     match (|| -> Result<i32> {
         let root = Path::new(&args.root);
@@ -5581,10 +5139,13 @@ fn cmd_local_info(args: &LocalInfoArgs) -> i32 {
     }
 }
 
+/// Default `shutdown` entrypoint, currently routed through the gRPC client
+/// path.
 fn cmd_shutdown(args: &ShutdownArgs) -> i32 {
     cmd_grpc_shutdown(args)
 }
 
+/// Sends the remote shutdown RPC and prints the server response.
 fn cmd_grpc_shutdown(args: &ShutdownArgs) -> i32 {
     match (|| -> Result<i32> {
         let mut client = grpc_client(&args.connection)?;
@@ -5600,613 +5161,12 @@ fn cmd_grpc_shutdown(args: &ShutdownArgs) -> i32 {
     }
 }
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "sspry",
-    about = "Scalable Screening and Prefiltering of Rules for YARA."
-)]
-struct Cli {
-    #[arg(
-        long = "perf-report",
-        global = true,
-        help = "Write JSON performance report to this path."
-    )]
-    perf_report: Option<String>,
-    #[arg(long = "perf-stdout", global = true, action = ArgAction::SetTrue, help = "Print JSON performance report on exit.")]
-    perf_stdout: bool,
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Debug, Subcommand)]
-enum Commands {
-    Serve(ServeArgs),
-    Index(IndexArgs),
-    LocalIndex(LocalIndexArgs),
-    Delete(DeleteArgs),
-    LocalDelete(LocalDeleteArgs),
-    RuleCheck(RuleCheckArgs),
-    Search(SearchCommandArgs),
-    LocalSearch(LocalSearchArgs),
-    SearchBatch(SearchBatchArgs),
-    Info(InfoCommandArgs),
-    LocalInfo(LocalInfoArgs),
-    Shutdown(ShutdownArgs),
-    Yara(YaraArgs),
-}
-
-#[derive(Debug, clap::Args)]
-struct IndexArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(required = true, help = "File or directory paths.")]
-    paths: Vec<String>,
-    #[arg(
-        long = "path-list",
-        action = ArgAction::SetTrue,
-        help = "Treat each input path as a newline-delimited manifest of file paths."
-    )]
-    path_list: bool,
-    #[arg(
-        long = "batch-size",
-        default_value_t = 64,
-        help = "Documents per insert_batch request."
-    )]
-    batch_size: usize,
-    #[arg(
-        long = "remote-batch-soft-limit-bytes",
-        default_value_t = REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
-        help = "Client-side soft payload cap in bytes for remote insert_batch requests."
-    )]
-    remote_batch_soft_limit_bytes: usize,
-    #[arg(
-        long = "insert-chunk-bytes",
-        default_value_t = grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
-        help = "Per-frame remote insert chunk size in bytes."
-    )]
-    grpc_insert_chunk_bytes: usize,
-    #[arg(
-        long = "workers",
-        help = "Process workers for recursive file scan/feature extraction before batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
-    )]
-    workers: Option<usize>,
-    #[arg(
-        long = "verbose",
-        action = ArgAction::SetTrue,
-        help = "Print timing details to stderr."
-    )]
-    verbose: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct LocalIndexArgs {
-    #[arg(
-        long = "root",
-        required = true,
-        help = "Direct local store root directory."
-    )]
-    root: String,
-    #[arg(
-        long = "candidate-shards",
-        default_value_t = 1,
-        help = "Number of independent candidate shards (lock stripes) to initialize when creating a new local store."
-    )]
-    candidate_shards: usize,
-    #[arg(
-        long = "force",
-        action = ArgAction::SetTrue,
-        help = "Reinitialize an existing local store before indexing."
-    )]
-    force: bool,
-    #[arg(
-        long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate for a newly created local store. Defaults to 0.38 when omitted."
-    )]
-    tier1_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate for a newly created local store. Defaults to 0.18 when omitted."
-    )]
-    tier2_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "gram-sizes",
-        default_value = "3,4",
-        help = "DB-wide gram-size pair as tier1,tier2 for a newly created local store. Supported pairs: 3,4 4,5 5,6 7,8."
-    )]
-    gram_sizes: String,
-    #[arg(
-        long = "compaction-idle-cooldown-s",
-        default_value_t = 5.0,
-        help = "Minimum idle time after writes before compaction is allowed to run for a newly created local store."
-    )]
-    compaction_idle_cooldown_s: f64,
-    #[arg(required = true, help = "File or directory paths.")]
-    paths: Vec<String>,
-    #[arg(
-        long = "path-list",
-        action = ArgAction::SetTrue,
-        help = "Treat each input path as a newline-delimited manifest of file paths."
-    )]
-    path_list: bool,
-    #[arg(
-        long = "batch-size",
-        default_value_t = 64,
-        help = "Documents per local insert batch."
-    )]
-    batch_size: usize,
-    #[arg(
-        long = "workers",
-        help = "Process workers for recursive file scan/feature extraction before local batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
-    )]
-    workers: Option<usize>,
-    #[arg(
-        long = "verbose",
-        action = ArgAction::SetTrue,
-        help = "Print timing details to stderr."
-    )]
-    verbose: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct DeleteArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(
-        required = true,
-        help = "Existing file paths or hex digests in the server's configured identity format."
-    )]
-    values: Vec<String>,
-}
-
-#[derive(Debug, clap::Args)]
-struct LocalDeleteArgs {
-    #[arg(
-        long = "root",
-        required = true,
-        help = "Direct local store root directory."
-    )]
-    root: String,
-    #[arg(
-        required = true,
-        help = "Existing file paths or hex digests in the store's identity format."
-    )]
-    values: Vec<String>,
-}
-
-#[derive(Debug, clap::Args)]
-struct RuleCheckArgs {
-    #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
-    rule: String,
-    #[arg(
-        long = "addr",
-        conflicts_with = "root",
-        help = "Use the active scan policy from a live server at host:port."
-    )]
-    addr: Option<String>,
-    #[arg(
-        long = "timeout",
-        default_value_t = DEFAULT_RPC_TIMEOUT,
-        requires = "addr",
-        help = "Connection/read timeout in seconds when --addr is used."
-    )]
-    timeout: f64,
-    #[arg(
-        long = "max-message-bytes",
-        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
-        requires = "addr",
-        help = "Maximum remote message size in bytes when --addr is used."
-    )]
-    max_message_bytes: usize,
-    #[arg(
-        long = "root",
-        conflicts_with = "addr",
-        help = "Use the active scan policy from a local store or forest root."
-    )]
-    root: Option<String>,
-    #[arg(
-        long = "id-source",
-        value_enum,
-        conflicts_with_all = ["addr", "root"],
-        help = "Assumed DB identity source when no live server or local root is provided."
-    )]
-    id_source: Option<CandidateIdSource>,
-    #[arg(
-        long = "gram-sizes",
-        conflicts_with_all = ["addr", "root"],
-        help = "Assumed DB gram-size pair as tier1,tier2 when no live server or local root is provided."
-    )]
-    gram_sizes: Option<String>,
-    #[arg(
-        long = "max-anchors-per-pattern",
-        default_value_t = 16,
-        help = "Keep at most this many anchors per pattern alternative while checking."
-    )]
-    max_anchors_per_pattern: usize,
-    #[arg(
-        long = "json",
-        action = ArgAction::SetTrue,
-        help = "Emit structured JSON instead of text."
-    )]
-    json: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct SearchCommandArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
-    rule: String,
-    #[arg(
-        long = "max-anchors-per-pattern",
-        default_value_t = 16,
-        help = "Keep at most this many anchors per pattern alternative."
-    )]
-    max_anchors_per_pattern: usize,
-    #[arg(
-        long = "max-candidates",
-        default_value_t = 10.0,
-        value_parser = parse_max_candidates_percent,
-        help = "Server-side candidate cap as a percentage of searchable documents; 0 means unlimited."
-    )]
-    max_candidates: f64,
-    #[arg(
-        long = "verify",
-        action = ArgAction::SetTrue,
-        default_value_t = false,
-        help = "Enable local YARA verification over candidate file paths."
-    )]
-    verify_yara_files: bool,
-    #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
-    verbose: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct LocalSearchArgs {
-    #[arg(
-        long = "root",
-        required = true,
-        help = "Candidate forest root for in-process search."
-    )]
-    root: String,
-    #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
-    rule: String,
-    #[arg(
-        long = "tree-search-workers",
-        default_value_t = 0,
-        help = "Forest-level tree search workers. 0 means auto up to the tree count."
-    )]
-    tree_search_workers: usize,
-    #[arg(
-        long = "max-anchors-per-pattern",
-        default_value_t = 16,
-        help = "Keep at most this many anchors per pattern alternative."
-    )]
-    max_anchors_per_pattern: usize,
-    #[arg(
-        long = "max-candidates",
-        default_value_t = 10.0,
-        value_parser = parse_max_candidates_percent,
-        help = "Candidate cap as a percentage of searchable documents; 0 means unlimited."
-    )]
-    max_candidates: f64,
-    #[arg(
-        long = "verify",
-        action = ArgAction::SetTrue,
-        default_value_t = false,
-        help = "Enable local YARA verification over candidate file paths."
-    )]
-    verify_yara_files: bool,
-    #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
-    verbose: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct SearchBatchArgs {
-    #[arg(
-        long = "root",
-        required = true,
-        help = "Candidate forest root for in-process batch search."
-    )]
-    root: String,
-    #[arg(
-        long = "rules-dir",
-        conflicts_with = "rule_manifest",
-        help = "Directory containing .yar files to search in sorted filename order."
-    )]
-    rules_dir: Option<String>,
-    #[arg(
-        long = "rule-manifest",
-        conflicts_with = "rules_dir",
-        help = "Newline-delimited manifest of rule file paths."
-    )]
-    rule_manifest: Option<String>,
-    #[arg(
-        long = "json-out",
-        required = true,
-        help = "Write batch JSON results to this path."
-    )]
-    json_out: String,
-    #[arg(
-        long = "tree-search-workers",
-        default_value_t = 0,
-        help = "Forest-level tree search workers. 0 means auto up to the tree count."
-    )]
-    tree_search_workers: usize,
-    #[arg(
-        long = "max-anchors-per-pattern",
-        default_value_t = 16,
-        help = "Keep at most this many anchors per pattern alternative."
-    )]
-    max_anchors_per_pattern: usize,
-    #[arg(
-        long = "max-candidates",
-        default_value_t = 10.0,
-        value_parser = parse_max_candidates_percent,
-        help = "Candidate cap per rule as a percentage of searchable documents; 0 means unlimited."
-    )]
-    max_candidates: f64,
-    #[arg(
-        long = "verify",
-        action = ArgAction::SetTrue,
-        help = "Enable local YARA verification over candidate file paths."
-    )]
-    verify_yara_files: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct InfoCommandArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(
-        long = "light",
-        action = ArgAction::SetTrue,
-        help = "Return lightweight server status without walking shard stats."
-    )]
-    light: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct LocalInfoArgs {
-    #[arg(
-        long = "root",
-        required = true,
-        help = "Direct local store or forest root directory."
-    )]
-    root: String,
-}
-
-#[derive(Debug, clap::Args)]
-struct ShutdownArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-}
-
-#[derive(Debug, clap::Args)]
-struct YaraArgs {
-    #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
-    rule: String,
-    #[arg(help = "Path to the file to scan.")]
-    file_path: String,
-    #[arg(
-        long = "scan-timeout",
-        default_value_t = 60,
-        help = "YARA scan timeout in seconds (default: 60)."
-    )]
-    scan_timeout: u64,
-    #[arg(
-        long = "show-tags",
-        action = ArgAction::SetTrue,
-        help = "Print matched rule tags."
-    )]
-    show_tags: bool,
-}
-
-#[derive(Debug, Clone, clap::Args)]
-struct ServeCommonArgs {
-    #[arg(
-        long = "addr",
-        env = "SSPRY_ADDR",
-        default_value = DEFAULT_RPC_ADDR,
-        help = "Bind address as host:port."
-    )]
-    addr: String,
-    #[arg(
-        long = "search-workers",
-        default_value_t = default_search_workers(),
-        help = "Server-side tree query workers per search. Forest searches run across at most this many trees at once. Default is max(1, cpus/4)."
-    )]
-    search_workers: usize,
-    #[arg(
-        long = "root",
-        default_value = DEFAULT_CANDIDATE_ROOT,
-        help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
-    )]
-    root: String,
-    #[arg(
-        long = "layout-profile",
-        value_enum,
-        default_value_t = ServeLayoutProfile::Standard,
-        help = "Shard-layout profile. `standard` defaults to 8 shards; `incremental` defaults to 8 shards for denser ingest batches and lower publish fanout."
-    )]
-    layout_profile: ServeLayoutProfile,
-    #[arg(
-        long = "shards",
-        help = "Number of independent candidate shards (lock stripes) for ingest/write paths. Overrides --layout-profile when set."
-    )]
-    shards: Option<usize>,
-    #[arg(
-        long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
-    )]
-    tier1_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to 0.18 when omitted."
-    )]
-    tier2_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "id-source",
-        value_enum,
-        default_value_t = CandidateIdSource::Sha256,
-        help = "DB-wide document identity source used by ingest and delete."
-    )]
-    id_source: CandidateIdSource,
-    #[arg(
-        long = "store-path",
-        action = ArgAction::SetTrue,
-        help = "Store the canonical file path as external_id for each inserted document."
-    )]
-    store_path: bool,
-    #[arg(
-        long = "gram-sizes",
-        default_value = "3,4",
-        help = "DB-wide gram-size pair as tier1,tier2. Supported pairs: 3,4 4,5 5,6 7,8."
-    )]
-    gram_sizes: String,
-}
-
-#[derive(Debug, clap::Args)]
-struct ServeArgs {
-    #[command(flatten)]
-    common: ServeCommonArgs,
-    #[arg(
-        long = "max-message-bytes",
-        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
-        help = "Maximum accepted remote message size in bytes."
-    )]
-    max_message_bytes: usize,
-}
-
-#[derive(Debug, clap::Args)]
-struct InitArgs {
-    #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate store root directory.")]
-    root: String,
-    #[arg(
-        long = "candidate-shards",
-        default_value_t = 1,
-        help = "Number of independent candidate shards (lock stripes) to initialize."
-    )]
-    candidate_shards: usize,
-    #[arg(long = "force", action = ArgAction::SetTrue, help = "Overwrite an existing candidate store.")]
-    force: bool,
-    #[arg(
-        long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
-    )]
-    tier1_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to 0.18 when omitted."
-    )]
-    tier2_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "gram-sizes",
-        default_value = "3,4",
-        help = "DB-wide gram-size pair as tier1,tier2. Supported pairs: 3,4 4,5 5,6 7,8."
-    )]
-    gram_sizes: String,
-    #[arg(
-        long = "compaction-idle-cooldown-s",
-        default_value_t = 5.0,
-        help = "Minimum idle time after writes before compaction is allowed to run."
-    )]
-    compaction_idle_cooldown_s: f64,
-}
-
+include!("app/cli.rs");
 #[cfg(test)]
-#[derive(Debug, clap::Args)]
-struct InternalIndexArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    file_path: String,
-    #[arg(long = "root", help = "Candidate store root directory.")]
-    root: Option<String>,
-    #[arg(
-        long = "external-id",
-        help = "Optional external identifier to associate with the document."
-    )]
-    external_id: Option<String>,
-    #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "File read chunk size in bytes.")]
-    chunk_size: usize,
-}
+mod tests;
 
-#[derive(Debug, clap::Args)]
-struct InternalIndexBatchArgs {
-    paths: Vec<String>,
-    #[arg(long = "path-list", action = ArgAction::SetTrue, help = "Treat input paths as newline-delimited file manifests.")]
-    path_list: bool,
-    #[arg(long = "root", help = "Candidate store root directory.")]
-    root: Option<String>,
-    #[arg(
-        long = "batch-size",
-        default_value_t = 64,
-        help = "Documents per batch request."
-    )]
-    batch_size: usize,
-    #[arg(
-        long = "workers",
-        default_value_t = default_ingest_workers(),
-        help = "Workers for recursive file scan before batched inserts."
-    )]
-    workers: usize,
-    #[arg(long = "chunk-size", default_value_t = 1024 * 1024, help = "Client read chunk size in bytes.")]
-    chunk_size: usize,
-    #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
-    verbose: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct InternalDeleteArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(long = "root", help = "Candidate store root directory.")]
-    root: Option<String>,
-    values: Vec<String>,
-}
-
-#[cfg(test)]
-#[derive(Debug, clap::Args)]
-struct InternalQueryArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(long = "root", help = "Candidate store root directory.")]
-    root: Option<String>,
-    #[arg(long = "rule", help = "Path to a restricted-YARA rule file.")]
-    rule: String,
-    #[arg(long = "cursor", default_value_t = 0, help = "Result cursor offset.")]
-    cursor: usize,
-    #[arg(long = "chunk-size", default_value_t = 128, help = "Page size.")]
-    chunk_size: usize,
-    #[arg(
-        long = "max-anchors-per-pattern",
-        alias = "max-anchors-per-alt",
-        default_value_t = 16,
-        help = "Maximum anchor grams kept per pattern alternative after planner reduction."
-    )]
-    max_anchors_per_pattern: usize,
-    #[arg(long = "force-tier1-only", action = ArgAction::SetTrue, help = "Disable tier2 fallback for complete documents.")]
-    force_tier1_only: bool,
-    #[arg(long = "no-tier2-fallback", action = ArgAction::SetTrue, help = "Disable optional tier2 fallback on complete documents.")]
-    no_tier2_fallback: bool,
-    #[arg(
-        long = "max-candidates",
-        default_value_t = 10.0,
-        value_parser = parse_max_candidates_percent,
-        help = "Maximum candidate percentage returned before paging; 0 means unlimited."
-    )]
-    max_candidates: f64,
-}
-
-#[cfg(test)]
-#[derive(Debug, clap::Args)]
-#[cfg(test)]
-struct InternalStatsArgs {
-    #[command(flatten)]
-    connection: ClientConnectionArgs,
-    #[arg(long = "root", help = "Candidate store root directory.")]
-    root: Option<String>,
-}
-
+/// Parses CLI arguments, configures perf reporting, dispatches the selected
+/// command, and flushes perf output before exiting.
 pub fn main(argv: Option<Vec<String>>) -> i32 {
     let argv_values = argv.unwrap_or_else(|| std::env::args().collect::<Vec<_>>());
     let cli = Cli::parse_from(argv_values.clone());
@@ -6236,1839 +5196,4 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
         }
     }
     exit_code
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    use crate::candidate::{CandidateConfig, QueryNode};
-
-    fn default_connection() -> ClientConnectionArgs {
-        ClientConnectionArgs {
-            addr: DEFAULT_RPC_ADDR.to_owned(),
-            timeout: DEFAULT_RPC_TIMEOUT,
-            max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
-        }
-    }
-
-    fn default_internal_init_args(root: &Path, candidate_shards: usize, force: bool) -> InitArgs {
-        InitArgs {
-            root: root.display().to_string(),
-            candidate_shards,
-            force,
-            tier1_filter_target_fp: None,
-            tier2_filter_target_fp: None,
-            gram_sizes: "3,4".to_owned(),
-            compaction_idle_cooldown_s: 5.0,
-        }
-    }
-
-    fn start_grpc_test_server(base: &Path, shard_count: usize) -> ClientConnectionArgs {
-        start_grpc_test_server_with_config(RpcServerConfig {
-            candidate_config: CandidateConfig {
-                root: base.join("server_candidate_db"),
-                ..CandidateConfig::default()
-            },
-            candidate_shards: shard_count,
-            search_workers: default_search_workers_for(4),
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            auto_publish_initial_idle_ms: 500,
-            auto_publish_storage_class: "unknown".to_owned(),
-            workspace_mode: true,
-        })
-    }
-
-    fn start_grpc_test_server_with_config(config: RpcServerConfig) -> ClientConnectionArgs {
-        let listener =
-            std::net::TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind test listener");
-        let port = listener.local_addr().expect("listener addr").port();
-        drop(listener);
-        thread::spawn(move || {
-            let _ = rpc::serve_grpc(DEFAULT_RPC_HOST, port, config);
-        });
-        let connection = ClientConnectionArgs {
-            addr: format!("{DEFAULT_RPC_HOST}:{port}"),
-            timeout: 0.5,
-            max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
-        };
-        for _ in 0..100 {
-            if grpc_client(&connection)
-                .and_then(|mut client| client.ping())
-                .is_ok()
-            {
-                return connection;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("test grpc server did not become ready");
-    }
-
-    #[test]
-    fn incremental_remote_batch_size_matches_full_payload_size() {
-        let empty = empty_remote_batch_payload_size().expect("empty payload size");
-        let rows = vec![
-            crate::rpc::serialize_candidate_insert_binary_row_parts(
-                &[0x11; 32],
-                123,
-                Some(3),
-                &[1, 2, 3],
-                Some(2),
-                &[4, 5, 6],
-                false,
-                &[],
-                Some("doc-1"),
-            )
-            .expect("row a"),
-            crate::rpc::serialize_candidate_insert_binary_row_parts(
-                &[0x22; 32],
-                456,
-                None,
-                &[10, 11, 12],
-                None,
-                &[13, 14, 15],
-                false,
-                &[],
-                None,
-            )
-            .expect("row b"),
-        ];
-        let mut running = empty;
-        let mut pending_rows = Vec::new();
-        for row in rows {
-            running += 4 + row.len();
-            pending_rows.push(row);
-            let exact =
-                crate::rpc::serialized_candidate_insert_binary_batch_payload(&pending_rows).len();
-            assert_eq!(running, exact);
-        }
-    }
-
-    fn default_serve_common_args() -> ServeCommonArgs {
-        ServeCommonArgs {
-            addr: DEFAULT_RPC_ADDR.to_owned(),
-            search_workers: default_search_workers_for(4),
-            root: DEFAULT_CANDIDATE_ROOT.to_owned(),
-            layout_profile: ServeLayoutProfile::Standard,
-            shards: None,
-            tier1_filter_target_fp: None,
-            tier2_filter_target_fp: None,
-            id_source: CandidateIdSource::Sha256,
-            store_path: false,
-            gram_sizes: "3,4".to_owned(),
-        }
-    }
-
-    fn default_serve_args() -> ServeArgs {
-        ServeArgs {
-            common: default_serve_common_args(),
-            max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
-        }
-    }
-
-    #[test]
-    fn serve_candidate_shard_count_uses_profile_default() {
-        let mut args = default_serve_common_args();
-        args.layout_profile = ServeLayoutProfile::Incremental;
-        assert_eq!(
-            serve_candidate_shard_count(&args),
-            DEFAULT_INCREMENTAL_SHARDS
-        );
-    }
-
-    #[test]
-    fn serve_candidate_shard_count_explicit_override_wins() {
-        let mut args = default_serve_common_args();
-        args.layout_profile = ServeLayoutProfile::Incremental;
-        args.shards = Some(17);
-        assert_eq!(serve_candidate_shard_count(&args), 17);
-    }
-
-    #[test]
-    fn search_related_commands_default_max_candidates_to_ten_percent() {
-        let cli =
-            Cli::try_parse_from(["sspry", "search", "--rule", "rule.yar"]).expect("parse search");
-        match cli.command {
-            Commands::Search(args) => assert_eq!(args.max_candidates, 10.0),
-            other => panic!("unexpected command: {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from([
-            "sspry",
-            "local-search",
-            "--root",
-            "db",
-            "--rule",
-            "rule.yar",
-        ])
-        .expect("parse local-search");
-        match cli.command {
-            Commands::LocalSearch(args) => assert_eq!(args.max_candidates, 10.0),
-            other => panic!("unexpected command: {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from([
-            "sspry",
-            "search-batch",
-            "--root",
-            "db",
-            "--json-out",
-            "out.json",
-        ])
-        .expect("parse search-batch");
-        match cli.command {
-            Commands::SearchBatch(args) => assert_eq!(args.max_candidates, 10.0),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_host_port_accepts_common_forms() {
-        assert_eq!(
-            parse_host_port("127.0.0.1:17653").expect("ipv4"),
-            ("127.0.0.1".to_owned(), 17653)
-        );
-        assert_eq!(
-            parse_host_port("example.com:443").expect("hostname"),
-            ("example.com".to_owned(), 443)
-        );
-        assert_eq!(
-            parse_host_port("[::1]:17653").expect("ipv6"),
-            ("::1".to_owned(), 17653)
-        );
-    }
-
-    #[test]
-    fn parse_host_port_rejects_invalid_values() {
-        assert!(parse_host_port("").is_err());
-        assert!(parse_host_port("127.0.0.1").is_err());
-        assert!(parse_host_port(":17653").is_err());
-        assert!(parse_host_port("127.0.0.1:notaport").is_err());
-        assert!(parse_host_port("[::1]").is_err());
-    }
-
-    #[test]
-    fn file_path_collection_and_hash_helpers_work() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let nested = tmp.path().join("nested");
-        let child = nested.join("child");
-        fs::create_dir_all(&child).expect("mkdir");
-        let sample = child.join("sample.bin");
-        fs::write(&sample, b"abcdef").expect("write sample");
-
-        let resolved = resolved_file_path(&sample).expect("resolve");
-        assert_eq!(resolved, fs::canonicalize(&sample).expect("canonicalize"));
-        assert_eq!(
-            path_identity_sha256(&sample).expect("path hash"),
-            path_identity_sha256(&resolved).expect("path hash again")
-        );
-        let file_digest = sha256_file(&sample, 2).expect("sha256 file");
-        assert_ne!(
-            file_digest,
-            path_identity_sha256(&sample).expect("path digest")
-        );
-        assert!(
-            sha256_file(&sample, 0)
-                .expect_err("zero chunk size")
-                .to_string()
-                .contains("positive integer")
-        );
-
-        let mut files = Vec::new();
-        collect_files_recursive(tmp.path(), &mut files).expect("collect files");
-        files.sort();
-        assert!(files.contains(&sample));
-        let mut singleton = Vec::new();
-        collect_files_recursive(&sample, &mut singleton).expect("collect single file");
-        assert_eq!(singleton, vec![sample.clone()]);
-        let mut missing = Vec::new();
-        collect_files_recursive(&tmp.path().join("missing.bin"), &mut missing)
-            .expect("missing path should be ignored");
-        assert!(missing.is_empty());
-        assert!(resolved_file_path(&tmp.path().join("missing.bin")).is_err());
-        assert!(path_identity_sha256(&tmp.path().join("missing.bin")).is_err());
-        assert!(decode_sha256_hex("abcd").is_err());
-    }
-
-    #[test]
-    fn json_config_and_binary_row_helpers_work() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let mut stats = serde_json::Map::new();
-        stats.insert("count".to_owned(), serde_json::json!(7));
-        stats.insert("ratio".to_owned(), serde_json::json!(0.25));
-        assert_eq!(json_usize(&stats, "count", 0), 7);
-        assert_eq!(json_usize(&stats, "missing", 5), 5);
-        assert_eq!(json_f64_opt(&stats, "ratio"), Some(0.25));
-        assert_eq!(json_f64_opt(&stats, "missing"), None);
-
-        let fixed = store_config_from_parts(
-            PathBuf::from("root"),
-            CandidateIdSource::Sha256,
-            true,
-            0.001,
-            0.002,
-            3,
-            4,
-            33.5,
-        );
-        assert_eq!(fixed.root, PathBuf::from("root"));
-        assert_eq!(fixed.id_source, "sha256");
-        assert!(fixed.store_path);
-        assert_eq!(fixed.tier2_gram_size, 3);
-        assert_eq!(fixed.tier1_gram_size, 4);
-        assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
-        assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
-        assert_eq!(fixed.filter_target_fp, None);
-        assert_eq!(fixed.compaction_idle_cooldown_s, 33.5);
-
-        let variable = store_config_from_parts(
-            PathBuf::from("root"),
-            CandidateIdSource::Sha256,
-            false,
-            0.01,
-            0.01,
-            5,
-            4,
-            9.25,
-        );
-        assert_eq!(variable.root, PathBuf::from("root"));
-        assert_eq!(variable.id_source, "sha256");
-        assert!(!variable.store_path);
-        assert_eq!(variable.tier1_filter_target_fp, Some(0.01));
-        assert_eq!(variable.tier2_filter_target_fp, Some(0.01));
-        assert_eq!(variable.filter_target_fp, Some(0.01));
-        assert_eq!(variable.tier2_gram_size, 5);
-        assert_eq!(variable.tier1_gram_size, 4);
-        assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
-
-        let row = IndexBatchRow {
-            sha256: [0xAA; 32],
-            file_size: 123,
-            filter_bytes: 2048,
-            bloom_item_estimate: Some(77),
-            bloom_filter: vec![1, 2, 3, 4],
-            tier2_filter_bytes: 0,
-            tier2_bloom_item_estimate: None,
-            tier2_bloom_filter: Vec::new(),
-            special_population: false,
-            metadata: vec![9, 8, 7],
-            external_id: Some("x".to_owned()),
-        };
-        let wire = serialize_candidate_document_binary_row(&row).expect("binary row");
-        let parsed =
-            crate::rpc::parse_candidate_insert_binary_row_for_test(&wire).expect("parse row");
-        assert_eq!(parsed.0, [0xAA; 32]);
-        assert_eq!(parsed.1, 123);
-        assert_eq!(parsed.2, Some(77));
-        assert_eq!(parsed.3, vec![1, 2, 3, 4]);
-        assert_eq!(parsed.7, vec![9, 8, 7]);
-        assert_eq!(parsed.8.as_deref(), Some("x"));
-
-        let tmp = tempdir().expect("tmp");
-        let config = CandidateConfig {
-            root: tmp.path().join("candidate_db"),
-            ..CandidateConfig::default()
-        };
-        let store = ensure_store(config.clone(), true).expect("init store");
-        assert_eq!(store.stats().doc_count, 0);
-        let reopened = ensure_store(config, false).expect("reopen store");
-        assert_eq!(reopened.stats().doc_count, 0);
-    }
-
-    #[test]
-    fn default_ingest_workers_matches_python_formula() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        assert_eq!(default_ingest_workers_for(1), 1);
-        assert_eq!(default_ingest_workers_for(2), 1);
-        assert_eq!(default_ingest_workers_for(3), 1);
-        assert_eq!(default_ingest_workers_for(4), 2);
-        assert_eq!(default_ingest_workers_for(7), 3);
-        assert_eq!(default_ingest_workers_for(8), 6);
-        assert_eq!(default_ingest_workers_for(9), 6);
-        assert_eq!(default_ingest_workers_for(16), 12);
-    }
-
-    #[test]
-    fn auto_ingest_workers_caps_rotational_and_small_workloads() {
-        assert_eq!(
-            auto_ingest_workers_for(
-                16,
-                500,
-                IngestStorageClass::SolidState,
-                IngestStorageClass::Unknown
-            ),
-            12
-        );
-        assert_eq!(
-            auto_ingest_workers_for(
-                16,
-                500,
-                IngestStorageClass::Rotational,
-                IngestStorageClass::Unknown
-            ),
-            4
-        );
-        assert_eq!(
-            auto_ingest_workers_for(
-                16,
-                3,
-                IngestStorageClass::SolidState,
-                IngestStorageClass::Unknown
-            ),
-            3
-        );
-        assert_eq!(
-            auto_ingest_workers_for(
-                16,
-                2,
-                IngestStorageClass::Rotational,
-                IngestStorageClass::Unknown
-            ),
-            2
-        );
-    }
-
-    #[test]
-    fn resolve_ingest_workers_respects_explicit_override() {
-        let resolved = resolve_ingest_workers(7, 500, &[], None);
-        assert_eq!(resolved.workers, 7);
-        assert!(!resolved.auto);
-        assert_eq!(resolved.input_storage, IngestStorageClass::Unknown);
-        assert_eq!(resolved.output_storage, IngestStorageClass::Unknown);
-    }
-
-    #[test]
-    fn default_search_workers_is_quarter_cpu_floor() {
-        assert_eq!(default_search_workers_for(1), 1);
-        assert_eq!(default_search_workers_for(2), 1);
-        assert_eq!(default_search_workers_for(3), 1);
-        assert_eq!(default_search_workers_for(4), 1);
-        assert_eq!(default_search_workers_for(7), 1);
-        assert_eq!(default_search_workers_for(8), 2);
-        assert_eq!(default_search_workers_for(16), 4);
-        assert_eq!(default_search_workers_for(20), 5);
-    }
-
-    #[test]
-    fn scan_candidate_batch_helpers_work() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let sample = tmp.path().join("sample.bin");
-        fs::write(&sample, b"well hello there").expect("sample");
-
-        let row = scan_index_batch_row(
-            &sample,
-            ScanPolicy {
-                fixed_filter_bytes: Some(2048),
-                tier1_filter_target_fp: None,
-                tier2_filter_target_fp: None,
-                gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
-                chunk_size: 4,
-                store_path: true,
-                id_source: CandidateIdSource::Sha256,
-            },
-        )
-        .expect("scan row");
-        assert_eq!(
-            row.external_id.as_deref(),
-            Some(
-                sample
-                    .canonicalize()
-                    .expect("canon")
-                    .to_string_lossy()
-                    .as_ref()
-            )
-        );
-
-        let md5_row = scan_index_batch_row(
-            &sample,
-            ScanPolicy {
-                fixed_filter_bytes: Some(2048),
-                tier1_filter_target_fp: None,
-                tier2_filter_target_fp: None,
-                gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
-                chunk_size: 4,
-                store_path: false,
-                id_source: CandidateIdSource::Md5,
-            },
-        )
-        .expect("scan md5 row");
-        assert_eq!(row.filter_bytes % 8, 0);
-        assert_eq!(row.tier2_filter_bytes % 8, 0);
-        assert_eq!(
-            md5_row.sha256,
-            identity_from_file(&sample, 4, CandidateIdSource::Md5).expect("md5 id")
-        );
-        assert!(md5_row.external_id.is_none());
-
-        let aligned_row = scan_index_batch_row(
-            &sample,
-            ScanPolicy {
-                fixed_filter_bytes: Some(2051),
-                tier1_filter_target_fp: None,
-                tier2_filter_target_fp: None,
-                gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
-                chunk_size: 4,
-                store_path: false,
-                id_source: CandidateIdSource::Sha256,
-            },
-        )
-        .expect("scan aligned row");
-        assert_eq!(aligned_row.filter_bytes, 2056);
-        assert_eq!(aligned_row.tier2_filter_bytes, 2056);
-
-        assert_eq!(merge_tier_used(Vec::<String>::new()), "unknown");
-        assert_eq!(merge_tier_used(vec![" tier1 ".to_owned()]), "tier1");
-        assert_eq!(
-            merge_tier_used(vec!["tier1".to_owned(), "tier2".to_owned()]),
-            "tier1+tier2"
-        );
-
-        let rule_path = tmp.path().join("rule.yar");
-        fs::write(
-            &rule_path,
-            "rule test { strings: $a = \"hello\" condition: $a }\n",
-        )
-        .expect("rule");
-        assert!(compile_yara_verifier(&rule_path).is_ok());
-        let bad_rule_path = tmp.path().join("bad_rule.yar");
-        fs::write(&bad_rule_path, "rule {").expect("bad rule");
-        assert!(compile_yara_verifier(&bad_rule_path).is_err());
-
-        let single_rule_path = tmp.path().join("single_rule.yar");
-        fs::write(
-            &single_rule_path,
-            "rule single_rule { strings: $a = { 41 42 43 44 } condition: $a }\n",
-        )
-        .expect("single rule");
-        assert_eq!(rule_file_has_single_rule(&single_rule_path), Some(true));
-
-        let multi_rule_path = tmp.path().join("multi_rule.yar");
-        fs::write(
-            &multi_rule_path,
-            concat!(
-                "rule first { strings: $a = { 41 42 43 44 } condition: $a }\n",
-                "rule second { strings: $a = { 45 46 47 48 } condition: $a }\n",
-            ),
-        )
-        .expect("multi rule");
-        assert_eq!(rule_file_has_single_rule(&multi_rule_path), Some(false));
-        assert!(fixed_literal_plan_from_rule(&multi_rule_path).is_none());
-
-        let fixed_match_path = tmp.path().join("fixed.bin");
-        fs::write(&fixed_match_path, b"--ABCDEFGH--").expect("fixed match");
-        let fixed_plan = FixedLiteralMatchPlan {
-            literals: HashMap::from([
-                ("$a".to_owned(), vec![b"ABCD".to_vec()]),
-                ("$b".to_owned(), vec![b"EFGH".to_vec()]),
-            ]),
-            literal_wide: HashMap::from([
-                ("$a".to_owned(), vec![false]),
-                ("$b".to_owned(), vec![false]),
-            ]),
-            literal_fullword: HashMap::from([
-                ("$a".to_owned(), vec![false]),
-                ("$b".to_owned(), vec![false]),
-            ]),
-            root: QueryNode {
-                kind: "and".to_owned(),
-                pattern_id: None,
-                threshold: None,
-                children: vec![
-                    QueryNode {
-                        kind: "pattern".to_owned(),
-                        pattern_id: Some("$a".to_owned()),
-                        threshold: None,
-                        children: Vec::new(),
-                    },
-                    QueryNode {
-                        kind: "pattern".to_owned(),
-                        pattern_id: Some("$b".to_owned()),
-                        threshold: None,
-                        children: Vec::new(),
-                    },
-                ],
-            },
-        };
-        assert!(verify_fixed_literal_plan_on_file(&fixed_match_path, &fixed_plan).expect("match"));
-        fs::write(&fixed_match_path, b"--ABCD----").expect("fixed miss");
-        assert!(!verify_fixed_literal_plan_on_file(&fixed_match_path, &fixed_plan).expect("miss"));
-
-        let fullword_path = tmp.path().join("fullword.bin");
-        fs::write(&fullword_path, b".WORD! xWORDx").expect("fullword bytes");
-        let fullword_plan = FixedLiteralMatchPlan {
-            literals: HashMap::from([("$a".to_owned(), vec![b"WORD".to_vec()])]),
-            literal_wide: HashMap::from([("$a".to_owned(), vec![false])]),
-            literal_fullword: HashMap::from([("$a".to_owned(), vec![true])]),
-            root: QueryNode {
-                kind: "pattern".to_owned(),
-                pattern_id: Some("$a".to_owned()),
-                threshold: None,
-                children: Vec::new(),
-            },
-        };
-        assert!(
-            verify_fixed_literal_plan_on_file(&fullword_path, &fullword_plan).expect("fullword")
-        );
-        fs::write(&fullword_path, b"xWORDx").expect("fullword miss bytes");
-        assert!(
-            !verify_fixed_literal_plan_on_file(&fullword_path, &fullword_plan)
-                .expect("fullword miss")
-        );
-    }
-
-    #[test]
-    fn scan_index_batch_row_perf_report_includes_stage_breakdown() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        let tmp = tempdir().expect("tmp");
-        let sample = tmp.path().join("sample.bin");
-        let perf_path = tmp.path().join("perf.json");
-        fs::write(
-            &sample,
-            b"MZthis file is long enough to exercise hll and metadata extraction",
-        )
-        .expect("sample");
-        crate::perf::configure(Some(perf_path), false);
-
-        let _row = scan_index_batch_row(
-            &sample,
-            ScanPolicy {
-                fixed_filter_bytes: None,
-                tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
-                tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
-                gram_sizes: GramSizes::new(3, 4).expect("gram sizes"),
-                chunk_size: 8,
-                store_path: false,
-                id_source: CandidateIdSource::Sha256,
-            },
-        )
-        .expect("scan row");
-
-        let report = crate::perf::report_value(0).expect("perf report");
-        let stages = report
-            .get("stages")
-            .and_then(serde_json::Value::as_object)
-            .expect("stages");
-        for stage in [
-            "candidate.scan_index_batch_row",
-            "candidate.scan_index_batch_row.estimate_unique_grams",
-            "candidate.scan_index_batch_row.filter_sizing",
-            "candidate.scan_index_batch_row.metadata",
-            "candidate.scan_index_batch_row.row_build",
-            "candidate.scan_file_features",
-        ] {
-            let stats = stages
-                .get(stage)
-                .unwrap_or_else(|| panic!("missing stage {stage}"));
-            assert_eq!(
-                stats.get("calls").and_then(serde_json::Value::as_u64),
-                Some(1),
-                "stage {stage}"
-            );
-        }
-        crate::perf::configure(None, false);
-    }
-
-    #[test]
-    fn candidate_helper_commands_work() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-        let sample_dir = base.join("samples");
-        let candidate_root = base.join("candidate_db");
-        let rule_path = base.join("rule.yar");
-        fs::create_dir_all(&sample_dir).expect("sample dir");
-        let sample_a = sample_dir.join("a.bin");
-        let sample_b = sample_dir.join("b.bin");
-        fs::write(&sample_a, b"xxABCDyy").expect("sample a");
-        fs::write(&sample_b, b"zzABCDqq").expect("sample b");
-        fs::write(
-            &rule_path,
-            r#"
-rule q {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("rule");
-
-        let candidate_init_args = default_internal_init_args(&candidate_root, 1, true);
-        assert_eq!(cmd_init(&candidate_init_args), 0);
-
-        let ingest_one = InternalIndexArgs {
-            connection: default_connection(),
-            file_path: sample_a.display().to_string(),
-            root: Some(candidate_root.display().to_string()),
-            external_id: Some("manual-a".to_owned()),
-            chunk_size: 1024,
-        };
-        assert_eq!(cmd_internal_index(&ingest_one), 0);
-
-        let ingest_batch = InternalIndexBatchArgs {
-            paths: vec![sample_dir.display().to_string()],
-            path_list: false,
-            root: Some(candidate_root.display().to_string()),
-            batch_size: 1,
-            workers: 2,
-            chunk_size: 1024,
-            verbose: false,
-        };
-        assert_eq!(cmd_internal_index_batch(&ingest_batch), 0);
-
-        let query_args = InternalQueryArgs {
-            connection: default_connection(),
-            root: Some(candidate_root.display().to_string()),
-            rule: rule_path.display().to_string(),
-            cursor: 0,
-            chunk_size: 10,
-            max_anchors_per_pattern: 8,
-            force_tier1_only: false,
-            no_tier2_fallback: false,
-            max_candidates: 100.0,
-        };
-        assert_eq!(cmd_internal_query(&query_args), 0);
-
-        let stats_args = InternalStatsArgs {
-            connection: default_connection(),
-            root: Some(candidate_root.display().to_string()),
-        };
-        assert_eq!(cmd_internal_stats(&stats_args), 0);
-
-        let delete_args = InternalDeleteArgs {
-            connection: default_connection(),
-            root: Some(candidate_root.display().to_string()),
-            values: vec![sample_a.display().to_string()],
-        };
-        assert_eq!(cmd_internal_delete(&delete_args), 0);
-        assert_eq!(
-            cmd_internal_delete(&InternalDeleteArgs {
-                connection: default_connection(),
-                root: Some(candidate_root.display().to_string()),
-                values: Vec::new(),
-            }),
-            1
-        );
-    }
-
-    #[test]
-    fn expand_input_paths_supports_path_lists() {
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-        let rel_dir = base.join("rel");
-        fs::create_dir_all(&rel_dir).expect("rel dir");
-        let rel_file = rel_dir.join("a.bin");
-        let abs_file = base.join("b.bin");
-        fs::write(&rel_file, b"a").expect("rel");
-        fs::write(&abs_file, b"b").expect("abs");
-        let list_path = base.join("dataset.txt");
-        fs::write(&list_path, format!("rel/a.bin\n{}\n\n", abs_file.display())).expect("list");
-
-        let expanded = expand_input_paths(&[list_path.display().to_string()], true).expect("list");
-        assert_eq!(expanded, vec![abs_file, rel_file]);
-    }
-
-    #[test]
-    fn yara_check_and_main_dispatch_work() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let rule_path = tmp.path().join("rule.yar");
-        let hit_path = tmp.path().join("hit.bin");
-        fs::write(
-            &rule_path,
-            "rule TestLiteral : tag_a { strings: $a = \"hello\" condition: $a }\n",
-        )
-        .expect("rule");
-        fs::write(&hit_path, b"well hello there").expect("hit");
-
-        assert_eq!(
-            cmd_yara(&YaraArgs {
-                rule: rule_path.display().to_string(),
-                file_path: hit_path.display().to_string(),
-                scan_timeout: 1,
-                show_tags: true,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_yara(&YaraArgs {
-                rule: tmp.path().join("missing.yar").display().to_string(),
-                file_path: hit_path.display().to_string(),
-                scan_timeout: 1,
-                show_tags: false,
-            }),
-            1
-        );
-        assert_eq!(
-            main(Some(vec![
-                "sspry".to_owned(),
-                "yara".to_owned(),
-                "--rule".to_owned(),
-                rule_path.display().to_string(),
-                hit_path.display().to_string(),
-            ])),
-            0
-        );
-    }
-
-    #[test]
-    fn local_multishard_candidate_commands_cover_root_branches() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-        let sample_dir = base.join("samples");
-        let candidate_root = base.join("candidate_db");
-        let rule_path = base.join("rule.yar");
-        fs::create_dir_all(&sample_dir).expect("sample dir");
-        let sample_a = sample_dir.join("a.bin");
-        let sample_b = sample_dir.join("b.bin");
-        let sample_c = sample_dir.join("c.bin");
-        fs::write(&sample_a, b"ABCD tail").expect("sample a");
-        fs::write(&sample_b, b"prefix ABCD").expect("sample b");
-        fs::write(&sample_c, b"ABCD extra").expect("sample c");
-        fs::write(
-            &rule_path,
-            r#"
-rule q {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("rule");
-
-        assert_eq!(
-            cmd_init(&default_internal_init_args(&candidate_root, 2, true)),
-            0
-        );
-        assert_eq!(
-            cmd_init(&default_internal_init_args(&candidate_root, 2, false)),
-            0
-        );
-        assert_eq!(
-            cmd_init(&default_internal_init_args(&candidate_root, 1, false)),
-            1
-        );
-
-        assert_eq!(
-            cmd_local_index(&LocalIndexArgs {
-                root: candidate_root.display().to_string(),
-                candidate_shards: 2,
-                force: false,
-                tier1_filter_target_fp: None,
-                tier2_filter_target_fp: None,
-                gram_sizes: "3,4".to_owned(),
-                compaction_idle_cooldown_s: 5.0,
-                paths: vec![
-                    sample_dir.display().to_string(),
-                    base.join("missing").display().to_string(),
-                ],
-                path_list: false,
-                batch_size: 1,
-                workers: Some(1),
-                verbose: false,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_internal_index_batch(&InternalIndexBatchArgs {
-                paths: vec![base.join("missing_only").display().to_string()],
-                path_list: false,
-                root: Some(candidate_root.display().to_string()),
-                batch_size: 1,
-                workers: 1,
-                chunk_size: 1024,
-                verbose: false,
-            }),
-            1
-        );
-        assert_eq!(
-            cmd_internal_index(&InternalIndexArgs {
-                connection: default_connection(),
-                file_path: sample_a.display().to_string(),
-                root: Some(candidate_root.display().to_string()),
-                external_id: Some("manual-root-id".to_owned()),
-                chunk_size: 1024,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_internal_query(&InternalQueryArgs {
-                connection: default_connection(),
-                root: Some(candidate_root.display().to_string()),
-                rule: rule_path.display().to_string(),
-                cursor: 0,
-                chunk_size: 1,
-                max_anchors_per_pattern: 2,
-                force_tier1_only: false,
-                no_tier2_fallback: false,
-                max_candidates: 2.0,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_internal_query(&InternalQueryArgs {
-                connection: default_connection(),
-                root: Some(candidate_root.display().to_string()),
-                rule: rule_path.display().to_string(),
-                cursor: 0,
-                chunk_size: 4,
-                max_anchors_per_pattern: 4,
-                force_tier1_only: true,
-                no_tier2_fallback: true,
-                max_candidates: 8.0,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_local_search(&LocalSearchArgs {
-                root: candidate_root.display().to_string(),
-                rule: rule_path.display().to_string(),
-                tree_search_workers: 2,
-                max_anchors_per_pattern: 4,
-                max_candidates: 8.0,
-                verify_yara_files: false,
-                verbose: false,
-            }),
-            0
-        );
-        let path_sha = hex::encode(sha256_file(&sample_b, 1024).expect("sha256"));
-        assert_eq!(
-            cmd_local_info(&LocalInfoArgs {
-                root: candidate_root.display().to_string(),
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_local_delete(&LocalDeleteArgs {
-                root: candidate_root.display().to_string(),
-                values: vec![path_sha],
-            }),
-            0
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn public_remote_commands_cover_grpc_path() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-        let sample_dir = base.join("remote_samples");
-        fs::create_dir_all(&sample_dir).expect("sample dir");
-        let sample_a = sample_dir.join("a.bin");
-        let sample_b = sample_dir.join("b.bin");
-        let sample_c = sample_dir.join("c.bin");
-        fs::write(&sample_a, b"ABCD remote one").expect("sample a");
-        fs::write(&sample_b, b"prefix ABCD remote two").expect("sample b");
-        fs::write(&sample_c, b"ABCD remote three").expect("sample c");
-        let rule_path = base.join("remote_rule.yar");
-        fs::write(
-            &rule_path,
-            r#"
-rule remote_q {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("rule");
-        let connection = start_grpc_test_server(base, 2);
-        let policy = server_scan_policy(&connection).expect("scan policy from server");
-        assert_eq!(policy.id_source, CandidateIdSource::Sha256);
-        assert!(!policy.store_path);
-        assert_eq!(policy.tier1_filter_target_fp, Some(0.38));
-        assert_eq!(policy.tier2_filter_target_fp, Some(0.18));
-        assert_eq!(policy.gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
-
-        assert_eq!(
-            cmd_index(&IndexArgs {
-                connection: connection.clone(),
-                paths: vec![
-                    sample_a.display().to_string(),
-                    sample_b.display().to_string(),
-                    sample_c.display().to_string()
-                ],
-                path_list: false,
-                batch_size: 1,
-                remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
-                grpc_insert_chunk_bytes: grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
-                workers: Some(2),
-                verbose: false,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_search(&SearchCommandArgs {
-                connection: connection.clone(),
-                rule: rule_path.display().to_string(),
-                max_anchors_per_pattern: 2,
-                max_candidates: 8.0,
-                verify_yara_files: false,
-                verbose: false,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_search(&SearchCommandArgs {
-                connection: connection.clone(),
-                rule: rule_path.display().to_string(),
-                max_anchors_per_pattern: 2,
-                max_candidates: 8.0,
-                verify_yara_files: true,
-                verbose: false,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_info(&InfoCommandArgs {
-                connection: connection.clone(),
-                light: false,
-            }),
-            0
-        );
-        assert_eq!(
-            cmd_delete(&DeleteArgs {
-                connection: connection.clone(),
-                values: vec![sample_a.display().to_string()],
-            }),
-            0
-        );
-        assert_eq!(
-            main(Some(vec![
-                "sspry".to_owned(),
-                "--perf-report".to_owned(),
-                base.join("perf").join("stats.json").display().to_string(),
-                "info".to_owned(),
-                "--addr".to_owned(),
-                connection.addr.clone(),
-            ])),
-            0
-        );
-    }
-
-    #[test]
-    fn main_returns_error_when_perf_report_path_is_unwritable() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let perf_dir = tmp.path().join("perf-as-dir");
-        let rule_path = tmp.path().join("rule.yar");
-        let hit_path = tmp.path().join("hit.bin");
-        fs::create_dir_all(&perf_dir).expect("perf dir");
-        fs::write(
-            &rule_path,
-            "rule TestLiteral { strings: $a = \"hello\" condition: $a }\n",
-        )
-        .expect("rule");
-        fs::write(&hit_path, b"hello").expect("hit");
-        assert_eq!(
-            main(Some(vec![
-                "sspry".to_owned(),
-                "--perf-report".to_owned(),
-                perf_dir.display().to_string(),
-                "yara".to_owned(),
-                "--rule".to_owned(),
-                rule_path.display().to_string(),
-                hit_path.display().to_string(),
-            ])),
-            1
-        );
-        crate::perf::configure(None, false);
-    }
-
-    #[test]
-    fn cmd_serve_reports_tcp_bind_errors() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let listener =
-            std::net::TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind occupied port");
-        let port = listener.local_addr().expect("listener addr").port();
-        let mut args = default_serve_args();
-        args.common.addr = format!("{DEFAULT_RPC_HOST}:{port}");
-        assert_eq!(cmd_serve(&args), 1);
-    }
-
-    #[test]
-    fn local_command_error_paths_report_failures() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let sample = tmp.path().join("sample.bin");
-        let missing_root = tmp.path().join("missing_root");
-        let missing_rule = tmp.path().join("missing_rule.yar");
-        fs::write(&sample, b"ABCD").expect("sample");
-
-        assert_eq!(
-            cmd_internal_index(&InternalIndexArgs {
-                connection: default_connection(),
-                file_path: sample.display().to_string(),
-                root: Some(missing_root.display().to_string()),
-                external_id: None,
-                chunk_size: 1024,
-            }),
-            1
-        );
-        assert_eq!(
-            cmd_local_info(&LocalInfoArgs {
-                root: missing_root.display().to_string(),
-            }),
-            1
-        );
-        assert_eq!(
-            cmd_local_search(&LocalSearchArgs {
-                root: missing_root.display().to_string(),
-                rule: missing_rule.display().to_string(),
-                tree_search_workers: 0,
-                max_anchors_per_pattern: 1,
-                max_candidates: 1.0,
-                verify_yara_files: false,
-                verbose: false,
-            }),
-            1
-        );
-        assert_eq!(
-            cmd_local_delete(&LocalDeleteArgs {
-                root: missing_root.display().to_string(),
-                values: vec![sample.display().to_string()],
-            }),
-            1
-        );
-        assert_eq!(
-            cmd_delete(&DeleteArgs {
-                connection: default_connection(),
-                values: vec!["not-a-valid-digest".to_owned()],
-            }),
-            1
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn public_ingest_and_delete_follow_server_identity_source() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-        let sample = base.join("identity.bin");
-        fs::write(&sample, b"ABCD identity").expect("sample");
-
-        let connection = start_grpc_test_server_with_config(RpcServerConfig {
-            candidate_config: CandidateConfig {
-                root: base.join("candidate_db"),
-                id_source: "md5".to_owned(),
-                ..CandidateConfig::default()
-            },
-            candidate_shards: 1,
-            search_workers: default_search_workers_for(4),
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            auto_publish_initial_idle_ms: 500,
-            auto_publish_storage_class: "unknown".to_owned(),
-            workspace_mode: true,
-        });
-
-        assert_eq!(
-            cmd_index(&IndexArgs {
-                connection: connection.clone(),
-                paths: vec![sample.display().to_string()],
-                path_list: false,
-                batch_size: 1,
-                remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
-                grpc_insert_chunk_bytes: grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
-                workers: Some(1),
-                verbose: false,
-            }),
-            0
-        );
-
-        assert_eq!(
-            cmd_delete(&DeleteArgs {
-                connection: connection.clone(),
-                values: vec![hex::encode(sha256_file(&sample, 1024).expect("sha256"))],
-            }),
-            1
-        );
-
-        assert_eq!(
-            cmd_delete(&DeleteArgs {
-                connection,
-                values: vec![hex::encode(md5_file(&sample, 1024).expect("md5"))],
-            }),
-            0
-        );
-    }
-
-    #[test]
-    fn non_sha256_identity_sources_normalize_consistently() {
-        let tmp = tempdir().expect("tmp");
-        let sample = tmp.path().join("sample.bin");
-        fs::write(&sample, b"identity-check-bytes").expect("sample");
-
-        let md5_bytes = md5_file(&sample, 1024).expect("md5");
-        let sha1_bytes = sha1_file(&sample, 1024).expect("sha1");
-        let sha512_bytes = sha512_file(&sample, 1024).expect("sha512");
-
-        assert_eq!(
-            identity_from_file(&sample, 1024, CandidateIdSource::Md5).expect("md5 file"),
-            identity_from_hex(&hex::encode(md5_bytes), CandidateIdSource::Md5).expect("md5 hex")
-        );
-        assert_eq!(
-            identity_from_file(&sample, 1024, CandidateIdSource::Sha1).expect("sha1 file"),
-            identity_from_hex(&hex::encode(sha1_bytes), CandidateIdSource::Sha1).expect("sha1 hex")
-        );
-        assert_eq!(
-            identity_from_file(&sample, 1024, CandidateIdSource::Sha512).expect("sha512 file"),
-            identity_from_hex(&hex::encode(sha512_bytes), CandidateIdSource::Sha512)
-                .expect("sha512 hex")
-        );
-
-        assert_ne!(
-            identity_from_file(&sample, 1024, CandidateIdSource::Md5).expect("md5 file"),
-            sha256_file(&sample, 1024).expect("sha256 file")
-        );
-    }
-
-    #[test]
-    fn digest_helpers_and_delete_resolution_cover_remaining_branches() {
-        let tmp = tempdir().expect("tmp");
-        let sample = tmp.path().join("sample.bin");
-        fs::write(&sample, b"identity-check-bytes").expect("sample");
-
-        assert!(
-            md5_file(&sample, 0)
-                .expect_err("md5 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha1_file(&sample, 0)
-                .expect_err("sha1 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-        assert!(
-            sha512_file(&sample, 0)
-                .expect_err("sha512 zero chunk")
-                .to_string()
-                .contains("positive integer")
-        );
-
-        assert_eq!(
-            detect_digest_identity_source(&"aa".repeat(16)),
-            Some(CandidateIdSource::Md5)
-        );
-        assert_eq!(
-            detect_digest_identity_source(&"bb".repeat(20)),
-            Some(CandidateIdSource::Sha1)
-        );
-        assert_eq!(
-            detect_digest_identity_source(&"cc".repeat(32)),
-            Some(CandidateIdSource::Sha256)
-        );
-        assert_eq!(
-            detect_digest_identity_source(&"dd".repeat(64)),
-            Some(CandidateIdSource::Sha512)
-        );
-        assert_eq!(detect_digest_identity_source("not-hex"), None);
-        assert_eq!(detect_digest_identity_source(&"ee".repeat(12)), None);
-
-        let sha256_hex = hex::encode(sha256_file(&sample, 1024).expect("sha256"));
-        let md5_hex = hex::encode(md5_file(&sample, 1024).expect("md5"));
-        let sha1_hex = hex::encode(sha1_file(&sample, 1024).expect("sha1"));
-        let sha512_hex = hex::encode(sha512_file(&sample, 1024).expect("sha512"));
-
-        assert_eq!(
-            resolve_delete_value(
-                sample.to_str().expect("sample"),
-                CandidateIdSource::Sha256,
-                1024,
-            )
-            .expect("path delete resolution"),
-            hex::encode(
-                identity_from_file(&sample, 1024, CandidateIdSource::Sha256)
-                    .expect("path identity")
-            )
-        );
-        assert_eq!(
-            resolve_delete_value(&md5_hex, CandidateIdSource::Md5, 1024)
-                .expect("md5 delete resolution"),
-            hex::encode(
-                identity_from_hex(&md5_hex, CandidateIdSource::Md5).expect("normalized md5")
-            )
-        );
-        assert_eq!(
-            resolve_delete_value(&sha1_hex, CandidateIdSource::Sha1, 1024)
-                .expect("sha1 delete resolution"),
-            hex::encode(
-                identity_from_hex(&sha1_hex, CandidateIdSource::Sha1).expect("normalized sha1")
-            )
-        );
-        assert_eq!(
-            resolve_delete_value(&sha512_hex, CandidateIdSource::Sha512, 1024)
-                .expect("sha512 delete resolution"),
-            hex::encode(
-                identity_from_hex(&sha512_hex, CandidateIdSource::Sha512)
-                    .expect("normalized sha512")
-            )
-        );
-        assert!(
-            resolve_delete_value(&md5_hex, CandidateIdSource::Sha256, 1024)
-                .expect_err("mismatched digest type")
-                .to_string()
-                .contains("server identity source is")
-        );
-        assert!(
-            resolve_delete_value("not-a-path-or-digest", CandidateIdSource::Sha256, 1024)
-                .expect_err("invalid delete value")
-                .to_string()
-                .contains("is neither an existing file path nor a valid")
-        );
-
-        assert_eq!(
-            resolve_delete_identity(
-                Some(&sha256_hex),
-                None,
-                None,
-                None,
-                None,
-                CandidateIdSource::Sha256,
-                1024,
-            )
-            .expect("resolved identity"),
-            hex::encode(
-                identity_from_hex(&sha256_hex, CandidateIdSource::Sha256)
-                    .expect("normalized sha256")
-            )
-        );
-    }
-
-    #[test]
-    fn batch_search_helper_functions_cover_local_forest_paths() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-
-        assert!(default_ingest_workers() >= 1);
-        assert_eq!(
-            remote_index_session_document_limit(0, 64),
-            REMOTE_INDEX_SESSION_MAX_DOCUMENTS
-        );
-        assert_eq!(
-            remote_index_session_document_limit(640 * 1024 * 4 * 8, 64),
-            64
-        );
-        assert_eq!(
-            remote_index_session_document_limit(640 * 1024 * 4 * 4096, 1),
-            REMOTE_INDEX_SESSION_MAX_DOCUMENTS
-        );
-        assert_eq!(
-            remote_index_session_input_bytes_limit(0),
-            REMOTE_INDEX_SESSION_MAX_INPUT_BYTES
-        );
-        assert_eq!(
-            remote_index_session_input_bytes_limit(4 << 30),
-            REMOTE_INDEX_SESSION_MIN_INPUT_BYTES
-        );
-        assert_eq!(
-            remote_index_session_input_bytes_limit(40 << 30),
-            REMOTE_INDEX_SESSION_MAX_INPUT_BYTES
-        );
-        assert!(is_retryable_remote_index_rotation_error(&SspryError::from(
-            "server is publishing; retry later"
-        )));
-        assert!(is_retryable_remote_index_rotation_error(&SspryError::from(
-            "another index session is already active; retry later"
-        )));
-        assert!(is_retryable_remote_index_rotation_error(&SspryError::from(
-            "no active index session; cannot update progress"
-        )));
-        assert!(!is_retryable_remote_index_rotation_error(
-            &SspryError::from("fatal publish failure")
-        ));
-        assert_eq!(
-            append_path_suffix(Path::new("/tmp/out.json"), ".jsonl"),
-            PathBuf::from("/tmp/out.json.jsonl")
-        );
-        assert!(is_wide_word_unit(b"A\0"));
-        assert!(!is_wide_word_unit(b"A"));
-        assert!(!is_wide_word_unit(&[0xff, 0x00]));
-
-        let direct_root = base.join("direct");
-        fs::create_dir_all(direct_root.join("current")).expect("direct current");
-        assert_eq!(
-            forest_tree_roots(&direct_root).expect("direct tree roots"),
-            vec![direct_root.join("current")]
-        );
-
-        let empty_root = base.join("empty");
-        fs::create_dir_all(&empty_root).expect("empty root");
-        assert_eq!(
-            forest_tree_roots(&empty_root).expect("fallback tree roots"),
-            vec![empty_root.clone()]
-        );
-    }
-
-    #[test]
-    fn grpc_batch_helper_functions_cover_limits_and_oversize_rows() {
-        let empty_payload_size = empty_remote_batch_payload_size().expect("empty payload size");
-        let minimum_soft_limit = empty_payload_size.saturating_add(1);
-
-        assert_eq!(grpc_remote_batch_size(0), 1);
-        assert_eq!(grpc_remote_batch_size(3), 3);
-        assert_eq!(
-            grpc_remote_batch_size(GRPC_REMOTE_BATCH_MAX_ROWS + 5),
-            GRPC_REMOTE_BATCH_MAX_ROWS
-        );
-
-        assert_eq!(
-            grpc_remote_batch_soft_limit_bytes(1, empty_payload_size),
-            minimum_soft_limit
-        );
-        assert_eq!(
-            grpc_remote_batch_soft_limit_bytes(usize::MAX, empty_payload_size),
-            GRPC_REMOTE_BATCH_SOFT_LIMIT_BYTES.max(minimum_soft_limit)
-        );
-
-        assert_eq!(
-            remote_upload_queue_byte_limit(0, 1024),
-            2048.min(REMOTE_UPLOAD_QUEUE_MAX_BYTES)
-        );
-        assert_eq!(
-            remote_upload_queue_byte_limit(u64::MAX, 1024),
-            REMOTE_UPLOAD_QUEUE_MAX_BYTES
-        );
-
-        let pending_empty = RemotePendingBatch {
-            rows: Vec::new(),
-            payload_size: empty_payload_size,
-        };
-        let pending_non_empty = RemotePendingBatch {
-            rows: vec![vec![1, 2, 3]],
-            payload_size: empty_payload_size + 3,
-        };
-
-        assert!(
-            !prepare_serialized_remote_batch_row(
-                &pending_empty,
-                16,
-                empty_payload_size,
-                empty_payload_size + 32,
-                false,
-            )
-            .expect("fits empty batch")
-        );
-        assert!(
-            prepare_serialized_remote_batch_row(
-                &pending_non_empty,
-                4,
-                empty_payload_size,
-                empty_payload_size + 7,
-                false,
-            )
-            .expect("flush before oversize append")
-        );
-        assert!(
-            prepare_serialized_remote_batch_row(
-                &pending_non_empty,
-                64,
-                empty_payload_size,
-                empty_payload_size + 32,
-                true,
-            )
-            .expect("flush before oversize single row")
-        );
-        assert!(
-            prepare_serialized_remote_batch_row(
-                &pending_empty,
-                64,
-                empty_payload_size,
-                empty_payload_size + 32,
-                false,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn internal_local_only_commands_reject_removed_remote_paths() {
-        assert_eq!(
-            cmd_internal_index_batch(&InternalIndexBatchArgs {
-                paths: Vec::new(),
-                path_list: false,
-                root: None,
-                batch_size: 1,
-                workers: 1,
-                chunk_size: 1024,
-                verbose: false,
-            }),
-            1
-        );
-        assert_eq!(
-            cmd_internal_query(&InternalQueryArgs {
-                connection: default_connection(),
-                root: None,
-                rule: "/tmp/missing.yar".to_owned(),
-                cursor: 0,
-                chunk_size: 1,
-                max_anchors_per_pattern: 4,
-                force_tier1_only: false,
-                no_tier2_fallback: false,
-                max_candidates: 1.0,
-            }),
-            1
-        );
-    }
-
-    #[test]
-    fn batch_search_record_stream_roundtrips_json_outputs() {
-        let tmp = tempdir().expect("tmp");
-        let json_out = tmp.path().join("batch").join("search_summary.json");
-        let partial_json_out = append_path_suffix(&json_out, ".partial.json");
-        let jsonl_out = append_path_suffix(&json_out, ".jsonl");
-        let mut stream = BatchSearchRecordStream::new(&json_out).expect("stream");
-        assert_eq!(stream.jsonl_out(), jsonl_out.as_path());
-
-        let record_a = BatchSearchRecord {
-            rule: "rule_a".to_owned(),
-            rule_path: "/tmp/rule_a.yar".to_owned(),
-            exit_code: 0,
-            elapsed_ms_wall: 12.5,
-            error: None,
-            candidates: Some(2),
-            truncated: Some(false),
-            truncated_limit: None,
-            tier_used: Some("tier1+tier2".to_owned()),
-            verified_checked: Some(0),
-            verified_matched: Some(0),
-            verified_skipped: Some(0),
-            verbose_search_total_ms: Some(12.5),
-            verbose_search_plan_ms: Some(1.0),
-            verbose_search_query_ms: Some(11.0),
-            verbose_search_verify_ms: Some(0.5),
-            verbose_search_docs_scanned: Some(2),
-            verbose_search_metadata_loads: Some(0),
-            verbose_search_metadata_bytes: Some(0),
-            verbose_search_tier1_bloom_loads: Some(2),
-            verbose_search_tier1_bloom_bytes: Some(128),
-            verbose_search_tier2_bloom_loads: Some(1),
-            verbose_search_tier2_bloom_bytes: Some(64),
-            verbose_search_prepared_query_bytes: Some(32),
-            verbose_search_prepared_pattern_plan_bytes: Some(16),
-            verbose_search_prepared_mask_cache_bytes: Some(8),
-            verbose_search_prepared_pattern_count: Some(1),
-            verbose_search_prepared_mask_cache_entries: Some(1),
-            verbose_search_prepared_fixed_literal_count: Some(1),
-            verbose_search_prepared_tier1_alternatives: Some(1),
-            verbose_search_prepared_tier2_alternatives: Some(1),
-            verbose_search_prepared_tier1_shift_variants: Some(1),
-            verbose_search_prepared_tier2_shift_variants: Some(1),
-            verbose_search_prepared_tier1_any_lane_alternatives: Some(0),
-            verbose_search_prepared_tier2_any_lane_alternatives: Some(0),
-            verbose_search_prepared_tier1_compacted_any_lane_alternatives: Some(0),
-            verbose_search_prepared_tier2_compacted_any_lane_alternatives: Some(0),
-            verbose_search_prepared_any_lane_variant_sets: Some(0),
-            verbose_search_prepared_compacted_any_lane_grams: Some(0),
-            verbose_search_prepared_max_pattern_bytes: Some(4),
-            verbose_search_prepared_max_pattern_id: Some("$a".to_owned()),
-            verbose_search_prepared_impossible_query: Some(false),
-            verbose_search_max_candidates: Some(100.0),
-            verbose_search_max_anchors_per_pattern: Some(8),
-            verbose_search_candidates: Some(2),
-            verbose_search_verify_enabled: Some(false),
-            verbose_search_client_current_rss_kb: Some(1024),
-            verbose_search_client_peak_rss_kb: Some(2048),
-            verbose_search_client_smaps_rss_kb: Some(1024),
-            verbose_search_client_anonymous_kb: Some(512),
-            verbose_search_client_private_clean_kb: Some(64),
-            verbose_search_client_private_dirty_kb: Some(128),
-            verbose_search_client_shared_clean_kb: Some(256),
-            verbose_search_server_current_rss_kb: Some(4096),
-            verbose_search_server_peak_rss_kb: Some(8192),
-            verbose_search_tree_count: Some(2),
-            verbose_search_tree_search_workers: Some(2),
-        };
-        let record_b = BatchSearchRecord {
-            rule: "rule_b".to_owned(),
-            rule_path: "/tmp/rule_b.yar".to_owned(),
-            exit_code: 1,
-            elapsed_ms_wall: 3.5,
-            error: Some("boom".to_owned()),
-            candidates: None,
-            truncated: None,
-            truncated_limit: None,
-            tier_used: None,
-            verified_checked: None,
-            verified_matched: None,
-            verified_skipped: None,
-            verbose_search_total_ms: None,
-            verbose_search_plan_ms: None,
-            verbose_search_query_ms: None,
-            verbose_search_verify_ms: None,
-            verbose_search_docs_scanned: None,
-            verbose_search_metadata_loads: None,
-            verbose_search_metadata_bytes: None,
-            verbose_search_tier1_bloom_loads: None,
-            verbose_search_tier1_bloom_bytes: None,
-            verbose_search_tier2_bloom_loads: None,
-            verbose_search_tier2_bloom_bytes: None,
-            verbose_search_prepared_query_bytes: None,
-            verbose_search_prepared_pattern_plan_bytes: None,
-            verbose_search_prepared_mask_cache_bytes: None,
-            verbose_search_prepared_pattern_count: None,
-            verbose_search_prepared_mask_cache_entries: None,
-            verbose_search_prepared_fixed_literal_count: None,
-            verbose_search_prepared_tier1_alternatives: None,
-            verbose_search_prepared_tier2_alternatives: None,
-            verbose_search_prepared_tier1_shift_variants: None,
-            verbose_search_prepared_tier2_shift_variants: None,
-            verbose_search_prepared_tier1_any_lane_alternatives: None,
-            verbose_search_prepared_tier2_any_lane_alternatives: None,
-            verbose_search_prepared_tier1_compacted_any_lane_alternatives: None,
-            verbose_search_prepared_tier2_compacted_any_lane_alternatives: None,
-            verbose_search_prepared_any_lane_variant_sets: None,
-            verbose_search_prepared_compacted_any_lane_grams: None,
-            verbose_search_prepared_max_pattern_bytes: None,
-            verbose_search_prepared_max_pattern_id: None,
-            verbose_search_prepared_impossible_query: None,
-            verbose_search_max_candidates: None,
-            verbose_search_max_anchors_per_pattern: None,
-            verbose_search_candidates: None,
-            verbose_search_verify_enabled: None,
-            verbose_search_client_current_rss_kb: None,
-            verbose_search_client_peak_rss_kb: None,
-            verbose_search_client_smaps_rss_kb: None,
-            verbose_search_client_anonymous_kb: None,
-            verbose_search_client_private_clean_kb: None,
-            verbose_search_client_private_dirty_kb: None,
-            verbose_search_client_shared_clean_kb: None,
-            verbose_search_server_current_rss_kb: None,
-            verbose_search_server_peak_rss_kb: None,
-            verbose_search_tree_count: None,
-            verbose_search_tree_search_workers: None,
-        };
-
-        stream.push(&record_a).expect("push record a");
-        stream.push(&record_b).expect("push record b");
-        assert_eq!(stream.finish().expect("finish"), 2);
-
-        let json_rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&fs::read(&json_out).expect("json output")).expect("json rows");
-        assert_eq!(json_rows.len(), 2);
-
-        let jsonl_lines = fs::read_to_string(&jsonl_out)
-            .expect("jsonl output")
-            .lines()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(jsonl_lines.len(), 2);
-        assert!(!partial_json_out.exists());
-    }
-
-    #[test]
-    fn local_forest_search_wrappers_and_cmd_search_batch_work() {
-        let _guard = crate::perf::test_lock().lock().expect("perf lock");
-        crate::perf::configure(None, false);
-        let tmp = tempdir().expect("tmp");
-        let base = tmp.path();
-        let forest_root = base.join("forest");
-        let rules_dir = base.join("rules");
-        fs::create_dir_all(&forest_root).expect("forest root");
-        fs::create_dir_all(&rules_dir).expect("rules dir");
-
-        for (tree_idx, files) in [
-            (
-                0usize,
-                vec![
-                    ("match_a.bin", b"tree zero ABCD hit one".as_slice()),
-                    ("miss_a.bin", b"tree zero miss".as_slice()),
-                ],
-            ),
-            (
-                1usize,
-                vec![
-                    ("match_b.bin", b"tree one prefix ABCD hit two".as_slice()),
-                    ("miss_b.bin", b"tree one miss".as_slice()),
-                ],
-            ),
-        ] {
-            let tree_root = forest_root
-                .join(format!("tree_{tree_idx:02}"))
-                .join("current");
-            let sample_dir = base.join(format!("tree_{tree_idx:02}_samples"));
-            fs::create_dir_all(&sample_dir).expect("sample dir");
-            for (name, bytes) in files {
-                fs::write(sample_dir.join(name), bytes).expect("sample file");
-            }
-            assert_eq!(
-                cmd_init(&default_internal_init_args(&tree_root, 1, true)),
-                0
-            );
-            assert_eq!(
-                cmd_internal_index_batch(&InternalIndexBatchArgs {
-                    paths: vec![sample_dir.display().to_string()],
-                    path_list: false,
-                    root: Some(tree_root.display().to_string()),
-                    batch_size: 1,
-                    workers: 1,
-                    chunk_size: 1024,
-                    verbose: false,
-                }),
-                0
-            );
-        }
-
-        let match_rule = rules_dir.join("0001_match.yar");
-        let miss_rule = rules_dir.join("0002_miss.yar");
-        fs::write(
-            &match_rule,
-            r#"
-rule match_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("match rule");
-        fs::write(
-            &miss_rule,
-            r#"
-rule miss_rule {
-  strings:
-    $a = "WXYZ"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("miss rule");
-
-        let manifest = base.join("rules.txt");
-        fs::write(
-            &manifest,
-            format!("{}\n{}\n", miss_rule.display(), match_rule.display()),
-        )
-        .expect("manifest");
-        assert_eq!(
-            collect_rules_from_args(&Some(rules_dir.display().to_string()), &None)
-                .expect("rules dir"),
-            vec![match_rule.clone(), miss_rule.clone()]
-        );
-        assert_eq!(
-            collect_rules_from_args(&None, &Some(manifest.display().to_string()))
-                .expect("manifest rules"),
-            vec![match_rule.clone(), miss_rule.clone()]
-        );
-        assert!(collect_rules_from_args(&None, &None).is_err());
-
-        assert_eq!(
-            forest_tree_roots(&forest_root).expect("forest tree roots"),
-            vec![
-                forest_root.join("tree_00").join("current"),
-                forest_root.join("tree_01").join("current")
-            ]
-        );
-
-        let mut tree_groups = open_forest_tree_groups(&forest_root).expect("open forest");
-        assert_eq!(tree_groups.len(), 2);
-        let (gram_sizes, active_identity_source, summary_cap_bytes) =
-            validate_forest_search_policy(&tree_groups).expect("search policy");
-        assert_eq!(gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
-        assert_eq!(active_identity_source.as_deref(), Some("sha256"));
-        assert_eq!(summary_cap_bytes, 0);
-
-        let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-            &match_rule,
-            gram_sizes,
-            active_identity_source.as_deref(),
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile plan");
-        let prepared =
-            forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes).expect("profile");
-        assert!(prepared.pattern_count >= 1);
-
-        let local_tree = query_store_group_all_candidates(&mut tree_groups[0].stores, &plan, true)
-            .expect("local tree query");
-        assert_eq!(local_tree.hashes.len(), 1);
-        assert_eq!(local_tree.external_ids.len(), 1);
-
-        let local_forest = query_local_forest_all_candidates(&mut tree_groups, &plan, true, 2)
-            .expect("forest query");
-        assert_eq!(local_forest.total_candidates, 2);
-        assert_eq!(local_forest.hashes.len(), 2);
-        assert_eq!(
-            local_forest
-                .external_ids
-                .as_ref()
-                .expect("external ids")
-                .len(),
-            2
-        );
-        assert!(local_forest.query_profile.docs_scanned >= 2);
-        assert!(!local_forest.tier_used.is_empty());
-
-        clear_local_forest_search_caches(&mut tree_groups);
-        let after_clear = query_local_forest_all_candidates(&mut tree_groups, &plan, false, 2)
-            .expect("forest query after clear");
-        assert_eq!(after_clear.total_candidates, 2);
-        assert!(after_clear.external_ids.is_none());
-
-        let json_out = base.join("batch_results.json");
-        assert_eq!(
-            cmd_search_batch(&SearchBatchArgs {
-                root: forest_root.display().to_string(),
-                rules_dir: Some(rules_dir.display().to_string()),
-                rule_manifest: None,
-                json_out: json_out.display().to_string(),
-                tree_search_workers: 2,
-                max_anchors_per_pattern: 8,
-                max_candidates: 100.0,
-                verify_yara_files: false,
-            }),
-            0
-        );
-
-        let batch_rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&fs::read(&json_out).expect("batch json")).expect("batch rows");
-        assert_eq!(batch_rows.len(), 2);
-        let candidates_by_rule = batch_rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get("rule")
-                        .and_then(serde_json::Value::as_str)
-                        .expect("rule name")
-                        .to_owned(),
-                    row.get("candidates")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        assert_eq!(candidates_by_rule.get("0001_match.yar"), Some(&2));
-        assert_eq!(candidates_by_rule.get("0002_miss.yar"), Some(&0));
-        assert!(append_path_suffix(&json_out, ".jsonl").exists());
-    }
 }

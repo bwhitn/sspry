@@ -24,6 +24,8 @@ struct GrpcInsertFrameIter {
 }
 
 impl GrpcInsertFrameIter {
+    /// Creates a streaming frame iterator that chunks encoded insert rows into
+    /// bounded gRPC payloads.
     fn new(rows: Vec<Vec<u8>>, chunk_bytes: usize) -> Self {
         Self {
             rows,
@@ -38,6 +40,8 @@ impl GrpcInsertFrameIter {
 impl Iterator for GrpcInsertFrameIter {
     type Item = v1::InsertFrame;
 
+    /// Emits the next insert frame, preserving row boundaries and sending a
+    /// final empty `stream_complete` frame once all rows are exhausted.
     fn next(&mut self) -> Option<Self::Item> {
         if self.row_idx >= self.rows.len() {
             if self.sent_stream_complete {
@@ -72,6 +76,8 @@ impl Iterator for GrpcInsertFrameIter {
     }
 }
 
+/// Normalizes a user-supplied gRPC address into an `http://` or `https://`
+/// endpoint string accepted by `tonic`.
 fn grpc_endpoint(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_owned()
@@ -80,6 +86,7 @@ fn grpc_endpoint(addr: &str) -> String {
     }
 }
 
+/// Converts transport or runtime errors into the project's generic error type.
 fn tonic_error(err: impl ToString) -> SspryError {
     SspryError::from(err.to_string())
 }
@@ -105,10 +112,13 @@ pub struct GrpcSearchFrame {
 }
 
 impl BlockingGrpcClient {
+    /// Connects to the server with the default message-size limit.
     pub fn connect(addr: &str, timeout: Duration) -> Result<Self> {
         Self::connect_with_limits(addr, timeout, DEFAULT_MAX_REQUEST_BYTES)
     }
 
+    /// Connects to the server, building a private Tokio runtime and applying
+    /// explicit gRPC message-size limits.
     pub fn connect_with_limits(
         addr: &str,
         timeout: Duration,
@@ -136,10 +146,13 @@ impl BlockingGrpcClient {
         })
     }
 
+    /// Updates the maximum payload size used when client-side insert rows are
+    /// chunked into streaming frames.
     pub fn set_insert_chunk_bytes(&mut self, chunk_bytes: usize) {
         self.insert_chunk_bytes = chunk_bytes.max(1).min(self.max_message_bytes.max(1));
     }
 
+    /// Calls the server `Ping` RPC and returns the response message.
     pub fn ping(&mut self) -> Result<String> {
         let response = self
             .runtime
@@ -148,6 +161,7 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    /// Calls the server `Stats` RPC and returns the raw protobuf response.
     pub fn stats(&mut self) -> Result<v1::StatsResponse> {
         let response = self
             .runtime
@@ -156,6 +170,7 @@ impl BlockingGrpcClient {
         Ok(response.into_inner())
     }
 
+    /// Calls the server `Status` RPC and returns the raw protobuf response.
     pub fn status(&mut self) -> Result<v1::StatusResponse> {
         let response = self
             .runtime
@@ -164,6 +179,7 @@ impl BlockingGrpcClient {
         Ok(response.into_inner())
     }
 
+    /// Requests graceful server shutdown and returns the server's message.
     pub fn shutdown(&mut self) -> Result<String> {
         let response = self
             .runtime
@@ -172,6 +188,8 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    /// Triggers a publish cycle on the server and returns the resulting status
+    /// message.
     pub fn publish(&mut self) -> Result<String> {
         let response = self
             .runtime
@@ -180,6 +198,7 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    /// Starts an index session and returns the server-provided status message.
     pub fn begin_index_session(&mut self) -> Result<String> {
         let response = self
             .runtime
@@ -192,6 +211,8 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    /// Registers an indexing client and returns its server-assigned client ID
+    /// together with the lease timeout in milliseconds.
     pub fn begin_index_client(&mut self, heartbeat_interval_ms: u64) -> Result<(u64, u64)> {
         let response = self
             .runtime
@@ -207,6 +228,7 @@ impl BlockingGrpcClient {
         Ok((response.client_id, response.lease_timeout_ms))
     }
 
+    /// Renews the lease for an active indexing client.
     pub fn heartbeat_index_client(&mut self, client_id: u64) -> Result<()> {
         let _response = self
             .runtime
@@ -219,6 +241,7 @@ impl BlockingGrpcClient {
         Ok(())
     }
 
+    /// Reports current index-session progress counters to the server.
     pub fn update_index_session_progress(
         &mut self,
         total_documents: Option<usize>,
@@ -241,6 +264,8 @@ impl BlockingGrpcClient {
         Ok(())
     }
 
+    /// Ends the active index session and returns the server's completion
+    /// message.
     pub fn end_index_session(&mut self) -> Result<String> {
         let response = self
             .runtime
@@ -253,6 +278,7 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    /// Ends a previously registered indexing client lease.
     pub fn end_index_client(&mut self, client_id: u64) -> Result<String> {
         let response = self
             .runtime
@@ -265,6 +291,8 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
+    /// Deletes one candidate document by SHA-256 and maps the protobuf reply
+    /// into the local response type.
     pub fn candidate_delete_sha256(&mut self, sha256: &str) -> Result<CandidateDeleteResponse> {
         let response = self
             .runtime
@@ -284,6 +312,8 @@ impl BlockingGrpcClient {
         })
     }
 
+    /// Streams search frames from the server and invokes the supplied callback
+    /// for each mapped local frame.
     pub fn search_stream<F>(&mut self, request: v1::SearchRequest, mut on_frame: F) -> Result<()>
     where
         F: FnMut(GrpcSearchFrame) -> Result<()>,
@@ -321,10 +351,13 @@ impl BlockingGrpcClient {
         })
     }
 
+    /// Inserts binary rows with the client's currently configured chunk size.
     pub fn insert_binary_rows(&mut self, rows: Vec<Vec<u8>>) -> Result<v1::InsertSummary> {
         self.insert_binary_rows_with_chunk(rows, self.insert_chunk_bytes)
     }
 
+    /// Streams encoded insert rows to the server using an explicit per-frame
+    /// chunk size.
     pub fn insert_binary_rows_with_chunk(
         &mut self,
         rows: Vec<Vec<u8>>,
@@ -339,6 +372,8 @@ impl BlockingGrpcClient {
     }
 }
 
+/// Converts an optional protobuf query-profile summary into the local struct
+/// used by the CLI and tests.
 fn query_profile_from_proto(summary: Option<&v1::QueryProfileSummary>) -> CandidateQueryProfile {
     let Some(summary) = summary else {
         return CandidateQueryProfile::default();
@@ -354,6 +389,8 @@ fn query_profile_from_proto(summary: Option<&v1::QueryProfileSummary>) -> Candid
     }
 }
 
+/// Converts an optional protobuf prepared-query profile into the local summary
+/// type used by higher layers.
 fn prepared_query_profile_from_proto(
     summary: Option<&v1::PreparedQueryProfileSummary>,
 ) -> CandidatePreparedQueryProfile {

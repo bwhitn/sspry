@@ -55,6 +55,8 @@ pub enum RuleCheckStatus {
 }
 
 impl RuleCheckStatus {
+    /// Returns the stable wire-format label used in JSON responses and CLI
+    /// output.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Searchable => "searchable",
@@ -63,6 +65,7 @@ impl RuleCheckStatus {
         }
     }
 
+    /// Combines two rule-check outcomes, keeping the most severe status.
     fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Self::Unsupported, _) | (_, Self::Unsupported) => Self::Unsupported,
@@ -82,6 +85,8 @@ pub enum RuleCheckSeverity {
 }
 
 impl RuleCheckSeverity {
+    /// Returns the stable wire-format label used in JSON responses and CLI
+    /// output.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Error => "error",
@@ -145,6 +150,8 @@ pub struct RuleCheckFileReport {
 }
 
 #[cfg(test)]
+/// Estimates the heap footprint owned by one compiled pattern plan for tests
+/// that enforce cache-size limits.
 fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
     let alternatives_bytes = pattern
         .alternatives
@@ -211,6 +218,8 @@ fn pattern_plan_memory_bytes(pattern: &PatternPlan) -> u64 {
 }
 
 #[cfg(test)]
+/// Estimates the recursive heap footprint of a query node tree for tests that
+/// enforce cache-size limits.
 fn query_node_memory_bytes(node: &QueryNode) -> u64 {
     (std::mem::size_of::<QueryNode>() as u64)
         .saturating_add(node.kind.capacity() as u64)
@@ -233,6 +242,8 @@ fn query_node_memory_bytes(node: &QueryNode) -> u64 {
 }
 
 #[cfg(test)]
+/// Estimates the total memory retained by a compiled query plan for cache-size
+/// tests.
 pub(crate) fn compiled_query_plan_memory_bytes(plan: &CompiledQueryPlan) -> u64 {
     (std::mem::size_of::<CompiledQueryPlan>() as u64)
         .saturating_add(
@@ -248,6 +259,8 @@ pub(crate) fn compiled_query_plan_memory_bytes(plan: &CompiledQueryPlan) -> u64 
         .saturating_add(query_node_memory_bytes(&plan.root))
 }
 
+/// Normalizes the user-facing max-candidates percentage into the supported
+/// `0..=100` range, treating non-positive or invalid values as unlimited.
 pub fn normalize_max_candidates(max_candidates: f64) -> f64 {
     if !max_candidates.is_finite() || max_candidates <= 0.0 {
         0.0
@@ -256,6 +269,8 @@ pub fn normalize_max_candidates(max_candidates: f64) -> f64 {
     }
 }
 
+/// Converts a max-candidates percentage into an absolute candidate cap for the
+/// current document count.
 pub fn resolve_max_candidates(doc_count: usize, max_candidates_pct: f64) -> usize {
     if !max_candidates_pct.is_finite() || max_candidates_pct <= 0.0 {
         return usize::MAX;
@@ -328,6 +343,8 @@ enum ComparisonOp {
 }
 
 impl ComparisonOp {
+    /// Reverses the direction of a comparison when the parser swaps the left
+    /// and right operands.
     fn reverse(self) -> Self {
         match self {
             Self::Eq => Self::Eq,
@@ -402,10 +419,14 @@ struct RulePlanFragment {
     root: Option<QueryNode>,
 }
 
+/// Canonicalizes a rule name for case-insensitive matching across rule
+/// references.
 fn normalize_rule_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+/// Maps a tokenized comparison operator to the internal enum used by the query
+/// planner.
 fn comparison_op_from_token(token: &Token) -> Option<ComparisonOp> {
     match token {
         Token::EqEq => Some(ComparisonOp::Eq),
@@ -418,6 +439,7 @@ fn comparison_op_from_token(token: &Token) -> Option<ComparisonOp> {
     }
 }
 
+/// Builds the normalized query-node kind for a typed comparison.
 fn comparison_kind(prefix: &str, op: ComparisonOp) -> String {
     format!(
         "{prefix}_{}",
@@ -432,6 +454,8 @@ fn comparison_kind(prefix: &str, op: ComparisonOp) -> String {
     )
 }
 
+/// Returns true when a pattern has at least one searchable anchor in tier 1,
+/// tier 2, or the fixed-literal verifier fast path.
 fn pattern_has_searchable_anchor(
     alternatives: &[Vec<u64>],
     tier2_alternatives: &[Vec<u64>],
@@ -442,6 +466,8 @@ fn pattern_has_searchable_anchor(
         || fixed_literals.iter().any(|literal| !literal.is_empty())
 }
 
+/// Decodes a fixed-width hexadecimal digest while validating length and
+/// character set.
 fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != N * 2 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -455,6 +481,7 @@ fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]>
     Ok(out)
 }
 
+/// Re-encodes a digest into the store's normalized 32-byte identity namespace.
 fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"sspry-identity\0");
@@ -466,6 +493,8 @@ fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Normalizes a user-supplied hash literal into the searchable identity form
+/// used by the candidate store.
 fn normalize_identity_literal(hash_kind: &str, value: &str) -> Result<String> {
     match hash_kind {
         "md5" => Ok(hex::encode(normalize_identity_digest(
@@ -483,6 +512,8 @@ fn normalize_identity_literal(hash_kind: &str, value: &str) -> Result<String> {
     }
 }
 
+/// Returns true when a module call is intentionally ignored by the searchable
+/// query subset.
 fn ignored_search_module_name(name: &str) -> bool {
     IGNORED_SEARCH_MODULES.iter().any(|module| {
         name == *module
@@ -492,6 +523,8 @@ fn ignored_search_module_name(name: &str) -> bool {
     })
 }
 
+/// Scans condition text and records ignored module calls so rule-check output
+/// can explain why they were dropped.
 fn collect_ignored_module_call_names(condition_text: &str) -> BTreeSet<String> {
     let chars = condition_text.chars().collect::<Vec<_>>();
     let mut out = BTreeSet::<String>::new();
@@ -527,6 +560,8 @@ fn collect_ignored_module_call_names(condition_text: &str) -> BTreeSet<String> {
 
 impl ConditionParser {
     #[cfg(test)]
+    /// Test-only constructor that builds a parser without rule-reference
+    /// metadata.
     fn new(
         text: &str,
         known_patterns: HashSet<String>,
@@ -541,6 +576,8 @@ impl ConditionParser {
         )
     }
 
+    /// Builds a parser over one tokenized condition, including pattern and rule
+    /// metadata used for selector expansion and validation.
     fn new_with_rules(
         text: &str,
         known_patterns: HashSet<String>,
@@ -561,10 +598,13 @@ impl ConditionParser {
         })
     }
 
+    /// Returns the next token without consuming it.
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.index)
     }
 
+    /// Consumes one token and optionally validates that it matches the expected
+    /// token kind.
     fn consume(&mut self, expected: Option<&Token>) -> Result<Token> {
         let Some(token) = self.tokens.get(self.index).cloned() else {
             return Err(SspryError::from("Unexpected end of condition."));
@@ -581,6 +621,7 @@ impl ConditionParser {
         Ok(token)
     }
 
+    /// Parses the full condition expression and rejects any trailing tokens.
     fn parse(&mut self) -> Result<QueryNode> {
         if self.tokens.is_empty() {
             return Err(SspryError::from("Condition section is empty."));
@@ -594,6 +635,7 @@ impl ConditionParser {
         Ok(node)
     }
 
+    /// Parses a left-associative OR chain into one query tree node.
     fn parse_or(&mut self) -> Result<QueryNode> {
         let mut nodes = vec![self.parse_and()?];
         while matches!(self.peek(), Some(Token::Or)) {
@@ -612,6 +654,7 @@ impl ConditionParser {
         }
     }
 
+    /// Parses a left-associative AND chain into one query tree node.
     fn parse_and(&mut self) -> Result<QueryNode> {
         let mut nodes = vec![self.parse_factor()?];
         while matches!(self.peek(), Some(Token::And)) {
@@ -630,6 +673,8 @@ impl ConditionParser {
         }
     }
 
+    /// Parses one atomic condition term, including grouped expressions,
+    /// pattern references, metadata predicates, and verifier-only constructs.
     fn parse_factor(&mut self) -> Result<QueryNode> {
         match self.peek() {
             Some(Token::LParen) => {
@@ -1059,6 +1104,8 @@ impl ConditionParser {
         }
     }
 
+    /// Parses the synthetic `verifierloop($id)` helper used to represent
+    /// rewritten verifier-only iterator constructs.
     fn parse_verifier_only_loop(&mut self) -> Result<QueryNode> {
         let Token::Id(raw_id) = self.consume(None)? else {
             return Err(SspryError::from(
@@ -1097,6 +1144,8 @@ impl ConditionParser {
         })
     }
 
+    /// Parses an `any/all of ...` expression into an `n_of` query node with a
+    /// resolved threshold.
     fn parse_n_of_expression(&mut self, threshold: usize) -> Result<QueryNode> {
         let children = self.parse_n_of_targets()?;
         let resolved_threshold = if threshold == usize::MAX {
@@ -1117,6 +1166,8 @@ impl ConditionParser {
         })
     }
 
+    /// Parses one range-bound expression used by `in (start..end)` match
+    /// constraints.
     fn parse_range_bound_expr(&mut self) -> Result<RangeBoundExpr> {
         match self.consume(None)? {
             Token::Int(value) => Ok(RangeBoundExpr::Literal(value)),
@@ -1152,6 +1203,7 @@ impl ConditionParser {
         }
     }
 
+    /// Parses one byte-offset expression used by `$id at ...` constraints.
     fn parse_at_offset_expr(&mut self, raw_id: &str) -> Result<AtOffsetExpr> {
         match self.consume(None)? {
             Token::Int(value) => Ok(AtOffsetExpr::Literal(value)),
@@ -1187,6 +1239,8 @@ impl ConditionParser {
         }
     }
 
+    /// Parses searchable whole-file hash equality constraints such as
+    /// `hash.sha256(0, filesize) == "..."`.
     fn parse_hash_identity_equality(&mut self, field_name: &str) -> Result<QueryNode> {
         let Some(hash_kind) = field_name.strip_prefix("hash.") else {
             return Err(SspryError::from(format!(
@@ -1244,6 +1298,7 @@ impl ConditionParser {
         })
     }
 
+    /// Parses searchable whole-file entropy comparisons.
     fn parse_math_entropy_comparison(&mut self, field_name: &str) -> Result<QueryNode> {
         let Token::Int(offset) = self.consume(None)? else {
             return Err(SspryError::from(format!(
@@ -1294,6 +1349,8 @@ impl ConditionParser {
         })
     }
 
+    /// Parses the selector portion of an `any/all of ...` expression and
+    /// expands it into concrete pattern nodes.
     fn parse_n_of_targets(&mut self) -> Result<Vec<QueryNode>> {
         let pattern_ids = match self.peek() {
             Some(Token::LParen) => self.parse_n_of_target_list()?,
@@ -1340,6 +1397,7 @@ impl ConditionParser {
             .collect())
     }
 
+    /// Parses a parenthesized selector list used by `any/all of (...)`.
     fn parse_n_of_target_list(&mut self) -> Result<Vec<String>> {
         self.consume(Some(&Token::LParen))?;
         let mut pattern_ids = Vec::<String>::new();
@@ -1374,6 +1432,7 @@ impl ConditionParser {
         Ok(pattern_ids)
     }
 
+    /// Expands one exact or wildcard string selector into concrete pattern ids.
     fn expand_pattern_selector(&self, raw_id: &str) -> Result<Vec<String>> {
         if let Some(prefix) = raw_id.strip_suffix('*') {
             let matches = self
@@ -1397,6 +1456,8 @@ impl ConditionParser {
         Ok(vec![raw_id.to_owned()])
     }
 
+    /// Simplifies trivial `#id op value` count constraints into direct pattern
+    /// or negated-pattern nodes when possible.
     fn simplify_trivial_count_constraint(
         &self,
         raw_id: &str,
@@ -1426,6 +1487,7 @@ impl ConditionParser {
     }
 }
 
+/// Tokenizes the normalized YARA condition text into the parser token stream.
 fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = text.chars().collect();
@@ -1667,6 +1729,8 @@ fn tokenize_condition(text: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+/// Encodes a parsed range-bound expression back into the compact string format
+/// stored in verifier-only node payloads.
 fn encode_range_bound_expr(expr: &RangeBoundExpr) -> String {
     match expr {
         RangeBoundExpr::Literal(value) => value.to_string(),
@@ -1676,6 +1740,8 @@ fn encode_range_bound_expr(expr: &RangeBoundExpr) -> String {
     }
 }
 
+/// Encodes a parsed offset expression back into the compact string format
+/// stored in verifier-only node payloads.
 fn encode_at_offset_expr(expr: &AtOffsetExpr) -> String {
     match expr {
         AtOffsetExpr::Literal(value) => value.to_string(),
@@ -1685,6 +1751,7 @@ fn encode_at_offset_expr(expr: &AtOffsetExpr) -> String {
     }
 }
 
+/// Extracts distinct fixed-width grams from a byte slice.
 fn grams_from_bytes(blob: &[u8], gram_size: usize) -> Vec<u64> {
     if blob.len() < gram_size {
         return Vec::new();
@@ -1700,14 +1767,18 @@ fn grams_from_bytes(blob: &[u8], gram_size: usize) -> Vec<u64> {
     out
 }
 
+/// Extracts distinct tier-1 grams from a byte slice.
 fn grams_tier1_from_bytes(blob: &[u8], tier1_gram_size: usize) -> Vec<u64> {
     grams_from_bytes(blob, tier1_gram_size)
 }
 
+/// Extracts distinct tier-2 grams from a byte slice.
 fn grams_tier2_from_bytes(blob: &[u8], tier2_gram_size: usize) -> Vec<u64> {
     grams_from_bytes(blob, tier2_gram_size)
 }
 
+/// Removes line and block comments from rule text while preserving offsets well
+/// enough for subsequent structural parsing.
 fn strip_rule_comments(rule_text: &str) -> String {
     let chars = rule_text.chars().collect::<Vec<_>>();
     let mut out = String::with_capacity(rule_text.len());
@@ -1816,6 +1887,8 @@ fn strip_rule_comments(rule_text: &str) -> String {
     out
 }
 
+/// Splits one rule block into its strings section, raw condition text, and the
+/// rewritten searchable condition text.
 fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String, String)> {
     let sanitized = strip_rule_comments(rule_text);
     let mut strings_lines = Vec::new();
@@ -1859,6 +1932,8 @@ fn parse_rule_sections(rule_text: &str) -> Result<(Vec<String>, String, String)>
     ))
 }
 
+/// Finds the matching closing brace for a rule block while ignoring braces that
+/// appear inside strings and regexes.
 fn match_rule_brace_span(text: &str, open_idx: usize) -> Result<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
@@ -1925,6 +2000,7 @@ fn match_rule_brace_span(text: &str, open_idx: usize) -> Result<usize> {
     Err(SspryError::from("Unterminated rule block."))
 }
 
+/// Extracts every parseable rule block from a YARA source file.
 fn parse_rule_blocks(rule_text: &str) -> Result<Vec<ParsedRuleBlock>> {
     let sanitized = strip_rule_comments(rule_text);
     let mut blocks = Vec::<ParsedRuleBlock>::new();
@@ -1978,6 +2054,8 @@ fn parse_rule_blocks(rule_text: &str) -> Result<Vec<ParsedRuleBlock>> {
     Ok(blocks)
 }
 
+/// Consumes a balanced parenthesized span from condition text, respecting
+/// embedded strings and regexes.
 fn consume_parenthesized_span(chars: &[char], open_idx: usize) -> Option<usize> {
     if chars.get(open_idx) != Some(&'(') {
         return None;
@@ -2046,6 +2124,8 @@ fn consume_parenthesized_span(chars: &[char], open_idx: usize) -> Option<usize> 
     None
 }
 
+/// Rewrites ignored module calls into placeholder identifiers so the remaining
+/// condition can still be parsed and analyzed.
 fn rewrite_ignored_module_calls(condition_text: &str) -> String {
     let chars = condition_text.chars().collect::<Vec<_>>();
     let mut out = String::with_capacity(condition_text.len());
@@ -2083,6 +2163,8 @@ fn rewrite_ignored_module_calls(condition_text: &str) -> String {
     out
 }
 
+/// Rewrites certain verifier-only `for any` loops into synthetic parser forms
+/// that preserve their searchable anchor.
 fn rewrite_verifier_only_for_any_loops(condition_text: &str) -> String {
     let chars = condition_text.chars().collect::<Vec<_>>();
     let mut out = String::with_capacity(condition_text.len());
@@ -2101,6 +2183,8 @@ fn rewrite_verifier_only_for_any_loops(condition_text: &str) -> String {
     out
 }
 
+/// Recognizes verifier-only `for any/all of ... : ($ at pe.entry_point)` loops
+/// so they can be expanded into explicit anchored pattern expressions.
 fn consume_verifier_only_for_of_at_loop(
     chars: &[char],
     start: usize,
@@ -2147,6 +2231,8 @@ fn consume_verifier_only_for_of_at_loop(
     Some((end, any, selector))
 }
 
+/// Expands the selector inside a verifier-only `for ... of` loop into concrete
+/// pattern ids.
 fn expand_verifier_only_for_of_selector(
     selector: &str,
     known_pattern_names: &[String],
@@ -2206,6 +2292,8 @@ fn expand_verifier_only_for_of_selector(
     Ok(out)
 }
 
+/// Rewrites verifier-only `for any/all of ... at pe.entry_point` loops into
+/// equivalent searchable boolean expressions.
 fn rewrite_verifier_only_for_of_at_loops(
     condition_text: &str,
     known_pattern_names: &[String],
@@ -2236,6 +2324,7 @@ fn rewrite_verifier_only_for_of_at_loops(
     Ok(out)
 }
 
+/// Advances past ASCII whitespace in condition text.
 fn skip_condition_ws(chars: &[char], mut index: usize) -> usize {
     while index < chars.len() && chars[index].is_whitespace() {
         index += 1;
@@ -2243,6 +2332,8 @@ fn skip_condition_ws(chars: &[char], mut index: usize) -> usize {
     index
 }
 
+/// Consumes a case-insensitive condition keyword when it appears on identifier
+/// boundaries.
 fn consume_condition_keyword(chars: &[char], index: usize, keyword: &str) -> Option<usize> {
     let end = index.checked_add(keyword.len())?;
     if end > chars.len() {
@@ -2270,6 +2361,7 @@ fn consume_condition_keyword(chars: &[char], index: usize, keyword: &str) -> Opt
     Some(end)
 }
 
+/// Consumes one plain identifier from condition text.
 fn consume_condition_identifier(chars: &[char], index: usize) -> Option<(usize, String)> {
     if index >= chars.len() || !(chars[index].is_ascii_alphabetic() || chars[index] == '_') {
         return None;
@@ -2281,6 +2373,8 @@ fn consume_condition_identifier(chars: &[char], index: usize) -> Option<(usize, 
     Some((end, chars[index..end].iter().collect()))
 }
 
+/// Recognizes verifier-only `for any i in (1..#id) : (...)` loops so they can
+/// be rewritten into the synthetic `verifierloop($id)` form.
 fn consume_verifier_only_for_any_loop(chars: &[char], start: usize) -> Option<(usize, String)> {
     let mut index = consume_condition_keyword(chars, start, "for")?;
     index = skip_condition_ws(chars, index);
@@ -2325,6 +2419,7 @@ fn consume_verifier_only_for_any_loop(chars: &[char], start: usize) -> Option<(u
     Some((end, format!("${pattern_name}")))
 }
 
+/// Removes ignored-module placeholder predicates from the parsed query tree.
 fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
     match node.kind.as_str() {
         "ignored_module_predicate" => None,
@@ -2426,6 +2521,7 @@ fn prune_ignored_module_predicates(node: QueryNode) -> Option<QueryNode> {
     }
 }
 
+/// Parses one quoted literal string definition from a rule strings section.
 fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
     let trimmed = line.trim();
     let Some(eq_idx) = trimmed.find('=') else {
@@ -2515,6 +2611,7 @@ fn parse_literal_line(line: &str) -> Result<Option<PatternDef>> {
     }))
 }
 
+/// Returns the pattern id when a strings line appears to define a regex.
 fn parse_regex_pattern_id(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let eq_idx = trimmed.find('=')?;
@@ -2527,6 +2624,8 @@ fn parse_regex_pattern_id(line: &str) -> Option<String> {
     }
 }
 
+/// Parses one regex definition and extracts the mandatory literal windows that
+/// can anchor search.
 fn parse_regex_line(line: &str, gram_sizes: GramSizes) -> Result<Option<PatternDef>> {
     let trimmed = line.trim();
     let Some(eq_idx) = trimmed.find('=') else {
@@ -2633,6 +2732,8 @@ fn parse_regex_line(line: &str, gram_sizes: GramSizes) -> Result<Option<PatternD
     }))
 }
 
+/// Extracts the strongest mandatory literal that can safely anchor a searchable
+/// regex pattern.
 fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RegexAtom {
@@ -2985,6 +3086,7 @@ enum HexToken {
     Group(Vec<Vec<u8>>),
 }
 
+/// Returns the byte positions whose ASCII case can vary in a nocase literal.
 fn nocase_toggle_positions(bytes: &[u8]) -> Vec<usize> {
     bytes
         .iter()
@@ -2993,6 +3095,7 @@ fn nocase_toggle_positions(bytes: &[u8]) -> Vec<usize> {
         .collect()
 }
 
+/// Expands one ASCII nocase literal window into every distinct case variant.
 fn expand_ascii_nocase_variants(bytes: &[u8]) -> Vec<Vec<u8>> {
     let positions = nocase_toggle_positions(bytes);
     if positions.is_empty() {
@@ -3016,6 +3119,8 @@ fn expand_ascii_nocase_variants(bytes: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Assigns a rough selectivity hint to one byte when ranking candidate anchor
+/// windows.
 fn anchor_hint_for_byte(byte: u8) -> u128 {
     match byte {
         0 => 0,
@@ -3029,6 +3134,8 @@ fn anchor_hint_for_byte(byte: u8) -> u128 {
     }
 }
 
+/// Scores a literal window by byte stability and distinct gram content to help
+/// choose stronger anchors.
 fn bytes_anchor_hint(bytes: &[u8], gram_sizes: GramSizes) -> u128 {
     if bytes.is_empty() {
         return 0;
@@ -3053,10 +3160,13 @@ fn bytes_anchor_hint(bytes: &[u8], gram_sizes: GramSizes) -> u128 {
         .saturating_add(unique_tier2.saturating_mul(8))
 }
 
+/// Scores one fixed gram as an anchor candidate.
 fn exact_gram_anchor_hint(gram: u64, gram_size: usize) -> u128 {
     bytes_anchor_hint(&gram.to_le_bytes()[..gram_size], GramSizes::default())
 }
 
+/// Chooses a bounded-size literal window for `nocase` search and expands it
+/// into concrete case variants.
 fn derive_nocase_search_alternatives(
     literal: &[u8],
     wide: bool,
@@ -3137,6 +3247,7 @@ fn derive_nocase_search_alternatives(
     Ok(expand_ascii_nocase_variants(window))
 }
 
+/// Parses one packed concrete-byte token from a hex string.
 fn parse_hex_bytes_token(token: &str) -> Result<Vec<u8>> {
     let compact = token
         .chars()
@@ -3158,6 +3269,7 @@ fn parse_hex_bytes_token(token: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Tokenizes a hex-string body into whitespace-delimited structural tokens.
 fn tokenize_hex_body(body: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -3207,6 +3319,7 @@ fn tokenize_hex_body(body: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Parses one simple alternation group inside a hex string.
 fn parse_hex_group_token(token: &str) -> Result<Vec<Vec<u8>>> {
     let inner = token
         .strip_prefix('(')
@@ -3244,6 +3357,8 @@ fn parse_hex_group_token(token: &str) -> Result<Vec<Vec<u8>>> {
     Ok(branches)
 }
 
+/// Converts a hex-string body into normalized token types used by the gram
+/// extractor.
 fn parse_hex_body_tokens(body: &str) -> Result<Vec<HexToken>> {
     let mut out = Vec::new();
     for token in tokenize_hex_body(body)? {
@@ -3274,6 +3389,8 @@ fn parse_hex_body_tokens(body: &str) -> Result<Vec<HexToken>> {
     Ok(out)
 }
 
+/// Parses one hex-string definition into tier-1/tier-2 gram alternatives and
+/// optional fixed literals.
 fn parse_hex_line_to_grams(
     line: &str,
     gram_sizes: GramSizes,
@@ -3383,6 +3500,7 @@ fn parse_hex_line_to_grams(
     )))
 }
 
+/// Returns true when a token represents a variable-length hex gap.
 fn is_gap_token(token: &str) -> bool {
     if !(token.starts_with('[') && token.ends_with(']')) {
         return false;
@@ -3397,6 +3515,8 @@ fn is_gap_token(token: &str) -> bool {
         && right.chars().all(|ch| ch.is_ascii_digit())
 }
 
+/// Ranks and trims grams for one alternative so large literals do not produce
+/// an excessive number of anchors.
 fn optimize_grams(
     grams: &[u64],
     fixed_literal: &[u8],
@@ -3482,6 +3602,7 @@ fn optimize_grams(
     selected
 }
 
+/// Estimates how selective a pattern looks from its shortest alternative.
 fn pattern_selectivity_score(pattern_id: &str, patterns: &BTreeMap<String, Vec<Vec<u64>>>) -> u128 {
     let Some(alternatives) = patterns.get(pattern_id) else {
         return u128::MAX;
@@ -3498,6 +3619,7 @@ fn pattern_selectivity_score(pattern_id: &str, patterns: &BTreeMap<String, Vec<V
         .unwrap_or(u128::MAX)
 }
 
+/// Reorders OR branches so more selective subtrees evaluate first.
 fn reorder_or_nodes_for_selectivity(
     node: &mut QueryNode,
     patterns: &BTreeMap<String, Vec<Vec<u64>>>,
@@ -3512,6 +3634,7 @@ fn reorder_or_nodes_for_selectivity(
         .sort_by_key(|child| node_selectivity_score(child, patterns));
 }
 
+/// Collects every pattern id referenced under one query subtree.
 fn collect_patterns(node: &QueryNode, out: &mut HashSet<String>) {
     if node.kind == "pattern" {
         if let Some(pattern_id) = &node.pattern_id {
@@ -3524,6 +3647,8 @@ fn collect_patterns(node: &QueryNode, out: &mut HashSet<String>) {
     }
 }
 
+/// Assigns tighter anchor budgets to patterns that appear under wide OR
+/// branches.
 fn collect_or_branch_budgets(
     node: &QueryNode,
     base_budget: usize,
@@ -3551,6 +3676,7 @@ fn collect_or_branch_budgets(
     }
 }
 
+/// Removes duplicate children from OR nodes after planning rewrites.
 fn dedupe_or_nodes(node: &mut QueryNode) {
     for child in &mut node.children {
         dedupe_or_nodes(child);
@@ -3562,6 +3688,8 @@ fn dedupe_or_nodes(node: &mut QueryNode) {
     node.children.retain(|child| seen.insert(child.clone()));
 }
 
+/// Deduplicates pattern alternatives while preserving the aligned fixed-literal
+/// side tables.
 fn dedupe_pattern_alternatives(
     alternatives: Vec<Vec<u64>>,
     tier2_alternatives: Vec<Vec<u64>>,
@@ -3625,6 +3753,7 @@ fn dedupe_pattern_alternatives(
     )
 }
 
+/// Classifies numeric-read functions by the literal type they accept.
 fn numeric_read_kind(name: &str) -> Option<NumericReadKind> {
     match name {
         "int16" | "uint16" | "int16be" | "uint16be" | "int32" | "uint32" | "int32be"
@@ -3636,6 +3765,7 @@ fn numeric_read_kind(name: &str) -> Option<NumericReadKind> {
     }
 }
 
+/// Parses the right-hand literal for an indexed numeric-read equality.
 fn parse_numeric_read_literal(
     parser: &mut ConditionParser,
     field_name: &str,
@@ -3665,6 +3795,8 @@ fn parse_numeric_read_literal(
     }
 }
 
+/// Splits a serialized numeric-read verifier expression back into function
+/// name, byte offset, and literal text.
 fn parse_numeric_read_expression(expr: &str) -> Result<(&str, usize, &str)> {
     let Some((name, rest)) = expr.split_once('(') else {
         return Err(SspryError::from(format!(
@@ -3682,6 +3814,8 @@ fn parse_numeric_read_expression(expr: &str) -> Result<(&str, usize, &str)> {
     Ok((name, offset, literal_text))
 }
 
+/// Encodes a numeric-read literal into the byte sequence used for exact anchor
+/// matching.
 fn numeric_read_anchor_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> {
     match name {
         "int16" => {
@@ -3810,6 +3944,8 @@ fn numeric_read_anchor_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> 
     }
 }
 
+/// Injects synthetic pattern anchors for exact numeric-read equality nodes so
+/// they can participate in indexed search.
 fn inject_numeric_read_anchor_patterns(
     node: &mut QueryNode,
     pattern_alternatives: &mut BTreeMap<String, Vec<Vec<u64>>>,
@@ -3879,6 +4015,7 @@ fn inject_numeric_read_anchor_patterns(
     Ok(())
 }
 
+/// Returns true when the query tree still contains any verifier-only nodes.
 fn contains_verifier_only_node(node: &QueryNode) -> bool {
     matches!(
         node.kind.as_str(),
@@ -3892,6 +4029,8 @@ fn contains_verifier_only_node(node: &QueryNode) -> bool {
 
 const FILE_PREFIX_8_BYTES: usize = 8;
 
+/// Resolves verifier-only offset expressions that can be proven from indexed
+/// prefix windows.
 fn verifier_only_at_prefix_offset(offset_text: &str) -> Option<(usize, usize)> {
     if offset_text == "0" {
         Some((0, FILE_PREFIX_8_BYTES))
@@ -3906,6 +4045,8 @@ fn verifier_only_at_prefix_offset(offset_text: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Returns true when every fixed literal for a pattern can be proven within the
+/// indexed prefix window at the requested offset.
 fn pattern_supports_exact_prefix_window(
     pattern: &PatternPlan,
     offset: usize,
@@ -3940,6 +4081,8 @@ fn pattern_supports_exact_prefix_window(
     saw_supported && all_supported
 }
 
+/// Returns true when a serialized numeric-read verifier expression is exact
+/// within the indexed file prefix.
 fn verifier_only_eq_is_index_exact(expr: &str) -> bool {
     let Ok((name, offset, literal_text)) = parse_numeric_read_expression(expr) else {
         return false;
@@ -3950,6 +4093,8 @@ fn verifier_only_eq_is_index_exact(expr: &str) -> bool {
     offset.saturating_add(expected.len()) <= FILE_PREFIX_8_BYTES
 }
 
+/// Returns true when one verifier-only node can be proven exactly from indexed
+/// prefix data alone.
 fn verifier_only_node_is_index_exact(
     node: &QueryNode,
     pattern_map: &HashMap<String, &PatternPlan>,
@@ -3979,6 +4124,7 @@ fn verifier_only_node_is_index_exact(
     }
 }
 
+/// Collects verifier-only node kinds that still require local verification.
 fn collect_unresolved_verifier_only_kinds(
     node: &QueryNode,
     pattern_map: &HashMap<String, &PatternPlan>,
@@ -4000,6 +4146,7 @@ fn collect_unresolved_verifier_only_kinds(
     }
 }
 
+/// Returns a human-readable label for one verifier-only node kind.
 fn verifier_only_kind_label(kind: &str) -> &'static str {
     match kind {
         "verifier_only_eq" => "byte-equality constraints around a match",
@@ -4011,6 +4158,7 @@ fn verifier_only_kind_label(kind: &str) -> &'static str {
     }
 }
 
+/// Returns the stable rule-check issue code for one verifier-only node kind.
 fn verifier_only_issue_code(kind: &str) -> &'static str {
     match kind {
         "verifier_only_eq" => "verifier-only-byte-equality",
@@ -4022,6 +4170,7 @@ fn verifier_only_issue_code(kind: &str) -> &'static str {
     }
 }
 
+/// Builds the user-facing rule-check message for a verifier-only node kind.
 fn verifier_only_issue_message(kind: &str) -> String {
     match kind {
         "verifier_only_eq" => "This rule uses byte-read equality outside sspry's exact indexed prefix window. sspry can narrow candidates, but exact evaluation requires local verification with --verify.".to_owned(),
@@ -4036,1115 +4185,12 @@ fn verifier_only_issue_message(kind: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RuleSourceLocation {
-    line: usize,
-    column: usize,
-}
+// Rule-check diagnostics and source mapping helpers live in a sibling file to keep
+// the core query-plan compiler readable.
+include!("query_plan/rule_check.rs");
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RuleSourceMatch {
-    location: RuleSourceLocation,
-    snippet: String,
-}
-
-struct RuleSourceContext<'a> {
-    full_text: &'a str,
-    block_text: &'a str,
-    block_start_offset: usize,
-}
-
-fn source_location_for_offset(rule_text: &str, offset: usize) -> RuleSourceLocation {
-    let mut line = 1usize;
-    let mut column = 1usize;
-    for ch in rule_text[..offset.min(rule_text.len())].chars() {
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    RuleSourceLocation { line, column }
-}
-
-fn source_snippet_for_offset(rule_text: &str, offset: usize) -> String {
-    let bounded_offset = offset.min(rule_text.len());
-    let line_start = rule_text[..bounded_offset]
-        .rfind('\n')
-        .map(|value| value + 1)
-        .unwrap_or(0);
-    let line_end = rule_text[bounded_offset..]
-        .find('\n')
-        .map(|value| bounded_offset + value)
-        .unwrap_or(rule_text.len());
-    rule_text[line_start..line_end].trim().to_owned()
-}
-
-fn source_match_for_offset(context: &RuleSourceContext<'_>, offset: usize) -> RuleSourceMatch {
-    RuleSourceMatch {
-        location: source_location_for_offset(
-            context.full_text,
-            context.block_start_offset.saturating_add(offset),
-        ),
-        snippet: source_snippet_for_offset(context.block_text, offset),
-    }
-}
-
-fn source_match_for_literal(
-    context: &RuleSourceContext<'_>,
-    literal: &str,
-) -> Option<RuleSourceMatch> {
-    context
-        .block_text
-        .find(literal)
-        .map(|offset| source_match_for_offset(context, offset))
-}
-
-fn source_match_for_condition_literal(
-    context: &RuleSourceContext<'_>,
-    literal: &str,
-) -> Option<RuleSourceMatch> {
-    if let Some(condition_offset) = context.block_text.find("condition:")
-        && let Some(relative_offset) = context.block_text[condition_offset..].find(literal)
-    {
-        return Some(source_match_for_offset(
-            context,
-            condition_offset + relative_offset,
-        ));
-    }
-    source_match_for_literal(context, literal)
-}
-
-fn source_match_for_condition_pattern_id(
-    context: &RuleSourceContext<'_>,
-    pattern_id: &str,
-) -> Option<RuleSourceMatch> {
-    source_match_for_condition_literal(context, pattern_id)
-}
-
-fn source_match_for_strings_literal(
-    context: &RuleSourceContext<'_>,
-    literal: &str,
-) -> Option<RuleSourceMatch> {
-    let strings_offset = context.block_text.find("strings:")?;
-    let section_end = context.block_text[strings_offset..]
-        .find("condition:")
-        .map(|offset| strings_offset + offset)
-        .unwrap_or(context.block_text.len());
-    let strings_section = &context.block_text[strings_offset..section_end];
-    strings_section
-        .find(literal)
-        .map(|relative_offset| source_match_for_offset(context, strings_offset + relative_offset))
-}
-
-fn source_match_for_first_strings_line(context: &RuleSourceContext<'_>) -> Option<RuleSourceMatch> {
-    let strings_offset = context.block_text.find("strings:")?;
-    let tail = &context.block_text[strings_offset..];
-    let newline_offset = tail.find('\n')?;
-    let body_start = strings_offset + newline_offset + 1;
-    let section_end = context.block_text[body_start..]
-        .find("condition:")
-        .map(|offset| body_start + offset)
-        .unwrap_or(context.block_text.len());
-    let remaining = &context.block_text[body_start..section_end];
-    let first_non_ws = remaining
-        .char_indices()
-        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))?;
-    Some(source_match_for_offset(context, body_start + first_non_ws))
-}
-
-fn extract_message_fragment(message: &str, prefix: &str) -> Option<String> {
-    let suffix = message.strip_prefix(prefix)?.trim();
-    let quoted = suffix.strip_prefix('"')?.strip_suffix('"')?;
-    Some(quoted.to_owned())
-}
-
-fn source_match_for_anchorless_verifier_only_condition(
-    context: &RuleSourceContext<'_>,
-) -> Option<RuleSourceMatch> {
-    for candidate in [
-        "uint8(", "uint16(", "uint32(", "uint64(", "int8(", "int16(", "int32(", "int64(",
-        "float32(", "float64(", " at ", " in (", "#", "for any", "for all",
-    ] {
-        if let Some(found) = source_match_for_condition_literal(context, candidate) {
-            return Some(found);
-        }
-    }
-    source_match_for_first_condition_line(context)
-}
-
-fn source_match_for_first_condition_line(
-    context: &RuleSourceContext<'_>,
-) -> Option<RuleSourceMatch> {
-    let condition_offset = context.block_text.find("condition:")?;
-    let tail = &context.block_text[condition_offset..];
-    let newline_offset = tail.find('\n')?;
-    let body_start = condition_offset + newline_offset + 1;
-    let remaining = &context.block_text[body_start..];
-    let first_non_ws = remaining
-        .char_indices()
-        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))?;
-    Some(source_match_for_offset(context, body_start + first_non_ws))
-}
-
-fn verifier_only_kind_match(
-    context: &RuleSourceContext<'_>,
-    kind: &str,
-) -> Option<RuleSourceMatch> {
-    let candidates: &[&str] = match kind {
-        "verifier_only_at" => &[" at ", " at\t", " at\r", " at\n"],
-        "verifier_only_count" => &["#", " of ("],
-        "verifier_only_in_range" => &[" in ("],
-        "verifier_only_loop" => &["for any", "for all"],
-        "verifier_only_eq" => &[
-            "uint8(", "uint16(", "uint32(", "uint64(", "int8(", "int16(", "int32(", "int64(",
-        ],
-        _ => &[],
-    };
-    candidates
-        .iter()
-        .find_map(|candidate| source_match_for_literal(context, candidate))
-}
-
-fn rule_check_issue(
-    rule_name: Option<&str>,
-    code: &str,
-    severity: RuleCheckSeverity,
-    message: impl Into<String>,
-    source_match: Option<RuleSourceMatch>,
-    remediation: Option<String>,
-) -> RuleCheckIssue {
-    RuleCheckIssue {
-        code: code.to_owned(),
-        severity,
-        message: message.into(),
-        rule: rule_name.map(str::to_owned),
-        line: source_match.as_ref().map(|value| value.location.line),
-        column: source_match.as_ref().map(|value| value.location.column),
-        snippet: source_match.map(|value| value.snippet),
-        remediation,
-    }
-}
-
-fn remediation_for_issue_code(code: &str) -> Option<String> {
-    match code {
-        "verifier-only-constraint" => Some(
-            "Run `search --verify` for exact results, or rewrite the rule around searchable anchored literals only."
-                .to_owned(),
-        ),
-        "verifier-only-byte-equality" => Some(
-            "Run `search --verify` for exact numeric or byte-read checks, or keep the full read inside the stored 8-byte file prefix."
-                .to_owned(),
-        ),
-        "verifier-only-offset" => Some(
-            "Run `search --verify` for exact offset checks, or rewrite the rule so the match fits inside an exact indexed prefix window such as `at 0` or `at pe.entry_point`."
-                .to_owned(),
-        ),
-        "verifier-only-count" => Some(
-            "Run `search --verify` for exact match counts, or rewrite the rule to avoid `#` count constraints."
-                .to_owned(),
-        ),
-        "verifier-only-range" => Some(
-            "Run `search --verify` for exact range checks, or rewrite the rule to avoid `in (...)` range constraints."
-                .to_owned(),
-        ),
-        "verifier-only-loop" => Some(
-            "Run `search --verify` for exact `for any` or `for all` evaluation, or rewrite the iterator into directly searchable anchored literals."
-                .to_owned(),
-        ),
-        "verifier-only-negation" => Some(
-            "Run `search --verify` for exact negative conditions, or rewrite the rule so the excluded terms become positive searchable anchors in separate filtering steps."
-                .to_owned(),
-        ),
-        "negated-search-unbounded" => Some(
-            "Add a positive searchable anchor outside the negated condition, or use direct/local YARA verification instead of sspry's indexed candidate search for this rule."
-                .to_owned(),
-        ),
-        "no-parseable-rule-block" => Some(
-            "Point `rule-check` at a real YARA rule file rather than an index/include list, or expand the include file before checking it."
-                .to_owned(),
-        ),
-        "no-condition-section" => Some(
-            "Add a `condition:` section to the rule so sspry can analyze the searchable logic."
-                .to_owned(),
-        ),
-        "ignored-module-no-anchor" => Some(
-            "Add a searchable string or hex anchor that survives after module predicates are pruned, or use `search --verify` on a positively anchored companion rule."
-                .to_owned(),
-        ),
-        "unsupported-regex-flags" => Some(
-            "Remove unsupported regex flags such as `nocase`, or rewrite the regex as anchored literals or hex that sspry can index."
-                .to_owned(),
-        ),
-        "unsupported-literal-flags" => Some(
-            "Remove unsupported literal flags such as `base64`, or pre-expand the transformed strings into ordinary searchable literals."
-                .to_owned(),
-        ),
-        "unsupported-hex-syntax" => Some(
-            "Rewrite the hex string to use sspry's supported syntax: concrete bytes, `??`, bounded gaps like `[n]` or `[n-m]`, and simple same-length groups."
-                .to_owned(),
-        ),
-        "regex-no-mandatory-literal" => Some(
-            "Rewrite the regex so it contains a stable mandatory literal anchor, or add a separate mandatory string/hex anchor alongside it."
-                .to_owned(),
-        ),
-        "unsupported-regex-syntax" => Some(
-            "Rewrite the regex to avoid unsupported regex syntax, or replace it with anchored literals or hex that sspry can index."
-                .to_owned(),
-        ),
-        "nocase-no-anchorable-window" => Some(
-            "Use a longer `nocase` literal, remove `nocase`, or add a separate mandatory anchorable literal so sspry can derive searchable grams."
-                .to_owned(),
-        ),
-        "unsupported-strings-declaration" => Some(
-            "Rewrite the string declaration into one of the supported forms: plain literal, regex, or hex with sspry's supported syntax."
-                .to_owned(),
-        ),
-        "unsupported-condition-field" => Some(
-            "Rewrite the rule around supported metadata or anchored literals, or reserve this predicate for local verification instead of indexed search."
-                .to_owned(),
-        ),
-        "nonliteral-byte-offset" => Some(
-            "Rewrite the byte-read offset to a literal constant that fits an indexed exact window, or move this condition behind `search --verify`."
-                .to_owned(),
-        ),
-        "count-requires-integer-literal" => Some(
-            "Rewrite the count comparison to use an integer literal, or verify the rule locally if it depends on dynamic count expressions."
-                .to_owned(),
-        ),
-        "numeric-read-literal-out-of-range" => Some(
-            "Use a literal constant that fits the numeric read width, or rewrite the comparison to avoid out-of-range values."
-                .to_owned(),
-        ),
-        "invalid-literal-string" => Some(
-            "Fix the string escaping so the literal is valid YARA text, then rerun `rule-check`."
-                .to_owned(),
-        ),
-        "unknown-rule-reference" => Some(
-            "Include or inline the referenced helper rule before checking, or fix the rule name reference."
-                .to_owned(),
-        ),
-        "unsupported-condition-syntax" => Some(
-            "Rewrite the condition into sspry's supported searchable subset; complex array indexing, bitwise expressions, and iterator-heavy module access are not currently indexed."
-                .to_owned(),
-        ),
-        "unsupported-comparison-operator" => Some(
-            "Rewrite the comparison into a supported searchable form such as equality or a positively anchored verify-only rule."
-                .to_owned(),
-        ),
-        "ignored-module-predicate" => Some(
-            "Use `search --verify` if these module predicates matter, or rewrite the rule to rely on indexed literals or metadata that sspry can evaluate directly."
-                .to_owned(),
-        ),
-        "hash-identity-mismatch" => Some(
-            "Point the check at a DB or server with the matching `--id-source`, or rewrite the rule to use the identity source that DB was built with."
-                .to_owned(),
-        ),
-        "hash-identity-source-unknown" => Some(
-            "Run `rule-check` with `--addr`, `--root`, or an explicit `--id-source` so whole-file hash rules can be evaluated against a real DB identity policy."
-                .to_owned(),
-        ),
-        "overbroad-union" => Some(
-            "Add a stable mandatory anchor that every matching branch must satisfy, or split the rule so the union fanout stays selective."
-                .to_owned(),
-        ),
-        "low-information-entrypoint-stub" => Some(
-            "Add a longer mandatory literal at the entry point, or rewrite the rule around a stronger PE-specific anchor."
-                .to_owned(),
-        ),
-        "low-information-range-rule" => Some(
-            "Add a longer mandatory literal outside the suffix/range constraint, or split the rule into a stronger searchable prefilter plus verification."
-                .to_owned(),
-        ),
-        "low-information-single-pattern" => Some(
-            "Use a longer literal or combine the pattern with another mandatory searchable condition."
-                .to_owned(),
-        ),
-        "requires-anchorable-literal-direct" => Some(
-            "Add a sufficiently specific literal anchor to the direct search condition, or simplify the pattern so sspry can derive searchable grams from it."
-                .to_owned(),
-        ),
-        "requires-anchorable-literal-at-in" => Some(
-            "Add a sufficiently specific literal anchor to the `at` or `in` condition, or simplify the pattern so sspry can derive searchable grams from it."
-                .to_owned(),
-        ),
-        "requires-anchorable-literal-loop" => Some(
-            "Add a sufficiently specific literal anchor before the iterator, or simplify the looped pattern so sspry can derive searchable grams from it."
-                .to_owned(),
-        ),
-        "requires-anchorable-literal-n-of" => Some(
-            "Add a sufficiently specific literal anchor to each `any of` or `all of` branch, or reduce the rule to a smaller searchable subset."
-                .to_owned(),
-        ),
-        "verifier-only-no-anchor" => Some(
-            "Add a searchable string or hex anchor so sspry can narrow candidates before verification."
-                .to_owned(),
-        ),
-        "unsupported-hash-function" => Some(
-            "Use one of the searchable whole-file hash forms: `hash.md5(0, filesize)`, `hash.sha1(0, filesize)`, or `hash.sha256(0, filesize)`."
-                .to_owned(),
-        ),
-        "whole-file-only" => Some(
-            "Rewrite the rule to the searchable whole-file form, or expect it to be unsupported for sspry candidate search."
-                .to_owned(),
-        ),
-        "requires-anchorable-literal" => Some(
-            "Add a sufficiently specific literal anchor to the rule, or simplify the pattern so sspry can derive searchable grams from it."
-                .to_owned(),
-        ),
-        "unsupported" => Some(
-            "Rewrite the rule into sspry's searchable subset, or use direct/local YARA verification for exact evaluation."
-                .to_owned(),
-        ),
-        _ => None,
-    }
-}
-
-fn classify_unsupported_issue_code(message: &str) -> &'static str {
-    if message == "Rule does not contain a parseable rule block." {
-        "no-parseable-rule-block"
-    } else if message == "Rule does not contain a condition section." {
-        "no-condition-section"
-    } else if message.contains("after pruning ignored module predicates") {
-        "ignored-module-no-anchor"
-    } else if message.starts_with("Unsupported regex flag(s) for ") {
-        "unsupported-regex-flags"
-    } else if message.starts_with("Unsupported literal flag(s) for ") {
-        "unsupported-literal-flags"
-    } else if message.starts_with("Unsupported hex token for ") {
-        "unsupported-hex-syntax"
-    } else if message == "Regex string does not contain a searchable mandatory literal." {
-        "regex-no-mandatory-literal"
-    } else if message.starts_with("Unsupported regex quantifier")
-        || message == "Unsupported regex quantifier body."
-        || message == "Unsupported regex group extension in searchable regex."
-    {
-        "unsupported-regex-syntax"
-    } else if message
-        == "nocase literal does not contain an anchorable window for the active gram sizes"
-    {
-        "nocase-no-anchorable-window"
-    } else if message.starts_with("Unsupported strings declaration: ") {
-        "unsupported-strings-declaration"
-    } else if message.starts_with("Unsupported condition field: ") {
-        "unsupported-condition-field"
-    } else if message.ends_with("requires an integer byte offset.") {
-        "nonliteral-byte-offset"
-    } else if message == "Count conditions require an integer literal." {
-        "count-requires-integer-literal"
-    } else if message.starts_with("Numeric read literal is out of range for ") {
-        "numeric-read-literal-out-of-range"
-    } else if message.starts_with("Invalid literal string: ") {
-        "invalid-literal-string"
-    } else if message.starts_with("Condition references unknown rule: ") {
-        "unknown-rule-reference"
-    } else if message.starts_with("Unsupported token in condition near: ")
-        || message.starts_with("Unexpected trailing token in condition:")
-    {
-        "unsupported-condition-syntax"
-    } else if message.starts_with("Unsupported count comparison token: ")
-        || message.starts_with("Expected token EqEq, got ")
-    {
-        "unsupported-comparison-operator"
-    } else if message.contains("current source is") && message.starts_with("hash.") {
-        "hash-identity-mismatch"
-    } else if message.contains("requires a known DB identity source") {
-        "hash-identity-source-unknown"
-    } else if message.contains("no mandatory anchorable pattern and union fanout") {
-        "overbroad-union"
-    } else if message.contains("entry-point stub provides only low-information gram anchors") {
-        "low-information-entrypoint-stub"
-    } else if message.contains("short range/suffix anchors are too weak at scale") {
-        "low-information-range-rule"
-    } else if message.contains("single-pattern rule provides only tiny gram anchors") {
-        "low-information-single-pattern"
-    } else if message.contains("requires an anchorable literal for direct search use") {
-        "requires-anchorable-literal-direct"
-    } else if message.contains("requires an anchorable literal for at/in search use") {
-        "requires-anchorable-literal-at-in"
-    } else if message.contains("requires an anchorable literal for verifier-loop search use") {
-        "requires-anchorable-literal-loop"
-    } else if message.contains("requires an anchorable literal for N-of search use") {
-        "requires-anchorable-literal-n-of"
-    } else if message.contains("Verifier-only indexed conditions require an anchorable literal") {
-        "verifier-only-no-anchor"
-    } else if message.contains("Unsupported searchable hash function") {
-        "unsupported-hash-function"
-    } else if message.contains("Only whole-file") {
-        "whole-file-only"
-    } else if message.contains("requires an anchorable literal") {
-        "requires-anchorable-literal"
-    } else {
-        "unsupported"
-    }
-}
-
-fn unsupported_issue_match(
-    context: &RuleSourceContext<'_>,
-    message: &str,
-) -> Option<RuleSourceMatch> {
-    let code = classify_unsupported_issue_code(message);
-    if let Some(hash_start) = message.find("hash.") {
-        let suffix = &message[hash_start..];
-        let end = suffix.find('(').unwrap_or(suffix.len());
-        let literal = &suffix[..end];
-        if !literal.is_empty() {
-            return source_match_for_literal(context, literal);
-        }
-    }
-    if message.contains("math.entropy") {
-        return source_match_for_literal(context, "math.entropy(");
-    }
-    match code {
-        "no-condition-section" => source_match_for_literal(context, "strings:")
-            .or_else(|| source_match_for_first_strings_line(context)),
-        "ignored-module-no-anchor" => {
-            for candidate in ["androguard.", "console.", "cuckoo."] {
-                if let Some(found) = source_match_for_condition_literal(context, candidate) {
-                    return Some(found);
-                }
-            }
-            source_match_for_first_condition_line(context)
-        }
-        "unsupported-regex-flags" | "unsupported-literal-flags" => message
-            .split_once(" for ")
-            .and_then(|(_, suffix)| suffix.split_once(':'))
-            .and_then(|(pattern_id, _)| source_match_for_strings_literal(context, pattern_id))
-            .or_else(|| source_match_for_first_strings_line(context)),
-        "unsupported-hex-syntax" => message
-            .split_once(" for ")
-            .and_then(|(_, suffix)| suffix.split_once(':'))
-            .and_then(|(pattern_id, _)| source_match_for_strings_literal(context, pattern_id))
-            .or_else(|| source_match_for_first_strings_line(context)),
-        "regex-no-mandatory-literal" => source_match_for_first_strings_line(context),
-        "unsupported-regex-syntax" | "nocase-no-anchorable-window" => {
-            source_match_for_first_strings_line(context)
-        }
-        "unsupported-strings-declaration" => {
-            extract_message_fragment(message, "Unsupported strings declaration: ")
-                .and_then(|fragment| source_match_for_strings_literal(context, &fragment))
-                .or_else(|| source_match_for_first_strings_line(context))
-        }
-        "unsupported-condition-field" => message
-            .strip_prefix("Unsupported condition field: ")
-            .and_then(|field| source_match_for_condition_literal(context, field))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "nonliteral-byte-offset" => message
-            .strip_suffix(" requires an integer byte offset.")
-            .and_then(|name| source_match_for_condition_literal(context, &format!("{name}(")))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "count-requires-integer-literal" => source_match_for_condition_literal(context, "#")
-            .or_else(|| source_match_for_condition_literal(context, " of ("))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "numeric-read-literal-out-of-range" => message
-            .strip_prefix("Numeric read literal is out of range for ")
-            .and_then(|suffix| suffix.split_once(':').map(|(name, _)| name))
-            .and_then(|name| source_match_for_condition_literal(context, &format!("{name}(")))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "invalid-literal-string" => source_match_for_first_strings_line(context),
-        "unknown-rule-reference" => message
-            .strip_prefix("Condition references unknown rule: ")
-            .and_then(|rule_name| source_match_for_condition_literal(context, rule_name))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "unsupported-condition-syntax" => {
-            extract_message_fragment(message, "Unsupported token in condition near: ")
-                .and_then(|fragment| source_match_for_condition_literal(context, &fragment))
-                .or_else(|| source_match_for_first_condition_line(context))
-        }
-        "unsupported-comparison-operator" => source_match_for_condition_literal(context, "!=")
-            .or_else(|| source_match_for_condition_literal(context, "#"))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "overbroad-union" => {
-            for candidate in ["any of", "or", "1 of", "2 of"] {
-                if let Some(found) = source_match_for_condition_literal(context, candidate) {
-                    return Some(found);
-                }
-            }
-            source_match_for_first_condition_line(context)
-        }
-        "low-information-entrypoint-stub" => {
-            source_match_for_condition_literal(context, "at pe.entry_point")
-        }
-        "low-information-range-rule" => source_match_for_condition_literal(context, " in ("),
-        "low-information-single-pattern" => source_match_for_first_condition_line(context),
-        "requires-anchorable-literal-direct" => extract_pattern_id_from_anchor_error(message)
-            .and_then(|pattern_id| source_match_for_condition_pattern_id(context, &pattern_id))
-            .or_else(|| source_match_for_first_condition_line(context)),
-        "requires-anchorable-literal-at-in" => extract_pattern_id_from_anchor_error(message)
-            .and_then(|pattern_id| {
-                source_match_for_condition_literal(context, &format!("{pattern_id} at"))
-                    .or_else(|| {
-                        source_match_for_condition_literal(context, &format!("{pattern_id} in"))
-                    })
-                    .or_else(|| source_match_for_condition_pattern_id(context, &pattern_id))
-            })
-            .or_else(|| source_match_for_condition_literal(context, " at "))
-            .or_else(|| source_match_for_condition_literal(context, " in (")),
-        "requires-anchorable-literal-loop" => {
-            source_match_for_condition_literal(context, "verifierloop(")
-                .or_else(|| source_match_for_condition_literal(context, "for any"))
-                .or_else(|| source_match_for_condition_literal(context, "for all"))
-        }
-        "requires-anchorable-literal-n-of" => {
-            if let Some(pattern_id) = extract_pattern_id_from_anchor_error(message)
-                && let Some(found) = source_match_for_condition_pattern_id(context, &pattern_id)
-            {
-                return Some(found);
-            }
-            for candidate in ["any of", "all of", "1 of", "2 of"] {
-                if let Some(found) = source_match_for_condition_literal(context, candidate) {
-                    return Some(found);
-                }
-            }
-            source_match_for_first_condition_line(context)
-        }
-        "verifier-only-no-anchor" => source_match_for_anchorless_verifier_only_condition(context),
-        _ => None,
-    }
-}
-
-fn extract_pattern_id_from_anchor_error(message: &str) -> Option<String> {
-    let suffix = message.strip_prefix("Pattern ")?;
-    let end = suffix.find(" requires an anchorable literal")?;
-    Some(suffix[..end].to_owned())
-}
-
-fn build_rule_check_report(
-    source_context: &RuleSourceContext<'_>,
-    rule_name: Option<&str>,
-    plan_result: Result<CompiledQueryPlan>,
-    ignored_module_calls: Vec<String>,
-) -> RuleCheckReport {
-    match plan_result {
-        Ok(plan) => {
-            let pattern_map = plan
-                .patterns
-                .iter()
-                .map(|pattern| (pattern.pattern_id.clone(), pattern))
-                .collect::<HashMap<_, _>>();
-            let mut verifier_only_kinds = BTreeSet::<String>::new();
-            collect_unresolved_verifier_only_kinds(
-                &plan.root,
-                &pattern_map,
-                &mut verifier_only_kinds,
-            );
-            let verifier_only_kinds = verifier_only_kinds.into_iter().collect::<Vec<_>>();
-            let mut issues = Vec::<RuleCheckIssue>::new();
-            let negated_search_match =
-                first_negated_search_condition_match(&plan.root, source_context);
-            let negated_search_unbounded =
-                negated_search_condition_makes_candidate_branch_unbounded(&plan.root);
-            for kind in &verifier_only_kinds {
-                let code = verifier_only_issue_code(kind);
-                issues.push(rule_check_issue(
-                    rule_name,
-                    code,
-                    RuleCheckSeverity::Warning,
-                    verifier_only_issue_message(kind),
-                    verifier_only_kind_match(source_context, kind),
-                    remediation_for_issue_code(code),
-                ));
-            }
-            if negated_search_unbounded {
-                issues.push(rule_check_issue(
-                    rule_name,
-                    "negated-search-unbounded",
-                    RuleCheckSeverity::Error,
-                    "This rule negates searchable string, hex, or verifier-only conditions without any exact positive prefilter. sspry's indexed candidate stage would treat that negated branch as always true, so the rule is not suitable for scalable indexed search as written.",
-                    negated_search_match.clone(),
-                    remediation_for_issue_code("negated-search-unbounded"),
-                ));
-            } else if let Some(source_match) = negated_search_match {
-                issues.push(rule_check_issue(
-                    rule_name,
-                    "verifier-only-negation",
-                    RuleCheckSeverity::Warning,
-                    "This rule negates searchable string, hex, or verifier-only conditions. sspry can keep the positive prefilter, but exact negative evaluation requires local verification with --verify.",
-                    Some(source_match),
-                    remediation_for_issue_code("verifier-only-negation"),
-                ));
-            }
-            for module_call in &ignored_module_calls {
-                issues.push(rule_check_issue(
-                    rule_name,
-                    "ignored-module-predicate",
-                    RuleCheckSeverity::Warning,
-                    format!(
-                        "Indexed candidate search prunes the module predicate `{module_call}`. Use --verify if you need exact module-aware results."
-                    ),
-                    source_match_for_literal(source_context, module_call),
-                    remediation_for_issue_code("ignored-module-predicate"),
-                ));
-            }
-            RuleCheckReport {
-                status: if negated_search_unbounded {
-                    RuleCheckStatus::Unsupported
-                } else if issues.is_empty() {
-                    RuleCheckStatus::Searchable
-                } else {
-                    RuleCheckStatus::SearchableNeedsVerify
-                },
-                issues,
-                verifier_only_kinds,
-                ignored_module_calls,
-            }
-        }
-        Err(err) => {
-            let error_message = err.to_string();
-            let error_code = classify_unsupported_issue_code(&error_message);
-            let mut issues = vec![rule_check_issue(
-                rule_name,
-                error_code,
-                RuleCheckSeverity::Error,
-                error_message.clone(),
-                unsupported_issue_match(source_context, &error_message),
-                remediation_for_issue_code(error_code),
-            )];
-            for module_call in &ignored_module_calls {
-                issues.push(rule_check_issue(
-                    rule_name,
-                    "ignored-module-predicate",
-                    RuleCheckSeverity::Warning,
-                    format!(
-                        "The rule also references the ignored module predicate `{module_call}`."
-                    ),
-                    source_match_for_literal(source_context, module_call),
-                    remediation_for_issue_code("ignored-module-predicate"),
-                ));
-            }
-            RuleCheckReport {
-                status: RuleCheckStatus::Unsupported,
-                issues,
-                verifier_only_kinds: Vec::new(),
-                ignored_module_calls,
-            }
-        }
-    }
-}
-
-fn contains_identity_node(node: &QueryNode) -> bool {
-    node.kind == "identity_eq" || node.children.iter().any(contains_identity_node)
-}
-
-fn contains_pattern_node(node: &QueryNode) -> bool {
-    node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
-}
-
-fn contains_pattern_or_verifier_only_node(node: &QueryNode) -> bool {
-    contains_pattern_node(node) || contains_verifier_only_node(node)
-}
-
-fn first_negated_search_condition_match(
-    node: &QueryNode,
-    context: &RuleSourceContext<'_>,
-) -> Option<RuleSourceMatch> {
-    if node.kind == "not"
-        && node
-            .children
-            .first()
-            .is_some_and(contains_pattern_or_verifier_only_node)
-    {
-        return source_match_for_condition_literal(context, "not ")
-            .or_else(|| source_match_for_first_condition_line(context));
-    }
-    node.children
-        .iter()
-        .find_map(|child| first_negated_search_condition_match(child, context))
-}
-
-fn summarize_rule_check_rules(rules: Vec<RuleCheckRuleReport>) -> RuleCheckFileReport {
-    let considered_rules = if rules.iter().any(|rule| !rule.is_private) {
-        rules.iter()
-            .filter(|rule| !rule.is_private)
-            .collect::<Vec<_>>()
-    } else {
-        rules.iter().collect::<Vec<_>>()
-    };
-    let mut status = RuleCheckStatus::Searchable;
-    let mut issues = Vec::<RuleCheckIssue>::new();
-    let mut verifier_only_kinds = BTreeSet::<String>::new();
-    let mut ignored_module_calls = BTreeSet::<String>::new();
-    for rule in considered_rules {
-        status = status.combine(rule.status);
-        issues.extend(rule.issues.iter().cloned());
-        verifier_only_kinds.extend(rule.verifier_only_kinds.iter().cloned());
-        ignored_module_calls.extend(rule.ignored_module_calls.iter().cloned());
-    }
-    RuleCheckFileReport {
-        status,
-        issues,
-        verifier_only_kinds: verifier_only_kinds.into_iter().collect(),
-        ignored_module_calls: ignored_module_calls.into_iter().collect(),
-        rules,
-    }
-}
-
-fn negated_search_condition_makes_candidate_branch_unbounded(node: &QueryNode) -> bool {
-    match node.kind.as_str() {
-        "not" => node
-            .children
-            .first()
-            .is_some_and(contains_pattern_or_verifier_only_node),
-        "and" => {
-            !node.children.is_empty()
-                && node
-                    .children
-                    .iter()
-                    .all(negated_search_condition_makes_candidate_branch_unbounded)
-        }
-        "or" => node
-            .children
-            .iter()
-            .any(negated_search_condition_makes_candidate_branch_unbounded),
-        "n_of" => {
-            let threshold = node.threshold.unwrap_or(1);
-            node.children
-                .iter()
-                .filter(|child| negated_search_condition_makes_candidate_branch_unbounded(child))
-                .count()
-                >= threshold
-        }
-        _ => false,
-    }
-}
-
-const OVERBROAD_UNION_FANOUT_LIMIT: usize = 160;
-const MANDATORY_PATTERN_COMBINATION_LIMIT: usize = 4096;
-const LOW_INFORMATION_EP_STUB_PATTERN_LIMIT: usize = 2;
-const LOW_INFORMATION_EP_STUB_MAX_TIER1_GRAMS: usize = 2;
-const LOW_INFORMATION_EP_STUB_MAX_TIER2_GRAMS: usize = 3;
-const LOW_INFORMATION_RANGE_RULE_PATTERN_LIMIT: usize = 3;
-const LOW_INFORMATION_RANGE_RULE_MAX_TIER1_GRAMS: usize = 1;
-const LOW_INFORMATION_RANGE_RULE_MAX_TIER2_GRAMS: usize = 2;
-const LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN: usize = 4;
-const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS: usize = 1;
-const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS: usize = 4;
-
-fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
-    pattern.alternatives.iter().any(|alt| !alt.is_empty())
-        || pattern.tier2_alternatives.iter().any(|alt| !alt.is_empty())
-        || pattern
-            .anchor_literals
-            .iter()
-            .any(|literal| !literal.is_empty())
-}
-
-fn pattern_has_anchor_literals(pattern: &PatternPlan) -> bool {
-    pattern
-        .anchor_literals
-        .iter()
-        .any(|literal| !literal.is_empty())
-}
-
-fn pattern_max_anchor_literal_len(pattern: &PatternPlan) -> usize {
-    pattern
-        .anchor_literals
-        .iter()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-}
-
-fn pattern_max_tier1_grams(pattern: &PatternPlan) -> usize {
-    pattern.alternatives.iter().map(Vec::len).max().unwrap_or(0)
-}
-
-fn pattern_max_tier2_grams(pattern: &PatternPlan) -> usize {
-    pattern
-        .tier2_alternatives
-        .iter()
-        .map(Vec::len)
-        .max()
-        .unwrap_or(0)
-}
-
-fn choose_bounded(n: usize, k: usize, limit: usize) -> Option<usize> {
-    if k > n {
-        return Some(0);
-    }
-    let k = k.min(n.saturating_sub(k));
-    let mut value = 1usize;
-    for i in 0..k {
-        let numerator = n.saturating_sub(i);
-        let denominator = i.saturating_add(1);
-        value = value.checked_mul(numerator)?;
-        value /= denominator;
-        if value > limit {
-            return None;
-        }
-    }
-    Some(value)
-}
-
-fn combinations_intersection_of_unions(
-    child_sets: &[HashSet<String>],
-    threshold: usize,
-) -> HashSet<String> {
-    fn visit(
-        child_sets: &[HashSet<String>],
-        threshold: usize,
-        start: usize,
-        current: &mut Vec<usize>,
-        intersection: &mut Option<HashSet<String>>,
-    ) {
-        if current.len() == threshold {
-            let union = current
-                .iter()
-                .flat_map(|idx| child_sets[*idx].iter().cloned())
-                .collect::<HashSet<_>>();
-            if let Some(existing) = intersection {
-                existing.retain(|pattern_id| union.contains(pattern_id));
-            } else {
-                *intersection = Some(union);
-            }
-            return;
-        }
-        let remaining = threshold.saturating_sub(current.len());
-        let max_start = child_sets.len().saturating_sub(remaining);
-        for idx in start..=max_start {
-            current.push(idx);
-            visit(child_sets, threshold, idx + 1, current, intersection);
-            current.pop();
-            if intersection.as_ref().is_some_and(HashSet::is_empty) {
-                return;
-            }
-        }
-    }
-
-    let mut intersection = None;
-    visit(
-        child_sets,
-        threshold,
-        0,
-        &mut Vec::with_capacity(threshold),
-        &mut intersection,
-    );
-    intersection.unwrap_or_default()
-}
-
-fn mandatory_pattern_ids(node: &QueryNode) -> HashSet<String> {
-    match node.kind.as_str() {
-        "pattern" => node.pattern_id.iter().cloned().collect::<HashSet<_>>(),
-        "and" => node
-            .children
-            .iter()
-            .flat_map(mandatory_pattern_ids)
-            .collect::<HashSet<_>>(),
-        "or" => {
-            let mut children = node.children.iter();
-            let Some(first) = children.next() else {
-                return HashSet::new();
-            };
-            let mut mandatory = mandatory_pattern_ids(first);
-            for child in children {
-                mandatory.retain(|pattern_id| mandatory_pattern_ids(child).contains(pattern_id));
-                if mandatory.is_empty() {
-                    break;
-                }
-            }
-            mandatory
-        }
-        "n_of" => {
-            let threshold = node.threshold.unwrap_or(0);
-            if threshold == 0 || node.children.is_empty() || threshold > node.children.len() {
-                return HashSet::new();
-            }
-            if threshold == node.children.len() {
-                return node
-                    .children
-                    .iter()
-                    .flat_map(mandatory_pattern_ids)
-                    .collect::<HashSet<_>>();
-            }
-            let Some(combo_count) = choose_bounded(
-                node.children.len(),
-                threshold,
-                MANDATORY_PATTERN_COMBINATION_LIMIT,
-            ) else {
-                return HashSet::new();
-            };
-            if combo_count == 0 {
-                return HashSet::new();
-            }
-            let child_sets = node
-                .children
-                .iter()
-                .map(mandatory_pattern_ids)
-                .collect::<Vec<_>>();
-            combinations_intersection_of_unions(&child_sets, threshold)
-        }
-        _ => HashSet::new(),
-    }
-}
-
-fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
-    match node.kind.as_str() {
-        "or" => {
-            node.children.len() > 1 || node.children.iter().any(node_has_branching_pattern_union)
-        }
-        "n_of" => {
-            let threshold = node.threshold.unwrap_or(0);
-            (threshold > 0 && threshold < node.children.len())
-                || node.children.iter().any(node_has_branching_pattern_union)
-        }
-        _ => node.children.iter().any(node_has_branching_pattern_union),
-    }
-}
-
-fn node_contains_kind(node: &QueryNode, kind: &str) -> bool {
-    node.kind == kind
-        || node
-            .children
-            .iter()
-            .any(|child| node_contains_kind(child, kind))
-}
-
-fn total_pattern_anchor_fanout(patterns: &[PatternPlan]) -> usize {
-    patterns
-        .iter()
-        .map(|pattern| {
-            pattern
-                .anchor_literals
-                .iter()
-                .filter(|literal| !literal.is_empty())
-                .count()
-                .max(
-                    pattern
-                        .alternatives
-                        .iter()
-                        .filter(|alt| !alt.is_empty())
-                        .count()
-                        .max(
-                            pattern
-                                .tier2_alternatives
-                                .iter()
-                                .filter(|alt| !alt.is_empty())
-                                .count(),
-                        ),
-                )
-                .max(1)
-        })
-        .sum()
-}
-
-fn reject_overbroad_pattern_union(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
-    if patterns.is_empty() || !node_has_branching_pattern_union(root) {
-        return Ok(());
-    }
-    let pattern_map = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern))
-        .collect::<HashMap<_, _>>();
-    let mandatory_anchorable = mandatory_pattern_ids(root)
-        .into_iter()
-        .filter(|pattern_id| {
-            pattern_map
-                .get(pattern_id)
-                .copied()
-                .is_some_and(pattern_is_anchorable)
-        })
-        .count();
-    if mandatory_anchorable > 0 {
-        return Ok(());
-    }
-    let fanout = total_pattern_anchor_fanout(patterns);
-    if fanout < OVERBROAD_UNION_FANOUT_LIMIT {
-        return Ok(());
-    }
-    Err(SspryError::from(format!(
-        "Rule is overbroad for scalable search: no mandatory anchorable pattern and union fanout {fanout} exceeds {OVERBROAD_UNION_FANOUT_LIMIT}. Add a stable mandatory anchor or split the rule."
-    )))
-}
-
-fn reject_low_information_entrypoint_stub(
-    root: &QueryNode,
-    patterns: &[PatternPlan],
-) -> Result<()> {
-    if patterns.is_empty()
-        || !node_contains_kind(root, "verifier_only_at")
-        || patterns.len() > LOW_INFORMATION_EP_STUB_PATTERN_LIMIT
-    {
-        return Ok(());
-    }
-    if patterns.iter().any(pattern_has_anchor_literals) {
-        return Ok(());
-    }
-    let max_tier1 = patterns
-        .iter()
-        .map(pattern_max_tier1_grams)
-        .max()
-        .unwrap_or(0);
-    let max_tier2 = patterns
-        .iter()
-        .map(pattern_max_tier2_grams)
-        .max()
-        .unwrap_or(0);
-    if max_tier1 > LOW_INFORMATION_EP_STUB_MAX_TIER1_GRAMS
-        || max_tier2 > LOW_INFORMATION_EP_STUB_MAX_TIER2_GRAMS
-    {
-        return Ok(());
-    }
-    Err(SspryError::from(
-        "Rule is overbroad for scalable search: entry-point stub provides only low-information gram anchors. Add a longer mandatory literal or split the rule.",
-    ))
-}
-
-fn reject_low_information_range_rule(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
-    if patterns.is_empty()
-        || !node_contains_kind(root, "verifier_only_in_range")
-        || patterns.len() > LOW_INFORMATION_RANGE_RULE_PATTERN_LIMIT
-        || patterns.len() < 2
-        || !node_contains_kind(root, "verifier_only_at")
-    {
-        return Ok(());
-    }
-    let max_anchor_len = patterns
-        .iter()
-        .map(pattern_max_anchor_literal_len)
-        .max()
-        .unwrap_or(0);
-    let max_tier1 = patterns
-        .iter()
-        .map(pattern_max_tier1_grams)
-        .max()
-        .unwrap_or(0);
-    let max_tier2 = patterns
-        .iter()
-        .map(pattern_max_tier2_grams)
-        .max()
-        .unwrap_or(0);
-    if max_anchor_len > LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN
-        || max_tier1 > LOW_INFORMATION_RANGE_RULE_MAX_TIER1_GRAMS
-        || max_tier2 > LOW_INFORMATION_RANGE_RULE_MAX_TIER2_GRAMS
-    {
-        return Ok(());
-    }
-    Err(SspryError::from(
-        "Rule is overbroad for scalable search: short range/suffix anchors are too weak at scale. Add a longer mandatory literal or split the rule.",
-    ))
-}
-
-fn reject_low_information_single_pattern(root: &QueryNode, patterns: &[PatternPlan]) -> Result<()> {
-    if patterns.len() != 1 || node_has_branching_pattern_union(root) {
-        return Ok(());
-    }
-    let pattern = &patterns[0];
-    if pattern_has_anchor_literals(pattern) {
-        return Ok(());
-    }
-    let max_tier1 = pattern_max_tier1_grams(pattern);
-    let max_tier2 = pattern_max_tier2_grams(pattern);
-    if max_tier1 > LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS
-        || max_tier2 > LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS
-    {
-        return Ok(());
-    }
-    Err(SspryError::from(
-        "Rule is overbroad for scalable search: single-pattern rule provides only tiny gram anchors. Add a longer literal or combine it with a stronger mandatory condition.",
-    ))
-}
-
+/// Builds a verifier-only execution plan when every pattern can be reduced to
+/// fixed-literal checks.
 pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteralMatchPlan> {
     if contains_identity_node(&plan.root) {
         return None;
@@ -5189,6 +4235,8 @@ pub fn fixed_literal_match_plan(plan: &CompiledQueryPlan) -> Option<FixedLiteral
     })
 }
 
+/// Evaluates a fixed-literal match map against the boolean query tree produced
+/// by the normal planner.
 pub fn evaluate_fixed_literal_match(
     node: &QueryNode,
     matches: &HashMap<String, bool>,
@@ -5355,4592 +4403,9 @@ fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<
     }
 }
 
-fn namespace_pattern_id(rule_name: &str, pattern_id: &str) -> String {
-    format!("{RULE_DEP_PATTERN_PREFIX}{rule_name}::{pattern_id}")
-}
-
-fn merge_rule_fragment(into: &mut RulePlanFragment, other: &RulePlanFragment) -> Result<()> {
-    for (key, value) in &other.pattern_alternatives {
-        if let Some(existing) = into.pattern_alternatives.insert(key.clone(), value.clone())
-            && existing != *value
-        {
-            return Err(SspryError::from(format!(
-                "Conflicting pattern alternatives for {key}"
-            )));
-        }
-    }
-    for (key, value) in &other.pattern_tier2_alternatives {
-        if let Some(existing) = into
-            .pattern_tier2_alternatives
-            .insert(key.clone(), value.clone())
-            && existing != *value
-        {
-            return Err(SspryError::from(format!(
-                "Conflicting tier2 pattern alternatives for {key}"
-            )));
-        }
-    }
-    for (key, value) in &other.pattern_anchor_literals {
-        if let Some(existing) = into
-            .pattern_anchor_literals
-            .insert(key.clone(), value.clone())
-            && existing != *value
-        {
-            return Err(SspryError::from(format!(
-                "Conflicting anchor literals for {key}"
-            )));
-        }
-    }
-    for (key, value) in &other.pattern_fixed_literals {
-        if let Some(existing) = into
-            .pattern_fixed_literals
-            .insert(key.clone(), value.clone())
-            && existing != *value
-        {
-            return Err(SspryError::from(format!(
-                "Conflicting fixed literals for {key}"
-            )));
-        }
-    }
-    for (key, value) in &other.pattern_fixed_literal_wide {
-        if let Some(existing) = into
-            .pattern_fixed_literal_wide
-            .insert(key.clone(), value.clone())
-            && existing != *value
-        {
-            return Err(SspryError::from(format!(
-                "Conflicting fixed literal wide flags for {key}"
-            )));
-        }
-    }
-    for (key, value) in &other.pattern_fixed_literal_fullword {
-        if let Some(existing) = into
-            .pattern_fixed_literal_fullword
-            .insert(key.clone(), value.clone())
-            && existing != *value
-        {
-            return Err(SspryError::from(format!(
-                "Conflicting fixed literal fullword flags for {key}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn collect_local_pattern_ids(fragment: &RulePlanFragment) -> HashSet<String> {
-    fragment
-        .pattern_alternatives
-        .keys()
-        .filter(|key| !key.starts_with(RULE_DEP_PATTERN_PREFIX))
-        .cloned()
-        .collect()
-}
-
-fn rename_verifier_pattern_id(
-    kind: &str,
-    pattern_id: &str,
-    local_pattern_ids: &HashSet<String>,
-    rule_name: &str,
-) -> String {
-    match kind {
-        "pattern" | "identity_eq" => {
-            if local_pattern_ids.contains(pattern_id) {
-                namespace_pattern_id(rule_name, pattern_id)
-            } else {
-                pattern_id.to_owned()
-            }
-        }
-        "verifier_only_at" => {
-            if let Some((raw_id, offset)) = pattern_id.split_once('@')
-                && local_pattern_ids.contains(raw_id)
-            {
-                return format!("{}@{offset}", namespace_pattern_id(rule_name, raw_id));
-            }
-            pattern_id.to_owned()
-        }
-        "verifier_only_count" => {
-            let mut parts = pattern_id.split(':');
-            let prefix = parts.next();
-            let raw_id = parts.next();
-            let op = parts.next();
-            let value = parts.next();
-            if prefix == Some("count")
-                && let (Some(raw_id), Some(op), Some(value)) = (raw_id, op, value)
-                && local_pattern_ids.contains(raw_id)
-            {
-                return format!(
-                    "count:{}:{op}:{value}",
-                    namespace_pattern_id(rule_name, raw_id)
-                );
-            }
-            pattern_id.to_owned()
-        }
-        "verifier_only_in_range" => {
-            let mut parts = pattern_id.split(':');
-            let prefix = parts.next();
-            let raw_id = parts.next();
-            let start = parts.next();
-            let end = parts.next();
-            if prefix == Some("range")
-                && let (Some(raw_id), Some(start), Some(end)) = (raw_id, start, end)
-                && local_pattern_ids.contains(raw_id)
-            {
-                return format!(
-                    "range:{}:{start}:{end}",
-                    namespace_pattern_id(rule_name, raw_id)
-                );
-            }
-            pattern_id.to_owned()
-        }
-        "verifier_only_loop" => {
-            if local_pattern_ids.contains(pattern_id) {
-                namespace_pattern_id(rule_name, pattern_id)
-            } else {
-                pattern_id.to_owned()
-            }
-        }
-        _ => pattern_id.to_owned(),
-    }
-}
-
-fn rename_fragment_for_rule_dependency(fragment: &mut RulePlanFragment, rule_name: &str) {
-    let local_pattern_ids = collect_local_pattern_ids(fragment);
-    if local_pattern_ids.is_empty() {
-        return;
-    }
-    let rename_map = local_pattern_ids
-        .iter()
-        .map(|pattern_id| {
-            (
-                pattern_id.clone(),
-                namespace_pattern_id(rule_name, pattern_id),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-
-    let remap_map = |map: &mut BTreeMap<String, Vec<Vec<u64>>>| {
-        let mut next = BTreeMap::<String, Vec<Vec<u64>>>::new();
-        for (key, value) in std::mem::take(map) {
-            let new_key = rename_map.get(&key).cloned().unwrap_or(key);
-            next.insert(new_key, value);
-        }
-        *map = next;
-    };
-    remap_map(&mut fragment.pattern_alternatives);
-    remap_map(&mut fragment.pattern_tier2_alternatives);
-
-    let remap_bytes = |map: &mut BTreeMap<String, Vec<Vec<u8>>>| {
-        let mut next = BTreeMap::<String, Vec<Vec<u8>>>::new();
-        for (key, value) in std::mem::take(map) {
-            let new_key = rename_map.get(&key).cloned().unwrap_or(key);
-            next.insert(new_key, value);
-        }
-        *map = next;
-    };
-    remap_bytes(&mut fragment.pattern_anchor_literals);
-    remap_bytes(&mut fragment.pattern_fixed_literals);
-
-    let remap_bools = |map: &mut BTreeMap<String, Vec<bool>>| {
-        let mut next = BTreeMap::<String, Vec<bool>>::new();
-        for (key, value) in std::mem::take(map) {
-            let new_key = rename_map.get(&key).cloned().unwrap_or(key);
-            next.insert(new_key, value);
-        }
-        *map = next;
-    };
-    remap_bools(&mut fragment.pattern_fixed_literal_wide);
-    remap_bools(&mut fragment.pattern_fixed_literal_fullword);
-
-    fn recurse(node: &mut QueryNode, local_pattern_ids: &HashSet<String>, rule_name: &str) {
-        if let Some(pattern_id) = node.pattern_id.as_mut() {
-            *pattern_id =
-                rename_verifier_pattern_id(&node.kind, pattern_id, local_pattern_ids, rule_name);
-        }
-        for child in &mut node.children {
-            recurse(child, local_pattern_ids, rule_name);
-        }
-    }
-    if let Some(root) = fragment.root.as_mut() {
-        recurse(root, &local_pattern_ids, rule_name);
-    }
-}
-
-fn build_local_rule_fragment(
-    rule: &ParsedRuleBlock,
-    known_rule_names: HashSet<String>,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-) -> Result<RulePlanFragment> {
-    let mut fragment = RulePlanFragment::default();
-    let mut next_anonymous_pattern_id = 0usize;
-    let mut verifier_only_pattern_ids = HashSet::<String>::new();
-    for line in &rule.strings_lines {
-        if let Some(def) = parse_literal_line(line)? {
-            let pattern_id = if def.pattern_id == "$" {
-                let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
-                next_anonymous_pattern_id += 1;
-                id
-            } else {
-                def.pattern_id.clone()
-            };
-            let mut alternatives = Vec::new();
-            let mut tier2_alternatives = Vec::new();
-            let mut anchor_literals = Vec::new();
-            let mut fixed_literals = Vec::new();
-            let mut wide_flags = Vec::new();
-            let mut fullword_flags = Vec::new();
-            for (((alt, wide), fullword), nocase) in def
-                .alternatives
-                .iter()
-                .zip(def.wide_flags.iter())
-                .zip(def.fullword_flags.iter())
-                .zip(def.nocase_flags.iter())
-            {
-                let effective_nocase = *nocase && alt.iter().any(u8::is_ascii_alphabetic);
-                let search_variants = if effective_nocase {
-                    derive_nocase_search_alternatives(alt, *wide, gram_sizes)?
-                } else {
-                    vec![alt.clone()]
-                };
-                for search_alt in search_variants {
-                    alternatives.push(grams_tier1_from_bytes(&search_alt, gram_sizes.tier1));
-                    tier2_alternatives.push(grams_tier2_from_bytes(&search_alt, gram_sizes.tier2));
-                    anchor_literals.push(search_alt.clone());
-                    fixed_literals.push(if def.exact_literals && !effective_nocase {
-                        alt.clone()
-                    } else {
-                        Vec::new()
-                    });
-                    wide_flags.push(*wide);
-                    fullword_flags.push(*fullword);
-                }
-            }
-            if !pattern_has_searchable_anchor(&alternatives, &tier2_alternatives, &fixed_literals) {
-                verifier_only_pattern_ids.insert(pattern_id);
-                continue;
-            }
-            fragment
-                .pattern_alternatives
-                .insert(pattern_id.clone(), alternatives);
-            fragment
-                .pattern_tier2_alternatives
-                .insert(pattern_id.clone(), tier2_alternatives);
-            fragment
-                .pattern_anchor_literals
-                .insert(pattern_id.clone(), anchor_literals);
-            fragment
-                .pattern_fixed_literals
-                .insert(pattern_id.clone(), fixed_literals);
-            fragment
-                .pattern_fixed_literal_wide
-                .insert(pattern_id.clone(), wide_flags);
-            fragment
-                .pattern_fixed_literal_fullword
-                .insert(pattern_id, fullword_flags);
-            continue;
-        }
-        match parse_regex_line(line, gram_sizes) {
-            Ok(Some(def)) => {
-                let pattern_id = if def.pattern_id == "$" {
-                    let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
-                    next_anonymous_pattern_id += 1;
-                    id
-                } else {
-                    def.pattern_id.clone()
-                };
-                let alternatives = def
-                    .alternatives
-                    .iter()
-                    .map(|alt| grams_tier1_from_bytes(alt, gram_sizes.tier1))
-                    .collect::<Vec<_>>();
-                let tier2_alternatives = def
-                    .alternatives
-                    .iter()
-                    .map(|alt| grams_tier2_from_bytes(alt, gram_sizes.tier2))
-                    .collect::<Vec<_>>();
-                let fixed_literals = if def.exact_literals {
-                    def.alternatives.clone()
-                } else {
-                    vec![Vec::new(); def.alternatives.len()]
-                };
-                let anchor_literals = def.alternatives.clone();
-                if !pattern_has_searchable_anchor(
-                    &alternatives,
-                    &tier2_alternatives,
-                    &fixed_literals,
-                ) {
-                    verifier_only_pattern_ids.insert(pattern_id);
-                    continue;
-                }
-                fragment
-                    .pattern_alternatives
-                    .insert(pattern_id.clone(), alternatives);
-                fragment
-                    .pattern_tier2_alternatives
-                    .insert(pattern_id.clone(), tier2_alternatives);
-                fragment
-                    .pattern_anchor_literals
-                    .insert(pattern_id.clone(), anchor_literals);
-                fragment
-                    .pattern_fixed_literals
-                    .insert(pattern_id.clone(), fixed_literals);
-                fragment
-                    .pattern_fixed_literal_wide
-                    .insert(pattern_id.clone(), def.wide_flags);
-                fragment
-                    .pattern_fixed_literal_fullword
-                    .insert(pattern_id, def.fullword_flags);
-                continue;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                if err
-                    .to_string()
-                    .contains("anchorable mandatory literal for the active gram sizes")
-                    && let Some(raw_pattern_id) = parse_regex_pattern_id(line)
-                {
-                    let pattern_id = if raw_pattern_id == "$" {
-                        let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
-                        next_anonymous_pattern_id += 1;
-                        id
-                    } else {
-                        raw_pattern_id
-                    };
-                    verifier_only_pattern_ids.insert(pattern_id);
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-        if let Some((raw_pattern_id, alternatives, tier2_alternatives, fixed_literals)) =
-            parse_hex_line_to_grams(line, gram_sizes)?
-        {
-            let pattern_id = if raw_pattern_id == "$" {
-                let id = format!("{ANONYMOUS_PATTERN_PREFIX}{next_anonymous_pattern_id}");
-                next_anonymous_pattern_id += 1;
-                id
-            } else {
-                raw_pattern_id
-            };
-            let alt_count = alternatives.len();
-            if !pattern_has_searchable_anchor(&alternatives, &tier2_alternatives, &fixed_literals) {
-                verifier_only_pattern_ids.insert(pattern_id);
-                continue;
-            }
-            fragment
-                .pattern_alternatives
-                .insert(pattern_id.clone(), alternatives);
-            fragment
-                .pattern_tier2_alternatives
-                .insert(pattern_id.clone(), tier2_alternatives);
-            fragment
-                .pattern_anchor_literals
-                .insert(pattern_id.clone(), fixed_literals.clone());
-            fragment
-                .pattern_fixed_literals
-                .insert(pattern_id.clone(), fixed_literals);
-            fragment
-                .pattern_fixed_literal_wide
-                .insert(pattern_id.clone(), vec![false; alt_count]);
-            fragment
-                .pattern_fixed_literal_fullword
-                .insert(pattern_id, vec![false; alt_count]);
-            continue;
-        }
-        return Err(SspryError::from(format!(
-            "Unsupported strings declaration: {:?}. Supported forms: $id = \"...\" [ascii|wide|fullword|nocase], $id = /.../ [ascii|wide|fullword], $id = {{ ... }}",
-            line.trim()
-        )));
-    }
-
-    let mut known_pattern_names = fragment
-        .pattern_alternatives
-        .keys()
-        .cloned()
-        .chain(verifier_only_pattern_ids.iter().cloned())
-        .collect::<Vec<_>>();
-    known_pattern_names.sort();
-    known_pattern_names.dedup();
-    let rewritten_condition =
-        rewrite_verifier_only_for_of_at_loops(&rule.condition_text, &known_pattern_names)?;
-    let mut parser = ConditionParser::new_with_rules(
-        &rewritten_condition,
-        fragment
-            .pattern_alternatives
-            .keys()
-            .cloned()
-            .chain(verifier_only_pattern_ids.iter().cloned())
-            .collect(),
-        verifier_only_pattern_ids,
-        known_rule_names,
-        active_identity_source,
-    )?;
-    fragment.root = Some(parser.parse()?);
-    Ok(fragment)
-}
-
-fn resolve_rule_refs(
-    node: &mut QueryNode,
-    fragment: &mut RulePlanFragment,
-    rules: &HashMap<String, ParsedRuleBlock>,
-    cache: &mut HashMap<String, RulePlanFragment>,
-    visiting: &mut HashSet<String>,
-    current_rule_name: &str,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: f64,
-) -> Result<()> {
-    if node.kind == "rule_ref" {
-        let referenced = node
-            .pattern_id
-            .clone()
-            .ok_or_else(|| SspryError::from("Rule reference node is missing a rule name."))?;
-        let helper = compile_rule_fragment(
-            &referenced,
-            rules,
-            cache,
-            visiting,
-            current_rule_name,
-            gram_sizes,
-            active_identity_source,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates,
-        )?;
-        merge_rule_fragment(fragment, &helper)?;
-        *node = helper.root.clone().ok_or_else(|| {
-            SspryError::from(format!("Rule {referenced} compiled without a root."))
-        })?;
-        return Ok(());
-    }
-    for child in &mut node.children {
-        resolve_rule_refs(
-            child,
-            fragment,
-            rules,
-            cache,
-            visiting,
-            current_rule_name,
-            gram_sizes,
-            active_identity_source,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates,
-        )?;
-    }
-    Ok(())
-}
-
-fn finalize_rule_fragment(
-    mut fragment: RulePlanFragment,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    _max_candidates: f64,
-) -> Result<RulePlanFragment> {
-    let mut root = prune_ignored_module_predicates(
-        fragment
-            .root
-            .take()
-            .ok_or_else(|| SspryError::from("Rule fragment is missing a root."))?,
-    )
-    .ok_or_else(|| {
-        SspryError::from(
-            "Rule condition does not contain searchable anchors after pruning ignored module predicates.",
-        )
-    })?;
-
-    let mut next_numeric_anchor_id = 0usize;
-    inject_numeric_read_anchor_patterns(
-        &mut root,
-        &mut fragment.pattern_alternatives,
-        &mut fragment.pattern_tier2_alternatives,
-        &mut fragment.pattern_anchor_literals,
-        &mut fragment.pattern_fixed_literals,
-        &mut fragment.pattern_fixed_literal_wide,
-        &mut fragment.pattern_fixed_literal_fullword,
-        gram_sizes,
-        &mut next_numeric_anchor_id,
-    )?;
-    let has_pattern = contains_pattern_node(&root);
-    let has_identity = contains_identity_node(&root);
-    if fragment.pattern_alternatives.is_empty() && !has_identity {
-        return Err(SspryError::from(
-            "Rule does not contain a strings section with supported entries.",
-        ));
-    }
-    if !has_pattern && !has_identity && contains_verifier_only_node(&root) {
-        return Err(SspryError::from(
-            "Verifier-only indexed conditions require an anchorable literal for the current gram sizes or another string/hex anchor.",
-        ));
-    }
-    reorder_or_nodes_for_selectivity(&mut root, &fragment.pattern_alternatives);
-    dedupe_or_nodes(&mut root);
-    let mut branch_budgets = HashMap::<String, usize>::new();
-    collect_or_branch_budgets(&root, max_anchors_per_alt, &mut branch_budgets);
-
-    let mut patterns = Vec::new();
-    for (pattern_id, alternatives) in std::mem::take(&mut fragment.pattern_alternatives) {
-        let tier2_alternatives = fragment
-            .pattern_tier2_alternatives
-            .remove(&pattern_id)
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let anchor_literals = fragment
-            .pattern_anchor_literals
-            .remove(&pattern_id)
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literals = fragment
-            .pattern_fixed_literals
-            .remove(&pattern_id)
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literal_wide = fragment
-            .pattern_fixed_literal_wide
-            .remove(&pattern_id)
-            .unwrap_or_else(|| vec![false; alternatives.len()]);
-        let fixed_literal_fullword = fragment
-            .pattern_fixed_literal_fullword
-            .remove(&pattern_id)
-            .unwrap_or_else(|| vec![false; alternatives.len()]);
-        let (
-            alternatives,
-            tier2_alternatives,
-            anchor_literals,
-            fixed_literals,
-            fixed_literal_wide,
-            fixed_literal_fullword,
-        ) = dedupe_pattern_alternatives(
-            alternatives,
-            tier2_alternatives,
-            anchor_literals,
-            fixed_literals,
-            fixed_literal_wide,
-            fixed_literal_fullword,
-        );
-        let budget = branch_budgets
-            .get(&pattern_id)
-            .copied()
-            .unwrap_or(max_anchors_per_alt)
-            .max(1);
-        let optimized = alternatives
-            .iter()
-            .zip(tier2_alternatives.iter())
-            .zip(anchor_literals.iter())
-            .map(|((alt, tier2_alt), anchor_literal)| {
-                if allow_tier2_fallback
-                    && !force_tier1_only
-                    && alt.is_empty()
-                    && !tier2_alt.is_empty()
-                    && anchor_literal.is_empty()
-                {
-                    Vec::new()
-                } else {
-                    optimize_grams(alt, anchor_literal, gram_sizes.tier1, budget)
-                }
-            })
-            .collect::<Vec<_>>();
-        patterns.push(PatternPlan {
-            pattern_id,
-            alternatives: optimized,
-            tier2_alternatives,
-            anchor_literals,
-            fixed_literals,
-            fixed_literal_wide,
-            fixed_literal_fullword,
-        });
-    }
-    fragment.root = Some(root);
-    fragment.pattern_alternatives = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.alternatives.clone()))
-        .collect();
-    fragment.pattern_tier2_alternatives = patterns
-        .iter()
-        .map(|pattern| {
-            (
-                pattern.pattern_id.clone(),
-                pattern.tier2_alternatives.clone(),
-            )
-        })
-        .collect();
-    fragment.pattern_anchor_literals = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.anchor_literals.clone()))
-        .collect();
-    fragment.pattern_fixed_literals = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literals.clone()))
-        .collect();
-    fragment.pattern_fixed_literal_wide = patterns
-        .iter()
-        .map(|pattern| {
-            (
-                pattern.pattern_id.clone(),
-                pattern.fixed_literal_wide.clone(),
-            )
-        })
-        .collect();
-    fragment.pattern_fixed_literal_fullword = patterns
-        .iter()
-        .map(|pattern| {
-            (
-                pattern.pattern_id.clone(),
-                pattern.fixed_literal_fullword.clone(),
-            )
-        })
-        .collect();
-    // Rebuild the optimized patterns as maps above, then return the root-bearing fragment.
-    fragment.pattern_alternatives = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.alternatives.clone()))
-        .collect();
-    fragment.pattern_tier2_alternatives = patterns
-        .iter()
-        .map(|pattern| {
-            (
-                pattern.pattern_id.clone(),
-                pattern.tier2_alternatives.clone(),
-            )
-        })
-        .collect();
-    fragment.pattern_anchor_literals = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.anchor_literals.clone()))
-        .collect();
-    fragment.pattern_fixed_literals = patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.fixed_literals.clone()))
-        .collect();
-    fragment.pattern_fixed_literal_wide = patterns
-        .iter()
-        .map(|pattern| {
-            (
-                pattern.pattern_id.clone(),
-                pattern.fixed_literal_wide.clone(),
-            )
-        })
-        .collect();
-    fragment.pattern_fixed_literal_fullword = patterns
-        .iter()
-        .map(|pattern| {
-            (
-                pattern.pattern_id.clone(),
-                pattern.fixed_literal_fullword.clone(),
-            )
-        })
-        .collect();
-    if !force_tier1_only {
-        // Keep the finalized patterns available to the outer compiler via the fragment maps.
-    }
-    Ok(fragment)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_rule_fragment(
-    rule_name: &str,
-    rules: &HashMap<String, ParsedRuleBlock>,
-    cache: &mut HashMap<String, RulePlanFragment>,
-    visiting: &mut HashSet<String>,
-    root_rule_name: &str,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: f64,
-) -> Result<RulePlanFragment> {
-    if rule_name != root_rule_name
-        && let Some(fragment) = cache.get(rule_name)
-    {
-        return Ok(fragment.clone());
-    }
-    let rule = rules.get(rule_name).ok_or_else(|| {
-        SspryError::from(format!("Condition references unknown rule: {rule_name}"))
-    })?;
-    if !visiting.insert(rule_name.to_owned()) {
-        return Err(SspryError::from(format!(
-            "Recursive rule reference cycle detected at {rule_name}"
-        )));
-    }
-    let known_rule_names = rules
-        .keys()
-        .filter(|name| name.as_str() != rule_name)
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut fragment =
-        build_local_rule_fragment(rule, known_rule_names, gram_sizes, active_identity_source)?;
-    if let Some(mut root) = fragment.root.take() {
-        resolve_rule_refs(
-            &mut root,
-            &mut fragment,
-            rules,
-            cache,
-            visiting,
-            rule_name,
-            gram_sizes,
-            active_identity_source,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates,
-        )?;
-        fragment.root = Some(root);
-    }
-    let mut fragment = finalize_rule_fragment(
-        fragment,
-        gram_sizes,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )?;
-    if rule_name != root_rule_name {
-        rename_fragment_for_rule_dependency(&mut fragment, rule_name);
-        cache.insert(rule_name.to_owned(), fragment.clone());
-    }
-    visiting.remove(rule_name);
-    Ok(fragment)
-}
-
-pub fn compile_query_plan_with_gram_sizes_and_identity_source(
-    rule_text: &str,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<CompiledQueryPlan> {
-    let max_candidates = normalize_max_candidates(max_candidates.into());
-    let rule_blocks = parse_rule_blocks(rule_text)?;
-    let root_rule_name = rule_blocks
-        .iter()
-        .find(|rule| !rule.is_private)
-        .or_else(|| rule_blocks.first())
-        .map(|rule| normalize_rule_name(&rule.name))
-        .ok_or_else(|| SspryError::from("Rule file does not contain a compilable rule."))?;
-    let rules = rule_blocks
-        .into_iter()
-        .map(|rule| (normalize_rule_name(&rule.name), rule))
-        .collect::<HashMap<_, _>>();
-    let mut cache = HashMap::<String, RulePlanFragment>::new();
-    let mut visiting = HashSet::<String>::new();
-    let fragment = compile_rule_fragment(
-        &root_rule_name,
-        &rules,
-        &mut cache,
-        &mut visiting,
-        &root_rule_name,
-        gram_sizes,
-        active_identity_source,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )?;
-    let root = fragment
-        .root
-        .clone()
-        .ok_or_else(|| SspryError::from("Compiled rule fragment is missing a root."))?;
-    let mut pattern_ids = fragment
-        .pattern_alternatives
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    pattern_ids.sort();
-    let mut patterns = Vec::with_capacity(pattern_ids.len());
-    for pattern_id in pattern_ids {
-        let alternatives = fragment
-            .pattern_alternatives
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_default();
-        let tier2_alternatives = fragment
-            .pattern_tier2_alternatives
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let anchor_literals = fragment
-            .pattern_anchor_literals
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literals = fragment
-            .pattern_fixed_literals
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literal_wide = fragment
-            .pattern_fixed_literal_wide
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![false; alternatives.len()]);
-        let fixed_literal_fullword = fragment
-            .pattern_fixed_literal_fullword
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![false; alternatives.len()]);
-        patterns.push(PatternPlan {
-            pattern_id,
-            alternatives,
-            tier2_alternatives,
-            anchor_literals,
-            fixed_literals,
-            fixed_literal_wide,
-            fixed_literal_fullword,
-        });
-    }
-    reject_overbroad_pattern_union(&root, &patterns)?;
-    reject_low_information_entrypoint_stub(&root, &patterns)?;
-    reject_low_information_range_rule(&root, &patterns)?;
-    reject_low_information_single_pattern(&root, &patterns)?;
-    Ok(CompiledQueryPlan {
-        patterns,
-        root,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-        tier2_gram_size: gram_sizes.tier2,
-        tier1_gram_size: gram_sizes.tier1,
-    })
-}
-
-fn compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
-    rule_blocks: &[ParsedRuleBlock],
-    root_rule_name: &str,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<CompiledQueryPlan> {
-    let max_candidates = normalize_max_candidates(max_candidates.into());
-    let normalized_root_rule_name = normalize_rule_name(root_rule_name);
-    let rules = rule_blocks
-        .iter()
-        .cloned()
-        .map(|rule| (normalize_rule_name(&rule.name), rule))
-        .collect::<HashMap<_, _>>();
-    if !rules.contains_key(&normalized_root_rule_name) {
-        return Err(SspryError::from(format!(
-            "Condition references unknown rule: {root_rule_name}"
-        )));
-    }
-    let mut cache = HashMap::<String, RulePlanFragment>::new();
-    let mut visiting = HashSet::<String>::new();
-    let fragment = compile_rule_fragment(
-        &normalized_root_rule_name,
-        &rules,
-        &mut cache,
-        &mut visiting,
-        &normalized_root_rule_name,
-        gram_sizes,
-        active_identity_source,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )?;
-    let root = fragment
-        .root
-        .clone()
-        .ok_or_else(|| SspryError::from("Compiled rule fragment is missing a root."))?;
-    let mut pattern_ids = fragment
-        .pattern_alternatives
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    pattern_ids.sort();
-    let mut patterns = Vec::with_capacity(pattern_ids.len());
-    for pattern_id in pattern_ids {
-        let alternatives = fragment
-            .pattern_alternatives
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_default();
-        let tier2_alternatives = fragment
-            .pattern_tier2_alternatives
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let anchor_literals = fragment
-            .pattern_anchor_literals
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literals = fragment
-            .pattern_fixed_literals
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![Vec::new(); alternatives.len()]);
-        let fixed_literal_wide = fragment
-            .pattern_fixed_literal_wide
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![false; alternatives.len()]);
-        let fixed_literal_fullword = fragment
-            .pattern_fixed_literal_fullword
-            .get(&pattern_id)
-            .cloned()
-            .unwrap_or_else(|| vec![false; alternatives.len()]);
-        patterns.push(PatternPlan {
-            pattern_id,
-            alternatives,
-            tier2_alternatives,
-            anchor_literals,
-            fixed_literals,
-            fixed_literal_wide,
-            fixed_literal_fullword,
-        });
-    }
-    reject_overbroad_pattern_union(&root, &patterns)?;
-    reject_low_information_entrypoint_stub(&root, &patterns)?;
-    reject_low_information_range_rule(&root, &patterns)?;
-    reject_low_information_single_pattern(&root, &patterns)?;
-    Ok(CompiledQueryPlan {
-        patterns,
-        root,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-        tier2_gram_size: gram_sizes.tier2,
-        tier1_gram_size: gram_sizes.tier1,
-    })
-}
-
-pub fn compile_query_plan_with_gram_sizes(
-    rule_text: &str,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<CompiledQueryPlan> {
-    compile_query_plan_with_gram_sizes_and_identity_source(
-        rule_text,
-        gram_sizes,
-        None,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-    rule_path: impl AsRef<Path>,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<CompiledQueryPlan> {
-    let text = fs::read_to_string(rule_path)?;
-    compile_query_plan_with_gram_sizes_and_identity_source(
-        &text,
-        gram_sizes,
-        active_identity_source,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn compile_query_plan_from_file_with_gram_sizes(
-    rule_path: impl AsRef<Path>,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<CompiledQueryPlan> {
-    compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-        rule_path,
-        gram_sizes,
-        None,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn rule_check_with_gram_sizes_and_identity_source(
-    rule_text: &str,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> RuleCheckReport {
-    let report = rule_check_all_with_gram_sizes_and_identity_source(
-        rule_text,
-        gram_sizes,
-        active_identity_source,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    );
-    if let Some(active_rule) = report
-        .rules
-        .iter()
-        .find(|rule| !rule.is_private)
-        .or_else(|| report.rules.first())
-    {
-        return RuleCheckReport {
-            status: active_rule.status,
-            issues: active_rule.issues.clone(),
-            verifier_only_kinds: active_rule.verifier_only_kinds.clone(),
-            ignored_module_calls: active_rule.ignored_module_calls.clone(),
-        };
-    }
-    RuleCheckReport {
-        status: report.status,
-        issues: report.issues,
-        verifier_only_kinds: report.verifier_only_kinds,
-        ignored_module_calls: report.ignored_module_calls,
-    }
-}
-
-pub fn rule_check_with_gram_sizes(
-    rule_text: &str,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> RuleCheckReport {
-    rule_check_with_gram_sizes_and_identity_source(
-        rule_text,
-        gram_sizes,
-        None,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn rule_check_all_with_gram_sizes_and_identity_source(
-    rule_text: &str,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> RuleCheckFileReport {
-    let max_candidates = max_candidates.into();
-    match parse_rule_blocks(rule_text) {
-        Ok(rule_blocks) => {
-            let mut rules = Vec::<RuleCheckRuleReport>::with_capacity(rule_blocks.len());
-            for block in &rule_blocks {
-                let source_context = RuleSourceContext {
-                    full_text: rule_text,
-                    block_text: &block.block_text,
-                    block_start_offset: block.block_start_offset,
-                };
-                let ignored_module_calls =
-                    collect_ignored_module_call_names(&block.raw_condition_text)
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                let report = build_rule_check_report(
-                    &source_context,
-                    Some(&block.name),
-                    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
-                        &rule_blocks,
-                        &block.name,
-                        gram_sizes,
-                        active_identity_source,
-                        max_anchors_per_alt,
-                        force_tier1_only,
-                        allow_tier2_fallback,
-                        max_candidates,
-                    ),
-                    ignored_module_calls,
-                );
-                rules.push(RuleCheckRuleReport {
-                    rule: block.name.clone(),
-                    is_private: block.is_private,
-                    status: report.status,
-                    issues: report.issues,
-                    verifier_only_kinds: report.verifier_only_kinds,
-                    ignored_module_calls: report.ignored_module_calls,
-                });
-            }
-            summarize_rule_check_rules(rules)
-        }
-        Err(err) => {
-            let source_context = RuleSourceContext {
-                full_text: rule_text,
-                block_text: rule_text,
-                block_start_offset: 0,
-            };
-            let report = build_rule_check_report(&source_context, None, Err(err), Vec::new());
-            RuleCheckFileReport {
-                status: report.status,
-                issues: report.issues,
-                verifier_only_kinds: report.verifier_only_kinds,
-                ignored_module_calls: report.ignored_module_calls,
-                rules: Vec::new(),
-            }
-        }
-    }
-}
-
-pub fn rule_check_all_with_gram_sizes(
-    rule_text: &str,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> RuleCheckFileReport {
-    rule_check_all_with_gram_sizes_and_identity_source(
-        rule_text,
-        gram_sizes,
-        None,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn rule_check_from_file_with_gram_sizes_and_identity_source(
-    rule_path: impl AsRef<Path>,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<RuleCheckReport> {
-    let text = fs::read_to_string(rule_path)?;
-    Ok(rule_check_with_gram_sizes_and_identity_source(
-        &text,
-        gram_sizes,
-        active_identity_source,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    ))
-}
-
-pub fn rule_check_from_file_with_gram_sizes(
-    rule_path: impl AsRef<Path>,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<RuleCheckReport> {
-    rule_check_from_file_with_gram_sizes_and_identity_source(
-        rule_path,
-        gram_sizes,
-        None,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
-
-pub fn rule_check_all_from_file_with_gram_sizes_and_identity_source(
-    rule_path: impl AsRef<Path>,
-    gram_sizes: GramSizes,
-    active_identity_source: Option<&str>,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<RuleCheckFileReport> {
-    let text = fs::read_to_string(rule_path)?;
-    Ok(rule_check_all_with_gram_sizes_and_identity_source(
-        &text,
-        gram_sizes,
-        active_identity_source,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    ))
-}
-
-pub fn rule_check_all_from_file_with_gram_sizes(
-    rule_path: impl AsRef<Path>,
-    gram_sizes: GramSizes,
-    max_anchors_per_alt: usize,
-    force_tier1_only: bool,
-    allow_tier2_fallback: bool,
-    max_candidates: impl Into<f64>,
-) -> Result<RuleCheckFileReport> {
-    rule_check_all_from_file_with_gram_sizes_and_identity_source(
-        rule_path,
-        gram_sizes,
-        None,
-        max_anchors_per_alt,
-        force_tier1_only,
-        allow_tier2_fallback,
-        max_candidates,
-    )
-}
+// Rule compilation and public entry points live in a sibling file so the parser
+// and plan-shaping logic stay easier to navigate.
+include!("query_plan/compile.rs");
 
 #[cfg(test)]
-mod tests {
-    use std::collections::{HashMap, HashSet};
-    use std::fs;
-
-    use tempfile::tempdir;
-
-    use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
-
-    use super::*;
-
-    fn default_gram_sizes() -> GramSizes {
-        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-            .expect("default gram sizes")
-    }
-
-    fn compile_query_plan_default(
-        rule_text: &str,
-        max_anchors_per_alt: usize,
-        force_tier1_only: bool,
-        allow_tier2_fallback: bool,
-        max_candidates: impl Into<f64>,
-    ) -> Result<CompiledQueryPlan> {
-        compile_query_plan_with_gram_sizes(
-            rule_text,
-            default_gram_sizes(),
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates.into(),
-        )
-    }
-
-    fn compile_query_plan_default_with_identity(
-        rule_text: &str,
-        active_identity_source: Option<&str>,
-        max_anchors_per_alt: usize,
-        force_tier1_only: bool,
-        allow_tier2_fallback: bool,
-        max_candidates: impl Into<f64>,
-    ) -> Result<CompiledQueryPlan> {
-        compile_query_plan_with_gram_sizes_and_identity_source(
-            rule_text,
-            default_gram_sizes(),
-            active_identity_source,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates.into(),
-        )
-    }
-
-    fn compile_query_plan_from_file_default(
-        rule_path: impl AsRef<Path>,
-        max_anchors_per_alt: usize,
-        force_tier1_only: bool,
-        allow_tier2_fallback: bool,
-        max_candidates: impl Into<f64>,
-    ) -> Result<CompiledQueryPlan> {
-        compile_query_plan_from_file_with_gram_sizes(
-            rule_path,
-            default_gram_sizes(),
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates.into(),
-        )
-    }
-
-    fn compile_query_plan_with_tier1_default_tier2(
-        rule_text: &str,
-        tier1_gram_size: usize,
-        max_anchors_per_alt: usize,
-        force_tier1_only: bool,
-        allow_tier2_fallback: bool,
-        max_candidates: impl Into<f64>,
-    ) -> Result<CompiledQueryPlan> {
-        compile_query_plan_with_gram_sizes(
-            rule_text,
-            GramSizes::new(tier1_gram_size, DEFAULT_TIER2_GRAM_SIZE)?,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates.into(),
-        )
-    }
-
-    fn compile_query_plan_from_file_with_tier1_default_tier2(
-        rule_path: impl AsRef<Path>,
-        tier1_gram_size: usize,
-        max_anchors_per_alt: usize,
-        force_tier1_only: bool,
-        allow_tier2_fallback: bool,
-        max_candidates: impl Into<f64>,
-    ) -> Result<CompiledQueryPlan> {
-        compile_query_plan_from_file_with_gram_sizes(
-            rule_path,
-            GramSizes::new(tier1_gram_size, DEFAULT_TIER2_GRAM_SIZE)?,
-            max_anchors_per_alt,
-            force_tier1_only,
-            allow_tier2_fallback,
-            max_candidates.into(),
-        )
-    }
-
-    #[test]
-    fn compile_restricted_yara_rule() {
-        let rule = r#"
-rule sample {
-  strings:
-    $a = "ABCD"
-    $b = "EF" wide
-    $c = { 01 02 ?? 04 05 [1-2] 06 07 08 09 }
-  condition:
-    $a and ($b or 1 of ($a, $c))
-}
-"#;
-        let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
-        assert!(matches!(plan, CompiledQueryPlan { .. }));
-        let patterns = plan
-            .patterns
-            .iter()
-            .map(|item| (item.pattern_id.as_str(), item))
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(patterns["$a"].alternatives.len(), 1);
-        assert_eq!(patterns["$a"].alternatives[0].len(), 2);
-        assert_eq!(patterns["$b"].alternatives.len(), 1);
-        assert_eq!(patterns["$b"].alternatives[0].len(), 2);
-        assert_eq!(
-            patterns["$c"].alternatives,
-            vec![vec![
-                pack_exact_gram(&[0x06, 0x07, 0x08]),
-                pack_exact_gram(&[0x07, 0x08, 0x09]),
-            ]]
-        );
-    }
-
-    #[test]
-    fn unsupported_construct_raises() {
-        let rule = r#"
-rule bad {
-  strings:
-    $a = /[0-9]+/
-  condition:
-    $a
-}
-"#;
-        assert!(compile_query_plan_default(rule, 8, false, true, 100_000).is_err());
-    }
-
-    #[test]
-    fn compile_rule_with_whole_file_hash_identity_condition() {
-        let rule = r#"
-rule hashed {
-  condition:
-    hash.sha256(0, filesize) == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-}
-"#;
-        let plan =
-            compile_query_plan_default_with_identity(rule, Some("sha256"), 8, false, true, 100_000)
-                .expect("plan");
-        assert!(plan.patterns.is_empty());
-        assert_eq!(plan.root.kind, "identity_eq");
-        assert_eq!(
-            plan.root.pattern_id.as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-    }
-
-    #[test]
-    fn whole_file_hash_identity_requires_matching_db_source() {
-        let rule = r#"
-rule hashed {
-  condition:
-    hash.md5(0, filesize) == "00112233445566778899aabbccddeeff"
-}
-"#;
-        assert!(
-            compile_query_plan_default_with_identity(rule, Some("sha256"), 8, false, true, 100_000)
-                .expect_err("mismatched source")
-                .to_string()
-                .contains("current source is sha256")
-        );
-        assert!(
-            compile_query_plan_default_with_identity(rule, None, 8, false, true, 100_000)
-                .expect_err("missing source")
-                .to_string()
-                .contains("requires a known DB identity source")
-        );
-    }
-
-    #[test]
-    fn compile_rule_with_md5_identity_normalizes_to_store_identity() {
-        let rule = r#"
-rule hashed {
-  condition:
-    hash.md5(0, filesize) == "00112233445566778899aabbccddeeff"
-}
-"#;
-        let plan =
-            compile_query_plan_default_with_identity(rule, Some("md5"), 8, false, true, 100_000)
-                .expect("plan");
-        let expected = hex::encode(crate::app::normalize_identity_digest(
-            "md5",
-            &hex::decode("00112233445566778899aabbccddeeff").expect("md5 bytes"),
-        ));
-        assert_eq!(plan.root.kind, "identity_eq");
-        assert_eq!(plan.root.pattern_id.as_deref(), Some(expected.as_str()));
-    }
-
-    #[test]
-    fn compile_rule_with_filesize_equality_condition() {
-        let rule = r#"
-rule sized {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and filesize == 8
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.patterns.len(), 1);
-        assert_eq!(plan.root.kind, "and");
-        assert_eq!(plan.root.children.len(), 2);
-        assert!(
-            plan.root
-                .children
-                .iter()
-                .any(|child| child.kind == "filesize_eq"
-                    && child.pattern_id.as_deref() == Some("filesize")
-                    && child.threshold == Some(8))
-        );
-    }
-
-    #[test]
-    fn compile_rule_with_filesize_comparisons_and_not() {
-        let rule = r#"
-rule sized {
-  strings:
-    $a = "ABCD"
-    $b = "WXYZ"
-  condition:
-    $a and not $b and filesize <= 10KB and filesize > 1KB
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.root.kind, "and");
-        assert!(plan.root.children.iter().any(|child| child.kind == "not"));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "filesize_le"
-                && child.pattern_id.as_deref() == Some("filesize")
-                && child.threshold == Some(10 * 1024)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "filesize_gt"
-                && child.pattern_id.as_deref() == Some("filesize")
-                && child.threshold == Some(1024)
-        }));
-    }
-
-    #[test]
-    fn compile_rule_with_metadata_and_time_conditions() {
-        let rule = r#"
-rule module_meta {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and pe.is_pe and PE.Machine == 0x14c and pe.is_64bit == true and ELF.OSABI == 3 and time.now == 42
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.patterns.len(), 1);
-        assert_eq!(plan.root.kind, "and");
-        assert_eq!(plan.root.children.len(), 6);
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("pe.is_pe")
-                && child.threshold == Some(1)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("pe.machine")
-                && child.threshold == Some(0x14c)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("pe.is_64bit")
-                && child.threshold == Some(1)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_eq"
-                && child.pattern_id.as_deref() == Some("elf.os_abi")
-                && child.threshold == Some(3)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "time_now_eq"
-                && child.pattern_id.as_deref() == Some("time.now")
-                && child.threshold == Some(42)
-        }));
-    }
-
-    #[test]
-    fn compile_rule_with_extended_metadata_and_time_comparisons() {
-        let rule = r#"
-rule metadata_cmp {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and lnk.creation_time < time.now and time.now >= 1700000000 and lnk.write_time != 5 and lnk.access_time <= lnk.write_time
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.root.kind, "and");
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_time_lt"
-                && child.pattern_id.as_deref() == Some("lnk.creation_time")
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "time_now_ge"
-                && child.pattern_id.as_deref() == Some("time.now")
-                && child.threshold == Some(1_700_000_000)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_ne"
-                && child.pattern_id.as_deref() == Some("lnk.write_time")
-                && child.threshold == Some(5)
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_field_le"
-                && child.pattern_id.as_deref() == Some("lnk.access_time|lnk.write_time")
-        }));
-    }
-
-    #[test]
-    fn compile_rule_with_math_entropy_whole_file_comparison() {
-        let rule = r#"
-rule entropy_cmp {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and math.entropy(0, filesize) > 7.2
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.root.kind, "and");
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "metadata_float_gt" && child.pattern_id.as_deref() == Some("math.entropy")
-        }));
-    }
-
-    #[test]
-    fn compile_rule_header_magic_numeric_reads_stay_as_numeric_checks() {
-        fn contains_verifier_eq(node: &QueryNode, expr: &str) -> bool {
-            (node.kind == "verifier_only_eq" && node.pattern_id.as_deref() == Some(expr))
-                || node
-                    .children
-                    .iter()
-                    .any(|child| contains_verifier_eq(child, expr))
-        }
-
-        let rule = r#"
-rule header_magic {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and uint16(0) == 0x5A4D and uint32(4) == 0x14c and uint32(0) == 0x464c457f and uint32(0) == 0x04034b50
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.root.kind, "and");
-        assert!(contains_verifier_eq(&plan.root, "uint16(0)==23117"));
-        assert!(contains_verifier_eq(&plan.root, "uint32(4)==332"));
-        assert!(contains_verifier_eq(&plan.root, "uint32(0)==1179403647"));
-        assert!(contains_verifier_eq(&plan.root, "uint32(0)==67324752"));
-        assert!(
-            !plan
-                .root
-                .children
-                .iter()
-                .any(|child| child.kind == "metadata_eq")
-        );
-    }
-
-    #[test]
-    fn compile_rule_with_numeric_read_verifier_nodes() {
-        let rule = r#"
-rule numeric_reads {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and uint32(0) == 0x14c and float32be(4) == 2.5
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.patterns.len(), 3);
-        assert_eq!(plan.root.kind, "and");
-        assert!(plan.patterns.iter().any(|pattern| {
-            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
-                && pattern
-                    .fixed_literals
-                    .iter()
-                    .any(|literal| literal == &0x14cu32.to_le_bytes())
-        }));
-        assert!(plan.patterns.iter().any(|pattern| {
-            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
-                && pattern
-                    .fixed_literals
-                    .iter()
-                    .any(|literal| literal == &2.5f32.to_bits().to_be_bytes())
-        }));
-        let mut verifier_children = 0usize;
-        for child in &plan.root.children {
-            if child.kind == "and" {
-                assert_eq!(child.children.len(), 2);
-                assert!(child.children.iter().any(|grandchild| {
-                    grandchild.kind == "pattern"
-                        && grandchild
-                            .pattern_id
-                            .as_deref()
-                            .is_some_and(|id| id.starts_with(NUMERIC_READ_ANCHOR_PREFIX))
-                }));
-                assert!(child.children.iter().any(|grandchild| {
-                    grandchild.kind == "verifier_only_eq"
-                        && grandchild.pattern_id.as_deref().is_some()
-                }));
-                verifier_children += 1;
-            }
-        }
-        assert_eq!(verifier_children, 2);
-    }
-
-    #[test]
-    fn compile_rule_with_extended_integer_read_verifier_nodes() {
-        fn contains_verifier_eq(node: &QueryNode, expr: &str) -> bool {
-            (node.kind == "verifier_only_eq" && node.pattern_id.as_deref() == Some(expr))
-                || node
-                    .children
-                    .iter()
-                    .any(|child| contains_verifier_eq(child, expr))
-        }
-
-        let rule = r#"
-rule numeric_reads_ext {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and int16be(0) == -2 and uint64(0) == 0x1122334455667788
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert!(plan.patterns.iter().any(|pattern| {
-            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
-                && pattern
-                    .fixed_literals
-                    .iter()
-                    .any(|literal| literal == &0x1122_3344_5566_7788u64.to_le_bytes())
-        }));
-        assert!(contains_verifier_eq(&plan.root, "int16be(0)==-2"));
-        assert!(contains_verifier_eq(
-            &plan.root,
-            "uint64(0)==1234605616436508552"
-        ));
-    }
-
-    #[test]
-    fn compile_rule_with_numeric_only_condition_uses_injected_anchor() {
-        let rule = r#"
-rule numeric_only {
-  strings:
-    $unused = "UNUSED"
-  condition:
-    uint32(0) == 0x4000
-}
-"#;
-        let plan = compile_query_plan_default(rule, 8, false, true, 100_000).expect("plan");
-        assert_eq!(plan.patterns.len(), 2);
-        assert_eq!(plan.root.kind, "and");
-        assert!(plan.patterns.iter().any(|pattern| {
-            pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX)
-                && pattern
-                    .fixed_literals
-                    .iter()
-                    .any(|literal| literal == &0x0000_4000u32.to_le_bytes())
-        }));
-        assert!(
-            plan.patterns
-                .iter()
-                .any(|pattern| pattern.pattern_id.as_str() == "$unused")
-        );
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "pattern"
-                && child
-                    .pattern_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with(NUMERIC_READ_ANCHOR_PREFIX))
-        }));
-        assert!(plan.root.children.iter().any(|child| {
-            child.kind == "verifier_only_eq"
-                && child.pattern_id.as_deref() == Some("uint32(0)==16384")
-        }));
-    }
-
-    #[test]
-    fn numeric_only_condition_rejects_unanchorable_literal_without_other_anchor() {
-        let rule = r#"
-rule numeric_only_unanchorable {
-  strings:
-    $unused = "UNUSED"
-  condition:
-    uint32(0) == 0x4000
-}
-"#;
-        let plan = compile_query_plan_with_gram_sizes(
-            rule,
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, 5).expect("gram sizes"),
-            8,
-            false,
-            true,
-            100_000,
-        )
-        .expect("numeric-only condition now has enough anchor grams");
-        assert_eq!(plan.patterns.len(), 2);
-        assert_eq!(plan.patterns[1].pattern_id, "__numeric_eq_anchor_0");
-    }
-
-    #[test]
-    fn tokenizer_parser_and_rule_sections_cover_edge_cases() {
-        assert!(
-            tokenize_condition("")
-                .expect("empty token stream")
-                .is_empty()
-        );
-        assert!(
-            tokenize_condition("$a and 2 of ($b, $c)")
-                .expect("tokenize supported condition")
-                .len()
-                > 4
-        );
-        assert!(
-            tokenize_condition("any of them and all of $a*")
-                .expect("tokenize any/all condition")
-                .len()
-                > 4
-        );
-        assert!(
-            tokenize_condition("filesize == 32 or $a")
-                .expect("tokenize filesize condition")
-                .len()
-                > 4
-        );
-        assert!(
-            tokenize_condition("not $a and filesize <= 10KB")
-                .expect("tokenize not/filesize comparison")
-                .len()
-                > 4
-        );
-        assert!(
-            tokenize_condition("filesize == 8B")
-                .expect_err("reject non-yara byte suffix")
-                .to_string()
-                .contains("Unsupported numeric suffix")
-        );
-        assert!(
-            tokenize_condition("PE.Machine == 0x14c and pe.is_pe == true and time.now == 42")
-                .expect("tokenize metadata condition")
-                .len()
-                > 8
-        );
-        assert!(
-            tokenize_condition("uint32(0) == 0x14c and float64(8) == 3.5")
-                .expect("tokenize numeric-read condition")
-                .len()
-                > 8
-        );
-        assert!(
-            tokenize_condition("#a > 2 and $a at 0")
-                .expect("tokenize count/at condition")
-                .len()
-                > 6
-        );
-        assert!(
-            tokenize_condition("$a in (filesize - 256 .. filesize)")
-                .expect("tokenize range condition")
-                .len()
-                > 8
-        );
-        assert!(
-            tokenize_condition("@")
-                .expect_err("unsupported token")
-                .to_string()
-                .contains("Unsupported token in condition")
-        );
-
-        let mut parser = ConditionParser::new("", HashSet::new(), None).expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("empty condition")
-                .to_string()
-                .contains("Condition section is empty")
-        );
-
-        let mut parser = ConditionParser::new(
-            "$a $b",
-            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("trailing token")
-                .to_string()
-                .contains("Unexpected trailing token")
-        );
-
-        let mut parser = ConditionParser::new("$missing", HashSet::from(["$a".to_owned()]), None)
-            .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("unknown pattern")
-                .to_string()
-                .contains("unknown string id")
-        );
-
-        let mut parser = ConditionParser::new("0 of ($a)", HashSet::from(["$a".to_owned()]), None)
-            .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("zero threshold")
-                .to_string()
-                .contains("threshold must be > 0")
-        );
-
-        let mut parser = ConditionParser::new(
-            "pe.machine",
-            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("missing metadata equality")
-                .to_string()
-                .contains("requires == <literal>")
-        );
-
-        let mut parser =
-            ConditionParser::new("uint32(x) == 1", HashSet::from(["$a".to_owned()]), None)
-                .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("invalid numeric offset")
-                .to_string()
-                .contains("requires an integer byte offset")
-        );
-
-        let mut parser = ConditionParser::new(
-            "1 of ($a $b)",
-            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("missing comma")
-                .to_string()
-                .contains("Expected ',' or ')'")
-        );
-
-        let mut parser = ConditionParser::new(
-            "all of $a*",
-            HashSet::from(["$a1".to_owned(), "$a2".to_owned(), "$b1".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        let wildcard = parser.parse().expect("wildcard parse");
-        assert_eq!(wildcard.kind, "n_of");
-        assert_eq!(wildcard.threshold, Some(2));
-        assert_eq!(wildcard.children.len(), 2);
-        assert_eq!(wildcard.children[0].pattern_id.as_deref(), Some("$a1"));
-        assert_eq!(wildcard.children[1].pattern_id.as_deref(), Some("$a2"));
-
-        let mut parser = ConditionParser::new(
-            "any of them",
-            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        let them = parser.parse().expect("them parse");
-        assert_eq!(them.kind, "n_of");
-        assert_eq!(them.threshold, Some(1));
-        assert_eq!(them.children.len(), 2);
-
-        let mut parser = ConditionParser::new("$a at 0", HashSet::from(["$a".to_owned()]), None)
-            .expect("parser");
-        let at_node = parser.parse().expect("at parse");
-        assert_eq!(at_node.kind, "and");
-        assert_eq!(at_node.children.len(), 2);
-        assert_eq!(at_node.children[0].kind, "pattern");
-        assert_eq!(at_node.children[0].pattern_id.as_deref(), Some("$a"));
-        assert_eq!(at_node.children[1].kind, "verifier_only_at");
-        assert_eq!(at_node.children[1].pattern_id.as_deref(), Some("$a@0"));
-
-        let mut parser = ConditionParser::new(
-            "$a at pe.entry_point",
-            HashSet::from(["$a".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        let at_entry = parser.parse().expect("entry at parse");
-        assert_eq!(at_entry.kind, "and");
-        assert_eq!(at_entry.children[1].kind, "verifier_only_at");
-        assert_eq!(
-            at_entry.children[1].pattern_id.as_deref(),
-            Some("$a@pe.entry_point")
-        );
-
-        let mut parser = ConditionParser::new(
-            "$a at (pe.entry_point + 4)",
-            HashSet::from(["$a".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        let at_entry_plus = parser.parse().expect("entry at plus parse");
-        assert_eq!(at_entry_plus.kind, "and");
-        assert_eq!(at_entry_plus.children[1].kind, "verifier_only_at");
-        assert_eq!(
-            at_entry_plus.children[1].pattern_id.as_deref(),
-            Some("$a@pe.entry_point+4")
-        );
-
-        let mut parser =
-            ConditionParser::new("#a > 2", HashSet::from(["$a".to_owned()]), None).expect("parser");
-        let count_node = parser.parse().expect("count parse");
-        assert_eq!(count_node.kind, "and");
-        assert_eq!(count_node.children.len(), 2);
-        assert_eq!(count_node.children[0].kind, "pattern");
-        assert_eq!(count_node.children[0].pattern_id.as_deref(), Some("$a"));
-        assert_eq!(count_node.children[1].kind, "verifier_only_count");
-        assert_eq!(
-            count_node.children[1].pattern_id.as_deref(),
-            Some("count:$a:gt:2")
-        );
-
-        let mut parser =
-            ConditionParser::new("#a > 0", HashSet::from(["$a".to_owned()]), None).expect("parser");
-        let count_exists = parser.parse().expect("count exists parse");
-        assert_eq!(count_exists.kind, "pattern");
-        assert_eq!(count_exists.pattern_id.as_deref(), Some("$a"));
-
-        let mut parser = ConditionParser::new("#a == 0", HashSet::from(["$a".to_owned()]), None)
-            .expect("parser");
-        let count_zero = parser.parse().expect("count zero parse");
-        assert_eq!(count_zero.kind, "not");
-        assert_eq!(count_zero.children.len(), 1);
-        assert_eq!(count_zero.children[0].kind, "pattern");
-        assert_eq!(count_zero.children[0].pattern_id.as_deref(), Some("$a"));
-
-        let mut parser = ConditionParser::new(
-            "$a in (filesize - 256 .. filesize)",
-            HashSet::from(["$a".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        let range_node = parser.parse().expect("range parse");
-        assert_eq!(range_node.kind, "and");
-        assert_eq!(range_node.children.len(), 2);
-        assert_eq!(range_node.children[0].kind, "pattern");
-        assert_eq!(range_node.children[0].pattern_id.as_deref(), Some("$a"));
-        assert_eq!(range_node.children[1].kind, "verifier_only_in_range");
-        assert_eq!(
-            range_node.children[1].pattern_id.as_deref(),
-            Some("range:$a:filesize-256:filesize")
-        );
-
-        let mut parser = ConditionParser::new(
-            "1 of $missing*",
-            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("missing wildcard selector")
-                .to_string()
-                .contains("matched no string ids")
-        );
-
-        let mut parser =
-            ConditionParser::new("( $a ", HashSet::from(["$a".to_owned()]), None).expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("unterminated paren")
-                .to_string()
-                .contains("Unexpected end of condition")
-        );
-
-        let plan = compile_query_plan_default(
-            r#"
-rule anon {
-  strings:
-    $ = "AAAA"
-    $ = "BBBB"
-    $ = { 43 43 43 43 }
-  condition:
-    any of them
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("anonymous strings plan");
-        assert_eq!(plan.patterns.len(), 3);
-        assert_eq!(plan.root.kind, "n_of");
-        assert_eq!(plan.root.threshold, Some(1));
-        assert_eq!(plan.root.children.len(), 3);
-        let mut ids = plan
-            .patterns
-            .iter()
-            .map(|pattern| pattern.pattern_id.clone())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), 3);
-        assert!(
-            ids.iter()
-                .all(|id| id.starts_with(ANONYMOUS_PATTERN_PREFIX))
-        );
-
-        let (strings, _raw_condition, condition) = parse_rule_sections(
-            r#"
-rule sample {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("rule sections");
-        assert_eq!(strings.len(), 1);
-        assert_eq!(condition.trim(), "$a");
-        let (strings, _raw_condition, condition) = parse_rule_sections(
-            r#"
-rule commented {
-  /*
-    header comment
-  */
-  strings:
-    $a = "ABCD" /* inline string comment */
-    /* block between strings */
-    $b = /foo\/bar/ /* regex comment */
-  condition:
-    /* condition comment */
-    $a or $b
-}
-"#,
-        )
-        .expect("rule sections");
-        assert_eq!(strings.len(), 2);
-        assert!(strings[0].contains(r#"$a = "ABCD""#));
-        assert!(strings[1].contains(r#"$b = /foo\/bar/"#));
-        assert_eq!(condition.trim(), "$a or $b");
-        let (strings, _raw_condition, condition) = parse_rule_sections(
-            r#"
-rule empty {
-  condition:
-    true
-}
-"#,
-        )
-        .expect("condition-only rule");
-        assert!(strings.is_empty());
-        assert_eq!(condition.trim(), "true");
-        let (_strings, _raw_condition, condition) = parse_rule_sections(
-            r#"
-rule looped {
-  strings:
-    $a = { FF 75 ?? FF 55 ?? }
-  condition:
-    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
-}
-"#,
-        )
-        .expect("for-any loop rewrite");
-        assert_eq!(condition.trim(), "verifierloop($a)");
-        let rewritten = rewrite_verifier_only_for_of_at_loops(
-            "for any of ($*): ($ at pe.entry_point)",
-            &["$a".to_owned(), "$b".to_owned()],
-        )
-        .expect("for-of at rewrite");
-        assert_eq!(
-            rewritten,
-            "(($a at pe.entry_point) or ($b at pe.entry_point))"
-        );
-        assert!(
-            parse_rule_sections(
-                r#"
-rule empty {
-  strings:
-    $a = "x"
-}
-"#,
-            )
-            .expect_err("missing condition")
-            .to_string()
-            .contains("condition section")
-        );
-    }
-
-    #[test]
-    fn literal_hex_and_optimization_helpers_cover_branches() {
-        let ascii_wide = parse_literal_line(r#"$a = "Ab" ascii wide"#)
-            .expect("literal")
-            .expect("pattern");
-        assert_eq!(ascii_wide.pattern_id, "$a");
-        assert_eq!(ascii_wide.alternatives.len(), 2);
-        let fullword = parse_literal_line(r#"$a = "Ab" fullword"#)
-            .expect("literal")
-            .expect("pattern");
-        assert_eq!(fullword.fullword_flags, vec![true]);
-        let nocase = parse_literal_line(r#"$a = "AbCd" nocase"#)
-            .expect("literal")
-            .expect("pattern");
-        assert_eq!(nocase.alternatives, vec![b"AbCd".to_vec()]);
-        assert_eq!(nocase.nocase_flags, vec![true]);
-        assert!(!nocase.exact_literals);
-        assert!(
-            parse_literal_line(r#"$a = "unterminated"#)
-                .expect_err("unterminated literal")
-                .to_string()
-                .contains("Invalid literal string")
-        );
-        assert!(
-            parse_literal_line("$a = { 01 02 }")
-                .expect("hex line is ignored")
-                .is_none()
-        );
-        assert!(
-            parse_literal_line("identifier = \"x\"")
-                .expect("non pattern line")
-                .is_none()
-        );
-
-        let (pattern_id, alternatives, tier2_alternatives, fixed_literals) =
-            parse_hex_line_to_grams(
-                "$h = { 41 42 43 44 ?? 45 46 47 48 [2-4] 49 4A 4B 4C }",
-                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                    .expect("default gram sizes"),
-            )
-            .expect("hex line")
-            .expect("parsed hex");
-        assert_eq!(pattern_id, "$h");
-        assert_eq!(alternatives.len(), 1);
-        assert_eq!(alternatives[0].len(), 6);
-        assert_eq!(tier2_alternatives[0].len(), 3);
-        assert!(fixed_literals[0].is_empty());
-        let packed = parse_hex_line_to_grams(
-            "$p = { 8bec 83ec10 }",
-            GramSizes::new(3, 4).expect("gram sizes"),
-        )
-        .expect("packed hex")
-        .expect("parsed packed");
-        assert_eq!(packed.0, "$p");
-        assert_eq!(packed.3, vec![vec![0x8b, 0xec, 0x83, 0xec, 0x10]]);
-        let grouped_hex = parse_hex_line_to_grams(
-            "$g = { 41 (42|43) 44 }",
-            GramSizes::new(3, 4).expect("gram sizes"),
-        )
-        .expect("grouped hex")
-        .expect("parsed grouped");
-        assert_eq!(grouped_hex.0, "$g");
-        assert_eq!(grouped_hex.1.len(), 2);
-        assert_eq!(
-            grouped_hex.3,
-            vec![vec![0x41, 0x42, 0x44], vec![0x41, 0x43, 0x44]]
-        );
-        assert!(
-            parse_hex_line_to_grams(
-                "$g = { 41 (42|4344) 45 }",
-                GramSizes::new(3, 4).expect("gram sizes"),
-            )
-            .expect_err("mismatched group lengths")
-            .to_string()
-            .contains("same non-zero byte length")
-        );
-        assert!(is_gap_token("[3]"));
-        assert!(is_gap_token("[1-9]"));
-        assert!(!is_gap_token("[a-b]"));
-        assert!(
-            parse_hex_line_to_grams(
-                "$h = { }",
-                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                    .expect("default gram sizes"),
-            )
-            .expect_err("empty hex body")
-            .to_string()
-            .contains("is empty")
-        );
-        assert!(
-            parse_hex_line_to_grams(
-                "$h = { GG }",
-                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                    .expect("default gram sizes"),
-            )
-            .expect_err("bad hex token")
-            .to_string()
-            .contains("Unsupported hex token")
-        );
-        let nibble_hex = parse_hex_line_to_grams(
-            "$h = { 41 4? 42 ?3 43 }",
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("nibble wildcard hex")
-        .expect("parsed nibble wildcard hex");
-        assert_eq!(nibble_hex.0, "$h");
-        assert_eq!(nibble_hex.1.len(), 1);
-        assert!(nibble_hex.3[0].is_empty());
-        assert!(
-            parse_hex_line_to_grams(
-                "$h = \"ABCD\"",
-                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                    .expect("default gram sizes"),
-            )
-            .expect("literal line should be ignored")
-            .is_none()
-        );
-
-        let grams = grams_from_bytes(b"ABCDEABCDE", 4);
-        assert_eq!(grams.len(), 5);
-        let ranked = optimize_grams(&grams, b"ABCDEABCDE", 4, 2);
-        assert_eq!(ranked.len(), 2);
-        assert_eq!(optimize_grams(&grams, b"", 4, 0), grams);
-
-        let regex = parse_regex_line(
-            r#"$r = /[A-Z]+applesause[0-9]+/"#,
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("regex parse")
-        .expect("regex pattern");
-        assert_eq!(regex.alternatives, vec![b"applesause".to_vec()]);
-        assert!(!regex.exact_literals);
-
-        let regex_escaped = parse_regex_line(
-            r#"$r = /https?:\/\/evil\.com/"#,
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("regex parse")
-        .expect("regex pattern");
-        assert_eq!(regex_escaped.alternatives, vec![b"://evil.com".to_vec()]);
-        let regex_alt = parse_regex_line(
-            r#"$r = /(apple|apricot)juice/"#,
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("regex parse")
-        .expect("regex pattern");
-        assert_eq!(regex_alt.alternatives, vec![b"juice".to_vec()]);
-        assert!(
-            parse_regex_line(
-                r#"$r = /(apple|orange)/"#,
-                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                    .expect("default gram sizes"),
-            )
-            .expect_err("common anchor too short")
-            .to_string()
-            .contains("anchorable mandatory literal")
-        );
-        let grouped = parse_regex_line(
-            r#"$r = /fooba(bar|baz)qux/"#,
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("regex parse")
-        .expect("regex pattern");
-        assert_eq!(grouped.alternatives, vec![b"fooba".to_vec()]);
-
-        let repeated_group = parse_regex_line(
-            r#"$r = /(90){2,20}/"#,
-            GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                .expect("default gram sizes"),
-        )
-        .expect("regex parse")
-        .expect("regex pattern");
-        assert_eq!(repeated_group.alternatives, vec![b"9090".to_vec()]);
-        assert!(
-            parse_regex_line(
-                r#"$r = /[0-9]+abc/"#,
-                GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
-                    .expect("default gram sizes"),
-            )
-            .expect_err("regex should now be unanchorable")
-            .to_string()
-            .contains("anchorable mandatory literal")
-        );
-    }
-
-    #[test]
-    fn compile_query_plan_covers_more_supported_and_error_paths() {
-        let rule = r#"
-rule sample {
-  strings:
-    $a = "ABCD" ascii
-    $b = "hi" wide
-    $c = { 01 02 03 04 [2] 05 06 07 08 }
-  condition:
-    ($a or $b) and 1 of ($a, $c)
-}
-"#;
-        let plan = compile_query_plan_default(rule, 1, true, false, 9).expect("compile");
-        assert!(plan.force_tier1_only);
-        assert!(!plan.allow_tier2_fallback);
-        assert_eq!(plan.max_candidates, 9.0);
-        assert_eq!(plan.patterns.len(), 3);
-        assert!(matches!(plan.root.kind.as_str(), "and"));
-        assert!(plan.patterns.iter().all(|pattern| {
-            pattern
-                .alternatives
-                .iter()
-                .all(|alternative| alternative.len() <= 1)
-        }));
-
-        assert_eq!(
-            compile_query_plan_default(rule, 1, false, true, 0.0)
-                .expect("zero remains unlimited percentage")
-                .max_candidates,
-            0.0
-        );
-        assert!(
-            compile_query_plan_default(
-                r#"
-rule bad {
-  strings:
-    $a = "ABCD"
-  condition:
-    1 of ($a, $missing)
-}
-"#,
-                8,
-                false,
-                true,
-                100,
-            )
-            .expect_err("unknown pattern in condition")
-            .to_string()
-            .contains("unknown string id")
-        );
-
-        let numeric_only = compile_query_plan_default(
-            r#"
-rule numeric_only {
-  strings:
-    $a = "ABCD"
-  condition:
-    uint32(0) == 1
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("numeric-only search should use numeric anchors");
-        assert_eq!(numeric_only.patterns.len(), 2);
-        assert!(
-            numeric_only
-                .patterns
-                .iter()
-                .any(|pattern| { pattern.pattern_id.starts_with(NUMERIC_READ_ANCHOR_PREFIX) })
-        );
-
-        let wildcard_sets = compile_query_plan_default(
-            r#"
-rule wildcard_sets {
-  strings:
-    $ruleA = "ABCD"
-    $ruleB = "BCDE"
-    $other = "CDEF"
-  condition:
-    any of ($ruleA, $ruleB) and all of $rule*
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("wildcard/set search support");
-        assert_eq!(wildcard_sets.patterns.len(), 3);
-        assert_eq!(wildcard_sets.root.kind, "and");
-        assert_eq!(wildcard_sets.root.children.len(), 2);
-        assert!(
-            wildcard_sets
-                .root
-                .children
-                .iter()
-                .all(|child| child.kind == "n_of")
-        );
-
-        let verifier_constraints = compile_query_plan_default(
-            r#"
-rule verifier_constraints {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a at 0 and #a > 1
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile verifier-only constraints");
-        assert_eq!(verifier_constraints.patterns.len(), 1);
-        assert_eq!(verifier_constraints.root.kind, "and");
-        assert!(verifier_constraints.root.children.iter().any(|child| {
-            child.kind == "and"
-                && child
-                    .children
-                    .iter()
-                    .any(|grandchild| grandchild.kind == "verifier_only_at")
-        }));
-        assert!(verifier_constraints.root.children.iter().any(|child| {
-            child.kind == "and"
-                && child
-                    .children
-                    .iter()
-                    .any(|grandchild| grandchild.kind == "verifier_only_count")
-        }));
-
-        let verifier_at_entry = compile_query_plan_default(
-            r#"
-rule verifier_at_entry {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a at pe.entry_point
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile verifier-only entry-point at");
-        assert_eq!(verifier_at_entry.patterns.len(), 1);
-        assert_eq!(verifier_at_entry.root.kind, "and");
-        assert!(
-            verifier_at_entry
-                .root
-                .children
-                .iter()
-                .any(|child| child.kind == "verifier_only_at")
-        );
-        let verifier_for_of_at = compile_query_plan_default(
-            r#"
-rule verifier_for_of_at {
-  strings:
-    $a = { 41 42 43 44 }
-    $b = { 45 46 47 48 }
-  condition:
-    for any of ($*) : ( $ at pe.entry_point )
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile verifier-only for-of at");
-        assert_eq!(verifier_for_of_at.root.kind, "or");
-        assert_eq!(verifier_for_of_at.root.children.len(), 2);
-        assert!(verifier_for_of_at.root.children.iter().all(|child| {
-            child.kind == "and"
-                && child
-                    .children
-                    .iter()
-                    .any(|grandchild| grandchild.kind == "verifier_only_at")
-        }));
-
-        let verifier_loop = compile_query_plan_default(
-            r#"
-rule verifier_loop {
-  strings:
-    $a = { 41 42 43 44 }
-  condition:
-    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile verifier-only loop");
-        assert_eq!(verifier_loop.patterns.len(), 1);
-        assert_eq!(verifier_loop.root.kind, "and");
-        assert!(
-            verifier_loop
-                .root
-                .children
-                .iter()
-                .any(|child| child.kind == "verifier_only_loop")
-        );
-        assert!(
-            compile_query_plan_default(
-                r#"
-rule bad_unanchorable_pattern {
-  strings:
-    $a = { 41 ?? 42 }
-  condition:
-    $a
-}
-"#,
-                8,
-                false,
-                true,
-                100,
-            )
-            .expect_err("unanchorable direct hex should fail")
-            .to_string()
-            .contains("requires an anchorable literal for direct search use")
-        );
-        assert!(
-            compile_query_plan_default(
-                r#"
-rule bad_unanchorable_at {
-  strings:
-    $a = { E8 ?? ?? ?? ?? 5D }
-  condition:
-    $a at pe.entry_point
-}
-"#,
-                8,
-                false,
-                true,
-                100,
-            )
-            .expect_err("unanchorable at should fail")
-            .to_string()
-            .contains("requires an anchorable literal for at/in search use")
-        );
-        assert!(
-            compile_query_plan_default(
-                r#"
-rule bad_unanchorable_loop {
-  strings:
-    $a = { FF 75 ?? FF 55 ?? }
-  condition:
-    verifierloop($a)
-}
-"#,
-                8,
-                false,
-                true,
-                100,
-            )
-            .expect_err("unanchorable verifier loop should fail")
-            .to_string()
-            .contains("requires an anchorable literal for verifier-loop search use")
-        );
-
-        let nocase = compile_query_plan_default(
-            r#"
-rule nocase_anchor {
-  strings:
-    $a = "AbCd" nocase
-  condition:
-    $a
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile nocase");
-        assert_eq!(nocase.patterns.len(), 1);
-        assert!(nocase.patterns[0].alternatives.len() > 1);
-        assert!(nocase.patterns[0].fixed_literals.iter().all(Vec::is_empty));
-
-        let balanced_nocase = derive_nocase_search_alternatives(
-            b"AbCdE-00!!",
-            false,
-            GramSizes {
-                tier2: DEFAULT_TIER2_GRAM_SIZE,
-                tier1: DEFAULT_TIER1_GRAM_SIZE,
-            },
-        )
-        .expect("balanced nocase");
-        assert_eq!(balanced_nocase.len(), 4);
-
-        let short_nocase = compile_query_plan_default(
-            r#"
-rule short_nocase_anchor {
-  strings:
-    $a = ".js" nocase
-  condition:
-    $a
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile short nocase");
-        assert_eq!(short_nocase.patterns.len(), 1);
-        assert!(short_nocase.patterns[0].alternatives.len() > 1);
-        assert!(
-            short_nocase.patterns[0]
-                .alternatives
-                .iter()
-                .all(|alt| !alt.is_empty())
-        );
-        assert!(
-            short_nocase.patterns[0]
-                .tier2_alternatives
-                .iter()
-                .all(|alt| alt.is_empty())
-        );
-
-        let ignored_modules = compile_query_plan_default(
-            r#"
-rule ignored_modules {
-  strings:
-    $a = "ABCD"
-    $b = "WXYZ"
-  condition:
-    ($a and androguard.url(/evil\.example/)) or
-    (not cuckoo.sync.mutex(/demo/) and console.log("dbg") and $b)
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("compile ignored imports");
-        assert_eq!(ignored_modules.patterns.len(), 2);
-        assert_eq!(ignored_modules.root.kind, "or");
-        assert_eq!(ignored_modules.root.children.len(), 2);
-        assert!(
-            ignored_modules
-                .root
-                .children
-                .iter()
-                .all(|child| child.kind == "pattern")
-        );
-
-        assert!(
-            compile_query_plan_with_gram_sizes(
-                r#"
-rule numeric_too_short_for_gram_sizes {
-  strings:
-    $a = "ABCD"
-  condition:
-    uint32(0) == 1
-}
-"#,
-                GramSizes::new(5, 6).expect("gram sizes"),
-                8,
-                false,
-                true,
-                100,
-            )
-            .is_err()
-        );
-
-        assert!(
-            compile_query_plan_default(
-                r#"
-rule numeric_rhs {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and uint32(0) == filesize
-}
-"#,
-                8,
-                false,
-                true,
-                100,
-            )
-            .expect_err("non-literal numeric rhs")
-            .to_string()
-            .contains("requires equality against a literal constant")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_simple_rule_as_searchable() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule simple_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn rule_check_all_reports_each_rule_in_multi_rule_file() {
-        let report = rule_check_all_with_gram_sizes_and_identity_source(
-            r#"
-rule searchable_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-
-rule unsupported_rule {
-  strings:
-    $b = "WXYZ"
-  condition:
-    not $b
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        assert_eq!(report.rules.len(), 2);
-        assert_eq!(report.rules[0].rule, "searchable_rule");
-        assert_eq!(report.rules[0].status, RuleCheckStatus::Searchable);
-        assert_eq!(report.rules[1].rule, "unsupported_rule");
-        assert_eq!(report.rules[1].status, RuleCheckStatus::Unsupported);
-        assert_eq!(
-            report.rules[1]
-                .issues
-                .first()
-                .and_then(|issue| issue.snippet.as_deref()),
-            Some("not $b")
-        );
-    }
-
-    #[test]
-    fn rule_check_all_ignores_private_helper_status_in_file_summary() {
-        let report = rule_check_all_with_gram_sizes_and_identity_source(
-            r#"
-private rule helper {
-  strings:
-    $a = "ABCD"
-  condition:
-    not $a
-}
-
-rule top {
-  strings:
-    $b = "WXYZ"
-  condition:
-    $b
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.issues.is_empty());
-        assert_eq!(report.rules.len(), 2);
-        assert!(report.rules[0].is_private);
-        assert_eq!(report.rules[0].status, RuleCheckStatus::Unsupported);
-        assert_eq!(report.rules[1].rule, "top");
-        assert_eq!(report.rules[1].status, RuleCheckStatus::Searchable);
-    }
-
-    #[test]
-    fn rule_check_all_preserves_file_locations_with_comments_before_later_rules() {
-        let report = rule_check_all_with_gram_sizes_and_identity_source(
-            r#"
-// leading comment with enough text to skew offsets
-rule one {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-
-// another long comment line to change stripped length
-rule two {
-  strings:
-    $b = "WXYZ"
-  condition:
-    not $b
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-
-        let issue = report.rules[1]
-            .issues
-            .iter()
-            .find(|issue| issue.code == "negated-search-unbounded")
-            .expect("negated issue");
-        assert_eq!(issue.rule.as_deref(), Some("two"));
-        assert_eq!(issue.line, Some(15));
-        assert_eq!(issue.column, Some(5));
-        assert_eq!(issue.snippet.as_deref(), Some("not $b"));
-    }
-
-    #[test]
-    fn rule_check_marks_verifier_only_constraints_as_needing_verify() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule exact_entrypoint_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a at pe.entry_point
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.verifier_only_kinds.is_empty());
-        assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn rule_check_marks_long_entrypoint_literals_as_needing_verify() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule verifier_rule {
-  strings:
-    $a = "ABCDEFGHIJKLMNOPQ"
-  condition:
-    $a at pe.entry_point
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        assert_eq!(
-            report.verifier_only_kinds,
-            vec!["verifier_only_at".to_owned()]
-        );
-        assert!(report.issues.iter().any(|issue| {
-            issue.code == "verifier-only-offset" && issue.message.contains("specific offset")
-        }));
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "verifier-only-offset")
-            .expect("verifier issue");
-        assert_eq!(issue.rule.as_deref(), Some("verifier_rule"));
-        assert_eq!(issue.line, Some(6));
-        assert!(issue.column.is_some());
-        assert_eq!(issue.snippet.as_deref(), Some("$a at pe.entry_point"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("search --verify")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_prefix_numeric_reads_as_searchable() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule exact_prefix_numeric_rule {
-  condition:
-    uint32(0) == 16909060
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.verifier_only_kinds.is_empty());
-        assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn rule_check_marks_in_prefix_numeric_reads_as_searchable() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule in_prefix_numeric_rule {
-  condition:
-    uint32(4) == 16909060
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.verifier_only_kinds.is_empty());
-        assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn rule_check_marks_out_of_prefix_numeric_reads_as_needing_verify() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule verifier_numeric_rule {
-  condition:
-    uint32(5) == 16909060
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        assert_eq!(
-            report.verifier_only_kinds,
-            vec!["verifier_only_eq".to_owned()]
-        );
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "verifier-only-byte-equality")
-            .expect("verifier issue");
-        assert_eq!(issue.rule.as_deref(), Some("verifier_numeric_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("uint32(5) == 16909060"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("8-byte file prefix")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_count_constraints_with_specific_issue_details() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule count_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    #a > 1
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        assert_eq!(
-            report.verifier_only_kinds,
-            vec!["verifier_only_count".to_owned()]
-        );
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "verifier-only-count")
-            .expect("count issue");
-        assert_eq!(issue.rule.as_deref(), Some("count_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("#a > 1"));
-        assert!(issue.message.contains("number of string matches"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("count constraints")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_trivial_positive_count_constraints_as_searchable() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule trivial_count_exists_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    #a > 0
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.verifier_only_kinds.is_empty());
-        assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn rule_check_marks_trivial_zero_count_constraints_as_unsupported() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule trivial_count_zero_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    #a == 0
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "negated-search-unbounded")
-            .expect("negated-search issue");
-        assert_eq!(issue.snippet.as_deref(), Some("#a == 0"));
-    }
-
-    #[test]
-    fn rule_check_marks_range_constraints_with_specific_issue_details() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule range_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a in (filesize-64..filesize)
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        assert_eq!(
-            report.verifier_only_kinds,
-            vec!["verifier_only_in_range".to_owned()]
-        );
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "verifier-only-range")
-            .expect("range issue");
-        assert_eq!(issue.rule.as_deref(), Some("range_rule"));
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("$a in (filesize-64..filesize)")
-        );
-        assert!(issue.message.contains("byte range"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("range constraints")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_loop_constraints_with_specific_issue_details() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule loop_rule {
-  strings:
-    $a = { 41 42 43 44 }
-  condition:
-    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        assert_eq!(
-            report.verifier_only_kinds,
-            vec!["verifier_only_loop".to_owned()]
-        );
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "verifier-only-loop")
-            .expect("loop issue");
-        assert_eq!(issue.rule.as_deref(), Some("loop_rule"));
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))")
-        );
-        assert!(issue.message.contains("for-any or for-all iterator"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("for any")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_negated_search_constraints_as_needing_verify() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule negated_search_rule {
-  strings:
-    $a = "ABCD"
-    $b = "WXYZ"
-  condition:
-    $a and not $b and filesize >= 8 and filesize < 9
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "verifier-only-negation")
-            .expect("negation issue");
-        assert_eq!(issue.rule.as_deref(), Some("negated_search_rule"));
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("$a and not $b and filesize >= 8 and filesize < 9")
-        );
-        assert!(issue.message.contains("negates searchable"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("search --verify")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_unbounded_negated_search_as_unsupported() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule negated_only_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    not $a
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "negated-search-unbounded")
-            .expect("negated unbounded issue");
-        assert_eq!(issue.rule.as_deref(), Some("negated_only_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("not $a"));
-        assert!(issue.message.contains("always true"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("positive searchable anchor")
-        );
-    }
-
-    #[test]
-    fn rule_check_keeps_metadata_negation_with_positive_anchor_as_searchable() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule metadata_negation_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and not filesize < 5KB
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Searchable);
-        assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn rule_check_marks_ignored_modules_as_needing_verify() {
-        let direct_ignored = collect_ignored_module_call_names(
-            r#"$a and console.log("dbg") and androguard.url(/evil\.example/)"#,
-        );
-        assert_eq!(
-            direct_ignored.into_iter().collect::<Vec<_>>(),
-            vec!["androguard.url".to_owned(), "console.log".to_owned()]
-        );
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule ignored_module_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and console.log("dbg") and androguard.url(/evil\.example/)
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::SearchableNeedsVerify);
-        assert_eq!(
-            report.ignored_module_calls,
-            vec!["androguard.url".to_owned(), "console.log".to_owned()]
-        );
-        assert!(report.issues.iter().any(|issue| {
-            issue.code == "ignored-module-predicate" && issue.message.contains("Use --verify")
-        }));
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.message.contains("console.log"))
-            .expect("console issue");
-        assert_eq!(issue.rule.as_deref(), Some("ignored_module_rule"));
-        assert_eq!(issue.line, Some(6));
-        assert!(issue.column.is_some());
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("$a and console.log(\"dbg\") and androguard.url(/evil\\.example/)")
-        );
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("module predicates")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_hash_identity_mismatch_as_unsupported() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule mismatched_hash {
-  condition:
-    hash.md5(0, filesize) == "0123456789abcdef0123456789abcdef"
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        assert!(report.issues.iter().any(|issue| {
-            issue.code == "hash-identity-mismatch"
-                && issue.message.contains("current source is sha256")
-        }));
-        let issue = report.issues.first().expect("unsupported issue");
-        assert_eq!(issue.rule.as_deref(), Some("mismatched_hash"));
-        assert_eq!(issue.line, Some(4));
-        assert!(issue.column.is_some());
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("hash.md5(0, filesize) == \"0123456789abcdef0123456789abcdef\"")
-        );
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("--id-source")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_parseable_rule_block_errors_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"include "index.yar""#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report.issues.first().expect("unsupported issue");
-        assert_eq!(issue.code, "no-parseable-rule-block");
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("real YARA rule file")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_ignored_module_only_rules_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule ignored_only_rule {
-  condition:
-    console.log("dbg")
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "ignored-module-no-anchor")
-            .expect("ignored-module-no-anchor issue");
-        assert_eq!(issue.rule.as_deref(), Some("ignored_only_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("console.log(\"dbg\")"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("searchable string or hex anchor")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_unsupported_regex_flags_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule regex_flag_rule {
-  strings:
-    $a = /evil/ nocase
-  condition:
-    $a
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "unsupported-regex-flags")
-            .expect("regex flag issue");
-        assert_eq!(issue.rule.as_deref(), Some("regex_flag_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("$a = /evil/ nocase"));
-    }
-
-    #[test]
-    fn rule_check_marks_unsupported_hex_syntax_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule bad_hex_rule {
-  strings:
-    $a = { 6a?? }
-  condition:
-    $a
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "unsupported-hex-syntax")
-            .expect("hex syntax issue");
-        assert_eq!(issue.rule.as_deref(), Some("bad_hex_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("$a = { 6a?? }"));
-    }
-
-    #[test]
-    fn rule_check_marks_nonliteral_byte_offsets_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule dynamic_offset_rule {
-  condition:
-    uint32(filesize) == 1
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "nonliteral-byte-offset")
-            .expect("byte offset issue");
-        assert_eq!(issue.rule.as_deref(), Some("dynamic_offset_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("uint32(filesize) == 1"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("literal constant")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_short_nocase_literals_without_anchor_window() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule short_nocase_rule {
-  strings:
-    $a = "ab" nocase
-  condition:
-    $a
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "nocase-no-anchorable-window")
-            .expect("nocase anchor issue");
-        assert_eq!(issue.rule.as_deref(), Some("short_nocase_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("$a = \"ab\" nocase"));
-    }
-
-    #[test]
-    fn rule_check_marks_missing_rule_references_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule parent_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and missing_helper
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "unknown-rule-reference")
-            .expect("unknown rule issue");
-        assert_eq!(issue.rule.as_deref(), Some("parent_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("$a and missing_helper"));
-    }
-
-    #[test]
-    fn rule_check_marks_unsupported_comparison_operator_with_specific_issue_code() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule unsupported_comparison_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    #a != 1
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "unsupported-comparison-operator")
-            .expect("unsupported comparison issue");
-        assert_eq!(issue.rule.as_deref(), Some("unsupported_comparison_rule"));
-        assert_eq!(issue.snippet.as_deref(), Some("#a != 1"));
-    }
-
-    #[test]
-    fn rule_check_marks_overbroad_union_as_specific_unsupported_issue() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule overbroad_iron_tiger_style {
-  strings:
-    $a = "Game Over Good Luck By Wind" nocase wide ascii
-    $b = "ReleiceName" nocase wide ascii
-    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
-    $d = "Winds Update" nocase wide ascii
-  condition:
-    uint16(0) == 0x5a4d and any of them
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "overbroad-union")
-            .expect("overbroad issue");
-        assert_eq!(issue.rule.as_deref(), Some("overbroad_iron_tiger_style"));
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("uint16(0) == 0x5a4d and any of them")
-        );
-        assert!(issue.message.contains("union fanout"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("mandatory anchor")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_low_information_entrypoint_stub_as_specific_unsupported_issue() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule low_information_entrypoint_stub {
-  strings:
-    $a0 = { 50 BE [4] 8D BE [4] 57 83 CD }
-  condition:
-    $a0 at pe.entry_point
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "low-information-entrypoint-stub")
-            .expect("entrypoint issue");
-        assert_eq!(
-            issue.rule.as_deref(),
-            Some("low_information_entrypoint_stub")
-        );
-        assert_eq!(issue.snippet.as_deref(), Some("$a0 at pe.entry_point"));
-        assert!(issue.message.contains("entry-point stub"));
-        assert!(
-            issue
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("longer mandatory literal")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_direct_unanchorable_pattern_with_direct_condition_snippet() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule bad_unanchorable_pattern {
-  strings:
-    $a = { 41 ?? 42 }
-  condition:
-    $a
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "requires-anchorable-literal-direct")
-            .expect("direct anchorability issue");
-        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_pattern"));
-        assert_eq!(issue.snippet.as_deref(), Some("$a"));
-    }
-
-    #[test]
-    fn rule_check_marks_at_in_unanchorable_pattern_with_condition_snippet() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule bad_unanchorable_at {
-  strings:
-    $a = { E8 ?? ?? ?? ?? 5D }
-  condition:
-    $a at pe.entry_point
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "requires-anchorable-literal-at-in")
-            .expect("at/in anchorability issue");
-        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_at"));
-        assert_eq!(issue.snippet.as_deref(), Some("$a at pe.entry_point"));
-    }
-
-    #[test]
-    fn rule_check_marks_loop_unanchorable_pattern_with_condition_snippet() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule bad_unanchorable_loop {
-  strings:
-    $a = { FF 75 ?? FF 55 ?? }
-  condition:
-    for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "requires-anchorable-literal-loop")
-            .expect("loop anchorability issue");
-        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_loop"));
-        assert_eq!(
-            issue.snippet.as_deref(),
-            Some("for any i in (1..#a): (uint8(@a[i] + 2) == uint8(@a[i] + 5))")
-        );
-    }
-
-    #[test]
-    fn rule_check_marks_n_of_unanchorable_pattern_with_condition_snippet() {
-        let report = rule_check_with_gram_sizes_and_identity_source(
-            r#"
-rule bad_unanchorable_n_of {
-  strings:
-    $a = { 41 ?? 42 }
-    $b = "ABCD"
-  condition:
-    any of ($a, $b)
-}
-"#,
-            default_gram_sizes(),
-            Some("sha256"),
-            8,
-            false,
-            true,
-            7.5,
-        );
-        assert_eq!(report.status, RuleCheckStatus::Unsupported);
-        let issue = report
-            .issues
-            .iter()
-            .find(|issue| issue.code == "requires-anchorable-literal-n-of")
-            .expect("n-of anchorability issue");
-        assert_eq!(issue.rule.as_deref(), Some("bad_unanchorable_n_of"));
-        assert_eq!(issue.snippet.as_deref(), Some("any of ($a, $b)"));
-    }
-
-    #[test]
-    fn fixed_literal_match_plan_roundtrips_simple_pattern_and_or() {
-        let rule = r#"
-rule sample {
-  strings:
-    $a = { 41 42 43 44 }
-    $b = { 45 46 47 48 }
-  condition:
-    $a or $b
-}
-"#;
-        let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
-        let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
-        assert_eq!(literal_plan.literals["$a"], vec![b"ABCD".to_vec()]);
-        assert_eq!(literal_plan.literal_wide["$a"], vec![false]);
-        assert_eq!(literal_plan.literal_fullword["$a"], vec![false]);
-        let mut matches = HashMap::new();
-        matches.insert("$a".to_owned(), false);
-        matches.insert("$b".to_owned(), true);
-        assert!(evaluate_fixed_literal_match(&literal_plan.root, &matches).expect("eval"));
-    }
-
-    #[test]
-    fn fixed_literal_match_plan_accepts_multi_literal_patterns() {
-        let rule = r#"
-rule sample {
-  strings:
-    $a = "AB" ascii wide fullword
-  condition:
-    $a
-}
-"#;
-        let plan = compile_query_plan_default(rule, 16, false, true, 100_000).expect("plan");
-        let literal_plan = fixed_literal_match_plan(&plan).expect("fixed literal plan");
-        let literals = literal_plan.literals.get("$a").expect("literals");
-        assert_eq!(literals.len(), 2);
-        assert_eq!(literals[0], b"AB".to_vec());
-        assert_eq!(literals[1], vec![b'A', 0, b'B', 0]);
-        assert_eq!(literal_plan.literal_wide["$a"], vec![false, true]);
-        assert_eq!(literal_plan.literal_fullword["$a"], vec![true, true]);
-
-        let regex_rule = r#"
-rule sample {
-  strings:
-    $a = /[A-Z]+applesause[0-9]+/
-  condition:
-    $a
-}
-"#;
-        let regex_plan =
-            compile_query_plan_default(regex_rule, 16, false, true, 100_000).expect("plan");
-        assert!(fixed_literal_match_plan(&regex_plan).is_none());
-
-        let grouped_regex_rule = r#"
-rule sample {
-  strings:
-    $a = /fooba(bar|baz)qux/
-  condition:
-    $a
-}
-"#;
-        let grouped_regex_plan =
-            compile_query_plan_default(grouped_regex_rule, 16, false, true, 100_000).expect("plan");
-        assert_eq!(grouped_regex_plan.patterns.len(), 1);
-        assert!(fixed_literal_match_plan(&grouped_regex_plan).is_none());
-    }
-
-    #[test]
-    fn branch_local_budget_reduces_or_branch_anchor_count() {
-        let rule = r#"
-rule sample {
-  strings:
-    $a = { 01 02 03 04 05 06 07 08 09 0A 0B 0C }
-    $b = { 11 12 13 14 15 16 17 18 19 1A 1B 1C }
-    $c = { 21 22 23 24 25 26 27 28 29 2A 2B 2C }
-  condition:
-    $a or $b or $c
-}
-"#;
-        let plan = compile_query_plan_default(rule, 4, false, true, 100_000).expect("plan");
-        for pattern in &plan.patterns {
-            assert!(pattern.alternatives[0].len() <= 2);
-        }
-    }
-
-    #[test]
-    fn compile_query_plan_from_file_roundtrip_works() {
-        let tmp = tempdir().expect("tmp");
-        let rule_path = tmp.path().join("rule.yar");
-        fs::write(
-            &rule_path,
-            r#"
-rule disk_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-        )
-        .expect("write rule");
-        let plan = compile_query_plan_from_file_default(&rule_path, 8, false, true, 100)
-            .expect("plan from file");
-        assert_eq!(plan.patterns.len(), 1);
-    }
-
-    #[test]
-    fn compile_query_plan_inlines_sibling_rule_references() {
-        let rule = r#"
-rule parent_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and helper_rule
-}
-
-private rule helper_rule {
-  strings:
-    $b = "WXYZ"
-  condition:
-    $b
-}
-"#;
-        let plan = compile_query_plan_default(rule, 4, false, true, 100_000).expect("plan");
-        let pattern_ids = plan
-            .patterns
-            .iter()
-            .map(|pattern| pattern.pattern_id.as_str())
-            .collect::<HashSet<_>>();
-        assert!(pattern_ids.contains("$a"));
-        assert!(pattern_ids.contains("__ruledep::helper_rule::$b"));
-        assert!(contains_pattern_node(&plan.root));
-    }
-
-    #[test]
-    fn compile_query_plan_inlines_case_insensitive_sibling_rule_references() {
-        let rule = r#"
-rule ParentRule {
-  strings:
-    $a = "ABCD"
-  condition:
-    HelperRule and $a
-}
-
-private rule HelperRule {
-  strings:
-    $b = "WXYZ"
-  condition:
-    $b
-}
-"#;
-        let plan = compile_query_plan_default(rule, 4, false, true, 100_000).expect("plan");
-        let pattern_ids = plan
-            .patterns
-            .iter()
-            .map(|pattern| pattern.pattern_id.as_str())
-            .collect::<HashSet<_>>();
-        assert!(pattern_ids.contains("$a"));
-        assert!(pattern_ids.contains("__ruledep::helperrule::$b"));
-    }
-
-    #[test]
-    fn compile_query_plan_reports_missing_rule_reference() {
-        let rule = r#"
-rule parent_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a and missing_helper
-}
-"#;
-        let err = compile_query_plan_default(rule, 4, false, true, 100_000)
-            .expect_err("missing helper should fail");
-        assert!(
-            err.to_string()
-                .contains("Condition references unknown rule")
-        );
-    }
-
-    #[test]
-    fn parser_and_helper_edge_cases_cover_remaining_branches() {
-        let mut parser =
-            ConditionParser::new("$a", HashSet::from(["$a".to_owned()]), None).expect("parser");
-        assert!(
-            parser
-                .consume(Some(&Token::LParen))
-                .expect_err("mismatched token")
-                .to_string()
-                .contains("Expected token")
-        );
-
-        let mut parser = ConditionParser::new(
-            "1 of ($a,)",
-            HashSet::from(["$a".to_owned(), "$b".to_owned()]),
-            None,
-        )
-        .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("expected pattern id")
-                .to_string()
-                .contains("Expected pattern id")
-        );
-
-        let mut parser = ConditionParser::new("1 of ($a,", HashSet::from(["$a".to_owned()]), None)
-            .expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("unterminated n-of")
-                .to_string()
-                .contains("Unexpected end of condition")
-        );
-
-        let mut parser =
-            ConditionParser::new("and", HashSet::from(["$a".to_owned()]), None).expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("unsupported condition token")
-                .to_string()
-                .contains("Unsupported condition token")
-        );
-
-        let mut parser = ConditionParser::new("xor == 7", HashSet::new(), None).expect("parser");
-        assert!(
-            parser
-                .parse()
-                .expect_err("unknown rule")
-                .to_string()
-                .contains("Condition references unknown rule")
-        );
-
-        assert!(
-            parse_literal_line("no equals here")
-                .expect("ignored")
-                .is_none()
-        );
-        assert!(
-            parse_literal_line("identifier = \"x\"")
-                .expect("non pattern")
-                .is_none()
-        );
-        assert!(
-            parse_literal_line("$a = { 01 02 }")
-                .expect("hex line ignored")
-                .is_none()
-        );
-        let escaped = parse_literal_line(r#"$a = "A\"B""#)
-            .expect("escaped literal")
-            .expect("pattern");
-        assert_eq!(escaped.alternatives[0], b"A\"B".to_vec());
-
-        let fixed = parse_hex_line_to_grams(
-            "$hex = { 41 42 43 44 45 }",
-            GramSizes::new(3, 4).expect("gram sizes"),
-        )
-        .expect("hex parse")
-        .expect("pattern");
-        assert_eq!(fixed.0, "$hex");
-        assert_eq!(fixed.3, vec![b"ABCDE".to_vec()]);
-        assert_eq!(fixed.1.len(), 1);
-        assert_eq!(fixed.1[0].len(), 3);
-        assert_eq!(fixed.2[0].len(), 2);
-        assert!(
-            parse_hex_line_to_grams(
-                "identifier = { 41 42 }",
-                GramSizes::new(3, 4).expect("gram sizes"),
-            )
-            .expect("ignored")
-            .is_none()
-        );
-        assert!(
-            parse_hex_line_to_grams(
-                "$hex = { 41 42 [x-y] 43 }",
-                GramSizes::new(3, 4).expect("gram sizes"),
-            )
-            .expect_err("bad gap token")
-            .to_string()
-            .contains("Unsupported hex token")
-        );
-
-        assert!(!is_gap_token("[]"));
-        assert!(!is_gap_token("[1-]"));
-        assert!(!is_gap_token("[abc]"));
-        assert_eq!(grams_from_bytes(b"abc", 4), Vec::<u64>::new());
-
-        let patterns = BTreeMap::from([
-            ("$a".to_owned(), vec![vec![1u64, 2u64]]),
-            ("$b".to_owned(), vec![vec![3u64]]),
-        ]);
-        let mut root = QueryNode {
-            kind: "or".to_owned(),
-            pattern_id: None,
-            threshold: None,
-            children: vec![
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$a".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$b".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-            ],
-        };
-        reorder_or_nodes_for_selectivity(&mut root, &patterns);
-        assert_eq!(root.children[0].pattern_id.as_deref(), Some("$b"));
-        assert_eq!(pattern_selectivity_score("$missing", &patterns), u128::MAX);
-        assert_eq!(
-            node_selectivity_score(
-                &QueryNode {
-                    kind: "bogus".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &patterns
-            ),
-            u128::MAX
-        );
-    }
-
-    #[test]
-    fn tier2_gram_size_wrapper_helpers_work() {
-        let rule = r#"
-rule q {
-  strings:
-    $a = { 41 42 43 44 45 }
-  condition:
-    $a
-}
-"#;
-        let plan =
-            compile_query_plan_with_tier1_default_tier2(rule, 3, 8, false, true, 50).expect("plan");
-        assert_eq!(plan.tier1_gram_size, 3);
-        assert_eq!(plan.tier2_gram_size, DEFAULT_TIER2_GRAM_SIZE);
-
-        let tmp = tempdir().expect("tmp");
-        let rule_path = tmp.path().join("rule.yar");
-        fs::write(&rule_path, rule).expect("rule");
-        let plan = compile_query_plan_from_file_with_tier1_default_tier2(
-            &rule_path, 3, 8, false, true, 50,
-        )
-        .expect("plan from file");
-        assert_eq!(plan.tier1_gram_size, 3);
-        assert_eq!(plan.max_candidates, 50.0);
-    }
-
-    #[test]
-    fn fixed_literal_helpers_cover_invalid_shapes_and_ast_variants() {
-        let mut patterns = BTreeMap::new();
-        patterns.insert("$a".to_owned(), vec![vec![1_u64, 2, 3]]);
-        patterns.insert("$b".to_owned(), vec![vec![4_u64, 5]]);
-        assert_eq!(
-            node_selectivity_score(
-                &QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                &patterns,
-            ),
-            u128::MAX
-        );
-        let pattern_b_score = pattern_selectivity_score("$b", &patterns);
-        assert_eq!(
-            node_selectivity_score(
-                &QueryNode {
-                    kind: "and".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: vec![
-                        QueryNode {
-                            kind: "pattern".to_owned(),
-                            pattern_id: Some("$a".to_owned()),
-                            threshold: None,
-                            children: Vec::new(),
-                        },
-                        QueryNode {
-                            kind: "pattern".to_owned(),
-                            pattern_id: Some("$b".to_owned()),
-                            threshold: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                },
-                &patterns,
-            ),
-            pattern_b_score
-        );
-        assert_eq!(
-            node_selectivity_score(
-                &QueryNode {
-                    kind: "or".to_owned(),
-                    pattern_id: None,
-                    threshold: None,
-                    children: vec![
-                        QueryNode {
-                            kind: "pattern".to_owned(),
-                            pattern_id: Some("$a".to_owned()),
-                            threshold: None,
-                            children: Vec::new(),
-                        },
-                        QueryNode {
-                            kind: "pattern".to_owned(),
-                            pattern_id: Some("$b".to_owned()),
-                            threshold: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                },
-                &patterns,
-            ),
-            pattern_b_score
-        );
-        assert_eq!(
-            node_selectivity_score(
-                &QueryNode {
-                    kind: "n_of".to_owned(),
-                    pattern_id: None,
-                    threshold: Some(1),
-                    children: vec![QueryNode {
-                        kind: "pattern".to_owned(),
-                        pattern_id: Some("$b".to_owned()),
-                        threshold: None,
-                        children: Vec::new(),
-                    }],
-                },
-                &patterns,
-            ),
-            pattern_b_score
-        );
-
-        let invalid_empty = CompiledQueryPlan {
-            patterns: vec![PatternPlan {
-                pattern_id: "$bad".to_owned(),
-                alternatives: vec![vec![1_u64]],
-                tier2_alternatives: vec![Vec::new()],
-                anchor_literals: vec![Vec::new()],
-                fixed_literals: vec![Vec::new()],
-                fixed_literal_wide: vec![false],
-                fixed_literal_fullword: vec![false],
-            }],
-            root: QueryNode {
-                kind: "pattern".to_owned(),
-                pattern_id: Some("$bad".to_owned()),
-                threshold: None,
-                children: Vec::new(),
-            },
-            force_tier1_only: false,
-            allow_tier2_fallback: true,
-            max_candidates: 1.0,
-            tier2_gram_size: 3,
-            tier1_gram_size: 4,
-        };
-        assert!(fixed_literal_match_plan(&invalid_empty).is_none());
-
-        let invalid_alternatives = CompiledQueryPlan {
-            patterns: vec![PatternPlan {
-                pattern_id: "$bad".to_owned(),
-                alternatives: vec![vec![1_u64], vec![2_u64]],
-                tier2_alternatives: vec![Vec::new(), Vec::new()],
-                anchor_literals: vec![vec![0x41], vec![0x42]],
-                fixed_literals: vec![vec![0x41]],
-                fixed_literal_wide: vec![false],
-                fixed_literal_fullword: vec![false],
-            }],
-            root: QueryNode {
-                kind: "pattern".to_owned(),
-                pattern_id: Some("$bad".to_owned()),
-                threshold: None,
-                children: Vec::new(),
-            },
-            force_tier1_only: false,
-            allow_tier2_fallback: true,
-            max_candidates: 1.0,
-            tier2_gram_size: 3,
-            tier1_gram_size: 4,
-        };
-        assert!(fixed_literal_match_plan(&invalid_alternatives).is_none());
-
-        let matches = HashMap::from([
-            ("$a".to_owned(), true),
-            ("$b".to_owned(), false),
-            ("$c".to_owned(), true),
-        ]);
-        let n_of = QueryNode {
-            kind: "n_of".to_owned(),
-            pattern_id: None,
-            threshold: Some(2),
-            children: vec![
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$a".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$b".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$c".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-            ],
-        };
-        assert!(evaluate_fixed_literal_match(&n_of, &matches).expect("n_of match"));
-        let n_of_missing_threshold = QueryNode {
-            kind: "n_of".to_owned(),
-            pattern_id: None,
-            threshold: None,
-            children: Vec::new(),
-        };
-        assert!(evaluate_fixed_literal_match(&n_of_missing_threshold, &matches).is_err());
-        let pattern_missing_id = QueryNode {
-            kind: "pattern".to_owned(),
-            pattern_id: None,
-            threshold: None,
-            children: Vec::new(),
-        };
-        assert!(evaluate_fixed_literal_match(&pattern_missing_id, &matches).is_err());
-        let unsupported = QueryNode {
-            kind: "xor".to_owned(),
-            pattern_id: None,
-            threshold: None,
-            children: Vec::new(),
-        };
-        assert!(evaluate_fixed_literal_match(&unsupported, &matches).is_err());
-    }
-
-    #[test]
-    fn dedupe_helpers_remove_duplicate_or_branches_and_alternatives() {
-        let mut root = QueryNode {
-            kind: "or".to_owned(),
-            pattern_id: None,
-            threshold: None,
-            children: vec![
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$a".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$a".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-                QueryNode {
-                    kind: "pattern".to_owned(),
-                    pattern_id: Some("$b".to_owned()),
-                    threshold: None,
-                    children: Vec::new(),
-                },
-            ],
-        };
-        dedupe_or_nodes(&mut root);
-        assert_eq!(root.children.len(), 2);
-        assert_eq!(root.children[0].pattern_id.as_deref(), Some("$a"));
-        assert_eq!(root.children[1].pattern_id.as_deref(), Some("$b"));
-
-        let (alts, alts5, anchors, literals, wide, fullword) = dedupe_pattern_alternatives(
-            vec![vec![1_u64, 2], vec![1_u64, 2], vec![3_u64]],
-            vec![vec![7_u64], vec![7_u64], vec![8_u64]],
-            vec![b"XY".to_vec(), b"XY".to_vec(), b"ZZ".to_vec()],
-            vec![b"AB".to_vec(), b"AB".to_vec(), b"CD".to_vec()],
-            vec![false, false, true],
-            vec![false, false, true],
-        );
-        assert_eq!(alts, vec![vec![1_u64, 2], vec![3_u64]]);
-        assert_eq!(alts5, vec![vec![7_u64], vec![8_u64]]);
-        assert_eq!(anchors, vec![b"XY".to_vec(), b"ZZ".to_vec()]);
-        assert_eq!(literals, vec![b"AB".to_vec(), b"CD".to_vec()]);
-        assert_eq!(wide, vec![false, true]);
-        assert_eq!(fullword, vec![false, true]);
-    }
-
-    #[test]
-    fn optimize_grams_prefers_more_selective_bytes_without_literal_positions() {
-        let gram_letters = pack_exact_gram(b"ASPX");
-        let gram_suffix = pack_exact_gram(b".pas");
-        let optimized = optimize_grams(&[gram_letters, gram_suffix], &[], 4, 1);
-        assert_eq!(optimized, vec![gram_suffix]);
-    }
-
-    #[test]
-    fn nocase_window_selection_prefers_fixed_byte_heavy_suffixes() {
-        let alts = derive_nocase_search_alternatives(
-            br"\UnitFrmManagerKeyLog.pas",
-            false,
-            GramSizes::default(),
-        )
-        .expect("nocase alternatives");
-        assert!(alts.iter().all(|alt| {
-            let lowered = alt
-                .iter()
-                .map(|byte| byte.to_ascii_lowercase())
-                .collect::<Vec<_>>();
-            lowered.windows(4).any(|window| window == b".pas")
-        }));
-    }
-
-    #[test]
-    fn overbroad_high_fanout_union_requires_mandatory_anchor() {
-        let err = compile_query_plan_default(
-            r#"
-rule overbroad_iron_tiger_style {
-  strings:
-    $a = "Game Over Good Luck By Wind" nocase wide ascii
-    $b = "ReleiceName" nocase wide ascii
-    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
-    $d = "Winds Update" nocase wide ascii
-  condition:
-    uint16(0) == 0x5a4d and any of them
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect_err("overbroad union should fail");
-        assert!(err.to_string().contains("overbroad for scalable search"));
-
-        compile_query_plan_default(
-            r#"
-rule narrow_all_of {
-  strings:
-    $a = "Game Over Good Luck By Wind" nocase wide ascii
-    $b = "ReleiceName" nocase wide ascii
-    $c = "jingtisanmenxiachuanxiao.vbs" nocase wide ascii
-    $d = "Winds Update" nocase wide ascii
-  condition:
-    uint16(0) == 0x5a4d and all of them
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("all-of rule should stay searchable");
-    }
-
-    #[test]
-    fn low_information_entrypoint_stub_is_rejected() {
-        let err = compile_query_plan_default(
-            r#"
-rule low_information_entrypoint_stub {
-  strings:
-    $a0 = { 50 BE [4] 8D BE [4] 57 83 CD }
-  condition:
-    $a0 at pe.entry_point
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect_err("low-information entrypoint stub should fail");
-        assert!(
-            err.to_string()
-                .contains("entry-point stub provides only low-information gram anchors")
-        );
-
-        compile_query_plan_default(
-            r#"
-rule stronger_entrypoint_anchor {
-  strings:
-    $a0 = { 50 BE [4] 8D BE [4] 57 83 CD 11 22 33 44 55 66 77 88 99 AA BB CC }
-  condition:
-    $a0 at pe.entry_point
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("stronger entrypoint anchor should compile");
-    }
-
-    #[test]
-    fn low_information_range_rule_is_rejected() {
-        compile_query_plan_default(
-            r#"
-rule low_information_range_rule {
-  strings:
-    $hdr = { 50 4B 03 04 }
-    $ext = ".js" nocase
-  condition:
-    $hdr at 0 and $ext in (filesize-100..filesize)
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("smaller tier1 grams now make the range rule anchorable");
-
-        compile_query_plan_default(
-            r#"
-rule stronger_range_rule {
-  strings:
-    $hdr = { 50 4B 03 04 }
-    $ext = ".download-javascript-payload.js" nocase
-  condition:
-    $hdr at 0 and $ext in (filesize-100..filesize)
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("stronger range rule should compile");
-    }
-
-    #[test]
-    fn low_information_single_pattern_is_rejected() {
-        compile_query_plan_default(
-            r#"
-rule low_information_single_pattern {
-  strings:
-    $a = { C6 ?? ?? ?? ?? 00 62 C6 ?? ?? ?? ?? 00 6F C6 ?? ?? ?? ?? 00 6F C6 ?? ?? ?? ?? 00 75 }
-  condition:
-    $a
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("smaller tier1 grams now make the single-pattern rule anchorable");
-
-        compile_query_plan_default(
-            r#"
-rule stronger_single_pattern {
-  strings:
-    $a = "LongerAnchorLiteral"
-  condition:
-    $a
-}
-"#,
-            8,
-            false,
-            true,
-            100,
-        )
-        .expect("stronger single-pattern rule should compile");
-    }
-}
+mod tests;

@@ -11,6 +11,8 @@ impl<K, V> BoundedCache<K, V>
 where
     K: Clone + Eq + std::hash::Hash,
 {
+    /// Creates a bounded cache that retains at least one entry and evicts the
+    /// least-recently touched key when full.
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -19,11 +21,13 @@ where
         }
     }
 
+    /// Removes every cached entry and resets the recency queue.
     pub fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
     }
 
+    /// Returns a cloned cached value and marks the key as most recently used.
     pub fn get(&mut self, key: &K) -> Option<V>
     where
         V: Clone,
@@ -33,6 +37,8 @@ where
         Some(value)
     }
 
+    /// Inserts or replaces one cache entry, evicting the oldest live key when
+    /// the cache is already full.
     pub fn insert(&mut self, key: K, value: V) {
         if self.map.contains_key(&key) {
             self.map.insert(key.clone(), value);
@@ -52,6 +58,7 @@ where
         self.map.insert(key, value);
     }
 
+    /// Moves a key to the back of the recency queue.
     fn touch(&mut self, key: K) {
         if let Some(pos) = self.order.iter().position(|existing| existing == &key) {
             self.order.remove(pos);
@@ -59,10 +66,13 @@ where
         self.order.push_back(key);
     }
 
+    /// Returns the number of live entries currently stored in the cache.
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
 
+    /// Returns an iterator over the live key/value entries in arbitrary map
+    /// order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.map.iter()
     }
