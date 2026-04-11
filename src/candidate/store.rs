@@ -480,6 +480,12 @@ fn candidate_doc_memory_bytes(doc: &CandidateDoc) -> u64 {
     (std::mem::size_of::<CandidateDoc>() as u64).saturating_add(doc.sha256.capacity() as u64)
 }
 
+/// Converts an `Instant` into a saturated microsecond count for profiling
+/// fields stored as `u64`.
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 const DOC_META_ROW_BYTES: usize = 56;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
@@ -769,6 +775,8 @@ impl BlobSidecar {
     }
 
     #[cfg(test)]
+    /// Returns an in-place view into the mmap-backed blob sidecar when the
+    /// caller is running in whole-file mmap mode.
     fn mmap_slice<'a>(&'a self, offset: u64, len: usize, label: &str) -> Result<Option<&'a [u8]>> {
         if len == 0 {
             return Ok(Some(&[]));
@@ -2034,10 +2042,6 @@ impl CandidateStore {
             Option<String>,
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
-        fn elapsed_us(started: Instant) -> u64 {
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-        }
-
         struct PendingNewInsert<'a> {
             sha256: [u8; 32],
             sha256_hex: String,
@@ -3489,10 +3493,6 @@ impl CandidateStore {
         bloom_offset: u64,
         bloom_len: usize,
     ) -> Result<(DocMetaRow, CandidateDocRowPayloadProfile)> {
-        fn elapsed_us(started: Instant) -> u64 {
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-        }
-
         let mut profile = CandidateDocRowPayloadProfile::default();
         let (metadata_offset, metadata_len) = if metadata.is_empty() {
             (0, 0)
@@ -3547,10 +3547,6 @@ impl CandidateStore {
         external_id: Option<&str>,
         bloom_filter: &[u8],
     ) -> Result<(DocMetaRow, CandidateDocRowPayloadProfile)> {
-        fn elapsed_us(started: Instant) -> u64 {
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-        }
-
         let mut profile = CandidateDocRowPayloadProfile::default();
         let bloom_started = Instant::now();
         let bloom_offset = self.append_writers.blooms.append(bloom_filter)?;
@@ -3618,10 +3614,6 @@ impl CandidateStore {
         tier2_bloom_hashes: usize,
         tier2_bloom_filter: &[u8],
     ) -> Result<(Tier2DocMetaRow, CandidateDocRowPayloadProfile)> {
-        fn elapsed_us(started: Instant) -> u64 {
-            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-        }
-
         if tier2_bloom_filter.is_empty() {
             return Ok((
                 Tier2DocMetaRow::default(),

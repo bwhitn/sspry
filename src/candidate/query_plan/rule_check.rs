@@ -384,6 +384,8 @@ fn remediation_for_issue_code(code: &str) -> Option<String> {
     }
 }
 
+/// Maps raw compiler and rule-check error text into the stable issue codes
+/// emitted by CLI and JSON rule-check output.
 fn classify_unsupported_issue_code(message: &str) -> &'static str {
     if message == "Rule does not contain a parseable rule block." {
         "no-parseable-rule-block"
@@ -463,6 +465,8 @@ fn classify_unsupported_issue_code(message: &str) -> &'static str {
     }
 }
 
+/// Finds the most relevant source location and snippet for one unsupported-rule
+/// diagnostic message.
 fn unsupported_issue_match(
     context: &RuleSourceContext<'_>,
     message: &str,
@@ -730,18 +734,25 @@ fn build_rule_check_report(
     }
 }
 
+/// Returns true when the query tree contains a whole-file identity equality
+/// node anywhere below `node`.
 fn contains_identity_node(node: &QueryNode) -> bool {
     node.kind == "identity_eq" || node.children.iter().any(contains_identity_node)
 }
 
+/// Returns true when the query tree contains at least one pattern node.
 fn contains_pattern_node(node: &QueryNode) -> bool {
     node.kind == "pattern" || node.children.iter().any(contains_pattern_node)
 }
 
+/// Returns true when the query tree contains either a searchable pattern or a
+/// verifier-only node.
 fn contains_pattern_or_verifier_only_node(node: &QueryNode) -> bool {
     contains_pattern_node(node) || contains_verifier_only_node(node)
 }
 
+/// Finds the first source match that corresponds to a negated searchable or
+/// verifier-only branch.
 fn first_negated_search_condition_match(
     node: &QueryNode,
     context: &RuleSourceContext<'_>,
@@ -799,6 +810,8 @@ fn summarize_rule_check_rules(rules: Vec<RuleCheckRuleReport>) -> RuleCheckFileR
     }
 }
 
+/// Returns true when a negated searchable branch can admit candidates without
+/// any exact positive searchable constraint.
 fn negated_search_condition_makes_candidate_branch_unbounded(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "not" => node
@@ -840,6 +853,8 @@ const LOW_INFORMATION_RANGE_RULE_MAX_ANCHOR_LEN: usize = 4;
 const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER1_GRAMS: usize = 1;
 const LOW_INFORMATION_SINGLE_PATTERN_MAX_TIER2_GRAMS: usize = 4;
 
+/// Returns true when the pattern still carries at least one non-empty anchor
+/// in tier1, tier2, or explicit anchor literals.
 fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
     pattern.alternatives.iter().any(|alt| !alt.is_empty())
         || pattern.tier2_alternatives.iter().any(|alt| !alt.is_empty())
@@ -849,6 +864,7 @@ fn pattern_is_anchorable(pattern: &PatternPlan) -> bool {
             .any(|literal| !literal.is_empty())
 }
 
+/// Returns true when the pattern exposes any explicit anchor literal bytes.
 fn pattern_has_anchor_literals(pattern: &PatternPlan) -> bool {
     pattern
         .anchor_literals
@@ -856,6 +872,7 @@ fn pattern_has_anchor_literals(pattern: &PatternPlan) -> bool {
         .any(|literal| !literal.is_empty())
 }
 
+/// Returns the longest explicit anchor literal length for one pattern.
 fn pattern_max_anchor_literal_len(pattern: &PatternPlan) -> usize {
     pattern
         .anchor_literals
@@ -865,10 +882,12 @@ fn pattern_max_anchor_literal_len(pattern: &PatternPlan) -> usize {
         .unwrap_or(0)
 }
 
+/// Returns the largest tier1 gram alternative length carried by the pattern.
 fn pattern_max_tier1_grams(pattern: &PatternPlan) -> usize {
     pattern.alternatives.iter().map(Vec::len).max().unwrap_or(0)
 }
 
+/// Returns the largest tier2 gram alternative length carried by the pattern.
 fn pattern_max_tier2_grams(pattern: &PatternPlan) -> usize {
     pattern
         .tier2_alternatives
@@ -878,6 +897,8 @@ fn pattern_max_tier2_grams(pattern: &PatternPlan) -> usize {
         .unwrap_or(0)
 }
 
+/// Computes `n choose k` while aborting when the bounded result would exceed
+/// `limit` or any intermediate multiplication overflows.
 fn choose_bounded(n: usize, k: usize, limit: usize) -> Option<usize> {
     if k > n {
         return Some(0);
@@ -896,10 +917,14 @@ fn choose_bounded(n: usize, k: usize, limit: usize) -> Option<usize> {
     Some(value)
 }
 
+/// Computes the pattern ids that remain mandatory across every threshold-sized
+/// combination of child mandatory-id sets.
 fn combinations_intersection_of_unions(
     child_sets: &[HashSet<String>],
     threshold: usize,
 ) -> HashSet<String> {
+    // Enumerates threshold-sized child combinations and intersects the union of
+    // mandatory ids produced by each combination.
     fn visit(
         child_sets: &[HashSet<String>],
         threshold: usize,
@@ -942,6 +967,8 @@ fn combinations_intersection_of_unions(
     intersection.unwrap_or_default()
 }
 
+/// Returns the pattern ids that must be satisfied whenever `node` evaluates to
+/// true.
 fn mandatory_pattern_ids(node: &QueryNode) -> HashSet<String> {
     match node.kind.as_str() {
         "pattern" => node.pattern_id.iter().cloned().collect::<HashSet<_>>(),
@@ -997,6 +1024,8 @@ fn mandatory_pattern_ids(node: &QueryNode) -> HashSet<String> {
     }
 }
 
+/// Returns true when the query tree contains an `or` or partial `n_of`
+/// branching pattern union.
 fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
     match node.kind.as_str() {
         "or" => {
@@ -1011,6 +1040,8 @@ fn node_has_branching_pattern_union(node: &QueryNode) -> bool {
     }
 }
 
+/// Returns true when the query tree contains at least one node of the
+/// requested kind.
 fn node_contains_kind(node: &QueryNode, kind: &str) -> bool {
     node.kind == kind
         || node
@@ -1019,6 +1050,8 @@ fn node_contains_kind(node: &QueryNode, kind: &str) -> bool {
             .any(|child| node_contains_kind(child, kind))
 }
 
+/// Estimates total anchor fanout across all patterns for overbroad-union
+/// screening.
 fn total_pattern_anchor_fanout(patterns: &[PatternPlan]) -> usize {
     patterns
         .iter()

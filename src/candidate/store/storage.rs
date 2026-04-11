@@ -297,6 +297,8 @@ pub(crate) fn cleanup_abandoned_compaction_roots(root: &Path) -> Result<usize> {
 }
 
 #[cfg(test)]
+/// Appends a packed little-endian `u32` slice to a blob sidecar and returns
+/// the starting offset.
 fn append_u32_slice(path: PathBuf, values: &[u32]) -> Result<u64> {
     if values.is_empty() {
         return Ok(0);
@@ -309,6 +311,8 @@ fn append_u32_slice(path: PathBuf, values: &[u32]) -> Result<u64> {
 }
 
 #[cfg(test)]
+/// Recursively sums the on-disk size of a file or directory tree for storage
+/// assertions.
 fn dir_size(path: &Path) -> u64 {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => metadata.len(),
@@ -397,6 +401,8 @@ fn load_candidate_binary_store(
 }
 
 #[cfg(test)]
+/// Returns one stored blob slice from an in-memory sidecar image while
+/// validating bounds for the requested document.
 fn read_blob<'a>(
     bytes: &'a [u8],
     offset: u64,
@@ -415,6 +421,8 @@ fn read_blob<'a>(
 }
 
 #[cfg(test)]
+/// Decodes one packed `u32` vector from an in-memory sidecar image for test
+/// assertions.
 fn read_u32_vec(
     bytes: &[u8],
     offset: u64,

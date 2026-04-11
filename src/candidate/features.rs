@@ -131,6 +131,8 @@ fn classify_special_population(file_size: u64, sampled_entropy_bits_per_byte: f6
 }
 
 #[cfg(test)]
+/// Test helper that packs every exact sliding gram of the requested size into
+/// `u64` values.
 fn iter_grams_from_bytes_exact_u64(data: &[u8], gram_size: usize) -> Vec<u64> {
     if data.len() < gram_size {
         return Vec::new();
@@ -314,6 +316,8 @@ pub fn estimate_unique_grams_for_size_hll(
 }
 
 #[cfg(test)]
+/// Test-only wrapper that estimates unique 4-byte grams through the shared HLL
+/// implementation.
 fn estimate_unique_grams4_hll(
     path: impl AsRef<Path>,
     chunk_size: usize,
@@ -323,6 +327,8 @@ fn estimate_unique_grams4_hll(
 }
 
 #[cfg(test)]
+/// Test-only wrapper that estimates unique default tier2 grams through the
+/// shared HLL implementation.
 fn estimate_unique_default_tier2_grams_hll(
     path: impl AsRef<Path>,
     chunk_size: usize,
@@ -332,6 +338,8 @@ fn estimate_unique_default_tier2_grams_hll(
 }
 
 #[cfg(test)]
+/// Test-only wrapper that estimates unique explicit tier2 gram sizes through
+/// the shared HLL implementation.
 fn estimate_unique_tier2_grams_hll(
     path: impl AsRef<Path>,
     tier2_gram_size: usize,
@@ -342,16 +350,21 @@ fn estimate_unique_tier2_grams_hll(
 }
 
 #[cfg(test)]
+/// Test helper that expands the shared exact-gram iterator for 4-byte grams.
 fn iter_grams4_from_bytes(data: &[u8]) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, 4)
 }
 
 #[cfg(test)]
+/// Test helper that expands the shared exact-gram iterator for default tier2
+/// grams.
 fn iter_default_tier2_grams_from_bytes(data: &[u8]) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, 5)
 }
 
 #[cfg(test)]
+/// Test helper that expands the shared exact-gram iterator for caller-selected
+/// tier2 gram sizes.
 fn iter_tier2_grams_from_bytes(data: &[u8], tier2_gram_size: usize) -> Vec<u64> {
     iter_grams_from_bytes_exact_u64(data, tier2_gram_size)
 }
@@ -510,6 +523,8 @@ mod tests {
     };
     use crate::candidate::grams::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
 
+    /// Uses the default tier1/tier2 gram sizes while delegating to the shared
+    /// feature scanner used in production.
     fn scan_file_features_default_grams(
         path: impl AsRef<std::path::Path>,
         filter_bytes: usize,
@@ -532,6 +547,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the 4-byte sliding gram helper emits the expected number of
+    /// windows and handles short inputs.
     fn grams4_iterates_sliding_windows() {
         let grams = iter_grams4_from_bytes(b"ABCDE");
         assert_eq!(grams.len(), 2);
@@ -539,6 +556,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the document-feature hash field remains easy to serialize as
+    /// lowercase hex.
     fn document_features_sha256_hex_formats_hash() {
         let features = super::DocumentFeatures {
             sha256: [0xAB; 32],
@@ -553,6 +572,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the bloom-only scanner rejects zero chunk sizes and still
+    /// hashes small files correctly.
     fn bloom_only_scan_hashes_file_and_validates_chunk_size() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("doc.bin");
@@ -570,6 +591,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the bloom-only scanner honors caller-supplied gram sizes and
+    /// produces both bloom tiers.
     fn bloom_only_scan_supports_custom_gram_sizes() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("custom.bin");
@@ -589,7 +612,10 @@ mod tests {
         assert!(!features.bloom_filter.is_empty());
         assert!(!features.tier2_bloom_filter.is_empty());
     }
+
     #[test]
+    /// Verifies the sampled-entropy heuristic only marks large, high-entropy
+    /// files as special-population content.
     fn sampled_entropy_classifier_distinguishes_special_population() {
         assert!(!super::classify_special_population(1024, 8.0));
         assert!(!super::classify_special_population(16 * 1024 * 1024, 7.0));
@@ -597,6 +623,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the 4-byte HLL wrapper enforces validation limits and stays
+    /// reasonably close to the exact unique-gram count.
     fn estimate_unique_grams4_hll_validation_and_accuracy_work() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("hll.bin");
@@ -634,6 +662,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the tier2 iterator and HLL wrappers behave correctly across
+    /// alternate tier2 gram sizes.
     fn wrapper_iterators_and_hll_helpers_cover_tier2_sizes() {
         let payload = b"ABCDEFG";
         assert_eq!(iter_default_tier2_grams_from_bytes(payload).len(), 3);
@@ -652,6 +682,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the paired HLL pass matches the single-size wrappers for both
+    /// different-size and same-size requests.
     fn paired_hll_estimate_matches_individual_estimates() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("paired-hll.bin");
@@ -672,6 +704,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the HLL helpers and bloom scanner still behave on short files
+    /// and low HLL precision values.
     fn hll_small_precision_branches_and_short_file_paths_work() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("short.bin");
@@ -699,6 +733,8 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the feature scan can compute an alternate identity digest
+    /// during the same pass used for bloom construction.
     fn bloom_only_scan_can_compute_alternate_identity_during_feature_pass() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("digest.bin");

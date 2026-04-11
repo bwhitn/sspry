@@ -839,6 +839,8 @@ impl ServerState {
         Ok(true)
     }
 
+    /// Starts the exclusive remote index session after rejecting requests that
+    /// would overlap with publish or paused-mutation states.
     fn handle_begin_index_session(&self) -> Result<CandidateIndexSessionResponse> {
         if self.publish_requested.load(Ordering::Acquire)
             || self.publish_in_progress.load(Ordering::Acquire)
@@ -931,6 +933,8 @@ impl ServerState {
         }
     }
 
+    /// Registers one index client lease and returns the heartbeat timings that
+    /// the caller must use to keep that lease alive.
     fn handle_begin_index_client(
         &self,
         request: &CandidateIndexClientBeginRequest,
@@ -972,6 +976,8 @@ impl ServerState {
         })
     }
 
+    /// Refreshes the lease timestamp for one active index client and rejects
+    /// unknown or expired client ids.
     fn handle_heartbeat_index_client(
         &self,
         request: &CandidateIndexClientHeartbeatRequest,
@@ -991,6 +997,8 @@ impl ServerState {
         })
     }
 
+    /// Updates total, submitted, and processed document counters for the
+    /// currently active index session.
     fn handle_update_index_session_progress(
         &self,
         request: &CandidateIndexSessionProgressRequest,
@@ -1015,6 +1023,8 @@ impl ServerState {
         })
     }
 
+    /// Adds inserted-document progress for server-side ingest paths that run
+    /// under an active index session.
     fn record_index_session_insert_progress(&self, inserted_count: usize) {
         if inserted_count == 0 || self.active_index_sessions.load(Ordering::Acquire) == 0 {
             return;
@@ -1028,6 +1038,8 @@ impl ServerState {
             .store(current_unix_ms(), Ordering::SeqCst);
     }
 
+    /// Accumulates per-batch ingest timings and byte counters into the active
+    /// index session telemetry snapshot.
     fn record_index_session_insert_batch_profile(
         &self,
         documents: usize,
@@ -1132,6 +1144,8 @@ impl ServerState {
             .fetch_add(store_profile.rebalance_tier2_us, Ordering::SeqCst);
     }
 
+    /// Ends the active index session, refreshes adaptive publish state, and
+    /// wakes maintenance workers.
     fn handle_end_index_session(&self) -> Result<CandidateIndexSessionResponse> {
         let previous = self.active_index_sessions.swap(0, Ordering::SeqCst);
         if previous == 0 {
@@ -1148,6 +1162,8 @@ impl ServerState {
         })
     }
 
+    /// Releases one index client lease and requests publish follow-up when the
+    /// final client exits.
     fn handle_end_index_client(
         &self,
         request: &CandidateIndexClientHeartbeatRequest,
@@ -1179,6 +1195,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Serializes accumulated index-session insert-batch counters into the JSON
+    /// shape used by unit tests.
     fn index_server_insert_batch_profile_json(&self) -> Value {
         let mut out = Map::new();
         for (key, value) in [
@@ -1467,6 +1485,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Builds stats JSON plus collection timing for one store set, reusing the
+    /// cached snapshot when it is already available.
     fn candidate_stats_json_for_store_set_profiled(
         &self,
         store_set: &StoreSet,
@@ -1520,6 +1540,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Aggregates stats JSON plus collection timing across all published query
+    /// roots for test-only diagnostics.
     fn candidate_stats_json_for_query_store_sets_profiled(
         &self,
         operation: &str,
@@ -1718,6 +1740,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Reports entry count and estimated heap bytes for the normalized-plan
+    /// cache used in unit tests.
     fn normalized_plan_cache_stats(&self) -> (usize, u64) {
         self.normalized_plan_cache
             .lock()
@@ -1736,6 +1760,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Reports entry count and estimated heap bytes for the prepared-plan
+    /// cache used in unit tests.
     fn prepared_plan_cache_stats(&self) -> (usize, u64) {
         self.prepared_plan_cache
             .lock()
@@ -1754,6 +1780,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Reports entry count and estimated heap bytes for the cached-query
+    /// results store used in unit tests.
     fn query_cache_stats(&self) -> (usize, u64) {
         self.query_cache
             .lock()
@@ -1772,6 +1800,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Builds the expanded test-only stats JSON including publish, cache, and
+    /// workspace diagnostics.
     fn current_stats_json(&self) -> Result<Map<String, Value>> {
         let started_total = Instant::now();
         let now_unix_ms = current_unix_ms();
@@ -2412,6 +2442,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Builds the lighter test-only status JSON used by unit tests that do not
+    /// need the full profiled stats payload.
     fn status_json(&self) -> Result<Map<String, Value>> {
         let now_unix_ms = current_unix_ms();
         let adaptive = self.adaptive_publish_snapshot_or_default(now_unix_ms);
@@ -3071,6 +3103,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Executes one compaction cycle synchronously so tests can assert on the
+    /// immediate post-compaction state.
     fn run_compaction_cycle_for_tests(&self) -> Result<()> {
         let _ = self.run_compaction_cycle_once()?;
         Ok(())
@@ -3134,6 +3168,8 @@ impl ServerState {
         Ok(entry)
     }
 
+    /// Collects candidate hashes from one store using prebuilt query artifacts
+    /// and an uncapped internal max-candidates setting.
     fn collect_query_matches_single_store(
         store: &mut CandidateStore,
         plan: &CompiledQueryPlan,
@@ -3147,6 +3183,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Collects and merges candidate hashes across every shard in one store set
+    /// for deterministic query-cache tests.
     fn collect_query_matches_store_set(
         stores: &Arc<StoreSet>,
         plan: &CompiledQueryPlan,
@@ -3167,6 +3205,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Evaluates a compiled plan across all published shards, applies
+    /// truncation, and returns the cached-query shape used by tests.
     fn collect_query_matches_all_shards(
         &self,
         plan: &CompiledQueryPlan,
@@ -3296,6 +3336,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Decodes one wire-format insert row into validated typed payloads for the
+    /// test-only direct insert helpers.
     fn parse_candidate_insert_document(
         &self,
         document: &CandidateDocumentWire,
@@ -3378,6 +3420,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Inserts one already-parsed test document, updating workspace/search
+    /// bookkeeping just like the public insert path.
     fn handle_candidate_insert_parsed(
         &self,
         parsed: ParsedCandidateInsertDocument,
@@ -3423,6 +3467,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Parses and inserts one candidate document through the test-only direct
+    /// helper path.
     fn handle_candidate_insert(
         &self,
         document: &CandidateDocumentWire,
@@ -3688,6 +3734,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Parses and inserts a batch of test documents through the shared
+    /// batch-insert implementation.
     fn handle_candidate_insert_batch(
         &self,
         documents: &[CandidateDocumentWire],
@@ -3747,6 +3795,8 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    /// Runs the test-only direct candidate query path with caching, cursoring,
+    /// and chunking behavior that matches the public RPC shape.
     fn handle_candidate_query(
         &self,
         request: CandidateQueryRequest,

@@ -1015,6 +1015,8 @@ enum RuleCheckPolicySource {
 }
 
 impl RuleCheckPolicySource {
+    /// Returns the stable label describing where the effective rule-check
+    /// policy came from.
     fn as_str(self) -> &'static str {
         match self {
             Self::Defaults => "defaults",
@@ -1174,6 +1176,8 @@ trait RemoteBinaryInsertClient {
 }
 
 impl RemoteBinaryInsertClient for BlockingGrpcClient {
+    /// Sends one serialized binary insert batch over gRPC and returns the
+    /// server-reported insert count.
     fn candidate_insert_binary_rows(&mut self, rows: Vec<Vec<u8>>) -> Result<usize> {
         let response = self.insert_binary_rows(rows)?;
         Ok(usize::try_from(response.inserted_count).unwrap_or(usize::MAX))
@@ -1289,6 +1293,8 @@ struct RemoteEncodeStats {
 }
 
 #[cfg(test)]
+/// Derives the test-only remote index session document cap from the effective
+/// client memory budget and requested batch size.
 fn remote_index_session_document_limit(effective_budget_bytes: u64, batch_size: usize) -> usize {
     if effective_budget_bytes == 0 {
         return REMOTE_INDEX_SESSION_MAX_DOCUMENTS.max(batch_size);
@@ -1298,6 +1304,8 @@ fn remote_index_session_document_limit(effective_budget_bytes: u64, batch_size: 
 }
 
 #[cfg(test)]
+/// Derives the test-only remote index session input-byte cap from the
+/// effective client memory budget.
 fn remote_index_session_input_bytes_limit(effective_budget_bytes: u64) -> u64 {
     if effective_budget_bytes == 0 {
         return REMOTE_INDEX_SESSION_MAX_INPUT_BYTES;

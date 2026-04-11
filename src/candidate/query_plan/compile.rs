@@ -228,6 +228,8 @@ fn rename_fragment_for_rule_dependency(fragment: &mut RulePlanFragment, rule_nam
     remap_bools(&mut fragment.pattern_fixed_literal_wide);
     remap_bools(&mut fragment.pattern_fixed_literal_fullword);
 
+    // Rewrites local pattern ids throughout the query tree so helper-rule
+    // fragments can be merged into the caller's namespace.
     fn recurse(node: &mut QueryNode, local_pattern_ids: &HashSet<String>, rule_name: &str) {
         if let Some(pattern_id) = node.pattern_id.as_mut() {
             *pattern_id =

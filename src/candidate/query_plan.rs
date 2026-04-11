@@ -2237,6 +2237,8 @@ fn expand_verifier_only_for_of_selector(
     selector: &str,
     known_pattern_names: &[String],
 ) -> Result<Vec<String>> {
+    // Expands one selector item into concrete pattern ids, supporting `them`
+    // and `$prefix*` wildcards.
     fn expand_item(item: &str, known_pattern_names: &[String]) -> Result<Vec<String>> {
         let trimmed = item.trim();
         if trimmed.is_empty() {
@@ -2743,6 +2745,8 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
         Anchor,
     }
 
+    // Parses the quantifier that follows one regex atom and returns its minimum
+    // repetition count plus the number of characters consumed.
     fn parse_quantifier(chars: &[char], index: usize) -> Result<(usize, usize)> {
         if index >= chars.len() {
             return Ok((1, 0));
@@ -2778,6 +2782,8 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
         }
     }
 
+    // Splits a regex into top-level alternation branches while respecting
+    // escapes, character classes, and nested groups.
     fn split_top_level_alternation(regex_raw: &str) -> Result<Vec<&str>> {
         let mut parts = Vec::<&str>::new();
         let mut start = 0usize;
@@ -2824,6 +2830,8 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
         Ok(parts)
     }
 
+    // Finds the longest byte run shared by every alternation branch so the
+    // regex can still contribute one mandatory anchor.
     fn longest_common_substring(branch_runs: &[Vec<Vec<u8>>]) -> Vec<u8> {
         let Some(first_runs) = branch_runs.first() else {
             return Vec::new();
@@ -2850,7 +2858,11 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
         Vec::new()
     }
 
+    // Extracts the literal runs that every execution of one alternation branch
+    // must traverse.
     fn extract_regex_branch_mandatory_runs(regex_raw: &str) -> Result<Vec<Vec<u8>>> {
+        // Commits the currently accumulated literal run and resets the
+        // accumulator for the next run.
         fn flush_current(current: &mut Vec<u8>, runs: &mut Vec<Vec<u8>>) {
             if !current.is_empty() {
                 runs.push(current.clone());
@@ -2858,6 +2870,8 @@ fn extract_regex_mandatory_literal(regex_raw: &str) -> Result<Vec<u8>> {
             }
         }
 
+        // Parses a balanced parenthesized group so nested groups can be
+        // analyzed recursively as one regex atom.
         fn parse_group(chars: &[char], start: usize) -> Result<(String, usize)> {
             let mut depth = 1usize;
             let mut escaped = false;
@@ -3172,6 +3186,8 @@ fn derive_nocase_search_alternatives(
     wide: bool,
     gram_sizes: GramSizes,
 ) -> Result<Vec<Vec<u8>>> {
+    // Returns how many sliding grams of `gram_size` fit in a literal of `len`
+    // bytes.
     fn gram_count_for_len(len: usize, gram_size: usize) -> usize {
         if len < gram_size {
             0
@@ -4331,6 +4347,8 @@ pub fn evaluate_fixed_literal_match(
     }
 }
 
+/// Assigns a conservative selectivity score to one query node so `and`/`or`
+/// children can be ordered from most to least discriminating.
 fn node_selectivity_score(node: &QueryNode, patterns: &BTreeMap<String, Vec<Vec<u64>>>) -> u128 {
     match node.kind.as_str() {
         "pattern" => node

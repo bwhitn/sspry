@@ -1096,6 +1096,8 @@ mod tests {
     use crate::candidate::scan_file_features_bloom_only_with_gram_sizes;
     use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, GramSizes};
 
+    // Evaluates one synthetic YARA-X rule against a file so metadata fast-path
+    // expectations can be compared with the reference engine.
     fn yara_condition_matches_file(imports: &[&str], condition: &str, path: &Path) -> bool {
         let mut source = String::new();
         for module in imports {
@@ -1120,6 +1122,8 @@ mod tests {
             .is_some()
     }
 
+    // Fails when the compact-metadata shortcut rejects a file that the
+    // reference YARA-X evaluation accepted.
     fn assert_no_false_negative(label: &str, oracle: bool, ours: bool) {
         assert!(
             !oracle || ours,

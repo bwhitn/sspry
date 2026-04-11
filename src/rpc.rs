@@ -321,6 +321,8 @@ struct CachedStoreSetStats {
 }
 
 impl StoreSet {
+    /// Wraps one logical root and its per-shard stores into the mutex-backed
+    /// structure shared by direct, forest, and workspace modes.
     fn new(root: PathBuf, stores: Vec<CandidateStore>) -> Self {
         Self {
             root: Mutex::new(root),
@@ -331,6 +333,8 @@ impl StoreSet {
     }
 
     #[cfg(test)]
+    /// Consumes the store set and unwraps the owned stores for tests that need
+    /// direct access to shard contents.
     fn into_stores(self) -> Result<Vec<CandidateStore>> {
         self.stores
             .into_iter()
@@ -342,6 +346,8 @@ impl StoreSet {
             .collect()
     }
 
+    /// Returns a cloned copy of the current logical root path for this store
+    /// set.
     fn root(&self) -> Result<PathBuf> {
         self.root
             .lock()
@@ -349,6 +355,8 @@ impl StoreSet {
             .map_err(|_| SspryError::from("Store set root lock poisoned."))
     }
 
+    /// Retargets every shard to a new root after publish/workspace swaps and
+    /// clears any cached stats derived from the old location.
     fn retarget_root(&self, root: &Path, shard_count: usize) -> Result<()> {
         {
             let mut current_root = self
@@ -369,6 +377,8 @@ impl StoreSet {
     }
 
     #[cfg(test)]
+    /// Returns the cached stats snapshot for tests when one has already been
+    /// materialized for this store set.
     fn cached_stats(&self) -> Result<Option<(Map<String, Value>, u64)>> {
         let cache = self
             .stats_cache
@@ -380,6 +390,8 @@ impl StoreSet {
     }
 
     #[cfg(test)]
+    /// Stores one JSON stats snapshot plus deleted-byte totals for later test
+    /// reuse.
     fn set_cached_stats(
         &self,
         stats: Map<String, Value>,
@@ -397,6 +409,8 @@ impl StoreSet {
     }
 
     #[cfg(test)]
+    /// Clears the test-only stats cache after any mutation that invalidates the
+    /// previously aggregated view.
     fn invalidate_stats_cache(&self) -> Result<()> {
         let mut cache = self
             .stats_cache
@@ -407,6 +421,8 @@ impl StoreSet {
     }
 
     #[cfg(not(test))]
+    /// No-ops in non-test builds where store-set stats caching is not
+    /// compiled in.
     fn invalidate_stats_cache(&self) -> Result<()> {
         Ok(())
     }
@@ -1033,6 +1049,7 @@ include!("rpc/runtime.rs");
 
 #[tonic::async_trait]
 impl GrpcSspry for GrpcServerService {
+    /// Responds to health checks with a fixed `pong` payload.
     async fn ping(
         &self,
         _request: GrpcRequest<PingRequest>,
@@ -1042,6 +1059,7 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Builds the lightweight gRPC stats summary on a blocking worker thread.
     async fn stats(
         &self,
         _request: GrpcRequest<StatsRequest>,
@@ -1054,6 +1072,7 @@ impl GrpcSspry for GrpcServerService {
         Ok(GrpcResponse::new(response))
     }
 
+    /// Builds the full gRPC status payload on a blocking worker thread.
     async fn status(
         &self,
         _request: GrpcRequest<StatusRequest>,
@@ -1066,6 +1085,7 @@ impl GrpcSspry for GrpcServerService {
         Ok(GrpcResponse::new(response))
     }
 
+    /// Starts the exclusive index session used by remote ingest clients.
     async fn begin_index_session(
         &self,
         _request: GrpcRequest<IndexSessionBeginRequest>,
@@ -1080,6 +1100,8 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Registers one index client lease and returns the negotiated heartbeat
+    /// timing parameters.
     async fn begin_index_client(
         &self,
         request: GrpcRequest<IndexClientBeginRequest>,
@@ -1102,6 +1124,7 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Refreshes the lease for one active index client.
     async fn heartbeat_index_client(
         &self,
         request: GrpcRequest<IndexClientHeartbeatRequest>,
@@ -1121,6 +1144,8 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Updates submitted and processed document counters for the active remote
+    /// index session.
     async fn update_index_session_progress(
         &self,
         request: GrpcRequest<IndexSessionProgressRequest>,
@@ -1144,6 +1169,7 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Marks the current index session complete.
     async fn end_index_session(
         &self,
         _request: GrpcRequest<IndexSessionEndRequest>,
@@ -1158,6 +1184,8 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Releases one index client lease and lets publish scheduling observe the
+    /// new client count.
     async fn end_index_client(
         &self,
         request: GrpcRequest<IndexClientHeartbeatRequest>,
@@ -1177,6 +1205,7 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Requests an immediate publish through the blocking server-state path.
     async fn publish(
         &self,
         _request: GrpcRequest<PublishRequest>,
@@ -1191,6 +1220,7 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Marks the server as shutting down and acknowledges the RPC caller.
     async fn shutdown(
         &self,
         _request: GrpcRequest<ShutdownRequest>,
@@ -1201,6 +1231,8 @@ impl GrpcSspry for GrpcServerService {
         }))
     }
 
+    /// Deletes one document by configured identity and translates the internal
+    /// response into the gRPC wire shape.
     async fn delete(
         &self,
         request: GrpcRequest<GrpcDeleteRequest>,
@@ -1228,6 +1260,8 @@ impl GrpcSspry for GrpcServerService {
     type SearchStreamStream =
         tokio_stream::wrappers::ReceiverStream<std::result::Result<SearchFrame, GrpcStatus>>;
 
+    /// Compiles one search request, streams candidate frames over gRPC, and
+    /// emits per-stream tracing around plan and frame timing.
     async fn search_stream(
         &self,
         request: GrpcRequest<SearchRequest>,
@@ -1315,6 +1349,8 @@ impl GrpcSspry for GrpcServerService {
         ))
     }
 
+    /// Reassembles framed insert rows from the client stream and flushes them
+    /// through the shared batch-insert path.
     async fn insert_stream(
         &self,
         request: GrpcRequest<tonic::Streaming<InsertFrame>>,
