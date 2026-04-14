@@ -39,8 +39,8 @@ pub use query_plan::{
     rule_check_with_gram_sizes_and_identity_source, search_target_rule_names,
 };
 pub use store::{
-    CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidatePreparedQueryProfile,
-    CandidateQueryProfile, CandidateQueryResult, CandidateStats, CandidateStore,
+    CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryProfile,
+    CandidateQueryResult, CandidateStats, CandidateStore,
     DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, candidate_shard_index,
     candidate_shard_manifest_path, candidate_shard_root, read_candidate_shard_count,
     write_candidate_shard_count,

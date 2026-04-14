@@ -104,17 +104,13 @@ fn non_exact_patterns_use_any_lane_masks() {
         tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
-    let cache = build_pattern_mask_cache(
-        &[pattern],
-        &[(filter_bytes, bloom_hashes)],
-        &[],
-        DEFAULT_TIER1_GRAM_SIZE,
-        DEFAULT_TIER2_GRAM_SIZE,
-    )
-    .expect("mask cache");
-    let pattern_masks = cache.get("$a").expect("pattern masks");
-    assert!(pattern_masks.tier1[0].shifts.is_empty());
-    assert_eq!(pattern_masks.tier1[0].any_lane_values.len(), grams.len());
+    let runtime = build_runtime_query_artifacts(&plan).expect("runtime query artifacts");
+    let runtime_pattern = runtime
+        .runtime_patterns
+        .get("$a")
+        .expect("runtime pattern");
+    assert!(runtime_pattern.tier1[0].use_any_lane);
+    assert!(runtime_pattern.tier1[0].lane_variants.is_empty());
 
     let doc = CandidateDoc {
         doc_id: 0,
@@ -129,13 +125,13 @@ fn non_exact_patterns_use_any_lane_masks() {
     };
     let (mut inputs, load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bytes, &[]);
-    let outcome = evaluate_pattern(
-        &plan.patterns[0],
-        pattern_masks,
+    let outcome = evaluate_runtime_pattern_for_test(
+        &plan,
+        runtime.as_ref(),
+        "$a",
         &mut inputs,
         &mut load_tier1,
         &mut load_tier2,
-        &plan,
     )
     .expect("evaluate pattern");
     drop(load_metadata);
@@ -154,17 +150,27 @@ fn ambiguous_exact_patterns_fall_back_to_any_lane_masks() {
         fixed_literal_wide: vec![false],
         fixed_literal_fullword: vec![false],
     };
-    let cache = build_pattern_mask_cache(
-        &[pattern],
-        &[(64, 3)],
-        &[],
-        DEFAULT_TIER1_GRAM_SIZE,
-        DEFAULT_TIER2_GRAM_SIZE,
-    )
-    .expect("mask cache");
-    let pattern_masks = cache.get("$a").expect("pattern masks");
-    assert!(!pattern_masks.tier1[0].shifts.is_empty());
-    assert!(pattern_masks.tier1[0].any_lane_values.is_empty());
+    let plan = CompiledQueryPlan {
+        patterns: vec![pattern],
+        root: QueryNode {
+            kind: "pattern".to_owned(),
+            pattern_id: Some("$a".to_owned()),
+            threshold: None,
+            children: Vec::new(),
+        },
+        force_tier1_only: false,
+        allow_tier2_fallback: true,
+        max_candidates: 10.0,
+        tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+        tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+    };
+    let runtime = build_runtime_query_artifacts(&plan).expect("runtime query artifacts");
+    let runtime_pattern = runtime
+        .runtime_patterns
+        .get("$a")
+        .expect("runtime pattern");
+    assert!(!runtime_pattern.tier1[0].use_any_lane);
+    assert!(!runtime_pattern.tier1[0].lane_variants.is_empty());
 }
 
 #[test]
@@ -192,15 +198,7 @@ fn tier2_only_patterns_do_not_match_without_tier2_bloom_hit() {
         tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
-    let cache = build_pattern_mask_cache(
-        &[pattern],
-        &[(64, 3)],
-        &[(64, 3)],
-        DEFAULT_TIER1_GRAM_SIZE,
-        DEFAULT_TIER2_GRAM_SIZE,
-    )
-    .expect("mask cache");
-    let pattern_masks = cache.get("$a").expect("pattern masks");
+    let runtime = build_runtime_query_artifacts(&plan).expect("runtime query artifacts");
     let doc = CandidateDoc {
         doc_id: 0,
         sha256: String::new(),
@@ -215,13 +213,13 @@ fn tier2_only_patterns_do_not_match_without_tier2_bloom_hit() {
 
     let (mut miss_inputs, _load_metadata, mut miss_tier1, mut miss_tier2) =
         prefetched_query_inputs(&doc, &[], &[], &[]);
-    let miss = evaluate_pattern(
-        &plan.patterns[0],
-        pattern_masks,
+    let miss = evaluate_runtime_pattern_for_test(
+        &plan,
+        runtime.as_ref(),
+        "$a",
         &mut miss_inputs,
         &mut miss_tier1,
         &mut miss_tier2,
-        &plan,
     )
     .expect("evaluate miss");
     assert!(!miss.matched);
@@ -229,13 +227,13 @@ fn tier2_only_patterns_do_not_match_without_tier2_bloom_hit() {
     let tier2_bloom = lane_bloom_bytes(64, 3, &[pack_exact_gram(b"To:!")]);
     let (mut hit_inputs, _load_metadata, mut hit_tier1, mut hit_tier2) =
         prefetched_query_inputs(&doc, &[], &[], &tier2_bloom);
-    let hit = evaluate_pattern(
-        &plan.patterns[0],
-        pattern_masks,
+    let hit = evaluate_runtime_pattern_for_test(
+        &plan,
+        runtime.as_ref(),
+        "$a",
         &mut hit_inputs,
         &mut hit_tier1,
         &mut hit_tier2,
-        &plan,
     )
     .expect("evaluate hit");
     assert!(hit.matched);
@@ -263,6 +261,109 @@ fn prefetched_query_inputs<'a>(
         move || borrowed_bytes(metadata_bytes),
         move || borrowed_bytes(tier1_bloom_bytes),
         move || borrowed_bytes(tier2_bloom_bytes),
+    )
+}
+
+fn evaluate_runtime_pattern_for_test<'a, FT1, FT2>(
+    plan: &CompiledQueryPlan,
+    runtime: &RuntimeQueryArtifacts,
+    pattern_id: &str,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
+) -> Result<MatchOutcome>
+where
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let pattern = runtime
+        .patterns
+        .get(pattern_id)
+        .expect("runtime pattern missing");
+    let runtime_pattern = runtime
+        .runtime_patterns
+        .get(pattern_id)
+        .expect("runtime pattern artifacts missing");
+    let mut gram_cache = RuntimeGramMaskCache::default();
+    evaluate_pattern_runtime(
+        pattern,
+        runtime_pattern,
+        doc_inputs,
+        load_tier1,
+        load_tier2,
+        plan,
+        &mut gram_cache,
+    )
+}
+
+fn evaluate_runtime_node_for_test<'a, FM, FT1, FT2>(
+    node: &QueryNode,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_metadata: &mut FM,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
+    runtime: &RuntimeQueryArtifacts,
+    plan: &CompiledQueryPlan,
+    query_now_unix: u64,
+) -> Result<MatchOutcome>
+where
+    FM: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let mut eval_cache = QueryEvalCache::default();
+    let mut gram_cache = RuntimeGramMaskCache::default();
+    evaluate_node_runtime(
+        node,
+        doc_inputs,
+        load_metadata,
+        load_tier1,
+        load_tier2,
+        runtime,
+        plan,
+        query_now_unix,
+        &mut eval_cache,
+        &mut gram_cache,
+    )
+}
+
+fn evaluate_node_with_test_patterns<'a, FM, FT1, FT2>(
+    node: &QueryNode,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_metadata: &mut FM,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
+    patterns: &HashMap<String, PatternPlan>,
+    plan: &CompiledQueryPlan,
+    query_now_unix: u64,
+) -> Result<MatchOutcome>
+where
+    FM: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let mut eval_cache = QueryEvalCache::default();
+    let mut eval_pattern = |_pattern_id: &str,
+                            _doc_inputs: &mut LazyDocQueryInputs<'a>,
+                            _load_tier1: &mut FT1,
+                            _load_tier2: &mut FT2,
+                            _plan: &CompiledQueryPlan|
+     -> Result<MatchOutcome> {
+        Err(SspryError::from(
+            "pattern evaluation not expected in metadata-only test helper",
+        ))
+    };
+    evaluate_node_with_patterns(
+        node,
+        doc_inputs,
+        load_metadata,
+        load_tier1,
+        load_tier2,
+        patterns,
+        plan,
+        query_now_unix,
+        &mut eval_cache,
+        &mut eval_pattern,
     )
 }
 
@@ -295,18 +396,7 @@ fn evaluate_rule_against_file_blooms(
         64 * 1024,
         None,
     )?;
-    let patterns = plan
-        .patterns
-        .iter()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern.clone()))
-        .collect::<HashMap<_, _>>();
-    let mask_cache = build_pattern_mask_cache(
-        &plan.patterns,
-        &[(filter_bytes, bloom_hashes)],
-        &[(tier2_filter_bytes, tier2_bloom_hashes)],
-        plan.tier1_gram_size,
-        plan.tier2_gram_size,
-    )?;
+    let runtime = build_runtime_query_artifacts(&plan)?;
     let doc = CandidateDoc {
         doc_id: 0,
         sha256: hex::encode(features.sha256),
@@ -325,17 +415,15 @@ fn evaluate_rule_against_file_blooms(
             &features.bloom_filter,
             &features.tier2_bloom_filter,
         );
-    evaluate_node(
+    evaluate_runtime_node_for_test(
         &plan.root,
         &mut doc_inputs,
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
-        &patterns,
-        &mask_cache,
+        runtime.as_ref(),
         &plan,
         0,
-        &mut QueryEvalCache::default(),
     )
 }
 
@@ -1938,11 +2026,6 @@ fn query_and_ast_edge_paths_work() {
             fixed_literal_fullword: vec![false],
         },
     ];
-    let patterns = patterns_vec
-        .iter()
-        .cloned()
-        .map(|pattern| (pattern.pattern_id.clone(), pattern))
-        .collect::<HashMap<_, _>>();
     let eval_plan = CompiledQueryPlan {
         patterns: patterns_vec.clone(),
         root: QueryNode {
@@ -1957,25 +2040,18 @@ fn query_and_ast_edge_paths_work() {
         tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
+    let runtime = build_runtime_query_artifacts(&eval_plan).expect("runtime query artifacts");
     let tier2_bloom_bytes = &[][..];
-    let mask_cache = build_pattern_mask_cache(
-        &patterns_vec,
-        &[(64, 2)],
-        &[(64, 2)],
-        DEFAULT_TIER1_GRAM_SIZE,
-        DEFAULT_TIER2_GRAM_SIZE,
-    )
-    .expect("pattern mask cache");
 
     let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_pattern(
-        patterns.get("empty").expect("empty"),
-        mask_cache.get("empty").expect("empty masks"),
+    let outcome = evaluate_runtime_pattern_for_test(
+        &eval_plan,
+        runtime.as_ref(),
+        "empty",
         &mut doc_inputs,
         &mut load_tier1,
         &mut load_tier2,
-        &eval_plan,
     )
     .expect("empty pattern");
     assert!(outcome.matched);
@@ -1989,13 +2065,13 @@ fn query_and_ast_edge_paths_work() {
     let complete_doc = doc.clone();
     let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&complete_doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_pattern(
-        patterns.get("missing").expect("missing"),
-        mask_cache.get("missing").expect("missing masks"),
+    let outcome = evaluate_runtime_pattern_for_test(
+        &no_fallback_plan,
+        runtime.as_ref(),
+        "missing",
         &mut doc_inputs,
         &mut load_tier1,
         &mut load_tier2,
-        &no_fallback_plan,
     )
     .expect("no match");
     assert!(!outcome.matched);
@@ -2008,13 +2084,13 @@ fn query_and_ast_edge_paths_work() {
     };
     let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&complete_doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_pattern(
-        patterns.get("tier2").expect("tier2"),
-        mask_cache.get("tier2").expect("tier2 masks"),
+    let outcome = evaluate_runtime_pattern_for_test(
+        &allow_fallback_plan,
+        runtime.as_ref(),
+        "tier2",
         &mut doc_inputs,
         &mut load_tier1,
         &mut load_tier2,
-        &allow_fallback_plan,
     )
     .expect("complete doc should match via bloom path");
     assert!(outcome.matched);
@@ -2023,13 +2099,13 @@ fn query_and_ast_edge_paths_work() {
     let no_overlap_doc = doc.clone();
     let (mut doc_inputs, _load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&no_overlap_doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_pattern(
-        patterns.get("tier2").expect("tier2"),
-        mask_cache.get("tier2").expect("tier2 masks"),
+    let outcome = evaluate_runtime_pattern_for_test(
+        &allow_fallback_plan,
+        runtime.as_ref(),
+        "tier2",
         &mut doc_inputs,
         &mut load_tier1,
         &mut load_tier2,
-        &allow_fallback_plan,
     )
     .expect("bloom-only path should match from bloom anchors");
     assert!(outcome.matched);
@@ -2037,7 +2113,7 @@ fn query_and_ast_edge_paths_work() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_node(
+    let outcome = evaluate_runtime_node_for_test(
         &QueryNode {
             kind: "and".to_owned(),
             pattern_id: None,
@@ -2061,11 +2137,9 @@ fn query_and_ast_edge_paths_work() {
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
-        &patterns,
-        &mask_cache,
+        runtime.as_ref(),
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("and");
     assert!(!outcome.matched);
@@ -2073,7 +2147,7 @@ fn query_and_ast_edge_paths_work() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_node(
+    let outcome = evaluate_runtime_node_for_test(
         &QueryNode {
             kind: "or".to_owned(),
             pattern_id: None,
@@ -2097,11 +2171,9 @@ fn query_and_ast_edge_paths_work() {
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
-        &patterns,
-        &mask_cache,
+        runtime.as_ref(),
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("or");
     assert!(outcome.matched);
@@ -2109,7 +2181,7 @@ fn query_and_ast_edge_paths_work() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_node(
+    let outcome = evaluate_runtime_node_for_test(
         &QueryNode {
             kind: "n_of".to_owned(),
             pattern_id: None,
@@ -2133,11 +2205,9 @@ fn query_and_ast_edge_paths_work() {
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
-        &patterns,
-        &mask_cache,
+        runtime.as_ref(),
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("n_of");
     assert!(outcome.matched);
@@ -2147,7 +2217,7 @@ fn query_and_ast_edge_paths_work() {
         {
             let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
                 prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-            evaluate_node(
+            evaluate_runtime_node_for_test(
                 &QueryNode {
                     kind: "n_of".to_owned(),
                     pattern_id: None,
@@ -2158,11 +2228,9 @@ fn query_and_ast_edge_paths_work() {
                 &mut load_metadata,
                 &mut load_tier1,
                 &mut load_tier2,
-                &patterns,
-                &mask_cache,
+                runtime.as_ref(),
                 &eval_plan,
                 0,
-                &mut QueryEvalCache::default(),
             )
         }
         .expect_err("missing threshold")
@@ -2173,7 +2241,7 @@ fn query_and_ast_edge_paths_work() {
         {
             let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
                 prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-            evaluate_node(
+            evaluate_runtime_node_for_test(
                 &QueryNode {
                     kind: "bogus".to_owned(),
                     pattern_id: None,
@@ -2184,11 +2252,9 @@ fn query_and_ast_edge_paths_work() {
                 &mut load_metadata,
                 &mut load_tier1,
                 &mut load_tier2,
-                &patterns,
-                &mask_cache,
+                runtime.as_ref(),
                 &eval_plan,
                 0,
-                &mut QueryEvalCache::default(),
             )
         }
         .expect_err("unsupported kind")
@@ -2198,7 +2264,7 @@ fn query_and_ast_edge_paths_work() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_node(
+    let outcome = evaluate_runtime_node_for_test(
         &QueryNode {
             kind: "not".to_owned(),
             pattern_id: None,
@@ -2214,18 +2280,16 @@ fn query_and_ast_edge_paths_work() {
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
-        &patterns,
-        &mask_cache,
+        runtime.as_ref(),
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("not pattern");
     assert!(outcome.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &bloom_bytes, tier2_bloom_bytes);
-    let outcome = evaluate_node(
+    let outcome = evaluate_runtime_node_for_test(
         &QueryNode {
             kind: "not".to_owned(),
             pattern_id: None,
@@ -2241,11 +2305,9 @@ fn query_and_ast_edge_paths_work() {
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
-        &patterns,
-        &mask_cache,
+        runtime.as_ref(),
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("not filesize");
     assert!(!outcome.matched);
@@ -2402,7 +2464,6 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         deleted: false,
     };
     let patterns = HashMap::<String, PatternPlan>::new();
-    let mask_cache = PatternMaskCache::new();
     let eval_plan = CompiledQueryPlan {
         patterns: Vec::new(),
         root: QueryNode {
@@ -2420,24 +2481,22 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let metadata_outcome = evaluate_node(
+    let metadata_outcome = evaluate_node_with_test_patterns(
         &eval_plan.root,
         &mut doc_inputs,
         &mut load_metadata,
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("metadata eq");
     assert!(metadata_outcome.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &[], &[]);
-    let unknown_outcome = evaluate_node(
+    let unknown_outcome = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "metadata_eq".to_owned(),
             pattern_id: Some("elf.machine".to_owned()),
@@ -2449,17 +2508,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("unknown metadata eq");
     assert!(unknown_outcome.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let time_outcome = evaluate_node(
+    let time_outcome = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "time_now_eq".to_owned(),
             pattern_id: Some("time.now".to_owned()),
@@ -2471,17 +2528,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         1234,
-        &mut QueryEvalCache::default(),
     )
     .expect("time now eq");
     assert!(time_outcome.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let time_gt_outcome = evaluate_node(
+    let time_gt_outcome = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "time_now_gt".to_owned(),
             pattern_id: Some("time.now".to_owned()),
@@ -2493,17 +2548,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         1234,
-        &mut QueryEvalCache::default(),
     )
     .expect("time now gt");
     assert!(time_gt_outcome.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let verifier_outcome = evaluate_node(
+    let verifier_outcome = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_eq".to_owned(),
             pattern_id: Some("uint16(0)==23117".to_owned()),
@@ -2515,10 +2568,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("verifier only eq");
     assert!(verifier_outcome.matched);
@@ -2533,7 +2584,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
     };
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
-    let numeric_true = evaluate_node(
+    let numeric_true = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_eq".to_owned(),
             pattern_id: Some("uint64(0)==1234605616436508552".to_owned()),
@@ -2545,10 +2596,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("uint64 prefix eq");
     assert!(numeric_true.matched);
@@ -2559,7 +2608,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
-    let numeric_u32 = evaluate_node(
+    let numeric_u32 = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_eq".to_owned(),
             pattern_id: Some("uint32(0)==1432778632".to_owned()),
@@ -2571,10 +2620,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("uint32 prefix eq");
     assert_eq!(
@@ -2588,7 +2635,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
-    let numeric_u32_offset = evaluate_node(
+    let numeric_u32_offset = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_eq".to_owned(),
             pattern_id: Some("uint32(4)==287454020".to_owned()),
@@ -2600,10 +2647,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("uint32 prefix eq at offset 4");
     assert_eq!(
@@ -2617,7 +2662,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&numeric_doc, &numeric_metadata, &[], &[]);
-    let numeric_false = evaluate_node(
+    let numeric_false = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_eq".to_owned(),
             pattern_id: Some("int16be(0)==-2".to_owned()),
@@ -2629,10 +2674,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("int16be prefix eq");
     assert!(!numeric_false.matched);
@@ -2652,7 +2695,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
     };
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&short_doc, &short_metadata, &[], &[]);
-    let short_numeric = evaluate_node(
+    let short_numeric = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_eq".to_owned(),
             pattern_id: Some("uint32(0)==0".to_owned()),
@@ -2664,10 +2707,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("short uint64 prefix eq");
     assert_eq!(
@@ -2678,7 +2719,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let metadata_ne = evaluate_node(
+    let metadata_ne = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "metadata_ne".to_owned(),
             pattern_id: Some("pe.machine".to_owned()),
@@ -2690,17 +2731,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         200_000_000,
-        &mut QueryEvalCache::default(),
     )
     .expect("metadata ne");
     assert!(metadata_ne.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let metadata_time = evaluate_node(
+    let metadata_time = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "metadata_time_lt".to_owned(),
             pattern_id: Some("pe.timestamp".to_owned()),
@@ -2712,17 +2751,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         400_000_000,
-        &mut QueryEvalCache::default(),
     )
     .expect("metadata time lt");
     assert!(metadata_time.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let metadata_field = evaluate_node(
+    let metadata_field = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "metadata_field_lt".to_owned(),
             pattern_id: Some("pe.subsystem|pe.machine".to_owned()),
@@ -2734,10 +2771,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("metadata field lt");
     assert!(metadata_field.matched);
@@ -2756,7 +2791,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
     )]);
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let at_zero_true = evaluate_node(
+    let at_zero_true = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_at".to_owned(),
             pattern_id: Some("$mz@0".to_owned()),
@@ -2768,10 +2803,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &at_zero_patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("at zero prefix true");
     assert!(at_zero_true.matched);
@@ -2798,7 +2831,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
     )]);
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let at_zero_false = evaluate_node(
+    let at_zero_false = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_at".to_owned(),
             pattern_id: Some("$pk@0".to_owned()),
@@ -2810,10 +2843,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &at_zero_patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("at zero prefix false");
     assert!(!at_zero_false.matched);
@@ -2840,7 +2871,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
     )]);
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let at_entrypoint_true = evaluate_node(
+    let at_entrypoint_true = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_at".to_owned(),
             pattern_id: Some("$ep@pe.entry_point".to_owned()),
@@ -2852,17 +2883,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &entrypoint_patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("entrypoint prefix true");
     assert!(at_entrypoint_true.matched);
 
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &[], &[], &[]);
-    let at_entrypoint_without_metadata = evaluate_node(
+    let at_entrypoint_without_metadata = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_at".to_owned(),
             pattern_id: Some("$ep@pe.entry_point".to_owned()),
@@ -2874,10 +2903,8 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &entrypoint_patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("entrypoint prefix missing metadata");
     assert!(
@@ -2899,7 +2926,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
     )]);
     let (mut doc_inputs, mut load_metadata, mut load_tier1, mut load_tier2) =
         prefetched_query_inputs(&doc, &metadata_bytes, &[], &[]);
-    let at_entrypoint_plus_true = evaluate_node(
+    let at_entrypoint_plus_true = evaluate_node_with_test_patterns(
         &QueryNode {
             kind: "verifier_only_at".to_owned(),
             pattern_id: Some("$ep_plus@pe.entry_point+5".to_owned()),
@@ -2911,17 +2938,15 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
         &mut load_tier1,
         &mut load_tier2,
         &shifted_entrypoint_patterns,
-        &mask_cache,
         &eval_plan,
         0,
-        &mut QueryEvalCache::default(),
     )
     .expect("entrypoint prefix plus offset");
     assert!(at_entrypoint_plus_true.matched);
 }
 
 #[test]
-fn prepared_query_cache_reuses_entries_and_invalidates_on_mutation() {
+fn query_artifact_cache_reuses_entries_and_invalidates_on_mutation() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("store");
     let mut store = CandidateStore::init(
@@ -2997,22 +3022,22 @@ fn prepared_query_cache_reuses_entries_and_invalidates_on_mutation() {
     };
 
     let first = store.query_candidates(&plan, 0, 64).expect("first query");
-    assert_eq!(store.prepared_query_cache.len(), 1);
+    assert_eq!(store.query_artifact_cache.len(), 1);
 
     let second = store.query_candidates(&plan, 0, 64).expect("second query");
     assert_eq!(first.total_candidates, second.total_candidates);
-    assert_eq!(store.prepared_query_cache.len(), 1);
+    assert_eq!(store.query_artifact_cache.len(), 1);
 
     let delete = store.delete_document(&hex::encode(sha256)).expect("delete");
     assert_eq!(delete.status, "deleted");
-    assert_eq!(store.prepared_query_cache.len(), 0);
+    assert_eq!(store.query_artifact_cache.len(), 0);
 
     let _third = store.query_candidates(&plan, 0, 64).expect("third query");
-    assert_eq!(store.prepared_query_cache.len(), 1);
+    assert_eq!(store.query_artifact_cache.len(), 1);
 }
 
 #[test]
-fn clear_search_caches_empties_prepared_query_cache() {
+fn clear_search_caches_empties_query_artifact_cache() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("store");
     let mut store = CandidateStore::init(
@@ -3061,9 +3086,9 @@ rule q {
     .expect("plan");
 
     let _ = store.query_candidates(&plan, 0, 64).expect("query");
-    assert_eq!(store.prepared_query_cache.len(), 1);
+    assert_eq!(store.query_artifact_cache.len(), 1);
     store.clear_search_caches();
-    assert_eq!(store.prepared_query_cache.len(), 0);
+    assert_eq!(store.query_artifact_cache.len(), 0);
 }
 
 #[test]
@@ -3306,106 +3331,6 @@ fn query_candidates_tier2_and_metadata_only_scans_docs_without_tier1_loads() {
     assert_eq!(result.query_profile.tier1_bloom_loads, 0);
     assert_eq!(result.query_profile.tier2_bloom_loads, 2);
     assert_eq!(result.tier_used, "tier2");
-}
-
-#[test]
-fn collect_query_hits_with_prepared_batch_reuses_doc_sidecar_loads_across_rules() {
-    let tmp = tempdir().expect("tmp");
-    let root = tmp.path().join("store");
-    let mut store = CandidateStore::init(
-        CandidateConfig {
-            root,
-            filter_target_fp: None,
-            tier1_filter_target_fp: None,
-            tier2_filter_target_fp: None,
-            ..CandidateConfig::default()
-        },
-        true,
-    )
-    .expect("init");
-
-    let gram = pack_exact_gram(b"ABC");
-    for idx in 0..2u8 {
-        let sha256 = [idx + 1; 32];
-        let filter_bytes = store
-            .resolve_filter_bytes_for_file_size(123, None)
-            .expect("filter bytes");
-        let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, None, None);
-        let bloom_bytes = lane_bloom_bytes(filter_bytes, bloom_hashes, &[gram]);
-        store
-            .insert_document_with_metadata(
-                sha256,
-                123,
-                None,
-                None,
-                None,
-                None,
-                filter_bytes,
-                &bloom_bytes,
-                0,
-                &[],
-                &[],
-                false,
-                None,
-            )
-            .expect("insert doc");
-    }
-
-    let make_plan = |pattern_id: &str| CompiledQueryPlan {
-        patterns: vec![PatternPlan {
-            pattern_id: pattern_id.to_owned(),
-            alternatives: vec![vec![gram]],
-            tier2_alternatives: vec![Vec::new()],
-            anchor_literals: vec![vec![b'A', b'B', b'C']],
-            fixed_literals: vec![vec![b'A', b'B', b'C']],
-            fixed_literal_wide: vec![false],
-            fixed_literal_fullword: vec![false],
-        }],
-        root: QueryNode {
-            kind: "pattern".to_owned(),
-            pattern_id: Some(pattern_id.to_owned()),
-            threshold: None,
-            children: Vec::new(),
-        },
-        force_tier1_only: false,
-        allow_tier2_fallback: true,
-        max_candidates: 8.0,
-        tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
-        tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
-    };
-
-    let plan_a = make_plan("$a");
-    let plan_b = make_plan("$b");
-    let prepared_a = store.prepare_query_artifacts(&plan_a).expect("prepared a");
-    let prepared_b = store.prepare_query_artifacts(&plan_b).expect("prepared b");
-
-    let single_a = store
-        .collect_query_hits_with_prepared(&plan_a, prepared_a.as_ref())
-        .expect("single query a");
-    let single_b = store
-        .collect_query_hits_with_prepared(&plan_b, prepared_b.as_ref())
-        .expect("single query b");
-    let singles_tier1_loads = single_a
-        .2
-        .tier1_bloom_loads
-        .saturating_add(single_b.2.tier1_bloom_loads);
-    assert_eq!(singles_tier1_loads, 4);
-
-    let batched = store
-        .collect_query_hits_with_prepared_batch(&[plan_a, plan_b], &[prepared_a, prepared_b])
-        .expect("batched query");
-    assert_eq!(batched.len(), 2);
-    assert_eq!(batched[0].0, single_a.0);
-    assert_eq!(batched[1].0, single_b.0);
-    assert_eq!(batched[0].1, "tier1");
-    assert_eq!(batched[1].1, "tier1");
-    assert_eq!(batched[0].2.docs_scanned, 2);
-    assert_eq!(batched[1].2.docs_scanned, 2);
-    let batched_tier1_loads = batched[0]
-        .2
-        .tier1_bloom_loads
-        .saturating_add(batched[1].2.tier1_bloom_loads);
-    assert_eq!(batched_tier1_loads, 2);
 }
 
 #[test]

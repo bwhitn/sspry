@@ -248,7 +248,6 @@ fn grpc_search_frame_to_internal_preserves_bundled_rule_metadata() {
         truncated: false,
         tier_used: "tier1".to_owned(),
         query_profile: CandidateQueryProfile::default(),
-        prepared_query_profile: CandidatePreparedQueryProfile::default(),
     };
 
     let internal = grpc_search_frame_to_internal(frame);
@@ -315,7 +314,6 @@ rule rule_two {
                 target_rule_name: "rule_one".to_owned(),
                 tier_used: String::new(),
                 query_profile: CandidateQueryProfile::default(),
-                prepared_query_profile: CandidatePreparedQueryProfile::default(),
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
@@ -330,7 +328,6 @@ rule rule_two {
                     docs_scanned: 11,
                     ..CandidateQueryProfile::default()
                 },
-                prepared_query_profile: CandidatePreparedQueryProfile::default(),
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
@@ -342,7 +339,6 @@ rule rule_two {
                 target_rule_name: "rule_two".to_owned(),
                 tier_used: String::new(),
                 query_profile: CandidateQueryProfile::default(),
-                prepared_query_profile: CandidatePreparedQueryProfile::default(),
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
@@ -357,7 +353,6 @@ rule rule_two {
                     docs_scanned: 22,
                     ..CandidateQueryProfile::default()
                 },
-                prepared_query_profile: CandidatePreparedQueryProfile::default(),
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
@@ -369,7 +364,6 @@ rule rule_two {
                 target_rule_name: String::new(),
                 tier_used: String::new(),
                 query_profile: CandidateQueryProfile::default(),
-                prepared_query_profile: CandidatePreparedQueryProfile::default(),
                 query_eval_nanos: 0,
             })?;
             Ok(())
@@ -1748,25 +1742,6 @@ fn batch_search_record_stream_roundtrips_json_outputs() {
         verbose_search_tier1_bloom_bytes: Some(128),
         verbose_search_tier2_bloom_loads: Some(1),
         verbose_search_tier2_bloom_bytes: Some(64),
-        verbose_search_prepared_query_bytes: Some(32),
-        verbose_search_prepared_pattern_plan_bytes: Some(16),
-        verbose_search_prepared_mask_cache_bytes: Some(8),
-        verbose_search_prepared_pattern_count: Some(1),
-        verbose_search_prepared_mask_cache_entries: Some(1),
-        verbose_search_prepared_fixed_literal_count: Some(1),
-        verbose_search_prepared_tier1_alternatives: Some(1),
-        verbose_search_prepared_tier2_alternatives: Some(1),
-        verbose_search_prepared_tier1_shift_variants: Some(1),
-        verbose_search_prepared_tier2_shift_variants: Some(1),
-        verbose_search_prepared_tier1_any_lane_alternatives: Some(0),
-        verbose_search_prepared_tier2_any_lane_alternatives: Some(0),
-        verbose_search_prepared_tier1_compacted_any_lane_alternatives: Some(0),
-        verbose_search_prepared_tier2_compacted_any_lane_alternatives: Some(0),
-        verbose_search_prepared_any_lane_variant_sets: Some(0),
-        verbose_search_prepared_compacted_any_lane_grams: Some(0),
-        verbose_search_prepared_max_pattern_bytes: Some(4),
-        verbose_search_prepared_max_pattern_id: Some("$a".to_owned()),
-        verbose_search_prepared_impossible_query: Some(false),
         verbose_search_max_candidates: Some(100.0),
         verbose_search_max_anchors_per_pattern: Some(8),
         verbose_search_candidates: Some(2),
@@ -1807,25 +1782,6 @@ fn batch_search_record_stream_roundtrips_json_outputs() {
         verbose_search_tier1_bloom_bytes: None,
         verbose_search_tier2_bloom_loads: None,
         verbose_search_tier2_bloom_bytes: None,
-        verbose_search_prepared_query_bytes: None,
-        verbose_search_prepared_pattern_plan_bytes: None,
-        verbose_search_prepared_mask_cache_bytes: None,
-        verbose_search_prepared_pattern_count: None,
-        verbose_search_prepared_mask_cache_entries: None,
-        verbose_search_prepared_fixed_literal_count: None,
-        verbose_search_prepared_tier1_alternatives: None,
-        verbose_search_prepared_tier2_alternatives: None,
-        verbose_search_prepared_tier1_shift_variants: None,
-        verbose_search_prepared_tier2_shift_variants: None,
-        verbose_search_prepared_tier1_any_lane_alternatives: None,
-        verbose_search_prepared_tier2_any_lane_alternatives: None,
-        verbose_search_prepared_tier1_compacted_any_lane_alternatives: None,
-        verbose_search_prepared_tier2_compacted_any_lane_alternatives: None,
-        verbose_search_prepared_any_lane_variant_sets: None,
-        verbose_search_prepared_compacted_any_lane_grams: None,
-        verbose_search_prepared_max_pattern_bytes: None,
-        verbose_search_prepared_max_pattern_id: None,
-        verbose_search_prepared_impossible_query: None,
         verbose_search_max_candidates: None,
         verbose_search_max_anchors_per_pattern: None,
         verbose_search_candidates: None,
@@ -1983,9 +1939,7 @@ rule miss_rule {
         100,
     )
     .expect("compile plan");
-    let prepared =
-        forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes).expect("profile");
-    assert!(prepared.pattern_count >= 1);
+    assert_eq!(summary_cap_bytes, 0);
 
     let local_tree = query_store_group_all_candidates(&mut tree_groups[0].stores, &plan, true)
         .expect("local tree query");

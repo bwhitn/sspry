@@ -279,7 +279,6 @@ message SearchFrame {
   bool truncated = 6;
   string tier_used = 7;
   QueryProfileSummary query_profile = 8;
-  PreparedQueryProfileSummary prepared_query_profile = 9;
   bool rule_complete = 10;
   string target_rule_name = 11;
 }
@@ -292,28 +291,6 @@ message QueryProfileSummary {
   uint64 tier1_bloom_bytes = 5;
   uint64 tier2_bloom_loads = 6;
   uint64 tier2_bloom_bytes = 7;
-}
-
-message PreparedQueryProfileSummary {
-  bool impossible_query = 1;
-  uint64 prepared_query_bytes = 2;
-  uint64 prepared_pattern_plan_bytes = 3;
-  uint64 prepared_mask_cache_bytes = 4;
-  uint64 pattern_count = 5;
-  uint64 mask_cache_entries = 6;
-  uint64 fixed_literal_count = 7;
-  uint64 tier1_alternatives = 8;
-  uint64 tier2_alternatives = 9;
-  uint64 tier1_shift_variants = 10;
-  uint64 tier2_shift_variants = 11;
-  uint64 tier1_any_lane_alternatives = 12;
-  uint64 tier2_any_lane_alternatives = 13;
-  uint64 tier1_compacted_any_lane_alternatives = 14;
-  uint64 tier2_compacted_any_lane_alternatives = 15;
-  uint64 any_lane_variant_sets = 16;
-  uint64 compacted_any_lane_grams = 17;
-  uint64 max_pattern_bytes = 18;
-  OptionalString max_pattern_id = 19;
 }
 
 message InsertFrame {

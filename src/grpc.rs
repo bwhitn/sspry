@@ -4,7 +4,7 @@ use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::candidate::{CandidatePreparedQueryProfile, CandidateQueryProfile};
+use crate::candidate::CandidateQueryProfile;
 use crate::rpc::CandidateDeleteResponse;
 use crate::rpc::DEFAULT_MAX_REQUEST_BYTES;
 use crate::{Result, SspryError};
@@ -110,7 +110,6 @@ pub struct GrpcSearchFrame {
     pub truncated: bool,
     pub tier_used: String,
     pub query_profile: CandidateQueryProfile,
-    pub prepared_query_profile: CandidatePreparedQueryProfile,
 }
 
 impl BlockingGrpcClient {
@@ -329,8 +328,6 @@ impl BlockingGrpcClient {
             while let Some(frame) = stream.next().await {
                 let frame = frame.map_err(tonic_error)?;
                 let query_profile = query_profile_from_proto(frame.query_profile.as_ref());
-                let prepared_query_profile =
-                    prepared_query_profile_from_proto(frame.prepared_query_profile.as_ref());
                 let mapped = GrpcSearchFrame {
                     sha256: frame.sha256,
                     external_ids: frame
@@ -347,7 +344,6 @@ impl BlockingGrpcClient {
                     truncated: frame.truncated,
                     tier_used: frame.tier_used,
                     query_profile,
-                    prepared_query_profile,
                 };
                 on_frame(mapped)?;
             }
@@ -390,40 +386,6 @@ fn query_profile_from_proto(summary: Option<&v1::QueryProfileSummary>) -> Candid
         tier1_bloom_bytes: summary.tier1_bloom_bytes,
         tier2_bloom_loads: summary.tier2_bloom_loads,
         tier2_bloom_bytes: summary.tier2_bloom_bytes,
-    }
-}
-
-/// Converts an optional protobuf prepared-query profile into the local summary
-/// type used by higher layers.
-fn prepared_query_profile_from_proto(
-    summary: Option<&v1::PreparedQueryProfileSummary>,
-) -> CandidatePreparedQueryProfile {
-    let Some(summary) = summary else {
-        return CandidatePreparedQueryProfile::default();
-    };
-    CandidatePreparedQueryProfile {
-        impossible_query: summary.impossible_query,
-        prepared_query_bytes: summary.prepared_query_bytes,
-        prepared_pattern_plan_bytes: summary.prepared_pattern_plan_bytes,
-        prepared_mask_cache_bytes: summary.prepared_mask_cache_bytes,
-        pattern_count: summary.pattern_count,
-        mask_cache_entries: summary.mask_cache_entries,
-        fixed_literal_count: summary.fixed_literal_count,
-        tier1_alternatives: summary.tier1_alternatives,
-        tier2_alternatives: summary.tier2_alternatives,
-        tier1_shift_variants: summary.tier1_shift_variants,
-        tier2_shift_variants: summary.tier2_shift_variants,
-        tier1_any_lane_alternatives: summary.tier1_any_lane_alternatives,
-        tier2_any_lane_alternatives: summary.tier2_any_lane_alternatives,
-        tier1_compacted_any_lane_alternatives: summary.tier1_compacted_any_lane_alternatives,
-        tier2_compacted_any_lane_alternatives: summary.tier2_compacted_any_lane_alternatives,
-        any_lane_variant_sets: summary.any_lane_variant_sets,
-        compacted_any_lane_grams: summary.compacted_any_lane_grams,
-        max_pattern_bytes: summary.max_pattern_bytes,
-        max_pattern_id: summary
-            .max_pattern_id
-            .as_ref()
-            .and_then(|value| value.has_value.then(|| value.value.clone())),
     }
 }
 

@@ -563,7 +563,7 @@ fn direct_server_query_caches_results_and_external_ids() {
     );
     assert_eq!(
         state
-            .prepared_plan_cache
+            .query_artifact_cache
             .lock()
             .expect("prepared plan cache")
             .len(),
@@ -2681,12 +2681,6 @@ fn direct_multishard_stream_candidate_query_frames_returns_hits_from_all_shards(
     assert_eq!(stream_complete.len(), 1);
     assert_eq!(stream_complete[0].tier_used, "tier1");
     assert!(stream_complete[0].query_profile.docs_scanned >= 2);
-    assert_eq!(
-        stream_complete[0]
-            .prepared_query_profile
-            .prepared_query_bytes,
-        0
-    );
 
     let mut hashes = Vec::new();
     let mut external_ids = Vec::new();
@@ -2775,10 +2769,7 @@ fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_r
     let rule_complete = frames
         .iter()
         .filter(|frame| frame.rule_complete)
-        .map(|frame| {
-            assert_eq!(frame.prepared_query_profile.prepared_query_bytes, 0);
-            frame.target_rule_name.clone()
-        })
+        .map(|frame| frame.target_rule_name.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         rule_complete,

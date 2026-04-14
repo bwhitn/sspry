@@ -25,8 +25,8 @@ use crate::candidate::query_plan::{
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
-    CandidateStore, CompiledQueryPlan, DEFAULT_TIER1_FILTER_TARGET_FP,
+    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
+    DEFAULT_TIER1_FILTER_TARGET_FP,
     DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index,
     candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
@@ -1846,7 +1846,6 @@ struct SearchExecution {
     truncated_limit: Option<usize>,
     rows: Vec<String>,
     query_profile: CandidateQueryProfile,
-    prepared_query_profile: CandidatePreparedQueryProfile,
     external_ids: Vec<Option<String>>,
     tree_count: Option<usize>,
     tree_search_workers: Option<usize>,
@@ -1863,7 +1862,6 @@ struct SearchExecutionAccumulator {
     external_ids: Vec<Option<String>>,
     accepted_positions: HashMap<String, usize>,
     query_profile: CandidateQueryProfile,
-    prepared_query_profile: CandidatePreparedQueryProfile,
     total_candidates: usize,
     tier_used: String,
     truncated: bool,
@@ -1886,7 +1884,6 @@ impl SearchExecutionAccumulator {
             self.terminal_received = true;
             self.tier_used = frame.tier_used;
             self.query_profile = frame.query_profile;
-            self.prepared_query_profile = frame.prepared_query_profile;
             return Ok(());
         }
 
@@ -1947,7 +1944,6 @@ impl SearchExecutionAccumulator {
             truncated_limit: self.truncated_limit,
             rows: self.rows,
             query_profile: self.query_profile,
-            prepared_query_profile: self.prepared_query_profile,
             external_ids: self.external_ids,
             tree_count: None,
             tree_search_workers: None,
@@ -1983,25 +1979,6 @@ struct BatchSearchRecord {
     verbose_search_tier1_bloom_bytes: Option<u64>,
     verbose_search_tier2_bloom_loads: Option<u64>,
     verbose_search_tier2_bloom_bytes: Option<u64>,
-    verbose_search_prepared_query_bytes: Option<u64>,
-    verbose_search_prepared_pattern_plan_bytes: Option<u64>,
-    verbose_search_prepared_mask_cache_bytes: Option<u64>,
-    verbose_search_prepared_pattern_count: Option<u64>,
-    verbose_search_prepared_mask_cache_entries: Option<u64>,
-    verbose_search_prepared_fixed_literal_count: Option<u64>,
-    verbose_search_prepared_tier1_alternatives: Option<u64>,
-    verbose_search_prepared_tier2_alternatives: Option<u64>,
-    verbose_search_prepared_tier1_shift_variants: Option<u64>,
-    verbose_search_prepared_tier2_shift_variants: Option<u64>,
-    verbose_search_prepared_tier1_any_lane_alternatives: Option<u64>,
-    verbose_search_prepared_tier2_any_lane_alternatives: Option<u64>,
-    verbose_search_prepared_tier1_compacted_any_lane_alternatives: Option<u64>,
-    verbose_search_prepared_tier2_compacted_any_lane_alternatives: Option<u64>,
-    verbose_search_prepared_any_lane_variant_sets: Option<u64>,
-    verbose_search_prepared_compacted_any_lane_grams: Option<u64>,
-    verbose_search_prepared_max_pattern_bytes: Option<u64>,
-    verbose_search_prepared_max_pattern_id: Option<String>,
-    verbose_search_prepared_impossible_query: Option<bool>,
     verbose_search_max_candidates: Option<f64>,
     verbose_search_max_anchors_per_pattern: Option<usize>,
     verbose_search_candidates: Option<usize>,
@@ -2050,7 +2027,6 @@ struct LocalSearchContext {
     tree_count: usize,
     gram_sizes: GramSizes,
     active_identity_source: Option<String>,
-    summary_cap_bytes: usize,
     tree_search_workers: usize,
 }
 
@@ -2060,20 +2036,18 @@ impl LocalSearchContext {
     fn open(args: &LocalSearchArgs) -> Result<Self> {
         let tree_groups = open_forest_tree_groups(Path::new(&args.root))?;
         let tree_count = tree_groups.len();
-        let (gram_sizes, active_identity_source, summary_cap_bytes) =
-            validate_forest_search_policy(&tree_groups)?;
+        let (gram_sizes, active_identity_source, _) = validate_forest_search_policy(&tree_groups)?;
         let tree_search_workers = args.tree_search_workers.max(1).min(tree_count.max(1));
         Ok(Self {
             tree_groups,
             tree_count,
             gram_sizes,
             active_identity_source,
-            summary_cap_bytes,
             tree_search_workers,
         })
     }
 
-    /// Drops all per-store prepared-query caches so multi-rule local search
+    /// Drops all per-store query-artifact caches so multi-rule local search
     /// does not accumulate avoidable state between rules.
     fn clear_search_caches(&mut self) {
         clear_local_forest_search_caches(&mut self.tree_groups);
@@ -2243,35 +2217,6 @@ fn validate_forest_search_policy(
 // Rule-check policy resolution and human-readable formatting live in a sibling
 // file so search/indexing code is easier to navigate.
 include!("app/rule_check.rs");
-
-/// Builds the prepared-query profile that reflects the union of filter layouts
-/// across all trees in the forest.
-fn forest_prepared_query_profile(
-    tree_groups: &[TreeStoreGroup],
-    plan: &crate::candidate::CompiledQueryPlan,
-    _summary_cap_bytes: usize,
-) -> Result<crate::candidate::CandidatePreparedQueryProfile> {
-    let mut tier1_filter_keys = HashSet::<(usize, usize)>::new();
-    let mut tier2_filter_keys = HashSet::<(usize, usize)>::new();
-    for group in tree_groups {
-        for store in &group.stores {
-            tier1_filter_keys.extend(store.tier1_doc_filter_keys());
-            tier2_filter_keys.extend(store.tier2_doc_filter_keys());
-        }
-    }
-    let mut ordered_tier1_filter_keys = tier1_filter_keys.into_iter().collect::<Vec<_>>();
-    ordered_tier1_filter_keys.sort_unstable();
-    let mut ordered_tier2_filter_keys = tier2_filter_keys.into_iter().collect::<Vec<_>>();
-    ordered_tier2_filter_keys.sort_unstable();
-    Ok(crate::candidate::store::prepared_query_artifacts_profile(
-        crate::candidate::store::build_prepared_query_artifacts(
-            plan,
-            &ordered_tier1_filter_keys,
-            &ordered_tier2_filter_keys,
-        )?
-        .as_ref(),
-    ))
-}
 
 /// Executes a full candidate scan across one tree group's stores and merges the
 /// resulting hashes, external IDs, and query profile counters.
@@ -3440,24 +3385,6 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             !args.no_tier2_fallback,
             args.max_candidates,
         )?;
-        let mut tier1_filter_keys = std::collections::HashSet::<(usize, usize)>::new();
-        let mut tier2_filter_keys = std::collections::HashSet::<(usize, usize)>::new();
-        for store in &stores {
-            tier1_filter_keys.extend(store.tier1_doc_filter_keys());
-            tier2_filter_keys.extend(store.tier2_doc_filter_keys());
-        }
-        let mut ordered_tier1_filter_keys = tier1_filter_keys.into_iter().collect::<Vec<_>>();
-        ordered_tier1_filter_keys.sort_unstable();
-        let mut ordered_tier2_filter_keys = tier2_filter_keys.into_iter().collect::<Vec<_>>();
-        ordered_tier2_filter_keys.sort_unstable();
-        let prepared_query_profile = crate::candidate::store::prepared_query_artifacts_profile(
-            crate::candidate::store::build_prepared_query_artifacts(
-                &plan,
-                &ordered_tier1_filter_keys,
-                &ordered_tier2_filter_keys,
-            )?
-            .as_ref(),
-        );
         let result = if stores.len() == 1 {
             let mut resolved_plan = plan.clone();
             resolved_plan.max_candidates =
@@ -3474,7 +3401,6 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 truncated_limit: result.truncated_limit,
                 tier_used: result.tier_used,
                 query_profile: result.query_profile,
-                prepared_query_profile,
                 external_ids: None,
             }
         } else {
@@ -3518,7 +3444,6 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: merge_tier_used(tier_used),
                 query_profile,
-                prepared_query_profile,
                 external_ids: None,
             }
         };
@@ -4620,7 +4545,6 @@ fn grpc_search_frame_to_internal(frame: grpc::GrpcSearchFrame) -> rpc::Candidate
         target_rule_name: frame.target_rule_name,
         tier_used: frame.tier_used,
         query_profile: frame.query_profile,
-        prepared_query_profile: frame.prepared_query_profile,
         query_eval_nanos: 0,
     }
 }
@@ -4789,8 +4713,6 @@ fn execute_local_search_rule(
     )?;
     let plan_time = started_plan.elapsed();
     let started_query = Instant::now();
-    let prepared_query_profile =
-        forest_prepared_query_profile(&context.tree_groups, &plan, context.summary_cap_bytes)?;
     let local = query_local_forest_all_candidates(
         &mut context.tree_groups,
         &plan,
@@ -4806,7 +4728,6 @@ fn execute_local_search_rule(
         truncated_limit: local.truncated_limit,
         rows: local.hashes,
         query_profile: local.query_profile,
-        prepared_query_profile,
         external_ids: local.external_ids.unwrap_or_default(),
         tree_count: Some(context.tree_count),
         tree_search_workers: Some(context.tree_search_workers),
@@ -4903,85 +4824,6 @@ fn finish_search_execution(
             "verbose.search.tier2_bloom_bytes: {}",
             execution.query_profile.tier2_bloom_bytes
         );
-        eprintln!(
-            "verbose.search.prepared_query_bytes: {}",
-            execution.prepared_query_profile.prepared_query_bytes
-        );
-        eprintln!(
-            "verbose.search.prepared_pattern_plan_bytes: {}",
-            execution.prepared_query_profile.prepared_pattern_plan_bytes
-        );
-        eprintln!(
-            "verbose.search.prepared_mask_cache_bytes: {}",
-            execution.prepared_query_profile.prepared_mask_cache_bytes
-        );
-        eprintln!(
-            "verbose.search.prepared_pattern_count: {}",
-            execution.prepared_query_profile.pattern_count
-        );
-        eprintln!(
-            "verbose.search.prepared_mask_cache_entries: {}",
-            execution.prepared_query_profile.mask_cache_entries
-        );
-        eprintln!(
-            "verbose.search.prepared_fixed_literal_count: {}",
-            execution.prepared_query_profile.fixed_literal_count
-        );
-        eprintln!(
-            "verbose.search.prepared_tier1_alternatives: {}",
-            execution.prepared_query_profile.tier1_alternatives
-        );
-        eprintln!(
-            "verbose.search.prepared_tier2_alternatives: {}",
-            execution.prepared_query_profile.tier2_alternatives
-        );
-        eprintln!(
-            "verbose.search.prepared_tier1_shift_variants: {}",
-            execution.prepared_query_profile.tier1_shift_variants
-        );
-        eprintln!(
-            "verbose.search.prepared_tier2_shift_variants: {}",
-            execution.prepared_query_profile.tier2_shift_variants
-        );
-        eprintln!(
-            "verbose.search.prepared_tier1_any_lane_alternatives: {}",
-            execution.prepared_query_profile.tier1_any_lane_alternatives
-        );
-        eprintln!(
-            "verbose.search.prepared_tier2_any_lane_alternatives: {}",
-            execution.prepared_query_profile.tier2_any_lane_alternatives
-        );
-        eprintln!(
-            "verbose.search.prepared_tier1_compacted_any_lane_alternatives: {}",
-            execution
-                .prepared_query_profile
-                .tier1_compacted_any_lane_alternatives
-        );
-        eprintln!(
-            "verbose.search.prepared_tier2_compacted_any_lane_alternatives: {}",
-            execution
-                .prepared_query_profile
-                .tier2_compacted_any_lane_alternatives
-        );
-        eprintln!(
-            "verbose.search.prepared_any_lane_variant_sets: {}",
-            execution.prepared_query_profile.any_lane_variant_sets
-        );
-        eprintln!(
-            "verbose.search.prepared_compacted_any_lane_grams: {}",
-            execution.prepared_query_profile.compacted_any_lane_grams
-        );
-        eprintln!(
-            "verbose.search.prepared_max_pattern_bytes: {}",
-            execution.prepared_query_profile.max_pattern_bytes
-        );
-        eprintln!(
-            "verbose.search.prepared_impossible_query: {}",
-            execution.prepared_query_profile.impossible_query
-        );
-        if let Some(max_pattern_id) = &execution.prepared_query_profile.max_pattern_id {
-            eprintln!("verbose.search.prepared_max_pattern_id: {max_pattern_id}");
-        }
         eprintln!("verbose.search.max_candidates: {max_candidates}");
         eprintln!("verbose.search.max_anchors_per_pattern: {max_anchors_per_pattern}");
         eprintln!("verbose.search.candidates: {}", execution.total_candidates);
@@ -5184,8 +5026,7 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
         let rules = collect_rules_from_args(&args.rules_dir, &args.rule_manifest)?;
         let mut tree_groups = open_forest_tree_groups(root)?;
         let tree_count = tree_groups.len();
-        let (gram_sizes, active_identity_source, summary_cap_bytes) =
-            validate_forest_search_policy(&tree_groups)?;
+        let (gram_sizes, active_identity_source, _) = validate_forest_search_policy(&tree_groups)?;
         let tree_search_workers = args.tree_search_workers.max(1).min(tree_count.max(1));
         eprintln!(
             "search.batch.start rules={} trees={} tree_workers={}",
@@ -5218,8 +5059,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     true,
                     args.max_candidates,
                 )?;
-                let prepared_query_profile =
-                    forest_prepared_query_profile(&tree_groups, &plan, summary_cap_bytes)?;
                 let plan_ms = started_plan.elapsed().as_secs_f64() * 1000.0;
                 let started_query = Instant::now();
                 let local = query_local_forest_all_candidates(
@@ -5267,61 +5106,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_tier1_bloom_bytes: Some(local.query_profile.tier1_bloom_bytes),
                     verbose_search_tier2_bloom_loads: Some(local.query_profile.tier2_bloom_loads),
                     verbose_search_tier2_bloom_bytes: Some(local.query_profile.tier2_bloom_bytes),
-                    verbose_search_prepared_query_bytes: Some(
-                        prepared_query_profile.prepared_query_bytes,
-                    ),
-                    verbose_search_prepared_pattern_plan_bytes: Some(
-                        prepared_query_profile.prepared_pattern_plan_bytes,
-                    ),
-                    verbose_search_prepared_mask_cache_bytes: Some(
-                        prepared_query_profile.prepared_mask_cache_bytes,
-                    ),
-                    verbose_search_prepared_pattern_count: Some(
-                        prepared_query_profile.pattern_count,
-                    ),
-                    verbose_search_prepared_mask_cache_entries: Some(
-                        prepared_query_profile.mask_cache_entries,
-                    ),
-                    verbose_search_prepared_fixed_literal_count: Some(
-                        prepared_query_profile.fixed_literal_count,
-                    ),
-                    verbose_search_prepared_tier1_alternatives: Some(
-                        prepared_query_profile.tier1_alternatives,
-                    ),
-                    verbose_search_prepared_tier2_alternatives: Some(
-                        prepared_query_profile.tier2_alternatives,
-                    ),
-                    verbose_search_prepared_tier1_shift_variants: Some(
-                        prepared_query_profile.tier1_shift_variants,
-                    ),
-                    verbose_search_prepared_tier2_shift_variants: Some(
-                        prepared_query_profile.tier2_shift_variants,
-                    ),
-                    verbose_search_prepared_tier1_any_lane_alternatives: Some(
-                        prepared_query_profile.tier1_any_lane_alternatives,
-                    ),
-                    verbose_search_prepared_tier2_any_lane_alternatives: Some(
-                        prepared_query_profile.tier2_any_lane_alternatives,
-                    ),
-                    verbose_search_prepared_tier1_compacted_any_lane_alternatives: Some(
-                        prepared_query_profile.tier1_compacted_any_lane_alternatives,
-                    ),
-                    verbose_search_prepared_tier2_compacted_any_lane_alternatives: Some(
-                        prepared_query_profile.tier2_compacted_any_lane_alternatives,
-                    ),
-                    verbose_search_prepared_any_lane_variant_sets: Some(
-                        prepared_query_profile.any_lane_variant_sets,
-                    ),
-                    verbose_search_prepared_compacted_any_lane_grams: Some(
-                        prepared_query_profile.compacted_any_lane_grams,
-                    ),
-                    verbose_search_prepared_max_pattern_bytes: Some(
-                        prepared_query_profile.max_pattern_bytes,
-                    ),
-                    verbose_search_prepared_max_pattern_id: prepared_query_profile.max_pattern_id,
-                    verbose_search_prepared_impossible_query: Some(
-                        prepared_query_profile.impossible_query,
-                    ),
                     verbose_search_max_candidates: Some(args.max_candidates),
                     verbose_search_max_anchors_per_pattern: Some(args.max_anchors_per_pattern),
                     verbose_search_candidates: Some(local.total_candidates),
@@ -5364,25 +5148,6 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                     verbose_search_tier1_bloom_bytes: None,
                     verbose_search_tier2_bloom_loads: None,
                     verbose_search_tier2_bloom_bytes: None,
-                    verbose_search_prepared_query_bytes: None,
-                    verbose_search_prepared_pattern_plan_bytes: None,
-                    verbose_search_prepared_mask_cache_bytes: None,
-                    verbose_search_prepared_pattern_count: None,
-                    verbose_search_prepared_mask_cache_entries: None,
-                    verbose_search_prepared_fixed_literal_count: None,
-                    verbose_search_prepared_tier1_alternatives: None,
-                    verbose_search_prepared_tier2_alternatives: None,
-                    verbose_search_prepared_tier1_shift_variants: None,
-                    verbose_search_prepared_tier2_shift_variants: None,
-                    verbose_search_prepared_tier1_any_lane_alternatives: None,
-                    verbose_search_prepared_tier2_any_lane_alternatives: None,
-                    verbose_search_prepared_tier1_compacted_any_lane_alternatives: None,
-                    verbose_search_prepared_tier2_compacted_any_lane_alternatives: None,
-                    verbose_search_prepared_any_lane_variant_sets: None,
-                    verbose_search_prepared_compacted_any_lane_grams: None,
-                    verbose_search_prepared_max_pattern_bytes: None,
-                    verbose_search_prepared_max_pattern_id: None,
-                    verbose_search_prepared_impossible_query: None,
                     verbose_search_max_candidates: Some(args.max_candidates),
                     verbose_search_max_anchors_per_pattern: Some(args.max_anchors_per_pattern),
                     verbose_search_candidates: None,

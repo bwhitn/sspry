@@ -65,13 +65,13 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.special_doc_positions_bytes)
         .sum::<u64>();
-    let prepared_query_cache_entries = stats_rows
+    let query_artifact_cache_entries = stats_rows
         .iter()
-        .map(|item| item.prepared_query_cache_entries)
+        .map(|item| item.query_artifact_cache_entries)
         .sum::<usize>();
-    let prepared_query_cache_bytes = stats_rows
+    let query_artifact_cache_bytes = stats_rows
         .iter()
-        .map(|item| item.prepared_query_cache_bytes)
+        .map(|item| item.query_artifact_cache_bytes)
         .sum::<u64>();
     let compaction_idle_cooldown_s = stats_rows
         .iter()
@@ -124,12 +124,12 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(special_doc_positions_bytes),
     );
     out.insert(
-        "prepared_query_cache_entries".to_owned(),
-        json!(prepared_query_cache_entries),
+        "query_artifact_cache_entries".to_owned(),
+        json!(query_artifact_cache_entries),
     );
     out.insert(
-        "prepared_query_cache_bytes".to_owned(),
-        json!(prepared_query_cache_bytes),
+        "query_artifact_cache_bytes".to_owned(),
+        json!(query_artifact_cache_bytes),
     );
     out.insert("disk_usage_bytes".to_owned(), json!(disk_usage_bytes));
     out.insert(
@@ -244,8 +244,8 @@ fn empty_candidate_stats_json_for_config(
         tier2_doc_rows_bytes: 0,
         sha_index_bytes: 0,
         special_doc_positions_bytes: 0,
-        prepared_query_cache_entries: 0,
-        prepared_query_cache_bytes: 0,
+        query_artifact_cache_entries: 0,
+        query_artifact_cache_bytes: 0,
         mapped_bloom_bytes: 0,
         mapped_tier2_bloom_bytes: 0,
         mapped_metadata_bytes: 0,
@@ -658,8 +658,8 @@ fn grpc_empty_store_summary_for_config(
         tier2_doc_rows_bytes: 0,
         sha_index_bytes: 0,
         special_doc_positions_bytes: 0,
-        prepared_query_cache_entries: 0,
-        prepared_query_cache_bytes: 0,
+        query_artifact_cache_entries: 0,
+        query_artifact_cache_bytes: 0,
         mapped_bloom_bytes: 0,
         mapped_tier2_bloom_bytes: 0,
         mapped_metadata_bytes: 0,
@@ -964,34 +964,6 @@ fn grpc_query_profile_summary_from_internal(
     }
 }
 
-/// Converts the internal prepared-query profile into the protobuf summary
-/// attached to a completed search stream.
-fn grpc_prepared_query_profile_summary_from_internal(
-    profile: &CandidatePreparedQueryProfile,
-) -> PreparedQueryProfileSummary {
-    PreparedQueryProfileSummary {
-        impossible_query: profile.impossible_query,
-        prepared_query_bytes: profile.prepared_query_bytes,
-        prepared_pattern_plan_bytes: profile.prepared_pattern_plan_bytes,
-        prepared_mask_cache_bytes: profile.prepared_mask_cache_bytes,
-        pattern_count: profile.pattern_count,
-        mask_cache_entries: profile.mask_cache_entries,
-        fixed_literal_count: profile.fixed_literal_count,
-        tier1_alternatives: profile.tier1_alternatives,
-        tier2_alternatives: profile.tier2_alternatives,
-        tier1_shift_variants: profile.tier1_shift_variants,
-        tier2_shift_variants: profile.tier2_shift_variants,
-        tier1_any_lane_alternatives: profile.tier1_any_lane_alternatives,
-        tier2_any_lane_alternatives: profile.tier2_any_lane_alternatives,
-        tier1_compacted_any_lane_alternatives: profile.tier1_compacted_any_lane_alternatives,
-        tier2_compacted_any_lane_alternatives: profile.tier2_compacted_any_lane_alternatives,
-        any_lane_variant_sets: profile.any_lane_variant_sets,
-        compacted_any_lane_grams: profile.compacted_any_lane_grams,
-        max_pattern_bytes: profile.max_pattern_bytes,
-        max_pattern_id: Some(grpc_optional_string(profile.max_pattern_id.clone())),
-    }
-}
-
 /// Converts one internal streamed search frame into the protobuf frame sent to
 /// gRPC clients.
 ///
@@ -1023,13 +995,6 @@ fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<S
         query_profile: if frame.stream_complete || frame.rule_complete {
             Some(grpc_query_profile_summary_from_internal(
                 &frame.query_profile,
-            ))
-        } else {
-            None
-        },
-        prepared_query_profile: if frame.stream_complete || frame.rule_complete {
-            Some(grpc_prepared_query_profile_summary_from_internal(
-                &frame.prepared_query_profile,
             ))
         } else {
             None

@@ -87,8 +87,8 @@ For server-side search benchmarks with CPU and anon-memory sampling:
 ./scripts/server_search_bench.sh \
   --root ./candidate_db \
   --addr 127.0.0.1:18663 \
-  --out ./results/bench_prepared_workers6 \
-  --mode-label prepared \
+  --out ./results/bench_runtime_workers6 \
+  --mode-label runtime \
   --search-workers 6 \
   --rule-manifest /path/to/rules.manifest \
   --bundle-rule /path/to/bundle_10rules.yar

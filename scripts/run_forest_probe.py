@@ -333,23 +333,6 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
         'verbose.search.tier1_bloom_bytes',
         'verbose.search.tier2_bloom_loads',
         'verbose.search.tier2_bloom_bytes',
-        'verbose.search.prepared_query_bytes',
-        'verbose.search.prepared_pattern_plan_bytes',
-        'verbose.search.prepared_mask_cache_bytes',
-        'verbose.search.prepared_pattern_count',
-        'verbose.search.prepared_mask_cache_entries',
-        'verbose.search.prepared_fixed_literal_count',
-        'verbose.search.prepared_tier1_alternatives',
-        'verbose.search.prepared_tier2_alternatives',
-        'verbose.search.prepared_tier1_shift_variants',
-        'verbose.search.prepared_tier2_shift_variants',
-        'verbose.search.prepared_tier1_any_lane_alternatives',
-        'verbose.search.prepared_tier2_any_lane_alternatives',
-        'verbose.search.prepared_tier1_compacted_any_lane_alternatives',
-        'verbose.search.prepared_tier2_compacted_any_lane_alternatives',
-        'verbose.search.prepared_any_lane_variant_sets',
-        'verbose.search.prepared_compacted_any_lane_grams',
-        'verbose.search.prepared_max_pattern_bytes',
         'verbose.search.client_current_rss_kb',
         'verbose.search.client_peak_rss_kb',
         'verbose.search.client_smaps_rss_kb',
@@ -363,17 +346,6 @@ def parse_search_result(rule: Path, proc: subprocess.CompletedProcess, elapsed_m
         m = re.search(rf'^{re.escape(key)}: ([0-9.]+)$', proc.stderr or '', re.M)
         if m:
             record[key.replace('.', '_')] = float(m.group(1))
-    for key in (
-        'verbose.search.prepared_max_pattern_id',
-        'verbose.search.prepared_impossible_query',
-    ):
-        m = re.search(rf'^{re.escape(key)}: (.+)$', proc.stderr or '', re.M)
-        if m:
-            value = m.group(1).strip()
-            if key.endswith('impossible_query'):
-                record[key.replace('.', '_')] = value.lower() == 'true'
-            else:
-                record[key.replace('.', '_')] = value
     if proc.returncode != 0:
         first = ((proc.stdout or '').strip().splitlines() or (proc.stderr or '').strip().splitlines() or [''])[0]
         record['error'] = first
@@ -695,32 +667,6 @@ def aggregate_rule_results(rule: Path, tree_results: list[dict], elapsed_ms_para
         out['tier2_bloom_bytes'] = sum(int(item.get('verbose_search_tier2_bloom_bytes', 0)) for item in tree_results)
         out['verbose_search_total_ms_sum'] = sum(float(item.get('verbose_search_total_ms', 0.0)) for item in tree_results)
         out['verbose_search_total_ms_max'] = max(float(item.get('verbose_search_total_ms', 0.0)) for item in tree_results)
-        out['prepared_query_bytes_max'] = max(int(item.get('verbose_search_prepared_query_bytes', 0)) for item in tree_results)
-        out['prepared_pattern_plan_bytes_max'] = max(int(item.get('verbose_search_prepared_pattern_plan_bytes', 0)) for item in tree_results)
-        out['prepared_mask_cache_bytes_max'] = max(int(item.get('verbose_search_prepared_mask_cache_bytes', 0)) for item in tree_results)
-        out['prepared_pattern_count_max'] = max(int(item.get('verbose_search_prepared_pattern_count', 0)) for item in tree_results)
-        out['prepared_fixed_literal_count_max'] = max(int(item.get('verbose_search_prepared_fixed_literal_count', 0)) for item in tree_results)
-        out['prepared_tier1_any_lane_alternatives_max'] = max(int(item.get('verbose_search_prepared_tier1_any_lane_alternatives', 0)) for item in tree_results)
-        out['prepared_tier2_any_lane_alternatives_max'] = max(int(item.get('verbose_search_prepared_tier2_any_lane_alternatives', 0)) for item in tree_results)
-        out['prepared_tier1_compacted_any_lane_alternatives_max'] = max(int(item.get('verbose_search_prepared_tier1_compacted_any_lane_alternatives', 0)) for item in tree_results)
-        out['prepared_tier2_compacted_any_lane_alternatives_max'] = max(int(item.get('verbose_search_prepared_tier2_compacted_any_lane_alternatives', 0)) for item in tree_results)
-        out['prepared_any_lane_variant_sets_max'] = max(int(item.get('verbose_search_prepared_any_lane_variant_sets', 0)) for item in tree_results)
-        out['prepared_compacted_any_lane_grams_max'] = max(int(item.get('verbose_search_prepared_compacted_any_lane_grams', 0)) for item in tree_results)
-        out['prepared_max_pattern_bytes_max'] = max(int(item.get('verbose_search_prepared_max_pattern_bytes', 0)) for item in tree_results)
-        prepared_max_pattern_id = next(
-            (
-                item.get('verbose_search_prepared_max_pattern_id', '')
-                for item in sorted(
-                    tree_results,
-                    key=lambda item: int(item.get('verbose_search_prepared_query_bytes', 0)),
-                    reverse=True,
-                )
-                if item.get('verbose_search_prepared_max_pattern_id')
-            ),
-            '',
-        )
-        if prepared_max_pattern_id:
-            out['prepared_max_pattern_id'] = prepared_max_pattern_id
         tiers = sorted({item.get('tier_used', 'unknown') for item in tree_results})
         out['tier_used'] = '+'.join(tiers)
     else:

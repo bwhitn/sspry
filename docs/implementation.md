@@ -203,9 +203,9 @@ Current search improvements include:
 - duplicate OR subtree and alternative dedup
 - dynamic shard scheduling across server search workers
 - bounded server-side query-result cache
-- prepared-query artifact cache inside the store
-- per-rule prepared-query memory profiling
-- preserved selected anchor literals for prepared masks so chosen anchors do not silently degrade into broad any-lane masks
+- runtime query-artifact cache inside the store
+- per-rule runtime query-artifact memory profiling
+- preserved selected anchor literals for runtime lane selection so chosen anchors do not silently degrade into broad any-lane matching
 
 These are intended to be recall-safe planner/runtime improvements.
 

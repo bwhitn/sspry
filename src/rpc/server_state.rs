@@ -152,7 +152,7 @@ impl ServerState {
             )),
             #[cfg(test)]
             normalized_plan_cache: Mutex::new(BoundedCache::new(NORMALIZED_PLAN_CACHE_CAPACITY)),
-            prepared_plan_cache: Mutex::new(BoundedCache::new(PREPARED_PLAN_CACHE_CAPACITY)),
+            query_artifact_cache: Mutex::new(BoundedCache::new(QUERY_ARTIFACT_CACHE_CAPACITY)),
             #[cfg(test)]
             query_cache: Mutex::new(BoundedCache::new(QUERY_CACHE_CAPACITY)),
             search_admission: Mutex::new(SearchAdmissionState::default()),
@@ -1830,8 +1830,8 @@ impl ServerState {
     #[cfg(test)]
     /// Reports entry count and estimated heap bytes for the query-artifact
     /// cache used in unit tests.
-    fn prepared_plan_cache_stats(&self) -> (usize, u64) {
-        self.prepared_plan_cache
+    fn query_artifact_cache_stats(&self) -> (usize, u64) {
+        self.query_artifact_cache
             .lock()
             .map(|cache| {
                 let bytes = cache
@@ -1945,8 +1945,8 @@ impl ServerState {
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
         let (normalized_plan_cache_entries, normalized_plan_cache_bytes) =
             self.normalized_plan_cache_stats();
-        let (prepared_plan_cache_entries, prepared_plan_cache_bytes) =
-            self.prepared_plan_cache_stats();
+        let (query_artifact_cache_entries, query_artifact_cache_bytes) =
+            self.query_artifact_cache_stats();
         let (query_cache_entries, query_cache_bytes) = self.query_cache_stats();
         stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
         stats.insert("peak_rss_kb".to_owned(), json!(peak_rss_kb));
@@ -1959,12 +1959,12 @@ impl ServerState {
             json!(normalized_plan_cache_bytes),
         );
         stats.insert(
-            "prepared_plan_cache_entries".to_owned(),
-            json!(prepared_plan_cache_entries),
+            "query_artifact_cache_entries".to_owned(),
+            json!(query_artifact_cache_entries),
         );
         stats.insert(
-            "prepared_plan_cache_bytes".to_owned(),
-            json!(prepared_plan_cache_bytes),
+            "query_artifact_cache_bytes".to_owned(),
+            json!(query_artifact_cache_bytes),
         );
         stats.insert("query_cache_entries".to_owned(), json!(query_cache_entries));
         stats.insert("query_cache_bytes".to_owned(), json!(query_cache_bytes));
@@ -2579,8 +2579,8 @@ impl ServerState {
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
         let (normalized_plan_cache_entries, normalized_plan_cache_bytes) =
             self.normalized_plan_cache_stats();
-        let (prepared_plan_cache_entries, prepared_plan_cache_bytes) =
-            self.prepared_plan_cache_stats();
+        let (query_artifact_cache_entries, query_artifact_cache_bytes) =
+            self.query_artifact_cache_stats();
         let (query_cache_entries, query_cache_bytes) = self.query_cache_stats();
         stats.insert("current_rss_kb".to_owned(), json!(current_rss_kb));
         stats.insert("peak_rss_kb".to_owned(), json!(peak_rss_kb));
@@ -2593,12 +2593,12 @@ impl ServerState {
             json!(normalized_plan_cache_bytes),
         );
         stats.insert(
-            "prepared_plan_cache_entries".to_owned(),
-            json!(prepared_plan_cache_entries),
+            "query_artifact_cache_entries".to_owned(),
+            json!(query_artifact_cache_entries),
         );
         stats.insert(
-            "prepared_plan_cache_bytes".to_owned(),
-            json!(prepared_plan_cache_bytes),
+            "query_artifact_cache_bytes".to_owned(),
+            json!(query_artifact_cache_bytes),
         );
         stats.insert("query_cache_entries".to_owned(), json!(query_cache_entries));
         stats.insert("query_cache_bytes".to_owned(), json!(query_cache_bytes));
@@ -2994,7 +2994,7 @@ impl ServerState {
         if let Ok(mut cache) = self.normalized_plan_cache.lock() {
             cache.clear();
         }
-        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+        if let Ok(mut cache) = self.query_artifact_cache.lock() {
             cache.clear();
         }
         #[cfg(test)]
@@ -3178,7 +3178,7 @@ impl ServerState {
         Ok(())
     }
 
-    /// Serializes a compiled query plan into the cache key used by prepared and
+    /// Serializes a compiled query plan into the cache key used by artifact and
     /// cached query results.
     fn query_cache_key(plan: &CompiledQueryPlan) -> Result<String> {
         serde_json::to_string(plan).map_err(SspryError::from)
@@ -3192,26 +3192,26 @@ impl ServerState {
     ) -> Result<Arc<RuntimeQueryArtifacts>> {
         let key = Self::query_cache_key(plan)?;
         if let Some(entry) = self
-            .prepared_plan_cache
+            .query_artifact_cache
             .lock()
             .map_err(|_| SspryError::from("Query artifact cache lock poisoned."))?
             .get(&key)
         {
-            record_counter("rpc.handle_candidate_query_prepared_cache_hits_total", 1);
+            record_counter("rpc.handle_candidate_query_artifact_cache_hits_total", 1);
             return Ok(entry);
         }
-        record_counter("rpc.handle_candidate_query_prepared_cache_misses_total", 1);
+        record_counter("rpc.handle_candidate_query_artifact_cache_misses_total", 1);
         let entry = build_runtime_query_artifacts(plan)?;
         let entry_bytes = runtime_query_artifacts_memory_bytes(entry.as_ref());
-        if entry_bytes > PREPARED_PLAN_CACHE_MAX_ENTRY_BYTES {
+        if entry_bytes > QUERY_ARTIFACT_CACHE_MAX_ENTRY_BYTES {
             record_counter(
-                "rpc.handle_candidate_query_prepared_cache_skipped_oversize_total",
+                "rpc.handle_candidate_query_artifact_cache_skipped_oversize_total",
                 1,
             );
             return Ok(entry);
         }
         let mut cache = self
-            .prepared_plan_cache
+            .query_artifact_cache
             .lock()
             .map_err(|_| SspryError::from("Query artifact cache lock poisoned."))?;
         cache.insert(key, entry.clone());
@@ -3350,7 +3350,6 @@ impl ServerState {
         plan: &CompiledQueryPlan,
     ) -> Result<CachedCandidateQuery> {
         let runtime = self.shared_runtime_query_artifacts(plan)?;
-        let prepared_query_profile = CandidatePreparedQueryProfile::default();
         let store_sets = self.published_query_store_sets()?;
         let searchable_doc_count = store_sets
             .iter()
@@ -3378,7 +3377,6 @@ impl ServerState {
                 truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
                 query_profile,
-                prepared_query_profile,
             });
         }
 
@@ -3414,7 +3412,6 @@ impl ServerState {
                 truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
                 query_profile,
-                prepared_query_profile,
             });
         }
 
@@ -3485,7 +3482,6 @@ impl ServerState {
             truncated_limit: truncated.then_some(resolved_limit),
             tier_used: Self::merge_candidate_tier_used(&tier_used),
             query_profile,
-            prepared_query_profile,
         })
     }
 
@@ -4054,7 +4050,6 @@ impl ServerState {
             truncated_limit: cached.truncated_limit,
             tier_used: cached.tier_used.clone(),
             query_profile: cached.query_profile.clone(),
-            prepared_query_profile: cached.prepared_query_profile.clone(),
             external_ids,
         })
     }
@@ -4103,7 +4098,6 @@ impl ServerState {
                 runtime_query_artifacts_memory_bytes(runtime.as_ref())
             ));
         }
-        let prepared_query_profile = CandidatePreparedQueryProfile::default();
         let store_sets = self.published_query_store_sets()?;
         let searchable_doc_count = store_sets
             .iter()
@@ -4224,7 +4218,6 @@ impl ServerState {
                             target_rule_name: String::new(),
                             tier_used: String::new(),
                             query_profile: CandidateQueryProfile::default(),
-                            prepared_query_profile: CandidatePreparedQueryProfile::default(),
                             query_eval_nanos: 0,
                         })?;
                     }
@@ -4240,7 +4233,6 @@ impl ServerState {
                             target_rule_name: String::new(),
                             tier_used: String::new(),
                             query_profile: CandidateQueryProfile::default(),
-                            prepared_query_profile: CandidatePreparedQueryProfile::default(),
                             query_eval_nanos: 0,
                         })?;
                     }
@@ -4257,7 +4249,6 @@ impl ServerState {
             target_rule_name: String::new(),
             tier_used: Self::merge_candidate_tier_used(&tier_used),
             query_profile,
-            prepared_query_profile,
             query_eval_nanos: 0,
         })?;
         if let Some(plan_key) = plan_key.as_deref() {
@@ -4420,7 +4411,6 @@ impl ServerState {
                             target_rule_name: rule_name.clone(),
                             tier_used: String::new(),
                             query_profile: CandidateQueryProfile::default(),
-                            prepared_query_profile: CandidatePreparedQueryProfile::default(),
                             query_eval_nanos: 0,
                         })?;
                     }
@@ -4436,7 +4426,6 @@ impl ServerState {
                             target_rule_name: rule_name.clone(),
                             tier_used: String::new(),
                             query_profile: CandidateQueryProfile::default(),
-                            prepared_query_profile: CandidatePreparedQueryProfile::default(),
                             query_eval_nanos: 0,
                         })?;
                     }
@@ -4452,7 +4441,6 @@ impl ServerState {
                 target_rule_name: rule_name.clone(),
                 tier_used: Self::merge_candidate_tier_used(&accumulator.tier_used),
                 query_profile: accumulator.query_profile.clone(),
-                prepared_query_profile: CandidatePreparedQueryProfile::default(),
                 query_eval_nanos: accumulator.eval_nanos,
             })?;
         }
@@ -4466,7 +4454,6 @@ impl ServerState {
             target_rule_name: String::new(),
             tier_used: String::new(),
             query_profile: CandidateQueryProfile::default(),
-            prepared_query_profile: CandidatePreparedQueryProfile::default(),
             query_eval_nanos: 0,
         })?;
         Ok(())

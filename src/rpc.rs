@@ -26,8 +26,8 @@ use crate::candidate::store::{
     runtime_query_artifacts_memory_bytes, write_compacted_snapshot,
 };
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
-    CandidateStore, CompiledQueryPlan, GramSizes, candidate_shard_index, candidate_shard_root,
+    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
+    GramSizes, candidate_shard_index, candidate_shard_root,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     read_candidate_shard_count, resolve_max_candidates, search_target_rule_names,
     write_candidate_shard_count,
@@ -40,9 +40,9 @@ use crate::grpc::v1::{
     IndexClientHeartbeatRequest, IndexSessionBeginRequest, IndexSessionEndRequest,
     IndexSessionProgressRequest, IndexSessionResponse, IndexSessionSummary,
     InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
-    PingRequest, PingResponse, PreparedQueryProfileSummary, PublishRequest,
-    PublishResponse as GrpcPublishResponse, PublishSummary, PublishedTier2SnapshotSealSummary,
-    QueryProfileSummary, SearchFrame, SearchRequest, ShutdownRequest,
+    PingRequest, PingResponse, PublishRequest, PublishResponse as GrpcPublishResponse,
+    PublishSummary, PublishedTier2SnapshotSealSummary, QueryProfileSummary, SearchFrame,
+    SearchRequest, ShutdownRequest,
     ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary, StartupSummary, StatsRequest,
     StatsResponse, StatusRequest, StatusResponse, StoreSummary,
     sspry_server::{Sspry as GrpcSspry, SspryServer},
@@ -61,8 +61,8 @@ const GRPC_STREAM_INSERT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CANDIDATE_QUERY_CHUNK_SIZE: usize = 128;
 #[cfg(test)]
 const NORMALIZED_PLAN_CACHE_CAPACITY: usize = 64;
-const PREPARED_PLAN_CACHE_CAPACITY: usize = 4;
-const PREPARED_PLAN_CACHE_MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+const QUERY_ARTIFACT_CACHE_CAPACITY: usize = 4;
+const QUERY_ARTIFACT_CACHE_MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(test)]
 const QUERY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_CANDIDATE_SHARD_LOCK_TIMEOUT_MS: u64 = 1000;
@@ -194,8 +194,6 @@ pub struct CandidateQueryResponse {
     pub tier_used: String,
     #[serde(default)]
     pub query_profile: CandidateQueryProfile,
-    #[serde(default)]
-    pub prepared_query_profile: CandidatePreparedQueryProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ids: Option<Vec<Option<String>>>,
 }
@@ -218,8 +216,6 @@ pub(crate) struct CandidateQueryStreamFrame {
     pub tier_used: String,
     #[serde(default)]
     pub query_profile: CandidateQueryProfile,
-    #[serde(default)]
-    pub prepared_query_profile: CandidatePreparedQueryProfile,
     #[serde(default)]
     pub query_eval_nanos: u128,
 }
@@ -538,7 +534,7 @@ struct ServerState {
     adaptive_publish: Mutex<AdaptivePublishState>,
     #[cfg(test)]
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
-    prepared_plan_cache: Mutex<BoundedCache<String, Arc<RuntimeQueryArtifacts>>>,
+    query_artifact_cache: Mutex<BoundedCache<String, Arc<RuntimeQueryArtifacts>>>,
     #[cfg(test)]
     query_cache: Mutex<BoundedCache<String, Arc<CachedCandidateQuery>>>,
     search_admission: Mutex<SearchAdmissionState>,
@@ -586,7 +582,6 @@ struct CachedCandidateQuery {
     truncated_limit: Option<usize>,
     tier_used: String,
     query_profile: CandidateQueryProfile,
-    prepared_query_profile: CandidatePreparedQueryProfile,
 }
 
 #[cfg(test)]
@@ -594,14 +589,6 @@ struct CachedCandidateQuery {
 fn cached_candidate_query_memory_bytes(query: &CachedCandidateQuery) -> u64 {
     (std::mem::size_of::<CachedCandidateQuery>() as u64)
         .saturating_add(query.tier_used.capacity() as u64)
-        .saturating_add(
-            query
-                .prepared_query_profile
-                .max_pattern_id
-                .as_ref()
-                .map(|value| value.capacity() as u64)
-                .unwrap_or(0),
-        )
         .saturating_add(
             (query.ordered_hashes.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<String>() as u64),
