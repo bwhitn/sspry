@@ -21,17 +21,16 @@ use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status as GrpcStat
 use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
 use crate::candidate::store::{
     CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
-    CandidateInsertBatchProfile, CandidateStoreOpenProfile, PreparedQueryArtifacts,
-    build_prepared_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
-    prepared_query_artifacts_memory_bytes, prepared_query_artifacts_profile,
-    write_compacted_snapshot,
+    CandidateInsertBatchProfile, CandidateStoreOpenProfile, RuntimeQueryArtifacts,
+    build_runtime_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
+    runtime_query_artifacts_memory_bytes, write_compacted_snapshot,
 };
 use crate::candidate::{
     BoundedCache, CandidateConfig, CandidatePreparedQueryProfile, CandidateQueryProfile,
     CandidateStore, CompiledQueryPlan, GramSizes, candidate_shard_index, candidate_shard_root,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
-    compile_query_plan_with_gram_sizes_and_identity_source, read_candidate_shard_count,
-    resolve_max_candidates, write_candidate_shard_count,
+    read_candidate_shard_count, resolve_max_candidates, search_target_rule_names,
+    write_candidate_shard_count,
 };
 #[cfg(test)]
 use crate::candidate::{PatternPlan, QueryNode};
@@ -83,11 +82,10 @@ fn search_trace_log(message: impl AsRef<str>) {
     }
 }
 
-#[cfg(test)]
-/// Clamps the effective test worker count to the number of forest trees being
-/// queried.
-fn resolve_tree_query_workers(configured_workers: usize, tree_count: usize) -> usize {
-    configured_workers.max(1).min(tree_count.max(1))
+/// Clamps the effective search worker count to the number of shard/tree work
+/// units available for one query.
+fn resolve_search_workers(configured_workers: usize, work_unit_count: usize) -> usize {
+    configured_workers.max(1).min(work_unit_count.max(1))
 }
 
 /// Attempts to lock one candidate shard within a bounded timeout so searches
@@ -213,11 +211,17 @@ pub(crate) struct CandidateQueryStreamFrame {
     #[serde(default)]
     pub stream_complete: bool,
     #[serde(default)]
+    pub rule_complete: bool,
+    #[serde(default)]
+    pub target_rule_name: String,
+    #[serde(default)]
     pub tier_used: String,
     #[serde(default)]
     pub query_profile: CandidateQueryProfile,
     #[serde(default)]
     pub prepared_query_profile: CandidatePreparedQueryProfile,
+    #[serde(default)]
+    pub query_eval_nanos: u128,
 }
 
 #[cfg(test)]
@@ -534,7 +538,7 @@ struct ServerState {
     adaptive_publish: Mutex<AdaptivePublishState>,
     #[cfg(test)]
     normalized_plan_cache: Mutex<BoundedCache<String, Arc<CompiledQueryPlan>>>,
-    prepared_plan_cache: Mutex<BoundedCache<String, Arc<PreparedQueryArtifacts>>>,
+    prepared_plan_cache: Mutex<BoundedCache<String, Arc<RuntimeQueryArtifacts>>>,
     #[cfg(test)]
     query_cache: Mutex<BoundedCache<String, Arc<CachedCandidateQuery>>>,
     search_admission: Mutex<SearchAdmissionState>,
@@ -1282,28 +1286,13 @@ impl GrpcSspry for GrpcServerService {
                 request.allow_tier2_fallback,
                 request.target_rule_name
             ));
-            let plan = match state.compile_search_plan_from_yara_source(&request) {
-                Ok(plan) => plan,
+            let named_plans = match state.compile_search_plans_from_yara_source(&request) {
+                Ok(plans) => plans,
                 Err(err) => {
                     let _ = tx.blocking_send(Err(grpc_internal_status(err)));
                     return;
                 }
             };
-            let plan_key = match ServerState::query_cache_key(&plan) {
-                Ok(value) => value,
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(grpc_internal_status(err)));
-                    return;
-                }
-            };
-            search_trace_log(format!(
-                "grpc.plan plan_key={} compile_ms={} patterns={} max_candidates={} root={:?}",
-                plan_key,
-                grpc_started.elapsed().as_millis(),
-                plan.patterns.len(),
-                plan.max_candidates,
-                plan.root
-            ));
             let internal_request = CandidateQueryRequest {
                 plan: Value::Null,
                 cursor: 0,
@@ -1317,29 +1306,71 @@ impl GrpcSspry for GrpcServerService {
             let first_frame_started = Instant::now();
             let mut frame_count = 0usize;
             let mut candidate_count = 0usize;
-            let result = state.stream_candidate_query_frames(internal_request, &plan, |frame| {
-                let frame_candidates = frame.sha256.len();
-                frame_count += 1;
-                candidate_count += frame_candidates;
+            let result = if named_plans.len() == 1 {
+                let (_, plan) = &named_plans[0];
+                let plan_key = match ServerState::query_cache_key(plan) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(grpc_internal_status(err)));
+                        return;
+                    }
+                };
                 search_trace_log(format!(
-                    "grpc.frame plan_key={} idx={} candidates={} stream_complete={} elapsed_ms={}",
+                    "grpc.plan plan_key={} compile_ms={} patterns={} max_candidates={} root={:?}",
                     plan_key,
-                    frame_count,
-                    frame_candidates,
-                    frame.stream_complete,
-                    first_frame_started.elapsed().as_millis()
+                    grpc_started.elapsed().as_millis(),
+                    plan.patterns.len(),
+                    plan.max_candidates,
+                    plan.root
                 ));
-                let grpc_frame = grpc_search_frame_from_internal(frame)?;
-                tx.blocking_send(Ok(grpc_frame))
-                    .map_err(|_| SspryError::from("gRPC search stream receiver dropped"))?;
-                Ok(())
-            });
+                state.stream_candidate_query_frames(internal_request, plan, |frame| {
+                    let frame_candidates = frame.sha256.len();
+                    frame_count += 1;
+                    candidate_count += frame_candidates;
+                    search_trace_log(format!(
+                        "grpc.frame plan_key={} idx={} candidates={} stream_complete={} elapsed_ms={}",
+                        plan_key,
+                        frame_count,
+                        frame_candidates,
+                        frame.stream_complete,
+                        first_frame_started.elapsed().as_millis()
+                    ));
+                    let grpc_frame = grpc_search_frame_from_internal(frame)?;
+                    tx.blocking_send(Ok(grpc_frame))
+                        .map_err(|_| SspryError::from("gRPC search stream receiver dropped"))?;
+                    Ok(())
+                })
+            } else {
+                search_trace_log(format!(
+                    "grpc.bundle plan_count={} compile_ms={}",
+                    named_plans.len(),
+                    grpc_started.elapsed().as_millis()
+                ));
+                state.stream_candidate_query_frames_batch(internal_request, &named_plans, |frame| {
+                    let frame_candidates = frame.sha256.len();
+                    frame_count += 1;
+                    candidate_count += frame_candidates;
+                    search_trace_log(format!(
+                        "grpc.bundle.frame idx={} rule={} candidates={} stream_complete={} rule_complete={} elapsed_ms={}",
+                        frame_count,
+                        frame.target_rule_name,
+                        frame_candidates,
+                        frame.stream_complete,
+                        frame.rule_complete,
+                        first_frame_started.elapsed().as_millis()
+                    ));
+                    let grpc_frame = grpc_search_frame_from_internal(frame)?;
+                    tx.blocking_send(Ok(grpc_frame))
+                        .map_err(|_| SspryError::from("gRPC search stream receiver dropped"))?;
+                    Ok(())
+                })
+            };
             if let Err(err) = result {
                 let _ = tx.blocking_send(Err(grpc_internal_status(err)));
             } else {
                 search_trace_log(format!(
-                    "grpc.done plan_key={} frames={} candidates={} total_ms={}",
-                    plan_key,
+                    "grpc.done plans={} frames={} candidates={} total_ms={}",
+                    named_plans.len(),
                     frame_count,
                     candidate_count,
                     grpc_started.elapsed().as_millis()

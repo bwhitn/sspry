@@ -1017,15 +1017,17 @@ fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<S
         has_candidate_limit: frame.candidate_limit.is_some(),
         stream_complete: frame.stream_complete,
         truncated: false,
+        rule_complete: frame.rule_complete,
+        target_rule_name: frame.target_rule_name,
         tier_used: frame.tier_used,
-        query_profile: if frame.stream_complete {
+        query_profile: if frame.stream_complete || frame.rule_complete {
             Some(grpc_query_profile_summary_from_internal(
                 &frame.query_profile,
             ))
         } else {
             None
         },
-        prepared_query_profile: if frame.stream_complete {
+        prepared_query_profile: if frame.stream_complete || frame.rule_complete {
             Some(grpc_prepared_query_profile_summary_from_internal(
                 &frame.prepared_query_profile,
             ))

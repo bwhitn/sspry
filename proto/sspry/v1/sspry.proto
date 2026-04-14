@@ -280,6 +280,8 @@ message SearchFrame {
   string tier_used = 7;
   QueryProfileSummary query_profile = 8;
   PreparedQueryProfileSummary prepared_query_profile = 9;
+  bool rule_complete = 10;
+  string target_rule_name = 11;
 }
 
 message QueryProfileSummary {

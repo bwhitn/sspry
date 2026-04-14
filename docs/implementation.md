@@ -30,6 +30,8 @@ RPC mode itself now has two useful server shapes:
 
 Local forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
 
+RPC `serve --search-workers` uses a different scheduler than local forest mode: it fans out over concrete search work units, one per shard in direct/workspace mode and one per `(tree, shard)` pair in forest mode.
+
 `search-batch` is the long-lived variant of local forest mode:
 
 - open the forest once

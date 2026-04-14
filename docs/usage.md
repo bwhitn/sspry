@@ -37,9 +37,9 @@ Options:
   - maximum accepted remote message size
   - applies per gRPC message, not per document
 - `--search-workers <n>`
-  - server-side tree query workers per search
+  - server-side search workers per search
   - one top-level search runs at a time; later searches queue
-  - the active search fans out across at most this many trees concurrently
+  - the active search fans out across at most this many shard/tree work units concurrently
   - default is `max(1, cpus/4)`
 - `--root <path>`
   - root path to open
@@ -366,6 +366,44 @@ Behavior:
 - opens the forest once and reuses it across the whole rule sweep
 - intended for repeated benchmark and profiling passes on a preserved forest
 
+## server_search_bench helper
+
+```bash
+./scripts/server_search_bench.sh --root <db-root> --addr <host:port> --out <dir> [options]
+```
+
+Common options:
+
+- `--rule-manifest <path>`
+  - newline-delimited per-rule search list
+- `--bundle-rule <path>`
+  - bundle file for the bundled search phase
+- `--search-workers <n>`
+  - forwarded to `sspry serve --search-workers`
+- `--mode-label <text>`
+  - label stored in `phase_summary.tsv`
+- `--server-extra-arg <arg>`
+  - repeatable extra arg forwarded to `sspry serve`
+- `--search-extra-arg <arg>`
+  - repeatable extra arg forwarded to `sspry search`
+- `--sample-interval <sec>`
+  - `/proc` sample interval for server metrics
+- `--skip-individual`
+- `--skip-bundle`
+
+Outputs:
+
+- `phase_summary.tsv`
+  - per-phase client wall/CPU summary
+  - per-phase server CPU time and average CPU percent
+  - per-phase max `VmRSS`, `RssAnon`, `VmSwap`, `Pss_Anon`, `Private_Clean`, and `Private_Dirty`
+- `server_samples.tsv`
+  - raw timestamped `/proc` samples for the served benchmark
+- `individual_summary.tsv`
+  - per-rule client timings for the sequential phase
+
+Use this helper when you want benchmark runs that preserve anon-memory and server CPU telemetry instead of elapsed wall time alone.
+
 ## info
 
 ```bash
@@ -448,7 +486,7 @@ This bypasses the database and scans one file directly with `yara-x`.
 - treat `--gram-sizes` as a format choice, not a casual runtime knob
 - use `--tier1-set-fp` and `--tier2-set-fp` to control the disk-size vs candidate-quality tradeoff
 - use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
-- use `--search-workers` to control how many trees the active search runs across at once
+- use `--search-workers` to control how many shard/tree work units the active search runs across at once
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change
 - expect delete to be immediate logically in `current/`, return `missing` when the value is not present there, and be reclaimed physically later by background compaction of `current/`
 - `SIGINT` and `SIGTERM` trigger graceful drain and shutdown

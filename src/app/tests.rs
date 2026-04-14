@@ -2,6 +2,7 @@ use super::*;
 use tempfile::tempdir;
 
 use crate::candidate::{CandidateConfig, QueryNode};
+use crate::grpc::GrpcSearchFrame;
 
 fn default_connection() -> ClientConnectionArgs {
     ClientConnectionArgs {
@@ -233,6 +234,158 @@ include "second.yar"
         rules,
         vec!["first_rule".to_owned(), "second_rule".to_owned()]
     );
+}
+
+#[test]
+fn grpc_search_frame_to_internal_preserves_bundled_rule_metadata() {
+    let frame = GrpcSearchFrame {
+        sha256: vec!["aa".to_owned()],
+        external_ids: vec![Some("doc-a".to_owned())],
+        candidate_limit: Some(10),
+        stream_complete: false,
+        rule_complete: true,
+        target_rule_name: "bundle_rule".to_owned(),
+        truncated: false,
+        tier_used: "tier1".to_owned(),
+        query_profile: CandidateQueryProfile::default(),
+        prepared_query_profile: CandidatePreparedQueryProfile::default(),
+    };
+
+    let internal = grpc_search_frame_to_internal(frame);
+    assert!(internal.rule_complete);
+    assert_eq!(internal.target_rule_name, "bundle_rule".to_owned());
+    assert_eq!(internal.candidate_limit, Some(10));
+}
+
+#[test]
+fn collect_streamed_search_executions_batch_builds_one_execution_per_rule() {
+    let args = SearchCommandArgs {
+        connection: default_connection(),
+        rule: "bundle.yar".to_owned(),
+        verify_yara_files: false,
+        max_candidates: 100.0,
+        max_anchors_per_pattern: 16,
+        verbose: false,
+    };
+    let rule_text = r#"
+rule rule_one {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+
+rule rule_two {
+  strings:
+    $b = "beta"
+  condition:
+    $b
+}
+"#;
+    let planned_rules = ["rule_one", "rule_two"]
+        .into_iter()
+        .map(|rule_name| {
+            let started_plan = Instant::now();
+            let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                rule_text,
+                rule_name,
+                GramSizes::new(3, 4).expect("gram sizes"),
+                None,
+                args.max_anchors_per_pattern,
+                false,
+                true,
+                args.max_candidates,
+            )
+            .expect("compile plan");
+            (rule_name.to_owned(), plan, started_plan.elapsed())
+        })
+        .collect::<Vec<_>>();
+
+    let executions = collect_streamed_search_executions_batch(
+        &args,
+        planned_rules,
+        None,
+        &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: vec!["hash-a".to_owned()],
+                external_ids: Some(vec![None]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "rule_one".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: Vec::new(),
+                external_ids: None,
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: true,
+                target_rule_name: "rule_one".to_owned(),
+                tier_used: "tier1".to_owned(),
+                query_profile: CandidateQueryProfile {
+                    docs_scanned: 11,
+                    ..CandidateQueryProfile::default()
+                },
+                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: vec!["hash-b".to_owned()],
+                external_ids: Some(vec![None]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "rule_two".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: Vec::new(),
+                external_ids: None,
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: true,
+                target_rule_name: "rule_two".to_owned(),
+                tier_used: "tier2".to_owned(),
+                query_profile: CandidateQueryProfile {
+                    docs_scanned: 22,
+                    ..CandidateQueryProfile::default()
+                },
+                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: Vec::new(),
+                external_ids: None,
+                candidate_limit: None,
+                stream_complete: true,
+                rule_complete: false,
+                target_rule_name: String::new(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                prepared_query_profile: CandidatePreparedQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            Ok(())
+        },
+    )
+    .expect("collect bundled executions");
+
+    assert_eq!(executions.len(), 2);
+    assert_eq!(executions[0].0, "rule_one".to_owned());
+    assert_eq!(executions[0].1.rows, vec!["hash-a".to_owned()]);
+    assert_eq!(executions[0].1.tier_used, "tier1".to_owned());
+    assert_eq!(executions[0].1.query_profile.docs_scanned, 11);
+    assert_eq!(executions[1].0, "rule_two".to_owned());
+    assert_eq!(executions[1].1.rows, vec!["hash-b".to_owned()]);
+    assert_eq!(executions[1].1.tier_used, "tier2".to_owned());
+    assert_eq!(executions[1].1.query_profile.docs_scanned, 22);
 }
 
 #[test]

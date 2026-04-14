@@ -10,12 +10,12 @@ use base64::Engine;
 use tempfile::tempdir;
 
 #[test]
-fn resolve_tree_query_workers_caps_to_tree_count() {
-    assert_eq!(resolve_tree_query_workers(0, 0), 1);
-    assert_eq!(resolve_tree_query_workers(1, 0), 1);
-    assert_eq!(resolve_tree_query_workers(1, 1), 1);
-    assert_eq!(resolve_tree_query_workers(5, 3), 3);
-    assert_eq!(resolve_tree_query_workers(3, 5), 3);
+fn resolve_search_workers_caps_to_work_units() {
+    assert_eq!(resolve_search_workers(0, 0), 1);
+    assert_eq!(resolve_search_workers(1, 0), 1);
+    assert_eq!(resolve_search_workers(1, 1), 1);
+    assert_eq!(resolve_search_workers(5, 3), 3);
+    assert_eq!(resolve_search_workers(3, 5), 3);
 }
 
 fn lane_bloom_bytes(filter_bytes: usize, bloom_hashes: usize, grams: &[u64]) -> Vec<u8> {
@@ -128,6 +128,32 @@ fn sample_forest_server_state(base: &Path, candidate_shards: usize) -> Arc<Serve
         let _ = store.persist_meta_if_dirty().expect("persist tree meta");
     }
     state
+}
+
+fn exact_abc_plan(pattern_id: &str, max_candidates: f64) -> CompiledQueryPlan {
+    let gram = pack_exact_gram(b"ABC");
+    CompiledQueryPlan {
+        patterns: vec![PatternPlan {
+            pattern_id: pattern_id.to_owned(),
+            alternatives: vec![vec![gram]],
+            tier2_alternatives: vec![Vec::new()],
+            anchor_literals: vec![Vec::new()],
+            fixed_literals: vec![Vec::new()],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
+        }],
+        root: QueryNode {
+            kind: "pattern".to_owned(),
+            pattern_id: Some(pattern_id.to_owned()),
+            threshold: None,
+            children: Vec::new(),
+        },
+        force_tier1_only: false,
+        allow_tier2_fallback: true,
+        max_candidates,
+        tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+        tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+    }
 }
 
 fn sample_workspace_server_state(base: &Path, candidate_shards: usize) -> Arc<ServerState> {
@@ -285,14 +311,14 @@ fn forest_root_server_queries_across_all_trees() {
         tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
-    let prepared = state
-        .shared_prepared_query_artifacts(&plan)
-        .expect("prepared query");
+    let runtime = state
+        .shared_runtime_query_artifacts(&plan)
+        .expect("runtime query");
     for stores in &stores {
         let mut store = lock_candidate_store_blocking(&stores.stores[0]).expect("lock store");
         assert_eq!(store.stats().doc_count, 1);
         let (hits, _, _) =
-            ServerState::collect_query_matches_single_store(&mut store, &plan, &prepared)
+            ServerState::collect_query_matches_single_store(&mut store, &plan, &runtime)
                 .expect("single-store query");
         assert_eq!(hits.len(), 1);
     }
@@ -374,12 +400,12 @@ fn collect_query_matches_single_store_scans_once_when_hits_span_multiple_pages()
         tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
-    let prepared = state
-        .shared_prepared_query_artifacts(&plan)
-        .expect("prepared query");
+    let runtime = state
+        .shared_runtime_query_artifacts(&plan)
+        .expect("runtime query");
     let mut store = lock_candidate_store_blocking(store_lock).expect("lock store");
     let (hits, _, profile) =
-        ServerState::collect_query_matches_single_store(&mut store, &plan, &prepared)
+        ServerState::collect_query_matches_single_store(&mut store, &plan, &runtime)
             .expect("single-store query");
     assert_eq!(hits.len(), 129);
     assert_eq!(profile.docs_scanned, 129);
@@ -2576,6 +2602,353 @@ fn multishard_query_uses_parallel_collection_and_cached_results() {
     assert_eq!(second.sha256, first.sha256);
     assert_eq!(second.external_ids, first.external_ids);
     assert_eq!(second.tier_used, first.tier_used);
+}
+
+#[test]
+fn search_work_units_count_direct_shards_and_forest_tree_shards() {
+    let tmp = tempdir().expect("tmp");
+    let direct_state = sample_server_state_with_shards(tmp.path(), 2);
+    let direct_store_sets = direct_state
+        .published_query_store_sets()
+        .expect("direct query stores");
+    assert_eq!(direct_store_sets.len(), 1);
+    assert_eq!(ServerState::search_work_units(&direct_store_sets).len(), 2);
+
+    let forest_state = sample_forest_server_state(tmp.path(), 2);
+    let forest_store_sets = forest_state
+        .published_query_store_sets()
+        .expect("forest query stores");
+    assert_eq!(forest_store_sets.len(), 2);
+    assert_eq!(ServerState::search_work_units(&forest_store_sets).len(), 4);
+}
+
+#[test]
+fn direct_multishard_stream_candidate_query_frames_returns_hits_from_all_shards() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_server_state_with_shards(tmp.path(), 2);
+    let gram = pack_exact_gram(b"ABC");
+    let bloom_filter_b64 =
+        base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
+    let mut docs = Vec::new();
+    for byte in 1_u8..=64 {
+        let sha = [byte; 32];
+        if docs.iter().all(|existing: &[u8; 32]| {
+            state.candidate_store_index_for_sha256(existing)
+                != state.candidate_store_index_for_sha256(&sha)
+        }) {
+            docs.push(sha);
+        }
+        if docs.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(docs.len(), 2);
+    for (index, sha) in docs.into_iter().enumerate() {
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(sha),
+                file_size: 16,
+                bloom_filter_b64: bloom_filter_b64.clone(),
+                bloom_item_estimate: None,
+                tier2_bloom_filter_b64: None,
+                tier2_bloom_item_estimate: None,
+                special_population: false,
+                metadata_b64: None,
+                external_id: Some(format!("stream-parallel-{index}")),
+            })
+            .expect("insert doc");
+    }
+
+    let request = CandidateQueryRequest {
+        plan: Value::Null,
+        cursor: 0,
+        chunk_size: Some(1),
+        include_external_ids: true,
+    };
+    let plan = exact_abc_plan("$a", 8.0);
+    let mut frames = Vec::<CandidateQueryStreamFrame>::new();
+    state
+        .stream_candidate_query_frames(request, &plan, |frame| {
+            frames.push(frame);
+            Ok(())
+        })
+        .expect("stream single rule");
+
+    let stream_complete = frames
+        .iter()
+        .filter(|frame| frame.stream_complete)
+        .collect::<Vec<_>>();
+    assert_eq!(stream_complete.len(), 1);
+    assert_eq!(stream_complete[0].tier_used, "tier1");
+    assert!(stream_complete[0].query_profile.docs_scanned >= 2);
+    assert_eq!(
+        stream_complete[0]
+            .prepared_query_profile
+            .prepared_query_bytes,
+        0
+    );
+
+    let mut hashes = Vec::new();
+    let mut external_ids = Vec::new();
+    for frame in &frames {
+        if frame.stream_complete || frame.rule_complete {
+            continue;
+        }
+        hashes.extend(frame.sha256.iter().cloned());
+        external_ids.extend(frame.external_ids.clone().unwrap_or_default());
+    }
+    hashes.sort();
+    hashes.dedup();
+    external_ids.sort();
+    external_ids.dedup();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(
+        external_ids,
+        vec![
+            Some("stream-parallel-0".to_owned()),
+            Some("stream-parallel-1".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_rule() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_server_state_with_shards(tmp.path(), 2);
+    let gram = pack_exact_gram(b"ABC");
+    let bloom_filter_b64 =
+        base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
+    let mut docs = Vec::new();
+    for byte in 65_u8..=128 {
+        let sha = [byte; 32];
+        if docs.iter().all(|existing: &[u8; 32]| {
+            state.candidate_store_index_for_sha256(existing)
+                != state.candidate_store_index_for_sha256(&sha)
+        }) {
+            docs.push(sha);
+        }
+        if docs.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(docs.len(), 2);
+    for (index, sha) in docs.into_iter().enumerate() {
+        state
+            .handle_candidate_insert(&CandidateDocumentWire {
+                sha256: hex::encode(sha),
+                file_size: 16,
+                bloom_filter_b64: bloom_filter_b64.clone(),
+                bloom_item_estimate: None,
+                tier2_bloom_filter_b64: None,
+                tier2_bloom_item_estimate: None,
+                special_population: false,
+                metadata_b64: None,
+                external_id: Some(format!("batch-parallel-{index}")),
+            })
+            .expect("insert doc");
+    }
+
+    let request = CandidateQueryRequest {
+        plan: Value::Null,
+        cursor: 0,
+        chunk_size: Some(1),
+        include_external_ids: true,
+    };
+    let named_plans = vec![
+        ("rule_one".to_owned(), exact_abc_plan("$a", 8.0)),
+        ("rule_two".to_owned(), exact_abc_plan("$b", 8.0)),
+    ];
+    let mut frames = Vec::<CandidateQueryStreamFrame>::new();
+    state
+        .stream_candidate_query_frames_batch(request, &named_plans, |frame| {
+            frames.push(frame);
+            Ok(())
+        })
+        .expect("stream bundled rules");
+
+    let stream_complete = frames
+        .iter()
+        .filter(|frame| frame.stream_complete)
+        .collect::<Vec<_>>();
+    assert_eq!(stream_complete.len(), 1);
+
+    let rule_complete = frames
+        .iter()
+        .filter(|frame| frame.rule_complete)
+        .map(|frame| {
+            assert_eq!(frame.prepared_query_profile.prepared_query_bytes, 0);
+            frame.target_rule_name.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rule_complete,
+        vec!["rule_one".to_owned(), "rule_two".to_owned()]
+    );
+
+    let mut hits_by_rule = HashMap::<String, Vec<String>>::new();
+    let mut external_ids_by_rule = HashMap::<String, Vec<Option<String>>>::new();
+    for frame in &frames {
+        if frame.stream_complete || frame.rule_complete {
+            continue;
+        }
+        hits_by_rule
+            .entry(frame.target_rule_name.clone())
+            .or_default()
+            .extend(frame.sha256.iter().cloned());
+        external_ids_by_rule
+            .entry(frame.target_rule_name.clone())
+            .or_default()
+            .extend(frame.external_ids.clone().unwrap_or_default());
+    }
+
+    for rule_name in ["rule_one", "rule_two"] {
+        let Some(hashes) = hits_by_rule.get_mut(rule_name) else {
+            panic!("missing hits for {rule_name}");
+        };
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 2);
+
+        let Some(external_ids) = external_ids_by_rule.get_mut(rule_name) else {
+            panic!("missing external ids for {rule_name}");
+        };
+        external_ids.sort();
+        external_ids.dedup();
+        assert_eq!(
+            external_ids,
+            &vec![
+                Some("batch-parallel-0".to_owned()),
+                Some("batch-parallel-1".to_owned())
+            ]
+        );
+    }
+}
+
+#[test]
+fn forest_stream_candidate_query_frames_returns_hits_from_all_trees() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_forest_server_state(tmp.path(), 1);
+    let request = CandidateQueryRequest {
+        plan: Value::Null,
+        cursor: 0,
+        chunk_size: Some(1),
+        include_external_ids: true,
+    };
+    let plan = exact_abc_plan("$a", 8.0);
+    let mut frames = Vec::<CandidateQueryStreamFrame>::new();
+    state
+        .stream_candidate_query_frames(request, &plan, |frame| {
+            frames.push(frame);
+            Ok(())
+        })
+        .expect("stream single rule");
+
+    let stream_complete = frames
+        .iter()
+        .filter(|frame| frame.stream_complete)
+        .collect::<Vec<_>>();
+    assert_eq!(stream_complete.len(), 1);
+    assert_eq!(stream_complete[0].tier_used, "tier1");
+    assert!(stream_complete[0].query_profile.docs_scanned >= 2);
+
+    let mut hashes = Vec::new();
+    let mut external_ids = Vec::new();
+    for frame in &frames {
+        if frame.stream_complete || frame.rule_complete {
+            continue;
+        }
+        hashes.extend(frame.sha256.iter().cloned());
+        external_ids.extend(frame.external_ids.clone().unwrap_or_default());
+    }
+    hashes.sort();
+    hashes.dedup();
+    external_ids.sort();
+    external_ids.dedup();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(
+        external_ids,
+        vec![
+            Some("tree_00.bin".to_owned()),
+            Some("tree_01.bin".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn forest_stream_candidate_query_frames_batch_returns_hits_for_each_rule() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_forest_server_state(tmp.path(), 1);
+    let request = CandidateQueryRequest {
+        plan: Value::Null,
+        cursor: 0,
+        chunk_size: Some(1),
+        include_external_ids: true,
+    };
+    let named_plans = vec![
+        ("rule_one".to_owned(), exact_abc_plan("$a", 8.0)),
+        ("rule_two".to_owned(), exact_abc_plan("$b", 8.0)),
+    ];
+    let mut frames = Vec::<CandidateQueryStreamFrame>::new();
+    state
+        .stream_candidate_query_frames_batch(request, &named_plans, |frame| {
+            frames.push(frame);
+            Ok(())
+        })
+        .expect("stream bundled rules");
+
+    let stream_complete = frames
+        .iter()
+        .filter(|frame| frame.stream_complete)
+        .collect::<Vec<_>>();
+    assert_eq!(stream_complete.len(), 1);
+
+    let rule_complete = frames
+        .iter()
+        .filter(|frame| frame.rule_complete)
+        .map(|frame| frame.target_rule_name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rule_complete,
+        vec!["rule_one".to_owned(), "rule_two".to_owned()]
+    );
+
+    let mut hits_by_rule = HashMap::<String, Vec<String>>::new();
+    let mut external_ids_by_rule = HashMap::<String, Vec<Option<String>>>::new();
+    for frame in &frames {
+        if frame.stream_complete || frame.rule_complete {
+            continue;
+        }
+        hits_by_rule
+            .entry(frame.target_rule_name.clone())
+            .or_default()
+            .extend(frame.sha256.iter().cloned());
+        external_ids_by_rule
+            .entry(frame.target_rule_name.clone())
+            .or_default()
+            .extend(frame.external_ids.clone().unwrap_or_default());
+    }
+
+    for rule_name in ["rule_one", "rule_two"] {
+        let Some(hashes) = hits_by_rule.get_mut(rule_name) else {
+            panic!("missing hits for {rule_name}");
+        };
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 2);
+
+        let Some(external_ids) = external_ids_by_rule.get_mut(rule_name) else {
+            panic!("missing external ids for {rule_name}");
+        };
+        external_ids.sort();
+        external_ids.dedup();
+        assert_eq!(
+            external_ids,
+            &vec![
+                Some("tree_00.bin".to_owned()),
+                Some("tree_01.bin".to_owned())
+            ]
+        );
+    }
 }
 
 #[test]

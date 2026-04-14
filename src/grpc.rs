@@ -105,6 +105,8 @@ pub struct GrpcSearchFrame {
     pub external_ids: Vec<Option<String>>,
     pub candidate_limit: Option<usize>,
     pub stream_complete: bool,
+    pub rule_complete: bool,
+    pub target_rule_name: String,
     pub truncated: bool,
     pub tier_used: String,
     pub query_profile: CandidateQueryProfile,
@@ -340,6 +342,8 @@ impl BlockingGrpcClient {
                         .has_candidate_limit
                         .then_some(frame.candidate_limit as usize),
                     stream_complete: frame.stream_complete,
+                    rule_complete: frame.rule_complete,
+                    target_rule_name: frame.target_rule_name,
                     truncated: frame.truncated,
                     tier_used: frame.tier_used,
                     query_profile,

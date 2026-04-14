@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::File;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -35,17 +36,29 @@ fn reserve_port() -> u16 {
 }
 
 fn spawn_grpc_serve(port: u16, candidate_root: &Path) -> ChildGuard {
+    spawn_grpc_serve_with_stderr(port, candidate_root, Stdio::null(), &[])
+}
+
+fn spawn_grpc_serve_with_stderr(
+    port: u16,
+    candidate_root: &Path,
+    stderr: Stdio,
+    envs: &[(&str, &str)],
+) -> ChildGuard {
     let addr = format!("127.0.0.1:{port}");
-    let child = Command::new(bin_path())
+    let mut command = Command::new(bin_path());
+    command
         .arg("serve")
         .arg("--addr")
         .arg(&addr)
         .arg("--root")
         .arg(candidate_root)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn grpc serve");
+        .stderr(stderr);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn grpc serve");
     ChildGuard { child }
 }
 
@@ -217,4 +230,104 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
         assert!(Instant::now() < deadline, "gRPC server did not exit");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn grpc_cli_bundle_search_uses_one_rpc_request_for_multiple_rules() {
+    let tmp = tempdir().expect("tmp");
+    let candidate_root = tmp.path().join("grpc_candidate_db");
+    let sample_dir = tmp.path().join("samples");
+    fs::create_dir_all(&sample_dir).expect("create samples");
+    let sample_a = sample_dir.join("alpha.bin");
+    let sample_b = sample_dir.join("beta.bin");
+    fs::write(&sample_a, b"alpha hello over grpc\n").expect("write sample a");
+    fs::write(&sample_b, b"beta hello over grpc\n").expect("write sample b");
+
+    let rule_a = tmp.path().join("rule_a.yar");
+    let rule_b = tmp.path().join("rule_b.yar");
+    let bundle = tmp.path().join("bundle.yar");
+    fs::write(
+        &rule_a,
+        "rule hello_one {\n  strings:\n    $a = \"hello over grpc\"\n  condition:\n    $a\n}\n",
+    )
+    .expect("write rule a");
+    fs::write(
+        &rule_b,
+        "rule hello_two {\n  strings:\n    $a = \"hello over grpc\"\n  condition:\n    $a\n}\n",
+    )
+    .expect("write rule b");
+    fs::write(&bundle, "include \"rule_a.yar\"\ninclude \"rule_b.yar\"\n").expect("write bundle");
+
+    let stderr_log = tmp.path().join("server.stderr.log");
+    let port = reserve_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = spawn_grpc_serve_with_stderr(
+        port,
+        &candidate_root,
+        Stdio::from(File::create(&stderr_log).expect("create stderr log")),
+        &[("SSPRY_TRACE_SEARCH_STREAM", "1")],
+    );
+    let endpoint = format!("http://{addr}");
+
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match SspryClient::connect(endpoint.clone()).await {
+                Ok(mut client) => {
+                    if client.ping(PingRequest {}).await.is_ok() {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gRPC server did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let ingest = run_ok(&[
+        "index",
+        "--addr",
+        &addr,
+        sample_dir.to_str().expect("sample dir"),
+        "--batch-size",
+        "1",
+    ]);
+    assert!(ingest.contains("processed_documents: 2"));
+
+    let search = run_ok(&[
+        "search",
+        "--addr",
+        &addr,
+        "--rule",
+        bundle.to_str().expect("bundle"),
+        "--max-candidates",
+        "100",
+    ]);
+    assert!(search.contains("rule: hello_one"));
+    assert!(search.contains("rule: hello_two"));
+    assert_eq!(search.matches("candidates: 2").count(), 2);
+
+    let shutdown = run_ok(&["shutdown", "--addr", &addr]);
+    assert!(shutdown.contains("shutdown requested"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(_status)) = server.child.try_wait() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "gRPC server did not exit");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let stderr = fs::read_to_string(&stderr_log).expect("read stderr log");
+    assert_eq!(stderr.matches("trace.search_stream grpc.start").count(), 1);
+    assert!(stderr.contains("trace.search_stream grpc.bundle plan_count=2"));
 }

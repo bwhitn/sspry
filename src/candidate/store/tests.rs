@@ -3307,3 +3307,203 @@ fn query_candidates_tier2_and_metadata_only_scans_docs_without_tier1_loads() {
     assert_eq!(result.query_profile.tier2_bloom_loads, 2);
     assert_eq!(result.tier_used, "tier2");
 }
+
+#[test]
+fn collect_query_hits_with_prepared_batch_reuses_doc_sidecar_loads_across_rules() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("store");
+    let mut store = CandidateStore::init(
+        CandidateConfig {
+            root,
+            filter_target_fp: None,
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
+            ..CandidateConfig::default()
+        },
+        true,
+    )
+    .expect("init");
+
+    let gram = pack_exact_gram(b"ABC");
+    for idx in 0..2u8 {
+        let sha256 = [idx + 1; 32];
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(123, None)
+            .expect("filter bytes");
+        let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, None, None);
+        let bloom_bytes = lane_bloom_bytes(filter_bytes, bloom_hashes, &[gram]);
+        store
+            .insert_document_with_metadata(
+                sha256,
+                123,
+                None,
+                None,
+                None,
+                None,
+                filter_bytes,
+                &bloom_bytes,
+                0,
+                &[],
+                &[],
+                false,
+                None,
+            )
+            .expect("insert doc");
+    }
+
+    let make_plan = |pattern_id: &str| CompiledQueryPlan {
+        patterns: vec![PatternPlan {
+            pattern_id: pattern_id.to_owned(),
+            alternatives: vec![vec![gram]],
+            tier2_alternatives: vec![Vec::new()],
+            anchor_literals: vec![vec![b'A', b'B', b'C']],
+            fixed_literals: vec![vec![b'A', b'B', b'C']],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
+        }],
+        root: QueryNode {
+            kind: "pattern".to_owned(),
+            pattern_id: Some(pattern_id.to_owned()),
+            threshold: None,
+            children: Vec::new(),
+        },
+        force_tier1_only: false,
+        allow_tier2_fallback: true,
+        max_candidates: 8.0,
+        tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+        tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+    };
+
+    let plan_a = make_plan("$a");
+    let plan_b = make_plan("$b");
+    let prepared_a = store.prepare_query_artifacts(&plan_a).expect("prepared a");
+    let prepared_b = store.prepare_query_artifacts(&plan_b).expect("prepared b");
+
+    let single_a = store
+        .collect_query_hits_with_prepared(&plan_a, prepared_a.as_ref())
+        .expect("single query a");
+    let single_b = store
+        .collect_query_hits_with_prepared(&plan_b, prepared_b.as_ref())
+        .expect("single query b");
+    let singles_tier1_loads = single_a
+        .2
+        .tier1_bloom_loads
+        .saturating_add(single_b.2.tier1_bloom_loads);
+    assert_eq!(singles_tier1_loads, 4);
+
+    let batched = store
+        .collect_query_hits_with_prepared_batch(&[plan_a, plan_b], &[prepared_a, prepared_b])
+        .expect("batched query");
+    assert_eq!(batched.len(), 2);
+    assert_eq!(batched[0].0, single_a.0);
+    assert_eq!(batched[1].0, single_b.0);
+    assert_eq!(batched[0].1, "tier1");
+    assert_eq!(batched[1].1, "tier1");
+    assert_eq!(batched[0].2.docs_scanned, 2);
+    assert_eq!(batched[1].2.docs_scanned, 2);
+    let batched_tier1_loads = batched[0]
+        .2
+        .tier1_bloom_loads
+        .saturating_add(batched[1].2.tier1_bloom_loads);
+    assert_eq!(batched_tier1_loads, 2);
+}
+
+#[test]
+fn collect_query_hits_with_runtime_hash_batch_reuses_doc_sidecar_loads_across_rules() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("store");
+    let mut store = CandidateStore::init(
+        CandidateConfig {
+            root,
+            filter_target_fp: None,
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
+            ..CandidateConfig::default()
+        },
+        true,
+    )
+    .expect("init");
+
+    let gram = pack_exact_gram(b"ABC");
+    for idx in 0..2u8 {
+        let sha256 = [idx + 1; 32];
+        let filter_bytes = store
+            .resolve_filter_bytes_for_file_size(123, None)
+            .expect("filter bytes");
+        let bloom_hashes = store.resolve_bloom_hashes_for_document(filter_bytes, None, None);
+        let bloom_bytes = lane_bloom_bytes(filter_bytes, bloom_hashes, &[gram]);
+        store
+            .insert_document_with_metadata(
+                sha256,
+                123,
+                None,
+                None,
+                None,
+                None,
+                filter_bytes,
+                &bloom_bytes,
+                0,
+                &[],
+                &[],
+                false,
+                None,
+            )
+            .expect("insert doc");
+    }
+
+    let make_plan = |pattern_id: &str| CompiledQueryPlan {
+        patterns: vec![PatternPlan {
+            pattern_id: pattern_id.to_owned(),
+            alternatives: vec![vec![gram]],
+            tier2_alternatives: vec![Vec::new()],
+            anchor_literals: vec![vec![b'A', b'B', b'C']],
+            fixed_literals: vec![vec![b'A', b'B', b'C']],
+            fixed_literal_wide: vec![false],
+            fixed_literal_fullword: vec![false],
+        }],
+        root: QueryNode {
+            kind: "pattern".to_owned(),
+            pattern_id: Some(pattern_id.to_owned()),
+            threshold: None,
+            children: Vec::new(),
+        },
+        force_tier1_only: false,
+        allow_tier2_fallback: true,
+        max_candidates: 8.0,
+        tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
+        tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
+    };
+
+    let plan_a = make_plan("$a");
+    let plan_b = make_plan("$b");
+    let runtime_a = build_runtime_query_artifacts(&plan_a).expect("runtime a");
+    let runtime_b = build_runtime_query_artifacts(&plan_b).expect("runtime b");
+
+    let single_a = store
+        .collect_query_hits_with_runtime_hash(&plan_a, runtime_a.as_ref())
+        .expect("single query a");
+    let single_b = store
+        .collect_query_hits_with_runtime_hash(&plan_b, runtime_b.as_ref())
+        .expect("single query b");
+    let singles_tier1_loads = single_a
+        .2
+        .tier1_bloom_loads
+        .saturating_add(single_b.2.tier1_bloom_loads);
+    assert_eq!(singles_tier1_loads, 4);
+
+    let batched = store
+        .collect_query_hits_with_runtime_hash_batch(&[plan_a, plan_b], &[runtime_a, runtime_b])
+        .expect("batched query");
+    assert_eq!(batched.len(), 2);
+    assert_eq!(batched[0].0, single_a.0);
+    assert_eq!(batched[1].0, single_b.0);
+    assert_eq!(batched[0].1, "tier1");
+    assert_eq!(batched[1].1, "tier1");
+    assert_eq!(batched[0].2.docs_scanned, 2);
+    assert_eq!(batched[1].2.docs_scanned, 2);
+    let batched_tier1_loads = batched[0]
+        .2
+        .tier1_bloom_loads
+        .saturating_add(batched[1].2.tier1_bloom_loads);
+    assert_eq!(batched_tier1_loads, 2);
+}

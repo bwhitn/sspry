@@ -31,6 +31,7 @@ struct PreparedPatternMasks {
 }
 
 type PatternMaskCache = HashMap<String, PreparedPatternMasks>;
+type RuntimeGramMaskCache = HashMap<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>;
 
 const MAX_LANE_POSITION_VARIANTS: usize = 64;
 const PREPARED_QUERY_MASK_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
@@ -222,6 +223,78 @@ pub(crate) fn prepared_query_artifacts_memory_bytes(artifacts: &PreparedQueryArt
     (std::mem::size_of::<PreparedQueryArtifacts>() as u64)
         .saturating_add(patterns_bytes)
         .saturating_add(mask_cache_bytes)
+}
+
+/// Estimates the heap retained by one runtime-query alternative descriptor.
+fn runtime_alternative_artifacts_memory_bytes(artifacts: &RuntimeAlternativeArtifacts) -> u64 {
+    (std::mem::size_of::<RuntimeAlternativeArtifacts>() as u64)
+        .saturating_add(
+            (artifacts.lane_variants.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Vec<usize>>() as u64),
+        )
+        .saturating_add(
+            artifacts
+                .lane_variants
+                .iter()
+                .map(|lanes| {
+                    (std::mem::size_of::<Vec<usize>>() as u64).saturating_add(
+                        (lanes.capacity() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
+                    )
+                })
+                .sum::<u64>(),
+        )
+}
+
+/// Estimates the heap retained by one runtime-query pattern descriptor.
+fn runtime_pattern_artifacts_memory_bytes(artifacts: &RuntimePatternArtifacts) -> u64 {
+    (std::mem::size_of::<RuntimePatternArtifacts>() as u64)
+        .saturating_add(
+            (artifacts.tier1.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<RuntimeAlternativeArtifacts>() as u64),
+        )
+        .saturating_add(
+            artifacts
+                .tier1
+                .iter()
+                .map(runtime_alternative_artifacts_memory_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            (artifacts.tier2.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<RuntimeAlternativeArtifacts>() as u64),
+        )
+        .saturating_add(
+            artifacts
+                .tier2
+                .iter()
+                .map(runtime_alternative_artifacts_memory_bytes)
+                .sum::<u64>(),
+        )
+}
+
+/// Estimates the total heap footprint of one runtime-query artifact entry.
+pub(crate) fn runtime_query_artifacts_memory_bytes(artifacts: &RuntimeQueryArtifacts) -> u64 {
+    let patterns_bytes = artifacts
+        .patterns
+        .iter()
+        .map(|(key, pattern)| {
+            (std::mem::size_of::<String>() as u64)
+                .saturating_add(key.capacity() as u64)
+                .saturating_add(prepared_pattern_plan_memory_bytes(pattern))
+        })
+        .sum::<u64>();
+    let runtime_patterns_bytes = artifacts
+        .runtime_patterns
+        .iter()
+        .map(|(key, pattern)| {
+            (std::mem::size_of::<String>() as u64)
+                .saturating_add(key.capacity() as u64)
+                .saturating_add(runtime_pattern_artifacts_memory_bytes(pattern))
+        })
+        .sum::<u64>();
+    (std::mem::size_of::<RuntimeQueryArtifacts>() as u64)
+        .saturating_add(patterns_bytes)
+        .saturating_add(runtime_patterns_bytes)
 }
 
 /// Summarizes one prepared-query artifact set into the telemetry structure shown
@@ -789,6 +862,98 @@ pub(crate) fn build_prepared_query_artifacts(
     }))
 }
 
+/// Builds the runtime-query artifact bundle used by the hash-at-evaluation
+/// search path.
+pub(crate) fn build_runtime_query_artifacts(
+    plan: &CompiledQueryPlan,
+) -> Result<Arc<RuntimeQueryArtifacts>> {
+    let patterns = plan
+        .patterns
+        .iter()
+        .cloned()
+        .map(|pattern| (pattern.pattern_id.clone(), pattern))
+        .collect::<HashMap<_, _>>();
+    let runtime_patterns = plan
+        .patterns
+        .iter()
+        .map(|pattern| {
+            let tier1 = pattern
+                .alternatives
+                .iter()
+                .enumerate()
+                .map(|(alt_index, alternative)| {
+                    let anchor_literal = pattern
+                        .anchor_literals
+                        .get(alt_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let use_any_lane = anchor_literal.is_empty()
+                        || anchor_literal.len() < plan.tier1_gram_size
+                        || exact_pattern_has_ambiguous_positions(
+                            alternative,
+                            anchor_literal,
+                            plan.tier1_gram_size,
+                        );
+                    RuntimeAlternativeArtifacts {
+                        use_any_lane,
+                        lane_variants: if use_any_lane {
+                            Vec::new()
+                        } else {
+                            lane_position_variants_for_pattern(
+                                alternative,
+                                anchor_literal,
+                                plan.tier1_gram_size,
+                                DEFAULT_BLOOM_POSITION_LANES,
+                            )
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let tier2 = pattern
+                .tier2_alternatives
+                .iter()
+                .enumerate()
+                .map(|(alt_index, alternative)| {
+                    let anchor_literal = pattern
+                        .anchor_literals
+                        .get(alt_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let use_any_lane = anchor_literal.is_empty()
+                        || anchor_literal.len() < plan.tier2_gram_size
+                        || exact_pattern_has_ambiguous_positions(
+                            alternative,
+                            anchor_literal,
+                            plan.tier2_gram_size,
+                        );
+                    RuntimeAlternativeArtifacts {
+                        use_any_lane,
+                        lane_variants: if use_any_lane {
+                            Vec::new()
+                        } else {
+                            lane_position_variants_for_pattern(
+                                alternative,
+                                anchor_literal,
+                                plan.tier2_gram_size,
+                                DEFAULT_BLOOM_POSITION_LANES,
+                            )
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok::<(String, RuntimePatternArtifacts), SspryError>((
+                pattern.pattern_id.clone(),
+                RuntimePatternArtifacts { tier1, tier2 },
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    Ok(Arc::new(RuntimeQueryArtifacts {
+        patterns,
+        runtime_patterns,
+        impossible_query: node_structurally_impossible(&plan.root),
+    }))
+}
+
 /// Encodes the literal bytes used by verifier-only numeric-read comparisons.
 fn numeric_read_literal_bytes(name: &str, literal_text: &str) -> Result<Vec<u8>> {
     match name {
@@ -1284,42 +1449,248 @@ where
     Ok(MatchOutcome::default())
 }
 
-/// Recursively evaluates the compiled query tree for one document using bloom
-/// filters, metadata, and verifier-only prefix checks as needed.
-///
-/// How it works:
-/// - Reuses cached pattern outcomes where possible.
-/// - Dispatches on node kind for logical operators, metadata predicates, and
-///   verifier-only checks.
-/// - Propagates which bloom tiers were used so callers can report tier usage.
-///
-/// Inputs:
-/// - `node`: Current query-plan node to evaluate.
-/// - `doc_inputs`: Lazy access to the current document and sidecar payloads.
-/// - `load_metadata`, `load_tier1`, `load_tier2`: Deferred sidecar loaders.
-/// - `patterns`, `mask_cache`: Prepared query state keyed by pattern id.
-/// - `plan`: Query-level tier policy flags.
-/// - `query_now_unix`: Timestamp used by `time.now` predicates.
-/// - `eval_cache`: Per-document cache of already-evaluated pattern outcomes.
-///
-/// Returns:
-/// - Whether the subtree matched and which tiers were consumed.
-fn evaluate_node<'a, FM, FT1, FT2>(
+/// Reuses or materializes the bloom word masks for one gram/lane combination.
+fn cached_bloom_word_masks_in_lane(
+    value: u64,
+    size_bytes: usize,
+    hash_count: usize,
+    lane: usize,
+    lane_count: usize,
+    cache: &mut RuntimeGramMaskCache,
+) -> Result<Vec<(usize, u64)>> {
+    let key = (value, size_bytes, hash_count, lane, lane_count);
+    if let Some(entry) = cache.get(&key) {
+        return Ok(entry.clone());
+    }
+    let entry = bloom_word_masks_in_lane(&[value], size_bytes, hash_count, lane, lane_count)?;
+    cache.insert(key, entry.clone());
+    Ok(entry)
+}
+
+/// Checks whether every gram in an alternative can match at least one lane.
+fn runtime_any_lane_matches(
+    values: &[u64],
+    size_bytes: usize,
+    hash_count: usize,
+    bloom_bytes: &[u8],
+    cache: &mut RuntimeGramMaskCache,
+) -> Result<bool> {
+    for value in values {
+        let mut matched = false;
+        for lane in 0..DEFAULT_BLOOM_POSITION_LANES {
+            let required = cached_bloom_word_masks_in_lane(
+                *value,
+                size_bytes,
+                hash_count,
+                lane,
+                DEFAULT_BLOOM_POSITION_LANES,
+                cache,
+            )?;
+            if raw_filter_matches_word_masks(bloom_bytes, &required) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Checks whether any exact lane-position variant of an alternative matches.
+fn runtime_shifted_matches(
+    values: &[u64],
+    lane_variants: &[Vec<usize>],
+    size_bytes: usize,
+    hash_count: usize,
+    bloom_bytes: &[u8],
+    cache: &mut RuntimeGramMaskCache,
+) -> Result<bool> {
+    for lanes in lane_variants {
+        let required = merge_cached_lane_bloom_word_masks(
+            values,
+            size_bytes,
+            hash_count,
+            lanes,
+            DEFAULT_BLOOM_POSITION_LANES,
+            cache,
+        )?;
+        if raw_filter_matches_word_masks(bloom_bytes, &required) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Evaluates one pattern alternative by hashing query grams on demand.
+fn evaluate_pattern_runtime<'a, FT1, FT2>(
+    pattern: &PatternPlan,
+    runtime_pattern: &RuntimePatternArtifacts,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
+    plan: &CompiledQueryPlan,
+    gram_cache: &mut RuntimeGramMaskCache,
+) -> Result<MatchOutcome>
+where
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let allow_tier2 = !plan.force_tier1_only && plan.allow_tier2_fallback;
+    let tier2_only =
+        experiment_tier2_only_enabled() || experiment_tier2_and_metadata_only_enabled();
+    for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
+        let tier2_alternative = pattern
+            .tier2_alternatives
+            .get(alt_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if alternative.is_empty() && tier2_alternative.is_empty() {
+            return Ok(MatchOutcome {
+                matched: true,
+                tiers: TierFlags {
+                    used_tier1: !tier2_only,
+                    used_tier2: false,
+                },
+            });
+        }
+        let doc = doc_inputs.doc;
+        let mut used_tier1 = false;
+        if !tier2_only && !alternative.is_empty() {
+            let bloom_bytes = doc_inputs.tier1_bloom_bytes(load_tier1)?;
+            let runtime_alternative = runtime_pattern
+                .tier1
+                .get(alt_index)
+                .ok_or_else(|| SspryError::from("Runtime tier1 alternative missing"))?;
+            let primary_match = if runtime_alternative.use_any_lane {
+                runtime_any_lane_matches(
+                    alternative,
+                    doc.filter_bytes,
+                    doc.bloom_hashes,
+                    bloom_bytes,
+                    gram_cache,
+                )?
+            } else {
+                runtime_shifted_matches(
+                    alternative,
+                    &runtime_alternative.lane_variants,
+                    doc.filter_bytes,
+                    doc.bloom_hashes,
+                    bloom_bytes,
+                    gram_cache,
+                )?
+            };
+            if !primary_match {
+                continue;
+            }
+            used_tier1 = true;
+        }
+        let mut used_tier2 = false;
+        if !tier2_alternative.is_empty() {
+            if tier2_only {
+                if doc.tier2_filter_bytes == 0 || doc.tier2_bloom_hashes == 0 {
+                    continue;
+                }
+                let tier2_bloom_bytes = doc_inputs.tier2_bloom_bytes(load_tier2)?;
+                if tier2_bloom_bytes.is_empty() {
+                    continue;
+                }
+                let runtime_alternative = runtime_pattern
+                    .tier2
+                    .get(alt_index)
+                    .ok_or_else(|| SspryError::from("Runtime tier2 alternative missing"))?;
+                let tier2_match = if runtime_alternative.use_any_lane {
+                    runtime_any_lane_matches(
+                        tier2_alternative,
+                        doc.tier2_filter_bytes,
+                        doc.tier2_bloom_hashes,
+                        tier2_bloom_bytes,
+                        gram_cache,
+                    )?
+                } else {
+                    runtime_shifted_matches(
+                        tier2_alternative,
+                        &runtime_alternative.lane_variants,
+                        doc.tier2_filter_bytes,
+                        doc.tier2_bloom_hashes,
+                        tier2_bloom_bytes,
+                        gram_cache,
+                    )?
+                };
+                if !tier2_match {
+                    continue;
+                }
+                used_tier2 = true;
+            } else if allow_tier2 && doc.tier2_filter_bytes > 0 && doc.tier2_bloom_hashes > 0 {
+                let tier2_bloom_bytes = doc_inputs.tier2_bloom_bytes(load_tier2)?;
+                if tier2_bloom_bytes.is_empty() {
+                    continue;
+                }
+                let runtime_alternative = runtime_pattern
+                    .tier2
+                    .get(alt_index)
+                    .ok_or_else(|| SspryError::from("Runtime tier2 alternative missing"))?;
+                let tier2_match = if runtime_alternative.use_any_lane {
+                    runtime_any_lane_matches(
+                        tier2_alternative,
+                        doc.tier2_filter_bytes,
+                        doc.tier2_bloom_hashes,
+                        tier2_bloom_bytes,
+                        gram_cache,
+                    )?
+                } else {
+                    runtime_shifted_matches(
+                        tier2_alternative,
+                        &runtime_alternative.lane_variants,
+                        doc.tier2_filter_bytes,
+                        doc.tier2_bloom_hashes,
+                        tier2_bloom_bytes,
+                        gram_cache,
+                    )?
+                };
+                if !tier2_match {
+                    continue;
+                }
+                used_tier2 = true;
+            }
+        }
+        return Ok(MatchOutcome {
+            matched: true,
+            tiers: TierFlags {
+                used_tier1,
+                used_tier2,
+            },
+        });
+    }
+    Ok(MatchOutcome::default())
+}
+
+/// Shared query-tree walker used by both prepared-mask and runtime-hash
+/// pattern evaluators.
+fn evaluate_node_with_patterns<'a, FM, FT1, FT2, FE>(
     node: &QueryNode,
     doc_inputs: &mut LazyDocQueryInputs<'a>,
     load_metadata: &mut FM,
     load_tier1: &mut FT1,
     load_tier2: &mut FT2,
     patterns: &HashMap<String, PatternPlan>,
-    mask_cache: &PatternMaskCache,
     plan: &CompiledQueryPlan,
     query_now_unix: u64,
     eval_cache: &mut QueryEvalCache,
+    eval_pattern: &mut FE,
 ) -> Result<MatchOutcome>
 where
     FM: FnMut() -> Result<Cow<'a, [u8]>>,
     FT1: FnMut() -> Result<Cow<'a, [u8]>>,
     FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+    FE: FnMut(
+        &str,
+        &mut LazyDocQueryInputs<'a>,
+        &mut FT1,
+        &mut FT2,
+        &CompiledQueryPlan,
+    ) -> Result<MatchOutcome>,
 {
     match node.kind.as_str() {
         "pattern" => {
@@ -1330,20 +1701,7 @@ where
             if let Some(outcome) = eval_cache.pattern_outcomes.get(pattern_id).copied() {
                 return Ok(outcome);
             }
-            let pattern = patterns
-                .get(pattern_id)
-                .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
-            let pattern_masks = mask_cache
-                .get(pattern_id)
-                .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
-            let outcome = evaluate_pattern(
-                pattern,
-                pattern_masks,
-                doc_inputs,
-                load_tier1,
-                load_tier2,
-                plan,
-            )?;
+            let outcome = eval_pattern(pattern_id, doc_inputs, load_tier1, load_tier2, plan)?;
             eval_cache
                 .pattern_outcomes
                 .insert(pattern_id.clone(), outcome);
@@ -1370,17 +1728,17 @@ where
                     tiers: TierFlags::default(),
                 });
             }
-            let outcome = evaluate_node(
+            let outcome = evaluate_node_with_patterns(
                 child,
                 doc_inputs,
                 load_metadata,
                 load_tier1,
                 load_tier2,
                 patterns,
-                mask_cache,
                 plan,
                 query_now_unix,
                 eval_cache,
+                eval_pattern,
             )?;
             Ok(MatchOutcome {
                 matched: !outcome.matched,
@@ -1581,17 +1939,17 @@ where
         "and" => {
             let mut merged = TierFlags::default();
             for child in &node.children {
-                let outcome = evaluate_node(
+                let outcome = evaluate_node_with_patterns(
                     child,
                     doc_inputs,
                     load_metadata,
                     load_tier1,
                     load_tier2,
                     patterns,
-                    mask_cache,
                     plan,
                     query_now_unix,
                     eval_cache,
+                    eval_pattern,
                 )?;
                 if !outcome.matched {
                     return Ok(MatchOutcome::default());
@@ -1605,17 +1963,17 @@ where
         }
         "or" => {
             for child in &node.children {
-                let outcome = evaluate_node(
+                let outcome = evaluate_node_with_patterns(
                     child,
                     doc_inputs,
                     load_metadata,
                     load_tier1,
                     load_tier2,
                     patterns,
-                    mask_cache,
                     plan,
                     query_now_unix,
                     eval_cache,
+                    eval_pattern,
                 )?;
                 if outcome.matched {
                     return Ok(outcome);
@@ -1630,17 +1988,17 @@ where
             let mut matched_count = 0usize;
             let mut merged = TierFlags::default();
             for child in &node.children {
-                let outcome = evaluate_node(
+                let outcome = evaluate_node_with_patterns(
                     child,
                     doc_inputs,
                     load_metadata,
                     load_tier1,
                     load_tier2,
                     patterns,
-                    mask_cache,
                     plan,
                     query_now_unix,
                     eval_cache,
+                    eval_pattern,
                 )?;
                 if outcome.matched {
                     matched_count += 1;
@@ -1666,4 +2024,113 @@ where
             "Unsupported ast node kind: {other}"
         ))),
     }
+}
+
+/// Prepared-mask query-tree evaluator wrapper.
+fn evaluate_node<'a, FM, FT1, FT2>(
+    node: &QueryNode,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_metadata: &mut FM,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
+    patterns: &HashMap<String, PatternPlan>,
+    mask_cache: &PatternMaskCache,
+    plan: &CompiledQueryPlan,
+    query_now_unix: u64,
+    eval_cache: &mut QueryEvalCache,
+) -> Result<MatchOutcome>
+where
+    FM: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let mut eval_pattern = |pattern_id: &str,
+                            doc_inputs: &mut LazyDocQueryInputs<'a>,
+                            load_tier1: &mut FT1,
+                            load_tier2: &mut FT2,
+                            plan: &CompiledQueryPlan|
+     -> Result<MatchOutcome> {
+        let pattern = patterns
+            .get(pattern_id)
+            .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
+        let pattern_masks = mask_cache
+            .get(pattern_id)
+            .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
+        evaluate_pattern(
+            pattern,
+            pattern_masks,
+            doc_inputs,
+            load_tier1,
+            load_tier2,
+            plan,
+        )
+    };
+    evaluate_node_with_patterns(
+        node,
+        doc_inputs,
+        load_metadata,
+        load_tier1,
+        load_tier2,
+        patterns,
+        plan,
+        query_now_unix,
+        eval_cache,
+        &mut eval_pattern,
+    )
+}
+
+/// Runtime-hash query-tree evaluator wrapper.
+fn evaluate_node_runtime<'a, FM, FT1, FT2>(
+    node: &QueryNode,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_metadata: &mut FM,
+    load_tier1: &mut FT1,
+    load_tier2: &mut FT2,
+    runtime: &RuntimeQueryArtifacts,
+    plan: &CompiledQueryPlan,
+    query_now_unix: u64,
+    eval_cache: &mut QueryEvalCache,
+    gram_cache: &mut RuntimeGramMaskCache,
+) -> Result<MatchOutcome>
+where
+    FM: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT2: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let mut eval_pattern = |pattern_id: &str,
+                            doc_inputs: &mut LazyDocQueryInputs<'a>,
+                            load_tier1: &mut FT1,
+                            load_tier2: &mut FT2,
+                            plan: &CompiledQueryPlan|
+     -> Result<MatchOutcome> {
+        let pattern = runtime
+            .patterns
+            .get(pattern_id)
+            .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
+        let runtime_pattern = runtime
+            .runtime_patterns
+            .get(pattern_id)
+            .ok_or_else(|| SspryError::from(format!("Unknown runtime pattern id: {pattern_id}")))?;
+        evaluate_pattern_runtime(
+            pattern,
+            runtime_pattern,
+            doc_inputs,
+            load_tier1,
+            load_tier2,
+            plan,
+            gram_cache,
+        )
+    };
+    evaluate_node_with_patterns(
+        node,
+        doc_inputs,
+        load_metadata,
+        load_tier1,
+        load_tier2,
+        &runtime.patterns,
+        plan,
+        query_now_unix,
+        eval_cache,
+        &mut eval_pattern,
+    )
 }

@@ -250,6 +250,27 @@ impl CandidateQueryProfile {
             .tier2_bloom_bytes
             .saturating_add(other.tier2_bloom_bytes);
     }
+
+    /// Returns the saturating counter delta between two profile snapshots.
+    pub(crate) fn delta_since(&self, earlier: &Self) -> Self {
+        Self {
+            docs_scanned: self.docs_scanned.saturating_sub(earlier.docs_scanned),
+            metadata_loads: self.metadata_loads.saturating_sub(earlier.metadata_loads),
+            metadata_bytes: self.metadata_bytes.saturating_sub(earlier.metadata_bytes),
+            tier1_bloom_loads: self
+                .tier1_bloom_loads
+                .saturating_sub(earlier.tier1_bloom_loads),
+            tier1_bloom_bytes: self
+                .tier1_bloom_bytes
+                .saturating_sub(earlier.tier1_bloom_bytes),
+            tier2_bloom_loads: self
+                .tier2_bloom_loads
+                .saturating_sub(earlier.tier2_bloom_loads),
+            tier2_bloom_bytes: self
+                .tier2_bloom_bytes
+                .saturating_sub(earlier.tier2_bloom_bytes),
+        }
+    }
 }
 
 impl CandidatePreparedQueryProfile {
@@ -1052,6 +1073,25 @@ pub(crate) struct PreparedQueryArtifacts {
 }
 
 #[derive(Debug)]
+pub(crate) struct RuntimeQueryArtifacts {
+    patterns: HashMap<String, PatternPlan>,
+    runtime_patterns: HashMap<String, RuntimePatternArtifacts>,
+    impossible_query: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeAlternativeArtifacts {
+    use_any_lane: bool,
+    lane_variants: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePatternArtifacts {
+    tier1: Vec<RuntimeAlternativeArtifacts>,
+    tier2: Vec<RuntimeAlternativeArtifacts>,
+}
+
+#[derive(Debug)]
 pub struct CandidateStore {
     root: PathBuf,
     meta: ForestMeta,
@@ -1091,6 +1131,14 @@ struct MatchOutcome {
 #[derive(Default)]
 struct QueryEvalCache {
     pattern_outcomes: HashMap<String, MatchOutcome>,
+}
+
+#[derive(Default)]
+struct BatchedPreparedQueryResult {
+    hits: Vec<String>,
+    tiers: TierFlags,
+    profile: CandidateQueryProfile,
+    eval_nanos: u128,
 }
 
 struct LazyDocQueryInputs<'a> {
@@ -2962,6 +3010,59 @@ impl CandidateStore {
         Ok(Some((matched_hits, used_tiers, query_profile)))
     }
 
+    /// Attempts to answer a runtime-hash query from exact identity seeds so
+    /// only the matching documents need full evaluation.
+    fn query_identity_seed_hits_runtime(
+        &self,
+        plan: &CompiledQueryPlan,
+        runtime: &RuntimeQueryArtifacts,
+        gram_cache: &mut RuntimeGramMaskCache,
+    ) -> Result<Option<(Vec<String>, TierFlags, CandidateQueryProfile)>> {
+        let Some(seed_hashes) = Self::identity_seed_hashes(&plan.root) else {
+            return Ok(None);
+        };
+        let query_now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut matched_hits = Vec::<String>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for sha256 in seed_hashes {
+            let Some(pos) = self.sha_to_pos.get(&sha256).copied() else {
+                continue;
+            };
+            let doc = &self.docs[pos];
+            if doc.deleted {
+                continue;
+            }
+            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+            let mut doc_inputs = LazyDocQueryInputs::new(doc);
+            let mut load_metadata = || self.doc_metadata_bytes(pos);
+            let mut load_tier1 = || self.doc_bloom_bytes(pos);
+            let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+            let mut eval_cache = QueryEvalCache::default();
+            let outcome = evaluate_node_runtime(
+                &plan.root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                runtime,
+                plan,
+                query_now_unix,
+                &mut eval_cache,
+                gram_cache,
+            )?;
+            if outcome.matched {
+                matched_hits.push(doc.sha256.clone());
+                used_tiers.merge(outcome.tiers);
+            }
+            query_profile.merge_from(&doc_inputs.into_profile());
+        }
+        Ok(Some((matched_hits, used_tiers, query_profile)))
+    }
+
     /// Executes a query plan against the store and returns one paginated page
     /// of candidate SHA-256 values.
     pub fn query_candidates(
@@ -2981,6 +3082,7 @@ impl CandidateStore {
         )
     }
 
+    #[cfg(test)]
     /// Collects the full hit list for a prepared query without paginating it.
     pub(crate) fn collect_query_hits_with_prepared(
         &mut self,
@@ -2990,37 +3092,206 @@ impl CandidateStore {
         self.collect_query_hits_with_prepared_and_scope(plan, prepared, None)
     }
 
-    /// Runs the core query execution path using precomputed query artifacts and
-    /// updates aggregate query metrics.
-    fn collect_query_hits_with_prepared_and_scope(
+    /// Collects the full hit list for a runtime-hash query without paginating
+    /// it.
+    pub(crate) fn collect_query_hits_with_runtime_hash(
         &mut self,
         plan: &CompiledQueryPlan,
-        prepared: &PreparedQueryArtifacts,
-        mut total_scope: Option<&mut crate::perf::Scope>,
+        runtime: &RuntimeQueryArtifacts,
     ) -> Result<(Vec<String>, String, CandidateQueryProfile)> {
-        if prepared.impossible_query {
+        if runtime.impossible_query {
             return Ok((
                 Vec::new(),
                 "none".to_owned(),
                 CandidateQueryProfile::default(),
             ));
         }
-        let (matched_hits, used_tiers, query_profile) =
-            if let Some(identity_hits) = self.query_identity_seed_hits(plan, prepared)? {
-                identity_hits
-            } else {
-                self.scan_query_hits(plan, prepared)?
-            };
-        if let Some(scope) = total_scope.as_mut() {
-            scope.add_items(query_profile.docs_scanned);
+        let mut gram_cache = RuntimeGramMaskCache::default();
+        let (matched_hits, used_tiers, query_profile) = if let Some(identity_hits) =
+            self.query_identity_seed_hits_runtime(plan, runtime, &mut gram_cache)?
+        {
+            identity_hits
+        } else {
+            self.scan_query_hits_runtime(plan, runtime, &mut gram_cache)?
+        };
+        self.record_query_execution_profile(&query_profile, matched_hits.len());
+        Ok((matched_hits, used_tiers.as_label(), query_profile))
+    }
+
+    #[cfg(test)]
+    /// Collects hit lists for multiple prepared queries while scanning each
+    /// document at most once per lane.
+    pub(crate) fn collect_query_hits_with_prepared_batch(
+        &mut self,
+        plans: &[CompiledQueryPlan],
+        prepared: &[Arc<PreparedQueryArtifacts>],
+    ) -> Result<Vec<(Vec<String>, String, CandidateQueryProfile, u128)>> {
+        if plans.len() != prepared.len() {
+            return Err(SspryError::from(
+                "Bundled prepared queries require the same number of plans and artifacts.",
+            ));
         }
+
+        let mut results = (0..plans.len())
+            .map(|_| BatchedPreparedQueryResult::default())
+            .collect::<Vec<_>>();
+        let mut should_record_metrics = vec![false; plans.len()];
+        let mut scan_rule_indices = Vec::new();
+
+        for (index, (plan, prepared)) in plans.iter().zip(prepared.iter()).enumerate() {
+            if prepared.impossible_query {
+                continue;
+            }
+            should_record_metrics[index] = true;
+            let started = Instant::now();
+            if let Some((hits, tiers, profile)) =
+                self.query_identity_seed_hits(plan, prepared.as_ref())?
+            {
+                let result = &mut results[index];
+                result.hits = hits;
+                result.tiers = tiers;
+                result.profile = profile;
+                result.eval_nanos = started.elapsed().as_nanos();
+            } else {
+                scan_rule_indices.push(index);
+            }
+        }
+
+        if !scan_rule_indices.is_empty() {
+            let query_now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if self.has_live_regular_docs() {
+                self.scan_query_hits_all_docs_batch(
+                    plans,
+                    prepared,
+                    &scan_rule_indices,
+                    query_now_unix,
+                    &mut results,
+                )?;
+            }
+            if self.has_live_special_docs() {
+                self.scan_query_hits_special_lane_batch(
+                    plans,
+                    prepared,
+                    &scan_rule_indices,
+                    query_now_unix,
+                    &mut results,
+                )?;
+            }
+        }
+
+        let mut output = Vec::with_capacity(results.len());
+        for (index, result) in results.into_iter().enumerate() {
+            if should_record_metrics[index] {
+                self.record_query_execution_profile(&result.profile, result.hits.len());
+            }
+            output.push((
+                result.hits,
+                result.tiers.as_label(),
+                result.profile,
+                result.eval_nanos,
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Collects hit lists for multiple runtime-hash queries while scanning
+    /// each document at most once per lane.
+    pub(crate) fn collect_query_hits_with_runtime_hash_batch(
+        &mut self,
+        plans: &[CompiledQueryPlan],
+        runtime: &[Arc<RuntimeQueryArtifacts>],
+    ) -> Result<Vec<(Vec<String>, String, CandidateQueryProfile, u128)>> {
+        if plans.len() != runtime.len() {
+            return Err(SspryError::from(
+                "Bundled runtime-hash queries require the same number of plans and artifacts.",
+            ));
+        }
+
+        let mut results = (0..plans.len())
+            .map(|_| BatchedPreparedQueryResult::default())
+            .collect::<Vec<_>>();
+        let mut should_record_metrics = vec![false; plans.len()];
+        let mut scan_rule_indices = Vec::new();
+        let mut gram_cache = RuntimeGramMaskCache::default();
+
+        for (index, (plan, runtime)) in plans.iter().zip(runtime.iter()).enumerate() {
+            if runtime.impossible_query {
+                continue;
+            }
+            should_record_metrics[index] = true;
+            let started = Instant::now();
+            if let Some((hits, tiers, profile)) =
+                self.query_identity_seed_hits_runtime(plan, runtime.as_ref(), &mut gram_cache)?
+            {
+                let result = &mut results[index];
+                result.hits = hits;
+                result.tiers = tiers;
+                result.profile = profile;
+                result.eval_nanos = started.elapsed().as_nanos();
+            } else {
+                scan_rule_indices.push(index);
+            }
+        }
+
+        if !scan_rule_indices.is_empty() {
+            let query_now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if self.has_live_regular_docs() {
+                self.scan_query_hits_all_docs_batch_runtime(
+                    plans,
+                    runtime,
+                    &scan_rule_indices,
+                    query_now_unix,
+                    &mut gram_cache,
+                    &mut results,
+                )?;
+            }
+            if self.has_live_special_docs() {
+                self.scan_query_hits_special_lane_batch_runtime(
+                    plans,
+                    runtime,
+                    &scan_rule_indices,
+                    query_now_unix,
+                    &mut gram_cache,
+                    &mut results,
+                )?;
+            }
+        }
+
+        let mut output = Vec::with_capacity(results.len());
+        for (index, result) in results.into_iter().enumerate() {
+            if should_record_metrics[index] {
+                self.record_query_execution_profile(&result.profile, result.hits.len());
+            }
+            output.push((
+                result.hits,
+                result.tiers.as_label(),
+                result.profile,
+                result.eval_nanos,
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Records the standard query counters and telemetry for one completed
+    /// query profile.
+    fn record_query_execution_profile(
+        &mut self,
+        query_profile: &CandidateQueryProfile,
+        matched_hit_count: usize,
+    ) {
         record_counter(
             "candidate.query_candidates_docs_scanned_total",
             query_profile.docs_scanned,
         );
         record_counter(
             "candidate.query_candidates_matches_total",
-            matched_hits.len() as u64,
+            matched_hit_count as u64,
         );
         record_counter(
             "candidate.query_candidates_metadata_loads_total",
@@ -3048,9 +3319,36 @@ impl CandidateStore {
         );
         record_max(
             "candidate.query_candidates_max_matches",
-            matched_hits.len() as u64,
+            matched_hit_count as u64,
         );
-        self.record_query_metrics(query_profile.docs_scanned, matched_hits.len() as u64);
+        self.record_query_metrics(query_profile.docs_scanned, matched_hit_count as u64);
+    }
+
+    /// Runs the core query execution path using precomputed query artifacts and
+    /// updates aggregate query metrics.
+    fn collect_query_hits_with_prepared_and_scope(
+        &mut self,
+        plan: &CompiledQueryPlan,
+        prepared: &PreparedQueryArtifacts,
+        mut total_scope: Option<&mut crate::perf::Scope>,
+    ) -> Result<(Vec<String>, String, CandidateQueryProfile)> {
+        if prepared.impossible_query {
+            return Ok((
+                Vec::new(),
+                "none".to_owned(),
+                CandidateQueryProfile::default(),
+            ));
+        }
+        let (matched_hits, used_tiers, query_profile) =
+            if let Some(identity_hits) = self.query_identity_seed_hits(plan, prepared)? {
+                identity_hits
+            } else {
+                self.scan_query_hits(plan, prepared)?
+            };
+        if let Some(scope) = total_scope.as_mut() {
+            scope.add_items(query_profile.docs_scanned);
+        }
+        self.record_query_execution_profile(&query_profile, matched_hits.len());
         Ok((matched_hits, used_tiers.as_label(), query_profile))
     }
 
@@ -3130,6 +3428,277 @@ impl CandidateStore {
         Ok((matched_hits, used_tiers, query_profile))
     }
 
+    /// Dispatches runtime-hash query evaluation across the regular and
+    /// special-population lanes and merges their results.
+    fn scan_query_hits_runtime(
+        &self,
+        plan: &CompiledQueryPlan,
+        runtime: &RuntimeQueryArtifacts,
+        gram_cache: &mut RuntimeGramMaskCache,
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let has_regular_docs = self.has_live_regular_docs();
+        let has_special_docs = self.has_live_special_docs();
+        let mut query_profile = CandidateQueryProfile::default();
+        if !has_regular_docs && !has_special_docs {
+            return Ok((Vec::new(), TierFlags::default(), query_profile));
+        }
+        let query_now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut matched_hits = Vec::<String>::new();
+        let mut used_tiers = TierFlags::default();
+
+        if has_regular_docs {
+            let (hits, tiers, profile) =
+                self.scan_query_hits_all_docs_runtime(plan, runtime, query_now_unix, gram_cache)?;
+            matched_hits.extend(hits);
+            used_tiers.merge(tiers);
+            query_profile.merge_from(&profile);
+        }
+
+        if has_special_docs {
+            let (hits, tiers, profile) = self.scan_query_hits_special_lane_runtime(
+                plan,
+                runtime,
+                query_now_unix,
+                gram_cache,
+            )?;
+            matched_hits.extend(hits);
+            used_tiers.merge(tiers);
+            query_profile.merge_from(&profile);
+        }
+
+        Ok((matched_hits, used_tiers, query_profile))
+    }
+
+    #[cfg(test)]
+    /// Evaluates one document against every scan-based bundled rule while
+    /// sharing doc-side payload loads across those rule evaluations.
+    fn evaluate_query_batch_doc(
+        &self,
+        pos: usize,
+        doc: &CandidateDoc,
+        plans: &[CompiledQueryPlan],
+        prepared: &[Arc<PreparedQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        results: &mut [BatchedPreparedQueryResult],
+    ) -> Result<()> {
+        let mut doc_inputs = LazyDocQueryInputs::new(doc);
+        let mut load_metadata = || self.doc_metadata_bytes(pos);
+        let mut load_tier1 = || self.doc_bloom_bytes(pos);
+        let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+        let mut eval_caches = (0..scan_rule_indices.len())
+            .map(|_| QueryEvalCache::default())
+            .collect::<Vec<_>>();
+
+        for (cache_idx, result_idx) in scan_rule_indices.iter().copied().enumerate() {
+            let Some(result) = results.get_mut(result_idx) else {
+                continue;
+            };
+            result.profile.docs_scanned = result.profile.docs_scanned.saturating_add(1);
+            let profile_before = doc_inputs.profile.clone();
+            let started = Instant::now();
+            let prepared = prepared[result_idx].as_ref();
+            let outcome = evaluate_node(
+                &plans[result_idx].root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                &prepared.patterns,
+                &prepared.mask_cache,
+                &plans[result_idx],
+                query_now_unix,
+                &mut eval_caches[cache_idx],
+            )?;
+            result.eval_nanos = result
+                .eval_nanos
+                .saturating_add(started.elapsed().as_nanos());
+            let profile_delta = doc_inputs.profile.delta_since(&profile_before);
+            result.profile.merge_from(&profile_delta);
+            if outcome.matched {
+                result.hits.push(doc.sha256.clone());
+                result.tiers.merge(outcome.tiers);
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluates one document against every runtime-hash bundled rule while
+    /// sharing doc-side payload loads and query gram masks across rules.
+    fn evaluate_query_batch_doc_runtime(
+        &self,
+        pos: usize,
+        doc: &CandidateDoc,
+        plans: &[CompiledQueryPlan],
+        runtime: &[Arc<RuntimeQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+        results: &mut [BatchedPreparedQueryResult],
+    ) -> Result<()> {
+        let mut doc_inputs = LazyDocQueryInputs::new(doc);
+        let mut load_metadata = || self.doc_metadata_bytes(pos);
+        let mut load_tier1 = || self.doc_bloom_bytes(pos);
+        let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+        let mut eval_caches = (0..scan_rule_indices.len())
+            .map(|_| QueryEvalCache::default())
+            .collect::<Vec<_>>();
+
+        for (cache_idx, result_idx) in scan_rule_indices.iter().copied().enumerate() {
+            let Some(result) = results.get_mut(result_idx) else {
+                continue;
+            };
+            result.profile.docs_scanned = result.profile.docs_scanned.saturating_add(1);
+            let profile_before = doc_inputs.profile.clone();
+            let started = Instant::now();
+            let outcome = evaluate_node_runtime(
+                &plans[result_idx].root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                runtime[result_idx].as_ref(),
+                &plans[result_idx],
+                query_now_unix,
+                &mut eval_caches[cache_idx],
+                gram_cache,
+            )?;
+            result.eval_nanos = result
+                .eval_nanos
+                .saturating_add(started.elapsed().as_nanos());
+            let profile_delta = doc_inputs.profile.delta_since(&profile_before);
+            result.profile.merge_from(&profile_delta);
+            if outcome.matched {
+                result.hits.push(doc.sha256.clone());
+                result.tiers.merge(outcome.tiers);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    /// Evaluates bundled scan-based queries against every live regular doc in
+    /// one pass.
+    fn scan_query_hits_all_docs_batch(
+        &self,
+        plans: &[CompiledQueryPlan],
+        prepared: &[Arc<PreparedQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        results: &mut [BatchedPreparedQueryResult],
+    ) -> Result<()> {
+        for (pos, doc) in self.docs.iter().enumerate() {
+            if doc.deleted || doc.special_population {
+                continue;
+            }
+            self.evaluate_query_batch_doc(
+                pos,
+                doc,
+                plans,
+                prepared,
+                scan_rule_indices,
+                query_now_unix,
+                results,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Evaluates bundled runtime-hash queries against every live regular doc
+    /// in one pass.
+    fn scan_query_hits_all_docs_batch_runtime(
+        &self,
+        plans: &[CompiledQueryPlan],
+        runtime: &[Arc<RuntimeQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+        results: &mut [BatchedPreparedQueryResult],
+    ) -> Result<()> {
+        for (pos, doc) in self.docs.iter().enumerate() {
+            if doc.deleted || doc.special_population {
+                continue;
+            }
+            self.evaluate_query_batch_doc_runtime(
+                pos,
+                doc,
+                plans,
+                runtime,
+                scan_rule_indices,
+                query_now_unix,
+                gram_cache,
+                results,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    /// Evaluates bundled scan-based queries against every live special-population
+    /// doc in one pass.
+    fn scan_query_hits_special_lane_batch(
+        &self,
+        plans: &[CompiledQueryPlan],
+        prepared: &[Arc<PreparedQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        results: &mut [BatchedPreparedQueryResult],
+    ) -> Result<()> {
+        for pos in &self.special_doc_positions {
+            let Some(doc) = self.docs.get(*pos) else {
+                continue;
+            };
+            if doc.deleted || !doc.special_population {
+                continue;
+            }
+            self.evaluate_query_batch_doc(
+                *pos,
+                doc,
+                plans,
+                prepared,
+                scan_rule_indices,
+                query_now_unix,
+                results,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Evaluates bundled runtime-hash queries against every live
+    /// special-population doc in one pass.
+    fn scan_query_hits_special_lane_batch_runtime(
+        &self,
+        plans: &[CompiledQueryPlan],
+        runtime: &[Arc<RuntimeQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+        results: &mut [BatchedPreparedQueryResult],
+    ) -> Result<()> {
+        for pos in &self.special_doc_positions {
+            let Some(doc) = self.docs.get(*pos) else {
+                continue;
+            };
+            if doc.deleted || !doc.special_population {
+                continue;
+            }
+            self.evaluate_query_batch_doc_runtime(
+                *pos,
+                doc,
+                plans,
+                runtime,
+                scan_rule_indices,
+                query_now_unix,
+                gram_cache,
+                results,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Evaluates the query only against the special-population lane, which is
     /// stored separately from ordinary documents.
     fn scan_query_hits_special_lane(
@@ -3175,6 +3744,52 @@ impl CandidateStore {
         Ok((matched_hits, used_tiers, query_profile))
     }
 
+    /// Evaluates a runtime-hash query only against the special-population
+    /// lane, which is stored separately from ordinary documents.
+    fn scan_query_hits_special_lane_runtime(
+        &self,
+        plan: &CompiledQueryPlan,
+        runtime: &RuntimeQueryArtifacts,
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<String>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for pos in &self.special_doc_positions {
+            let Some(doc) = self.docs.get(*pos) else {
+                continue;
+            };
+            if doc.deleted || !doc.special_population {
+                continue;
+            }
+            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+            let mut doc_inputs = LazyDocQueryInputs::new(doc);
+            let mut load_metadata = || self.doc_metadata_bytes(*pos);
+            let mut load_tier1 = || self.doc_bloom_bytes(*pos);
+            let mut load_tier2 = || self.doc_tier2_bloom_bytes(*pos);
+            let mut eval_cache = QueryEvalCache::default();
+            let outcome = evaluate_node_runtime(
+                &plan.root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                runtime,
+                plan,
+                query_now_unix,
+                &mut eval_cache,
+                gram_cache,
+            )?;
+            if outcome.matched {
+                matched_hits.push(doc.sha256.clone());
+                used_tiers.merge(outcome.tiers);
+            }
+            query_profile.merge_from(&doc_inputs.into_profile());
+        }
+        Ok((matched_hits, used_tiers, query_profile))
+    }
+
     /// Evaluates the query across every live regular document in the store.
     fn scan_query_hits_all_docs(
         &self,
@@ -3206,6 +3821,49 @@ impl CandidateStore {
                 plan,
                 query_now_unix,
                 &mut eval_cache,
+            )?;
+            if outcome.matched {
+                matched_hits.push(doc.sha256.clone());
+                used_tiers.merge(outcome.tiers);
+            }
+            query_profile.merge_from(&doc_inputs.into_profile());
+        }
+        Ok((matched_hits, used_tiers, query_profile))
+    }
+
+    /// Evaluates a runtime-hash query across every live regular document in
+    /// the store.
+    fn scan_query_hits_all_docs_runtime(
+        &self,
+        plan: &CompiledQueryPlan,
+        runtime: &RuntimeQueryArtifacts,
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<String>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        for (pos, doc) in self.docs.iter().enumerate() {
+            if doc.deleted || doc.special_population {
+                continue;
+            }
+            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+            let mut doc_inputs = LazyDocQueryInputs::new(doc);
+            let mut load_metadata = || self.doc_metadata_bytes(pos);
+            let mut load_tier1 = || self.doc_bloom_bytes(pos);
+            let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+            let mut eval_cache = QueryEvalCache::default();
+            let outcome = evaluate_node_runtime(
+                &plan.root,
+                &mut doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                &mut load_tier2,
+                runtime,
+                plan,
+                query_now_unix,
+                &mut eval_cache,
+                gram_cache,
             )?;
             if outcome.matched {
                 matched_hits.push(doc.sha256.clone());

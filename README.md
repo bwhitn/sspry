@@ -78,3 +78,27 @@ If `cargo-llvm-cov` is installed:
 ```bash
 ./scripts/coverage.sh
 ```
+
+## Benchmarking
+
+For server-side search benchmarks with CPU and anon-memory sampling:
+
+```bash
+./scripts/server_search_bench.sh \
+  --root ./candidate_db \
+  --addr 127.0.0.1:18663 \
+  --out ./results/bench_prepared_workers6 \
+  --mode-label prepared \
+  --search-workers 6 \
+  --rule-manifest /path/to/rules.manifest \
+  --bundle-rule /path/to/bundle_10rules.yar
+```
+
+The benchmark helper records:
+
+- per-phase client elapsed, user CPU, system CPU, average CPU percent, and max RSS
+- per-phase server CPU time and average CPU percent
+- peak `VmRSS`, `RssAnon`, `VmSwap`, `Pss_Anon`, `Private_Clean`, and `Private_Dirty`
+- raw timestamped `/proc` samples in `server_samples.tsv`
+
+Use `--server-extra-arg` to forward extra serve flags such as alternate search modes when the binary exposes them.
