@@ -144,6 +144,30 @@ fn serve_candidate_shard_count_explicit_override_wins() {
 }
 
 #[test]
+fn resolve_serve_runtime_settings_prefers_existing_forest_tree_roots() {
+    let tmp = tempdir().expect("tmp");
+    let forest_root = tmp.path().join("forest");
+    let tree_root = forest_root.join("tree_00").join("current");
+    fs::create_dir_all(tree_root.parent().expect("tree parent")).expect("tree parent");
+
+    assert_eq!(cmd_init(&default_internal_init_args(&tree_root, 2, true)), 0);
+    assert!(forest_root.join("meta.json").exists());
+    assert!(!serve_uses_workspace_mode(&forest_root));
+
+    let existing_root =
+        existing_serve_store_root(&forest_root, false).expect("existing forest root");
+    assert_eq!(existing_root, Some(tree_root.clone()));
+
+    let mut args = default_serve_common_args();
+    args.root = forest_root.display().to_string();
+    let resolved = resolve_serve_runtime_settings(&args, ServeInitOptionSources::default())
+        .expect("resolved serve settings");
+    assert_eq!(resolved.candidate_shards, 2);
+    assert!(!resolved.workspace_mode);
+    assert_eq!(resolved.candidate_config.root, forest_root);
+}
+
+#[test]
 fn search_related_commands_default_max_candidates_to_ten_percent() {
     let cli = Cli::try_parse_from(["sspry", "search", "--rule", "rule.yar"]).expect("parse search");
     match cli.command {

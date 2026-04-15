@@ -3197,13 +3197,17 @@ fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option
         }
         return Ok(None);
     }
+    let tree_roots = forest_tree_roots(root)?;
+    if let Some(tree_root) = tree_roots
+        .iter()
+        .find(|tree_root| *tree_root != root && store_root_has_markers(tree_root))
+    {
+        return Ok(Some(tree_root.clone()));
+    }
     if store_root_has_markers(root) {
         return Ok(Some(root.to_path_buf()));
     }
-    let tree_roots = forest_tree_roots(root)?;
-    Ok(tree_roots
-        .into_iter()
-        .find(|tree_root| tree_root != root && store_root_has_markers(tree_root)))
+    Ok(None)
 }
 
 /// Resolves the effective serve-time runtime settings, reusing on-disk store
