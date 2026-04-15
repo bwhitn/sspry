@@ -1939,6 +1939,16 @@ rule miss_rule {
         100,
     )
     .expect("compile plan");
+    let miss_plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        &miss_rule,
+        gram_sizes,
+        active_identity_source.as_deref(),
+        8,
+        false,
+        true,
+        100,
+    )
+    .expect("compile miss plan");
     assert_eq!(summary_cap_bytes, 0);
 
     let local_tree = query_store_group_all_candidates(&mut tree_groups[0].stores, &plan, true)
@@ -1966,6 +1976,36 @@ rule miss_rule {
         .expect("forest query after clear");
     assert_eq!(after_clear.total_candidates, 2);
     assert!(after_clear.external_ids.is_none());
+
+    clear_local_forest_search_caches(&mut tree_groups);
+    let sequential_match =
+        query_local_forest_all_candidates(&mut tree_groups, &plan, false, 2).expect("match seq");
+    let sequential_miss = query_local_forest_all_candidates(&mut tree_groups, &miss_plan, false, 2)
+        .expect("miss seq");
+    let sequential_tier1_loads = sequential_match
+        .query_profile
+        .tier1_bloom_loads
+        .saturating_add(sequential_miss.query_profile.tier1_bloom_loads);
+
+    clear_local_forest_search_caches(&mut tree_groups);
+    let batched = query_local_forest_all_candidates_batch(
+        &mut tree_groups,
+        &[plan.clone(), miss_plan.clone()],
+        false,
+        2,
+    )
+    .expect("batched forest query");
+    assert_eq!(batched.len(), 2);
+    assert_eq!(batched[0].total_candidates, 2);
+    assert_eq!(batched[1].total_candidates, 0);
+    let batched_tier1_loads = batched
+        .iter()
+        .map(|aggregate| aggregate.query_profile.tier1_bloom_loads)
+        .sum::<u64>();
+    assert!(
+        batched_tier1_loads < sequential_tier1_loads,
+        "bundled local search should reuse tier1 bloom loads across rules"
+    );
 
     let json_out = base.join("batch_results.json");
     assert_eq!(
@@ -2001,5 +2041,14 @@ rule miss_rule {
         .collect::<HashMap<_, _>>();
     assert_eq!(candidates_by_rule.get("0001_match.yar"), Some(&2));
     assert_eq!(candidates_by_rule.get("0002_miss.yar"), Some(&0));
+    let batch_tier1_loads = batch_rows
+        .iter()
+        .map(|row| {
+            row.get("verbose_search_tier1_bloom_loads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    assert_eq!(batch_tier1_loads, batched_tier1_loads);
     assert!(append_path_suffix(&json_out, ".jsonl").exists());
 }
