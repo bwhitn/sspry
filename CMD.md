@@ -48,7 +48,8 @@ Key options:
 - `--max-message-bytes <BYTES>`
 - `--search-workers <N>`
   - one active top-level search per server
-  - the active search runs across at most this many trees at once
+  - direct/workspace mode fans out across shards
+  - forest mode fans out across shard/tree work units
   - default is `max(1, cpus/4)`
 - `--root <ROOT>`
   - workspace root, direct store root, or forest root
@@ -182,9 +183,9 @@ Behavior:
 - server compiles and executes the search plan
 - server serializes top-level searches and queues later requests
 - client deduplicates across the forest and applies the final percentage cap
-- if the expanded source contains multiple searchable rules, the command runs one search per rule identifier in source order
+- if the expanded source contains multiple searchable rules, the remote path sends one bundled gRPC request covering all named rules in source order
 - single-rule output stays unchanged
-- multi-rule output is emitted as one labeled block per rule identifier from the expanded source
+- multi-rule output is emitted as one labeled block per rule identifier as each rule completes
 - the command returns nonzero if any rule in the expanded source fails
 
 ## `local-search`
@@ -209,7 +210,7 @@ Behavior:
 
 - opens `tree_*/current` directly and searches the forest in-process
 - `--tree-search-workers 0` means auto up to the tree count
-- if the expanded source contains multiple searchable rules, the command runs one search per rule identifier in source order
+- if the expanded source contains multiple searchable rules, the command reuses one opened forest but still executes one rule at a time in source order
 - single-rule output stays unchanged
 - multi-rule output is emitted as one labeled block per rule identifier from the expanded source
 - the command returns nonzero if any rule in the expanded source fails
@@ -231,6 +232,8 @@ Usage: sspry search-batch --root <ROOT> --json-out <JSON_OUT> [OPTIONS]
 Behavior:
 
 - opens the forest once and reuses it across the whole rule sweep
+- compiles the rule files from `--rules-dir` / `--rule-manifest` once, then evaluates them in one bundled local forest sweep
+- writes both the final JSON file and an incremental `.jsonl` companion stream beside it
 - `--tree-search-workers 0` means auto up to the tree count
 
 ## `info`

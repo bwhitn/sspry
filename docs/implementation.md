@@ -14,11 +14,11 @@ At a high level:
    - per-document Tier1 bloom filters
    - per-document Tier2 bloom filters
    - metadata and optional stored file paths
-4. `search` compiles a restricted YARA rule into a query plan.
+4. `search` or `local-search` compiles restricted YARA into one or more named query plans from the top-level expanded source.
 5. The store returns candidate digests.
 6. If `--verify` is enabled, the client reopens stored file paths and verifies matches locally with `yara-x`.
 
-Public search now has two execution modes:
+Public interactive search now has two execution modes:
 
 - RPC mode: query one running `serve` process via `--addr`
 - local forest mode: query one forest root in-process via `local-search --root`
@@ -35,7 +35,8 @@ RPC `serve --search-workers` uses a different scheduler than local forest mode: 
 `search-batch` is the long-lived variant of local forest mode:
 
 - open the forest once
-- iterate many rules against the same live tree set
+- compile many rule files up front
+- evaluate them against the same live tree set in one bundled local sweep
 - emit per-rule JSON records for profiling
 
 ## Query Flow
@@ -47,11 +48,12 @@ The query path is:
 1. Parse restricted YARA into fixed literals / boolean structure.
 2. Extract Tier1 and Tier2 grams from the rule using the DB-wide gram sizes.
 3. Build an anchor plan with branch ordering, per-pattern anchor reduction, and preserved selected anchor literals.
-4. Query trees in parallel when searching a forest.
-5. Scan shard stores directly.
-6. Use per-document Tier1 and Tier2 blooms plus stored metadata to refine candidates.
-7. Collect candidate digests without ranking guarantees.
-8. Optionally verify file paths locally.
+4. Build runtime query artifacts from the compiled plan so bloom checks can hash grams during evaluation instead of storing a full query-side bloom image.
+5. Query trees in parallel when searching a forest.
+6. Scan shard stores directly.
+7. Use per-document Tier1 and Tier2 blooms plus stored metadata to refine candidates.
+8. Collect candidate digests without ranking guarantees.
+9. Optionally verify file paths locally.
 
 In local forest mode, the query path adds one layer above shard search:
 
@@ -61,7 +63,7 @@ In local forest mode, the query path adds one layer above shard search:
 4. fan out the query across trees with up to `tree_search_workers`
 5. merge candidate hashes, query profiles, and optional external ids
 
-In `search-batch`, that forest-open/validation work is done once for the whole sweep instead of once per rule.
+In `search-batch`, that forest-open/validation work is done once for the whole sweep instead of once per rule, and the bundled local evaluator walks the forest once for the active rule set rather than reopening the forest per rule file.
 
 ## Storage Layout
 
@@ -205,6 +207,7 @@ Current search improvements include:
 - bounded server-side query-result cache
 - runtime query-artifact cache inside the store
 - per-rule runtime query-artifact memory profiling
+- bundled runtime-hash evaluation for multi-rule local sweeps
 - preserved selected anchor literals for runtime lane selection so chosen anchors do not silently degrade into broad any-lane matching
 
 These are intended to be recall-safe planner/runtime improvements.

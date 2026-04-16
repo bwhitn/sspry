@@ -260,13 +260,14 @@ Behavior:
 - the client sends validated YARA source to the server
 - the server compiles and executes the search plan
 - only one top-level search runs at a time per server; later searches queue
-- candidate pages stream back to the client
+- for a single searchable rule, the server executes the normal one-rule path
+- if the expanded source contains multiple searchable rules, the remote path sends one bundled request covering all named rules from the top-level file
 - the client deduplicates across the forest before applying the final cap
 - if the candidate cap is reached, output includes `truncated: true` and `truncated_limit: <n>`
 - `--verify` reopens candidate file paths and runs local `yara-x` verification
 - verified search requires stored file paths to still exist on disk
 - candidate order is not guaranteed; search returns an unordered match set
-- if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
+- multi-rule stdout is grouped into one labeled block per rule identifier
 - the command exits nonzero if any rule in the expanded source fails to compile or execute
 
 ## local-search
@@ -295,6 +296,7 @@ Behavior:
 
 - `local-search` opens `tree_*/current` directly and searches the forest in-process
 - `--tree-search-workers` is the local forest concurrency knob shared by `local-search` and `search-batch`
+- if the expanded source contains multiple searchable rules, `local-search` still executes them one rule at a time while reusing the opened forest
 - if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
 - the command exits nonzero if any rule in the expanded source fails to compile or execute
 
@@ -364,6 +366,8 @@ Options:
 Behavior:
 
 - opens the forest once and reuses it across the whole rule sweep
+- compiles the requested rule files first, then evaluates the whole set in one bundled local forest pass
+- writes the final JSON file plus an incremental `.jsonl` stream beside it for long-running sweeps
 - intended for repeated benchmark and profiling passes on a preserved forest
 
 ## server_search_bench helper
@@ -377,7 +381,8 @@ Common options:
 - `--rule-manifest <path>`
   - newline-delimited per-rule search list
 - `--bundle-rule <path>`
-  - bundle file for the bundled search phase
+  - top-level YARA file for the bundled search phase
+  - commonly an include file that expands to the rule set you want to search in one remote request
 - `--search-workers <n>`
   - forwarded to `sspry serve --search-workers`
 - `--mode-label <text>`
@@ -488,6 +493,7 @@ This bypasses the database and scans one file directly with `yara-x`.
 - use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
 - use `--search-workers` to control how many shard/tree work units the active search runs across at once
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change
+- use `search-batch` when you want one-open bundled local sweeps and machine-readable JSON/JSONL output over a preserved forest
 - expect delete to be immediate logically in `current/`, return `missing` when the value is not present there, and be reclaimed physically later by background compaction of `current/`
 - `SIGINT` and `SIGTERM` trigger graceful drain and shutdown
 - `SIGUSR1` prints a live `info` snapshot to `stderr`

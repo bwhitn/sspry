@@ -6,7 +6,7 @@ A mutable file search database with fast candidate retrieval and optional YARA v
 
 ## Overview
 
-SSPRY is a scalable way to reduce the set of files that need to be scanned based on the YARA rule you intend to use. This isn’t meant for many rules to scan at one time, but rather for one-off scanning of a corpus of files. It is intended to avoid false negatives and have limited false positives. Other projects have done similar things, but the goal of this one is to do so in a scalable way that trades upfront processing for reduced memory and search processing, while keeping the overall database (Forest) size smaller than the sum of the files; however, it has a fair amount of disk I/O during searches. In addition to those, the database needs to support the insertion and deletion of items.
+SSPRY is a scalable way to reduce the set of files that need to be scanned based on the YARA rule you intend to use. The public search path supports both single-rule lookups and small bundled rule sets loaded from one top-level YARA file with normal `include "..."` directives. It is intended to avoid false negatives and have limited false positives. Other projects have done similar things, but the goal of this one is to do so in a scalable way that trades upfront processing for reduced memory and search processing, while keeping the overall database (Forest) size smaller than the sum of the files; however, it has a fair amount of disk I/O during searches. In addition to those, the database needs to support the insertion and deletion of items.
 
 ## Terms
 Candidate - An individual document that is returned as a possible match.<br>
@@ -29,7 +29,7 @@ Duplicate detection is prevented on insert into the same shard. This does mean t
 Most bloom-backed searches read the T1 blooms across the Trees being searched. Possible T1 matches may then require T2 reads and metadata checks. If a rule has no searchable string anchors, it may fall back to metadata checks, direct identity lookups, or later verification depending on the rule structure. An example of this could be a condition like “filesize < 4kb and pe.is_pe and pe.timestamp > time.now”, which could find a PE file smaller than 4kb and with a timestamp greater than the time of the search start.
 
 ## Program Architecture
-The program's architecture is client-server, with the client performing bloom creation and sending requests to the server, while the server handles the disk I/O for storage, search, and responses. The exception to this is the batch functions, which are mainly used in testing and allow batching searches (a list of YARA rules) and indexing (a list of paths to files to index). A quick note: these are clients and servers and do not have any built-in security, so it is recommended that they be on a closed network.
+The program's architecture is primarily client-server. During ingest, the client scans files and sends per-document bloom and metadata rows to the server. During search, the client sends validated YARA source and the server handles search planning, disk I/O, and candidate retrieval. The exception to this is the direct local path, where `local-search` opens a forest in-process and `search-batch` keeps that forest open for repeated bundled rule sweeps. A quick note: these are clients and servers and do not have any built-in security, so it is recommended that they be on a closed network.
 
 Additionally, if you opt to store path information when creating the Forest, you can automatically verify search results using it.
 
@@ -101,4 +101,4 @@ The benchmark helper records:
 - peak `VmRSS`, `RssAnon`, `VmSwap`, `Pss_Anon`, `Private_Clean`, and `Private_Dirty`
 - raw timestamped `/proc` samples in `server_samples.tsv`
 
-Use `--server-extra-arg` to forward extra serve flags such as alternate search modes when the binary exposes them.
+`--bundle-rule` should point to one top-level YARA file, commonly an include file that expands to the rule set you want to bundle into one remote `search` request. Use `--server-extra-arg` and `--search-extra-arg` to forward extra serve/search flags when needed.

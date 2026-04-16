@@ -50,6 +50,8 @@ Unverified candidate search:
 
 By default, `search` caps returned candidates at `10%` of searchable documents. Set `--max-candidates 0` to disable that cap.
 
+`--rule` can also point at one top-level YARA file that expands `include "..."` directives. If that expanded source contains multiple searchable rules, remote `search` runs them as one bundled request and prints one labeled result block per named rule.
+
 Verified search:
 
 ```bash
@@ -104,3 +106,4 @@ Signals:
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
 - Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with the default `8` keeps open and publish fanout low.
 - If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 8-shard layout.
+- For repeated local tuning against a preserved forest, prefer `search-batch` over reopening the forest for every rule.
