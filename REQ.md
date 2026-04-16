@@ -146,7 +146,7 @@ Each feature should be classified as one of:
 ## Documentation and Operability
 
 - Keep CLI documentation current.
-- Keep current behavior recorded in `TODO.md`.
+- Keep current behavior recorded in the maintained user and implementation documentation.
 - Keep project requirements recorded in this file.
 - Keep adaptive publish behavior and `info`/`info --light` surfaces understandable.
 - Remove stale references to superseded knobs and legacy naming.
