@@ -14,27 +14,30 @@ struct SearchWorkUnit {
 
 #[derive(Default)]
 struct BundledQueryAccumulator {
-    hashes: HashSet<String>,
-    external_ids: HashMap<String, Option<String>>,
     tier_used: Vec<String>,
     query_profile: CandidateQueryProfile,
     eval_nanos: u128,
 }
 
 impl BundledQueryAccumulator {
-    /// Merges one store-set-local accumulator into the final per-rule totals.
-    fn merge_from(&mut self, other: Self) {
-        self.hashes.extend(other.hashes);
-        self.tier_used.extend(other.tier_used);
-        self.query_profile.merge_from(&other.query_profile);
-        self.eval_nanos = self.eval_nanos.saturating_add(other.eval_nanos);
-        for (sha256, external_id) in other.external_ids {
-            self.external_ids.entry(sha256).or_insert(external_id);
-        }
+    /// Merges one store-set-local terminal summary into the final per-rule totals.
+    fn merge_from_partial(&mut self, partial: &BundledQueryPartial) {
+        self.tier_used.push(partial.tier_used.clone());
+        self.query_profile.merge_from(&partial.query_profile);
+        self.eval_nanos = self.eval_nanos.saturating_add(partial.eval_nanos);
     }
 }
 
-type BundledStoreQueryResult = (SearchWorkUnit, Vec<BundledQueryAccumulator>);
+#[derive(Default)]
+struct BundledQueryPartial {
+    hashes: Vec<String>,
+    external_ids: Option<Vec<Option<String>>>,
+    tier_used: String,
+    query_profile: CandidateQueryProfile,
+    eval_nanos: u128,
+}
+
+type BundledStoreQueryResult = (SearchWorkUnit, Vec<BundledQueryPartial>);
 
 impl ServerState {
     /// Initializes server state, opens or creates the underlying store layout,
@@ -3303,8 +3306,8 @@ impl ServerState {
         runtime: &[Arc<RuntimeQueryArtifacts>],
         include_external_ids: bool,
     ) -> Result<BundledStoreQueryResult> {
-        let mut accumulators = (0..plans.len())
-            .map(|_| BundledQueryAccumulator::default())
+        let mut partials = (0..plans.len())
+            .map(|_| BundledQueryPartial::default())
             .collect::<Vec<_>>();
         let store_lock = stores
             .stores
@@ -3316,30 +3319,17 @@ impl ServerState {
             .into_iter()
             .enumerate()
         {
-            let Some(accumulator) = accumulators.get_mut(index) else {
+            let Some(partial) = partials.get_mut(index) else {
                 continue;
             };
-            let external_ids = if include_external_ids {
-                Some(store.external_ids_for_sha256(&hits))
-            } else {
-                None
-            };
-            accumulator.hashes.extend(hits.iter().cloned());
-            accumulator.tier_used.push(tier_used);
-            accumulator.query_profile.merge_from(&query_profile);
-            accumulator.eval_nanos = accumulator.eval_nanos.saturating_add(eval_nanos);
-            if include_external_ids {
-                let external_ids = external_ids.unwrap_or_default();
-                for (sha256, external_id) in hits.into_iter().zip(external_ids.into_iter()) {
-                    accumulator
-                        .external_ids
-                        .entry(sha256)
-                        .or_insert(external_id);
-                }
-            }
+            partial.external_ids = include_external_ids.then(|| store.external_ids_for_sha256(&hits));
+            partial.hashes = hits;
+            partial.tier_used = tier_used;
+            partial.query_profile = query_profile;
+            partial.eval_nanos = eval_nanos;
         }
         drop(store);
-        Ok((work_unit, accumulators))
+        Ok((work_unit, partials))
     }
 
     #[cfg(test)]
@@ -4099,24 +4089,31 @@ impl ServerState {
             ));
         }
         let store_sets = self.published_query_store_sets()?;
-        let searchable_doc_count = store_sets
-            .iter()
-            .flat_map(|stores| stores.stores.iter())
-            .map(|store_lock| {
-                let store = lock_candidate_store_blocking(store_lock)?;
-                Ok::<usize, SspryError>(store.live_doc_count())
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .sum::<usize>();
-        let candidate_limit =
-            match resolve_max_candidates(searchable_doc_count, plan.max_candidates) {
+        let searchable_doc_count = if plan.max_candidates.is_finite() && plan.max_candidates > 0.0 {
+            Some(
+                store_sets
+                    .iter()
+                    .flat_map(|stores| stores.stores.iter())
+                    .map(|store_lock| {
+                        let store = lock_candidate_store_blocking(store_lock)?;
+                        Ok::<usize, SspryError>(store.live_doc_count())
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .sum::<usize>(),
+            )
+        } else {
+            None
+        };
+        let candidate_limit = searchable_doc_count.and_then(|doc_count| {
+            match resolve_max_candidates(doc_count, plan.max_candidates) {
                 usize::MAX => None,
                 value => Some(value),
-            };
+            }
+        });
         if let Some(plan_key) = plan_key.as_deref() {
             search_trace_log(format!(
-                "stream.scope plan_key={} store_sets={} searchable_doc_count={} candidate_limit={:?}",
+                "stream.scope plan_key={} store_sets={} searchable_doc_count={:?} candidate_limit={:?}",
                 plan_key,
                 store_sets.len(),
                 searchable_doc_count,
@@ -4261,6 +4258,68 @@ impl ServerState {
         Ok(())
     }
 
+    /// Emits one bundled work-unit result immediately while folding its
+    /// terminal query counters into the per-rule totals used for rule-complete
+    /// frames.
+    fn emit_stream_candidate_query_frames_batch_partial<F>(
+        partial: BundledStoreQueryResult,
+        named_plans: &[(String, CompiledQueryPlan)],
+        chunk_size: usize,
+        candidate_limits: &[Option<usize>],
+        accumulators: &mut [BundledQueryAccumulator],
+        mut on_frame: F,
+    ) -> Result<()>
+    where
+        F: FnMut(CandidateQueryStreamFrame) -> Result<()>,
+    {
+        let (_, local_partials) = partial;
+        for (index, local) in local_partials.into_iter().enumerate() {
+            let Some((rule_name, _)) = named_plans.get(index) else {
+                continue;
+            };
+            let Some(accumulator) = accumulators.get_mut(index) else {
+                continue;
+            };
+            accumulator.merge_from_partial(&local);
+
+            match local.external_ids {
+                Some(values) => {
+                    for (hash_chunk, external_id_chunk) in
+                        local.hashes.chunks(chunk_size).zip(values.chunks(chunk_size))
+                    {
+                        on_frame(CandidateQueryStreamFrame {
+                            sha256: hash_chunk.to_vec(),
+                            external_ids: Some(external_id_chunk.to_vec()),
+                            candidate_limit: candidate_limits[index],
+                            stream_complete: false,
+                            rule_complete: false,
+                            target_rule_name: rule_name.clone(),
+                            tier_used: String::new(),
+                            query_profile: CandidateQueryProfile::default(),
+                            query_eval_nanos: 0,
+                        })?;
+                    }
+                }
+                None => {
+                    for hash_chunk in local.hashes.chunks(chunk_size) {
+                        on_frame(CandidateQueryStreamFrame {
+                            sha256: hash_chunk.to_vec(),
+                            external_ids: None,
+                            candidate_limit: candidate_limits[index],
+                            stream_complete: false,
+                            rule_complete: false,
+                            target_rule_name: rule_name.clone(),
+                            tier_used: String::new(),
+                            query_profile: CandidateQueryProfile::default(),
+                            query_eval_nanos: 0,
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Streams one bundled search response by evaluating every named plan in a
     /// shared pass over each shard and grouping the streamed output by rule.
     fn stream_candidate_query_frames_batch<F>(
@@ -4291,46 +4350,64 @@ impl ServerState {
             .map(|plan| self.shared_runtime_query_artifacts(plan))
             .collect::<Result<Vec<_>>>()?;
         let store_sets = self.published_query_store_sets()?;
-        let searchable_doc_count = store_sets
+        let searchable_doc_count = if plans
             .iter()
-            .flat_map(|stores| stores.stores.iter())
-            .map(|store_lock| {
-                let store = lock_candidate_store_blocking(store_lock)?;
-                Ok::<usize, SspryError>(store.live_doc_count())
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .sum::<usize>();
+            .any(|plan| plan.max_candidates.is_finite() && plan.max_candidates > 0.0)
+        {
+            Some(
+                store_sets
+                    .iter()
+                    .flat_map(|stores| stores.stores.iter())
+                    .map(|store_lock| {
+                        let store = lock_candidate_store_blocking(store_lock)?;
+                        Ok::<usize, SspryError>(store.live_doc_count())
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .sum::<usize>(),
+            )
+        } else {
+            None
+        };
         let candidate_limits = plans
             .iter()
-            .map(
-                |plan| match resolve_max_candidates(searchable_doc_count, plan.max_candidates) {
-                    usize::MAX => None,
-                    value => Some(value),
-                },
-            )
+            .map(|plan| {
+                searchable_doc_count.and_then(|doc_count| {
+                    match resolve_max_candidates(doc_count, plan.max_candidates) {
+                        usize::MAX => None,
+                        value => Some(value),
+                    }
+                })
+            })
             .collect::<Vec<_>>();
         let mut accumulators = (0..named_plans.len())
             .map(|_| BundledQueryAccumulator::default())
             .collect::<Vec<_>>();
         let work_units = Self::search_work_units(&store_sets);
         let worker_count = resolve_search_workers(self.config.search_workers, work_units.len());
-        let mut partials = if work_units.len() <= 1 || worker_count <= 1 {
-            let mut partials = Vec::with_capacity(work_units.len());
+        if work_units.len() <= 1 || worker_count <= 1 {
             for work_unit in &work_units {
-                partials.push(Self::collect_stream_query_matches_store_batch(
-                    &store_sets[work_unit.store_set_idx],
-                    *work_unit,
-                    &plans,
-                    &runtime,
-                    request.include_external_ids,
-                )?);
+                Self::emit_stream_candidate_query_frames_batch_partial(
+                    Self::collect_stream_query_matches_store_batch(
+                        &store_sets[work_unit.store_set_idx],
+                        *work_unit,
+                        &plans,
+                        &runtime,
+                        request.include_external_ids,
+                    )?,
+                    named_plans,
+                    chunk_size,
+                    &candidate_limits,
+                    &mut accumulators,
+                    &mut on_frame,
+                )?;
             }
-            partials
         } else {
             let next_unit = AtomicUsize::new(0);
             let include_external_ids = request.include_external_ids;
-            let partials = thread::scope(|scope| {
+            let aborted = AtomicBool::new(false);
+            thread::scope(|scope| -> Result<()> {
+                let (tx, rx) = std::sync::mpsc::channel::<Result<BundledStoreQueryResult>>();
                 let mut handles = Vec::with_capacity(worker_count);
                 for _ in 0..worker_count {
                     let store_sets = &store_sets;
@@ -4338,100 +4415,79 @@ impl ServerState {
                     let plans = &plans;
                     let runtime = runtime.clone();
                     let next_unit = &next_unit;
-                    handles.push(
-                        scope.spawn(move || -> Result<Vec<BundledStoreQueryResult>> {
-                            let mut local = Vec::new();
-                            loop {
-                                let work_idx = next_unit.fetch_add(1, Ordering::Relaxed);
-                                if work_idx >= work_units.len() {
-                                    break;
-                                }
-                                let work_unit = work_units[work_idx];
-                                local.push(Self::collect_stream_query_matches_store_batch(
-                                    &store_sets[work_unit.store_set_idx],
-                                    work_unit,
-                                    plans,
-                                    &runtime,
-                                    include_external_ids,
-                                )?);
+                    let aborted = &aborted;
+                    let tx = tx.clone();
+                    handles.push(scope.spawn(move || -> Result<()> {
+                        loop {
+                            if aborted.load(Ordering::Relaxed) {
+                                break;
                             }
-                            Ok(local)
-                        }),
-                    );
+                            let work_idx = next_unit.fetch_add(1, Ordering::Relaxed);
+                            if work_idx >= work_units.len() {
+                                break;
+                            }
+                            let work_unit = work_units[work_idx];
+                            let partial = Self::collect_stream_query_matches_store_batch(
+                                &store_sets[work_unit.store_set_idx],
+                                work_unit,
+                                plans,
+                                &runtime,
+                                include_external_ids,
+                            );
+                            if partial.is_err() {
+                                aborted.store(true, Ordering::Relaxed);
+                            }
+                            if tx.send(partial).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    }));
+                }
+                drop(tx);
+
+                let mut first_error = None;
+                for partial in rx {
+                    match partial {
+                        Ok(partial) => {
+                            if first_error.is_some() {
+                                continue;
+                            }
+                            Self::emit_stream_candidate_query_frames_batch_partial(
+                                partial,
+                                named_plans,
+                                chunk_size,
+                                &candidate_limits,
+                                &mut accumulators,
+                                &mut on_frame,
+                            )?;
+                        }
+                        Err(err) => {
+                            aborted.store(true, Ordering::Relaxed);
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
                 }
 
-                let mut merged = Vec::new();
                 for handle in handles {
-                    let partial = handle.join().map_err(|_| {
+                    handle.join().map_err(|_| {
                         SspryError::from("Bundled candidate query worker panicked.")
                     })??;
-                    merged.extend(partial);
                 }
-                Ok::<Vec<BundledStoreQueryResult>, SspryError>(merged)
+
+                if let Some(err) = first_error {
+                    return Err(err);
+                }
+                Ok(())
             })?;
-            partials
-        };
-        partials.sort_by_key(|(work_unit, _)| *work_unit);
-        for (_, local_accumulators) in partials {
-            for (index, local) in local_accumulators.into_iter().enumerate() {
-                let Some(accumulator) = accumulators.get_mut(index) else {
-                    continue;
-                };
-                accumulator.merge_from(local);
-            }
         }
 
         for (index, (rule_name, _)) in named_plans.iter().enumerate() {
             let Some(accumulator) = accumulators.get_mut(index) else {
                 continue;
             };
-            let hashes = accumulator.hashes.drain().collect::<Vec<_>>();
-            let external_ids = if request.include_external_ids {
-                Some(
-                    hashes
-                        .iter()
-                        .map(|sha256| accumulator.external_ids.get(sha256).cloned().flatten())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            };
-
-            match external_ids {
-                Some(values) => {
-                    for (hash_chunk, external_id_chunk) in
-                        hashes.chunks(chunk_size).zip(values.chunks(chunk_size))
-                    {
-                        on_frame(CandidateQueryStreamFrame {
-                            sha256: hash_chunk.to_vec(),
-                            external_ids: Some(external_id_chunk.to_vec()),
-                            candidate_limit: candidate_limits[index],
-                            stream_complete: false,
-                            rule_complete: false,
-                            target_rule_name: rule_name.clone(),
-                            tier_used: String::new(),
-                            query_profile: CandidateQueryProfile::default(),
-                            query_eval_nanos: 0,
-                        })?;
-                    }
-                }
-                None => {
-                    for hash_chunk in hashes.chunks(chunk_size) {
-                        on_frame(CandidateQueryStreamFrame {
-                            sha256: hash_chunk.to_vec(),
-                            external_ids: None,
-                            candidate_limit: candidate_limits[index],
-                            stream_complete: false,
-                            rule_complete: false,
-                            target_rule_name: rule_name.clone(),
-                            tier_used: String::new(),
-                            query_profile: CandidateQueryProfile::default(),
-                            query_eval_nanos: 0,
-                        })?;
-                    }
-                }
-            }
-
             on_frame(CandidateQueryStreamFrame {
                 sha256: Vec::new(),
                 external_ids: None,

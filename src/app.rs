@@ -21,15 +21,12 @@ use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanne
 use crate::candidate::features::AdditionalDigestKind;
 use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
-    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
+    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
 };
-use crate::candidate::store::{RuntimeQueryArtifacts, build_runtime_query_artifacts};
+use crate::candidate::store::{build_runtime_query_artifacts, RuntimeQueryArtifacts};
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
-    DEFAULT_TIER1_FILTER_TARGET_FP,
-    DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes, HLL_DEFAULT_PRECISION, candidate_shard_index,
-    candidate_shard_root, choose_filter_bytes_for_file_size,
+    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     compile_query_plan_from_file_with_gram_sizes,
     compile_query_plan_from_file_with_gram_sizes_and_identity_source,
@@ -37,7 +34,9 @@ use crate::candidate::{
     estimate_unique_grams_pair_hll, extract_compact_document_metadata_with_entropy,
     load_rule_file_with_includes, read_candidate_shard_count, resolve_max_candidates,
     rule_check_all_from_file_with_gram_sizes_and_identity_source,
-    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names,
+    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names, BoundedCache,
+    CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan, GramSizes,
+    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, HLL_DEFAULT_PRECISION,
 };
 use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
@@ -2149,7 +2148,11 @@ fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
         .map(|entry| {
             let path = entry.path();
             let current = path.join("current");
-            if current.is_dir() { current } else { path }
+            if current.is_dir() {
+                current
+            } else {
+                path
+            }
         })
         .filter(|path| {
             path.is_dir()
@@ -2456,23 +2459,25 @@ fn query_local_forest_all_candidates_batch(
             let mut handles = Vec::new();
             for chunk in tree_groups.chunks_mut(chunk_size) {
                 let runtime = runtime.clone();
-                handles.push(scope.spawn(move || -> Result<Vec<LocalTreeQueryAggregate>> {
-                    let mut merged = (0..plans.len())
-                        .map(|_| LocalTreeQueryAggregate::default())
-                        .collect::<Vec<_>>();
-                    for group in chunk {
-                        let partial = query_store_group_all_candidates_batch(
-                            &mut group.stores,
-                            plans,
-                            &runtime,
-                            include_external_ids,
-                        )?;
-                        for (target, source) in merged.iter_mut().zip(partial.into_iter()) {
-                            merge_local_tree_query_aggregate(target, source);
+                handles.push(
+                    scope.spawn(move || -> Result<Vec<LocalTreeQueryAggregate>> {
+                        let mut merged = (0..plans.len())
+                            .map(|_| LocalTreeQueryAggregate::default())
+                            .collect::<Vec<_>>();
+                        for group in chunk {
+                            let partial = query_store_group_all_candidates_batch(
+                                &mut group.stores,
+                                plans,
+                                &runtime,
+                                include_external_ids,
+                            )?;
+                            for (target, source) in merged.iter_mut().zip(partial.into_iter()) {
+                                merge_local_tree_query_aggregate(target, source);
+                            }
                         }
-                    }
-                    Ok(merged)
-                }));
+                        Ok(merged)
+                    }),
+                );
             }
             let mut merged = Vec::with_capacity(handles.len());
             for handle in handles {
@@ -4660,8 +4665,112 @@ where
     Ok(accumulator.into_execution(plan, server_rss_kb, plan_time, started_query.elapsed()))
 }
 
+/// Flushes any consecutively completed bundled-rule accumulators in source
+/// order so callers can print or store results without waiting for the full
+/// bundle to finish.
+fn flush_streamed_search_executions_batch<G>(
+    pending_rules: &mut [Option<(String, CompiledQueryPlan, Duration)>],
+    accumulators: &mut [SearchExecutionAccumulator],
+    next_rule_index: &mut usize,
+    server_rss_kb: Option<(u64, u64)>,
+    query_time: Duration,
+    on_execution: &mut G,
+) -> Result<()>
+where
+    G: FnMut(String, SearchExecution, usize) -> Result<()>,
+{
+    while *next_rule_index < pending_rules.len() && accumulators[*next_rule_index].terminal_received
+    {
+        let index = *next_rule_index;
+        let (rule_name, plan, plan_time) = pending_rules[index]
+            .take()
+            .ok_or_else(|| SspryError::from("Bundled search rule state was already finalized."))?;
+        let execution = std::mem::take(&mut accumulators[index]).into_execution(
+            plan,
+            server_rss_kb,
+            plan_time,
+            query_time,
+        );
+        on_execution(rule_name, execution, index)?;
+        *next_rule_index += 1;
+    }
+    Ok(())
+}
+
+/// Streams bundled search executions and hands each completed rule to the
+/// caller as soon as its terminal frame arrives, preserving source order.
+fn stream_search_executions_batch<F, G>(
+    args: &SearchCommandArgs,
+    planned_rules: Vec<(String, CompiledQueryPlan, Duration)>,
+    server_rss_kb: Option<(u64, u64)>,
+    mut pump: F,
+    mut on_execution: G,
+) -> Result<()>
+where
+    F: FnMut(&mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>) -> Result<()>,
+    G: FnMut(String, SearchExecution, usize) -> Result<()>,
+{
+    let started_query = Instant::now();
+    let rule_indexes = planned_rules
+        .iter()
+        .enumerate()
+        .map(|(index, (rule_name, _, _))| (rule_name.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut pending_rules = planned_rules.into_iter().map(Some).collect::<Vec<_>>();
+    let mut accumulators = pending_rules
+        .iter()
+        .map(|_| SearchExecutionAccumulator::default())
+        .collect::<Vec<_>>();
+    let mut next_rule_index = 0usize;
+    let mut stream_complete = false;
+
+    pump(&mut |frame| {
+        if frame.stream_complete {
+            stream_complete = true;
+            return Ok(());
+        }
+        let Some(&rule_index) = rule_indexes.get(&frame.target_rule_name) else {
+            return Err(SspryError::from(format!(
+                "Bundled search returned unexpected rule frame `{}`.",
+                frame.target_rule_name
+            )));
+        };
+        accumulators[rule_index].apply_frame(args, frame)?;
+        flush_streamed_search_executions_batch(
+            &mut pending_rules,
+            &mut accumulators,
+            &mut next_rule_index,
+            server_rss_kb,
+            started_query.elapsed(),
+            &mut on_execution,
+        )
+    })?;
+
+    flush_streamed_search_executions_batch(
+        &mut pending_rules,
+        &mut accumulators,
+        &mut next_rule_index,
+        server_rss_kb,
+        started_query.elapsed(),
+        &mut on_execution,
+    )?;
+
+    if !stream_complete {
+        return Err(SspryError::from(
+            "Bundled search did not finish the response stream.",
+        ));
+    }
+    if let Some((rule_name, _, _)) = pending_rules.into_iter().flatten().next() {
+        return Err(SspryError::from(format!(
+            "Bundled search did not finish rule `{rule_name}`."
+        )));
+    }
+    Ok(())
+}
+
 /// Drains one bundled gRPC search response into per-rule execution summaries
 /// while preserving the original rule order from the input bundle.
+#[cfg(test)]
 fn collect_streamed_search_executions_batch<F>(
     args: &SearchCommandArgs,
     planned_rules: Vec<(String, CompiledQueryPlan, Duration)>,
@@ -4671,45 +4780,17 @@ fn collect_streamed_search_executions_batch<F>(
 where
     F: FnMut(&mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>) -> Result<()>,
 {
-    let started_query = Instant::now();
-    let rule_indexes = planned_rules
-        .iter()
-        .enumerate()
-        .map(|(index, (rule_name, _, _))| (rule_name.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let mut accumulators = planned_rules
-        .iter()
-        .map(|_| SearchExecutionAccumulator::default())
-        .collect::<Vec<_>>();
-
-    pump(&mut |frame| {
-        if frame.stream_complete {
-            return Ok(());
-        }
-        let Some(&rule_index) = rule_indexes.get(&frame.target_rule_name) else {
-            return Err(SspryError::from(format!(
-                "Bundled search returned unexpected rule frame `{}`.",
-                frame.target_rule_name
-            )));
-        };
-        accumulators[rule_index].apply_frame(args, frame)
-    })?;
-
-    let query_time = started_query.elapsed();
     let mut results = Vec::with_capacity(planned_rules.len());
-    for ((rule_name, plan, plan_time), accumulator) in
-        planned_rules.into_iter().zip(accumulators.into_iter())
-    {
-        if !accumulator.terminal_received {
-            return Err(SspryError::from(format!(
-                "Bundled search did not finish rule `{rule_name}`."
-            )));
-        }
-        results.push((
-            rule_name,
-            accumulator.into_execution(plan, server_rss_kb, plan_time, query_time),
-        ));
-    }
+    stream_search_executions_batch(
+        args,
+        planned_rules,
+        server_rss_kb,
+        &mut pump,
+        |rule_name, execution, _| {
+            results.push((rule_name, execution));
+            Ok(())
+        },
+    )?;
     Ok(results)
 }
 
@@ -4839,14 +4920,18 @@ fn compile_grpc_search_plan(
     Ok((plan, started_plan.elapsed()))
 }
 
-/// Executes one bundled remote search request and returns one execution per
-/// searchable rule in source order.
-fn execute_grpc_search_bundle(
+/// Executes one bundled remote search request and hands each completed rule to
+/// the caller as soon as it is available.
+fn execute_grpc_search_bundle_streaming<G>(
     args: &SearchCommandArgs,
     rule_text: &str,
     rule_names: &[String],
     context: &mut RemoteSearchContext,
-) -> Result<Vec<(String, SearchExecution)>> {
+    on_execution: G,
+) -> Result<()>
+where
+    G: FnMut(String, SearchExecution, usize) -> Result<()>,
+{
     let planned_rules = rule_names
         .iter()
         .map(|rule_name| {
@@ -4854,21 +4939,27 @@ fn execute_grpc_search_bundle(
             Ok::<_, SspryError>((rule_name.clone(), plan, plan_time))
         })
         .collect::<Result<Vec<_>>>()?;
-    collect_streamed_search_executions_batch(args, planned_rules, None, |on_frame| {
-        context.client.search_stream(
-            grpc::v1::SearchRequest {
-                yara_rule_source: rule_text.to_owned(),
-                target_rule_name: String::new(),
-                chunk_size: DEFAULT_SEARCH_RESULT_CHUNK_SIZE as u32,
-                include_external_ids: args.verify_yara_files,
-                max_candidates_percent: args.max_candidates,
-                max_anchors_per_pattern: args.max_anchors_per_pattern as u32,
-                force_tier1_only: false,
-                allow_tier2_fallback: true,
-            },
-            |frame| on_frame(grpc_search_frame_to_internal(frame)),
-        )
-    })
+    stream_search_executions_batch(
+        args,
+        planned_rules,
+        None,
+        |on_frame| {
+            context.client.search_stream(
+                grpc::v1::SearchRequest {
+                    yara_rule_source: rule_text.to_owned(),
+                    target_rule_name: String::new(),
+                    chunk_size: DEFAULT_SEARCH_RESULT_CHUNK_SIZE as u32,
+                    include_external_ids: args.verify_yara_files,
+                    max_candidates_percent: args.max_candidates,
+                    max_anchors_per_pattern: args.max_anchors_per_pattern as u32,
+                    force_tier1_only: false,
+                    allow_tier2_fallback: true,
+                },
+                |frame| on_frame(grpc_search_frame_to_internal(frame)),
+            )
+        },
+        on_execution,
+    )
 }
 
 /// Executes one local forest search against a reusable opened forest and shared
@@ -5064,29 +5155,34 @@ fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
         let multi_rule = rule_names.len() > 1;
         let mut context = RemoteSearchContext::connect(&args.connection)?;
         if multi_rule {
-            let executions =
-                execute_grpc_search_bundle(args, &rule_text, &rule_names, &mut context)?;
             let mut exit_code = 0;
-            for (index, (rule_name, execution)) in executions.into_iter().enumerate() {
-                let started_total = Instant::now()
-                    .checked_sub(execution.plan_time + execution.query_time)
-                    .unwrap_or_else(Instant::now);
-                if let Err(err) = finish_search_execution(
-                    rule_path,
-                    &rule_name,
-                    args.verify_yara_files,
-                    args.verbose,
-                    args.max_candidates,
-                    args.max_anchors_per_pattern,
-                    started_total,
-                    execution,
-                    true,
-                    index == 0,
-                ) {
-                    print_search_error(rule_path, &rule_name, &err, true, index == 0);
-                    exit_code = 1;
-                }
-            }
+            execute_grpc_search_bundle_streaming(
+                args,
+                &rule_text,
+                &rule_names,
+                &mut context,
+                |rule_name, execution, index| {
+                    let started_total = Instant::now()
+                        .checked_sub(execution.plan_time + execution.query_time)
+                        .unwrap_or_else(Instant::now);
+                    if let Err(err) = finish_search_execution(
+                        rule_path,
+                        &rule_name,
+                        args.verify_yara_files,
+                        args.verbose,
+                        args.max_candidates,
+                        args.max_anchors_per_pattern,
+                        started_total,
+                        execution,
+                        true,
+                        index == 0,
+                    ) {
+                        print_search_error(rule_path, &rule_name, &err, true, index == 0);
+                        exit_code = 1;
+                    }
+                    Ok(())
+                },
+            )?;
             return Ok(exit_code);
         }
         let mut exit_code = 0;
@@ -5368,7 +5464,9 @@ fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
                                     verbose_search_plan_ms: Some(prepared_rule.plan_ms),
                                     verbose_search_query_ms: Some(query_ms),
                                     verbose_search_verify_ms: Some(verify_ms),
-                                    verbose_search_docs_scanned: Some(local.query_profile.docs_scanned),
+                                    verbose_search_docs_scanned: Some(
+                                        local.query_profile.docs_scanned,
+                                    ),
                                     verbose_search_metadata_loads: Some(
                                         local.query_profile.metadata_loads,
                                     ),

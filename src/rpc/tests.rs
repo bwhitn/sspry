@@ -2749,8 +2749,8 @@ fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_r
         include_external_ids: true,
     };
     let named_plans = vec![
-        ("rule_one".to_owned(), exact_abc_plan("$a", 8.0)),
-        ("rule_two".to_owned(), exact_abc_plan("$b", 8.0)),
+        ("rule_one".to_owned(), exact_abc_plan("$a", 0.0)),
+        ("rule_two".to_owned(), exact_abc_plan("$b", 0.0)),
     ];
     let mut frames = Vec::<CandidateQueryStreamFrame>::new();
     state
@@ -2940,6 +2940,118 @@ fn forest_stream_candidate_query_frames_batch_returns_hits_for_each_rule() {
             ]
         );
     }
+}
+
+#[test]
+fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
+    let named_plans = vec![
+        ("rule_one".to_owned(), exact_abc_plan("$a", 8.0)),
+        ("rule_two".to_owned(), exact_abc_plan("$b", 8.0)),
+    ];
+    let candidate_limits = vec![Some(10), Some(20)];
+    let mut accumulators = vec![
+        BundledQueryAccumulator::default(),
+        BundledQueryAccumulator::default(),
+    ];
+    let mut frames = Vec::<CandidateQueryStreamFrame>::new();
+
+    let mut profile_one = CandidateQueryProfile::default();
+    profile_one.docs_scanned = 3;
+    let mut profile_two = CandidateQueryProfile::default();
+    profile_two.docs_scanned = 4;
+    ServerState::emit_stream_candidate_query_frames_batch_partial(
+        (
+            SearchWorkUnit {
+                store_set_idx: 0,
+                store_idx: 0,
+            },
+            vec![
+                BundledQueryPartial {
+                    hashes: vec!["hash-a".to_owned()],
+                    external_ids: Some(vec![Some("ext-a".to_owned())]),
+                    tier_used: "tier1".to_owned(),
+                    query_profile: profile_one.clone(),
+                    eval_nanos: 11,
+                },
+                BundledQueryPartial {
+                    hashes: vec!["hash-b".to_owned(), "hash-c".to_owned()],
+                    external_ids: Some(vec![Some("ext-b".to_owned()), None]),
+                    tier_used: "tier2".to_owned(),
+                    query_profile: profile_two.clone(),
+                    eval_nanos: 22,
+                },
+            ],
+        ),
+        &named_plans,
+        1,
+        &candidate_limits,
+        &mut accumulators,
+        |frame| {
+            frames.push(frame);
+            Ok(())
+        },
+    )
+    .expect("emit first bundled partial");
+
+    assert_eq!(frames.len(), 3);
+    assert!(frames.iter().all(|frame| !frame.stream_complete && !frame.rule_complete));
+    assert_eq!(frames[0].target_rule_name, "rule_one");
+    assert_eq!(frames[0].sha256, vec!["hash-a".to_owned()]);
+    assert_eq!(frames[1].target_rule_name, "rule_two");
+    assert_eq!(frames[1].sha256, vec!["hash-b".to_owned()]);
+    assert_eq!(frames[2].sha256, vec!["hash-c".to_owned()]);
+    assert_eq!(accumulators[0].tier_used, vec!["tier1".to_owned()]);
+    assert_eq!(accumulators[0].query_profile.docs_scanned, 3);
+    assert_eq!(accumulators[0].eval_nanos, 11);
+    assert_eq!(accumulators[1].tier_used, vec!["tier2".to_owned()]);
+    assert_eq!(accumulators[1].query_profile.docs_scanned, 4);
+    assert_eq!(accumulators[1].eval_nanos, 22);
+
+    let mut profile_three = CandidateQueryProfile::default();
+    profile_three.docs_scanned = 5;
+    let prior_frame_count = frames.len();
+    ServerState::emit_stream_candidate_query_frames_batch_partial(
+        (
+            SearchWorkUnit {
+                store_set_idx: 1,
+                store_idx: 0,
+            },
+            vec![
+                BundledQueryPartial {
+                    hashes: vec!["hash-d".to_owned()],
+                    external_ids: None,
+                    tier_used: "tier1".to_owned(),
+                    query_profile: profile_three,
+                    eval_nanos: 33,
+                },
+                BundledQueryPartial {
+                    hashes: Vec::new(),
+                    external_ids: None,
+                    tier_used: String::new(),
+                    query_profile: CandidateQueryProfile::default(),
+                    eval_nanos: 0,
+                },
+            ],
+        ),
+        &named_plans,
+        2,
+        &candidate_limits,
+        &mut accumulators,
+        |frame| {
+            frames.push(frame);
+            Ok(())
+        },
+    )
+    .expect("emit second bundled partial");
+
+    assert_eq!(frames.len(), prior_frame_count + 1);
+    assert_eq!(frames.last().expect("second partial frame").sha256, vec!["hash-d"]);
+    assert_eq!(
+        accumulators[0].tier_used,
+        vec!["tier1".to_owned(), "tier1".to_owned()]
+    );
+    assert_eq!(accumulators[0].query_profile.docs_scanned, 8);
+    assert_eq!(accumulators[0].eval_nanos, 44);
 }
 
 #[test]

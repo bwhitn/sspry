@@ -150,7 +150,10 @@ fn resolve_serve_runtime_settings_prefers_existing_forest_tree_roots() {
     let tree_root = forest_root.join("tree_00").join("current");
     fs::create_dir_all(tree_root.parent().expect("tree parent")).expect("tree parent");
 
-    assert_eq!(cmd_init(&default_internal_init_args(&tree_root, 2, true)), 0);
+    assert_eq!(
+        cmd_init(&default_internal_init_args(&tree_root, 2, true)),
+        0
+    );
     assert!(forest_root.join("meta.json").exists());
     assert!(!serve_uses_workspace_mode(&forest_root));
 
@@ -407,6 +410,165 @@ rule rule_two {
 }
 
 #[test]
+fn stream_search_executions_batch_flushes_rules_before_stream_complete() {
+    let args = SearchCommandArgs {
+        connection: default_connection(),
+        rule: "bundle.yar".to_owned(),
+        verify_yara_files: false,
+        max_candidates: 100.0,
+        max_anchors_per_pattern: 16,
+        verbose: false,
+    };
+    let rule_text = r#"
+rule rule_one {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+
+rule rule_two {
+  strings:
+    $b = "beta"
+  condition:
+    $b
+}
+"#;
+    let planned_rules = ["rule_one", "rule_two"]
+        .into_iter()
+        .map(|rule_name| {
+            let started_plan = Instant::now();
+            let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                rule_text,
+                rule_name,
+                GramSizes::new(3, 4).expect("gram sizes"),
+                None,
+                args.max_anchors_per_pattern,
+                false,
+                true,
+                args.max_candidates,
+            )
+            .expect("compile plan");
+            (rule_name.to_owned(), plan, started_plan.elapsed())
+        })
+        .collect::<Vec<_>>();
+    let callback_order = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let callback_order_for_cb = callback_order.clone();
+    let saw_stream_complete = std::rc::Rc::new(std::cell::Cell::new(false));
+    let saw_stream_complete_for_cb = saw_stream_complete.clone();
+
+    stream_search_executions_batch(
+        &args,
+        planned_rules,
+        None,
+        &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: vec!["hash-a".to_owned()],
+                external_ids: Some(vec![None]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "rule_one".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: Vec::new(),
+                external_ids: None,
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: true,
+                target_rule_name: "rule_one".to_owned(),
+                tier_used: "tier1".to_owned(),
+                query_profile: CandidateQueryProfile {
+                    docs_scanned: 11,
+                    ..CandidateQueryProfile::default()
+                },
+                query_eval_nanos: 0,
+            })?;
+            assert_eq!(
+                callback_order.borrow().as_slice(),
+                &[String::from("rule_one")]
+            );
+            assert!(!saw_stream_complete.get());
+
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: vec!["hash-b".to_owned()],
+                external_ids: Some(vec![None]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "rule_two".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: Vec::new(),
+                external_ids: None,
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: true,
+                target_rule_name: "rule_two".to_owned(),
+                tier_used: "tier2".to_owned(),
+                query_profile: CandidateQueryProfile {
+                    docs_scanned: 22,
+                    ..CandidateQueryProfile::default()
+                },
+                query_eval_nanos: 0,
+            })?;
+            assert_eq!(
+                callback_order.borrow().as_slice(),
+                &[String::from("rule_one"), String::from("rule_two")]
+            );
+            assert!(!saw_stream_complete.get());
+
+            saw_stream_complete.set(true);
+            on_frame(rpc::CandidateQueryStreamFrame {
+                sha256: Vec::new(),
+                external_ids: None,
+                candidate_limit: None,
+                stream_complete: true,
+                rule_complete: false,
+                target_rule_name: String::new(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            Ok(())
+        },
+        |rule_name, execution, index| {
+            assert!(!saw_stream_complete_for_cb.get());
+            callback_order_for_cb.borrow_mut().push(rule_name.clone());
+            match index {
+                0 => {
+                    assert_eq!(rule_name, "rule_one");
+                    assert_eq!(execution.rows, vec!["hash-a".to_owned()]);
+                    assert_eq!(execution.tier_used, "tier1".to_owned());
+                    assert_eq!(execution.query_profile.docs_scanned, 11);
+                }
+                1 => {
+                    assert_eq!(rule_name, "rule_two");
+                    assert_eq!(execution.rows, vec!["hash-b".to_owned()]);
+                    assert_eq!(execution.tier_used, "tier2".to_owned());
+                    assert_eq!(execution.query_profile.docs_scanned, 22);
+                }
+                other => panic!("unexpected callback index: {other}"),
+            }
+            Ok(())
+        },
+    )
+    .expect("stream bundled executions");
+
+    assert!(saw_stream_complete.get());
+    assert_eq!(
+        callback_order.borrow().as_slice(),
+        &[String::from("rule_one"), String::from("rule_two")]
+    );
+}
+
+#[test]
 fn parse_host_port_accepts_common_forms() {
     assert_eq!(
         parse_host_port("127.0.0.1:17653").expect("ipv4"),
@@ -453,12 +615,10 @@ fn file_path_collection_and_hash_helpers_work() {
         file_digest,
         path_identity_sha256(&sample).expect("path digest")
     );
-    assert!(
-        sha256_file(&sample, 0)
-            .expect_err("zero chunk size")
-            .to_string()
-            .contains("positive integer")
-    );
+    assert!(sha256_file(&sample, 0)
+        .expect_err("zero chunk size")
+        .to_string()
+        .contains("positive integer"));
 
     let mut files = Vec::new();
     collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -1452,24 +1612,18 @@ fn digest_helpers_and_delete_resolution_cover_remaining_branches() {
     let sample = tmp.path().join("sample.bin");
     fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-    assert!(
-        md5_file(&sample, 0)
-            .expect_err("md5 zero chunk")
-            .to_string()
-            .contains("positive integer")
-    );
-    assert!(
-        sha1_file(&sample, 0)
-            .expect_err("sha1 zero chunk")
-            .to_string()
-            .contains("positive integer")
-    );
-    assert!(
-        sha512_file(&sample, 0)
-            .expect_err("sha512 zero chunk")
-            .to_string()
-            .contains("positive integer")
-    );
+    assert!(md5_file(&sample, 0)
+        .expect_err("md5 zero chunk")
+        .to_string()
+        .contains("positive integer"));
+    assert!(sha1_file(&sample, 0)
+        .expect_err("sha1 zero chunk")
+        .to_string()
+        .contains("positive integer"));
+    assert!(sha512_file(&sample, 0)
+        .expect_err("sha512 zero chunk")
+        .to_string()
+        .contains("positive integer"));
 
     assert_eq!(
         detect_digest_identity_source(&"aa".repeat(16)),
@@ -1661,46 +1815,38 @@ fn grpc_batch_helper_functions_cover_limits_and_oversize_rows() {
         payload_size: empty_payload_size + 3,
     };
 
-    assert!(
-        !prepare_serialized_remote_batch_row(
-            &pending_empty,
-            16,
-            empty_payload_size,
-            empty_payload_size + 32,
-            false,
-        )
-        .expect("fits empty batch")
-    );
-    assert!(
-        prepare_serialized_remote_batch_row(
-            &pending_non_empty,
-            4,
-            empty_payload_size,
-            empty_payload_size + 7,
-            false,
-        )
-        .expect("flush before oversize append")
-    );
-    assert!(
-        prepare_serialized_remote_batch_row(
-            &pending_non_empty,
-            64,
-            empty_payload_size,
-            empty_payload_size + 32,
-            true,
-        )
-        .expect("flush before oversize single row")
-    );
-    assert!(
-        prepare_serialized_remote_batch_row(
-            &pending_empty,
-            64,
-            empty_payload_size,
-            empty_payload_size + 32,
-            false,
-        )
-        .is_err()
-    );
+    assert!(!prepare_serialized_remote_batch_row(
+        &pending_empty,
+        16,
+        empty_payload_size,
+        empty_payload_size + 32,
+        false,
+    )
+    .expect("fits empty batch"));
+    assert!(prepare_serialized_remote_batch_row(
+        &pending_non_empty,
+        4,
+        empty_payload_size,
+        empty_payload_size + 7,
+        false,
+    )
+    .expect("flush before oversize append"));
+    assert!(prepare_serialized_remote_batch_row(
+        &pending_non_empty,
+        64,
+        empty_payload_size,
+        empty_payload_size + 32,
+        true,
+    )
+    .expect("flush before oversize single row"));
+    assert!(prepare_serialized_remote_batch_row(
+        &pending_empty,
+        64,
+        empty_payload_size,
+        empty_payload_size + 32,
+        false,
+    )
+    .is_err());
 }
 
 #[test]
