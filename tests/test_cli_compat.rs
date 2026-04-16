@@ -405,6 +405,154 @@ rule rule_c {
 }
 
 #[test]
+fn serve_search_handles_bundled_rule_files_over_existing_forest_root() {
+    let tmp = tempdir().expect("tmp");
+    let base = tmp.path();
+    let forest_root = base.join("forest");
+    let tree_a_root = forest_root.join("tree_00").join("current");
+    let tree_b_root = forest_root.join("tree_01").join("current");
+    let tree_a_samples = base.join("tree_00_samples");
+    let tree_b_samples = base.join("tree_01_samples");
+    let rule_a = base.join("0001_abcd.yar");
+    let rule_b = base.join("0002_prefix.yar");
+    let rule_c = base.join("0003_shared.yar");
+    let bundle = base.join("bundle.yar");
+    let port = reserve_tcp_port();
+    fs::create_dir_all(&tree_a_samples).expect("mkdir tree a samples");
+    fs::create_dir_all(&tree_b_samples).expect("mkdir tree b samples");
+
+    fs::write(tree_a_samples.join("a.bin"), b"tree-zero ABCD SHARED").expect("write tree a hit");
+    fs::write(tree_a_samples.join("b.bin"), b"tree-zero filler").expect("write tree a miss");
+    fs::write(tree_b_samples.join("c.bin"), b"tree-one PREFIX SHARED").expect("write tree b hit");
+    fs::write(tree_b_samples.join("d.bin"), b"tree-one filler").expect("write tree b miss");
+
+    fs::write(
+        &rule_a,
+        r#"
+rule rule_a {
+  strings:
+    $a = "ABCD"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule a");
+    fs::write(
+        &rule_b,
+        r#"
+rule rule_b {
+  strings:
+    $a = "PREFIX"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule b");
+    fs::write(
+        &rule_c,
+        r#"
+rule rule_c {
+  strings:
+    $a = "SHARED"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write rule c");
+    fs::write(
+        &bundle,
+        concat!(
+            "include \"0001_abcd.yar\"\n",
+            "include \"0002_prefix.yar\"\n",
+            "include \"0003_shared.yar\"\n",
+        ),
+    )
+    .expect("write bundle");
+
+    let ingest_a = run_ok(&[
+        "local-index",
+        "--root",
+        tree_a_root.to_str().expect("tree a root"),
+        "--candidate-shards",
+        "2",
+        "--batch-size",
+        "1",
+        "--workers",
+        "1",
+        tree_a_samples.to_str().expect("tree a samples"),
+    ]);
+    assert!(ingest_a.contains("submitted_documents: 2"), "{ingest_a}");
+
+    let ingest_b = run_ok(&[
+        "local-index",
+        "--root",
+        tree_b_root.to_str().expect("tree b root"),
+        "--candidate-shards",
+        "2",
+        "--batch-size",
+        "1",
+        "--workers",
+        "1",
+        tree_b_samples.to_str().expect("tree b samples"),
+    ]);
+    assert!(ingest_b.contains("submitted_documents: 2"), "{ingest_b}");
+
+    assert!(forest_root.join("meta.json").exists());
+
+    let mut child = spawn_serve_tcp(port, &forest_root, &[]);
+    let addr = tcp_addr(port);
+    wait_for_info(&addr);
+
+    let info = run_ok(&["info", "--addr", &addr]);
+    let parsed: Value = serde_json::from_str(&info).expect("info json");
+    assert_eq!(
+        parsed.get("candidate_shards").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        parsed.get("workspace_mode").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(parsed.get("doc_count").and_then(Value::as_u64), Some(4));
+
+    let output = Command::new(bin_path())
+        .args([
+            "search",
+            "--addr",
+            &addr,
+            "--rule",
+            bundle.to_str().expect("bundle"),
+            "--max-candidates",
+            "100",
+        ])
+        .output()
+        .expect("run multi search");
+    assert!(
+        output.status.success(),
+        "forest multi search failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let blocks = split_search_blocks(&stdout);
+    assert_eq!(blocks.len(), 3, "{stdout}");
+    assert!(blocks[0].contains("rule: rule_a"), "{stdout}");
+    assert!(blocks[0].contains("rule_path:"), "{stdout}");
+    assert!(blocks[0].contains("exit_code: 0"), "{stdout}");
+    assert!(blocks[0].contains("candidates: 1"), "{stdout}");
+    assert!(blocks[1].contains("rule: rule_b"), "{stdout}");
+    assert!(blocks[1].contains("candidates: 1"), "{stdout}");
+    assert!(blocks[2].contains("rule: rule_c"), "{stdout}");
+    assert!(blocks[2].contains("candidates: 2"), "{stdout}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn local_search_handles_rule_files_with_includes() {
     let tmp = tempdir().expect("tmp");
     let base = tmp.path();
