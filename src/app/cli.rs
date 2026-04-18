@@ -1,7 +1,8 @@
 #[derive(Debug, Parser)]
 #[command(
     name = "sspry",
-    about = "Scalable Screening and Prefiltering of Rules for YARA."
+    about = "Scalable Screening and Prefiltering of Rules for YARA.",
+    after_help = "Default scan mode: sspry --rule <RULE> <FILE>"
 )]
 struct Cli {
     #[arg(
@@ -20,17 +21,82 @@ struct Cli {
 enum Commands {
     Serve(ServeArgs),
     Index(IndexArgs),
-    LocalIndex(LocalIndexArgs),
     Delete(DeleteArgs),
-    LocalDelete(LocalDeleteArgs),
     RuleCheck(RuleCheckArgs),
     Search(SearchCommandArgs),
-    LocalSearch(LocalSearchArgs),
-    SearchBatch(SearchBatchArgs),
     Info(InfoCommandArgs),
-    LocalInfo(LocalInfoArgs),
+    Local(LocalArgs),
     Shutdown(ShutdownArgs),
+    #[command(hide = true)]
     Yara(YaraArgs),
+}
+
+fn rewrite_default_yara_argv(argv: Vec<String>) -> Vec<String> {
+    if argv.len() <= 1 {
+        return argv;
+    }
+    let mut scan = 1usize;
+    while scan < argv.len() {
+        let token = &argv[scan];
+        match token.as_str() {
+            "--perf-report" => {
+                scan += 2;
+                continue;
+            }
+            "--perf-stdout" => {
+                scan += 1;
+                continue;
+            }
+            value if value.starts_with("--perf-report=") => {
+                scan += 1;
+                continue;
+            }
+            _ => break,
+        }
+    }
+    if scan >= argv.len() {
+        return argv;
+    }
+    let token = &argv[scan];
+    if matches!(token.as_str(), "-h" | "--help") {
+        return argv;
+    }
+    let is_named_command = matches!(
+        token.as_str(),
+        "serve"
+            | "index"
+            | "delete"
+            | "rule-check"
+            | "search"
+            | "info"
+            | "local"
+            | "shutdown"
+            | "help"
+            | "yara"
+    );
+    if is_named_command {
+        return argv;
+    }
+
+    let mut rewritten = Vec::with_capacity(argv.len() + 1);
+    rewritten.extend_from_slice(&argv[..scan]);
+    rewritten.push("yara".to_owned());
+    rewritten.extend_from_slice(&argv[scan..]);
+    rewritten
+}
+
+#[derive(Debug, clap::Args)]
+struct LocalArgs {
+    #[command(subcommand)]
+    command: LocalCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum LocalCommands {
+    Index(LocalIndexArgs),
+    Delete(LocalDeleteArgs),
+    Search(LocalSearchArgs),
+    Info(LocalInfoArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -296,59 +362,6 @@ struct LocalSearchArgs {
     verify_yara_files: bool,
     #[arg(long = "verbose", action = ArgAction::SetTrue, help = "Print timing details to stderr.")]
     verbose: bool,
-}
-
-#[derive(Debug, clap::Args)]
-struct SearchBatchArgs {
-    #[arg(
-        long = "root",
-        required = true,
-        help = "Candidate forest root for in-process batch search."
-    )]
-    root: String,
-    #[arg(
-        long = "rules-dir",
-        conflicts_with = "rule_manifest",
-        help = "Directory containing .yar files to search in sorted filename order."
-    )]
-    rules_dir: Option<String>,
-    #[arg(
-        long = "rule-manifest",
-        conflicts_with = "rules_dir",
-        help = "Newline-delimited manifest of rule file paths."
-    )]
-    rule_manifest: Option<String>,
-    #[arg(
-        long = "json-out",
-        required = true,
-        help = "Write batch JSON results to this path."
-    )]
-    json_out: String,
-    #[arg(
-        long = "tree-search-workers",
-        default_value_t = 0,
-        help = "Forest-level tree search workers. 0 means auto up to the tree count."
-    )]
-    tree_search_workers: usize,
-    #[arg(
-        long = "max-anchors-per-pattern",
-        default_value_t = 16,
-        help = "Keep at most this many anchors per pattern alternative."
-    )]
-    max_anchors_per_pattern: usize,
-    #[arg(
-        long = "max-candidates",
-        default_value_t = 10.0,
-        value_parser = parse_max_candidates_percent,
-        help = "Candidate cap per rule as a percentage of searchable documents; 0 means unlimited."
-    )]
-    max_candidates: f64,
-    #[arg(
-        long = "verify",
-        action = ArgAction::SetTrue,
-        help = "Enable local YARA verification over candidate file paths."
-    )]
-    verify_yara_files: bool,
 }
 
 #[derive(Debug, clap::Args)]

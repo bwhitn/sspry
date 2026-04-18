@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
+use std::fs::{self};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
@@ -23,13 +23,11 @@ use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
     evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
 };
-use crate::candidate::store::{build_runtime_query_artifacts, RuntimeQueryArtifacts};
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
     candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     compile_query_plan_from_file_with_gram_sizes,
-    compile_query_plan_from_file_with_gram_sizes_and_identity_source,
     derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
     estimate_unique_grams_pair_hll, extract_compact_document_metadata_with_entropy,
     load_rule_file_with_includes, read_candidate_shard_count, resolve_max_candidates,
@@ -1824,7 +1822,6 @@ struct LocalTreeQueryAggregate {
     external_ids: HashMap<String, Option<String>>,
     tier_used: Vec<String>,
     query_profile: crate::candidate::CandidateQueryProfile,
-    query_eval_nanos: u128,
 }
 
 #[derive(Debug)]
@@ -1836,7 +1833,6 @@ struct LocalForestQueryAggregate {
     tier_used: String,
     query_profile: crate::candidate::CandidateQueryProfile,
     external_ids: Option<Vec<Option<String>>>,
-    query_eval_nanos: u128,
 }
 
 #[derive(Debug)]
@@ -1956,48 +1952,6 @@ impl SearchExecutionAccumulator {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct BatchSearchRecord {
-    rule: String,
-    rule_path: String,
-    exit_code: i32,
-    elapsed_ms_wall: f64,
-    error: Option<String>,
-    candidates: Option<usize>,
-    truncated: Option<bool>,
-    truncated_limit: Option<usize>,
-    tier_used: Option<String>,
-    verified_checked: Option<usize>,
-    verified_matched: Option<usize>,
-    verified_skipped: Option<usize>,
-    verbose_search_total_ms: Option<f64>,
-    verbose_search_plan_ms: Option<f64>,
-    verbose_search_query_ms: Option<f64>,
-    verbose_search_verify_ms: Option<f64>,
-    verbose_search_docs_scanned: Option<u64>,
-    verbose_search_metadata_loads: Option<u64>,
-    verbose_search_metadata_bytes: Option<u64>,
-    verbose_search_tier1_bloom_loads: Option<u64>,
-    verbose_search_tier1_bloom_bytes: Option<u64>,
-    verbose_search_tier2_bloom_loads: Option<u64>,
-    verbose_search_tier2_bloom_bytes: Option<u64>,
-    verbose_search_max_candidates: Option<f64>,
-    verbose_search_max_anchors_per_pattern: Option<usize>,
-    verbose_search_candidates: Option<usize>,
-    verbose_search_verify_enabled: Option<bool>,
-    verbose_search_client_current_rss_kb: Option<usize>,
-    verbose_search_client_peak_rss_kb: Option<usize>,
-    verbose_search_client_smaps_rss_kb: Option<u64>,
-    verbose_search_client_anonymous_kb: Option<u64>,
-    verbose_search_client_private_clean_kb: Option<u64>,
-    verbose_search_client_private_dirty_kb: Option<u64>,
-    verbose_search_client_shared_clean_kb: Option<u64>,
-    verbose_search_server_current_rss_kb: Option<u64>,
-    verbose_search_server_peak_rss_kb: Option<u64>,
-    verbose_search_tree_count: Option<usize>,
-    verbose_search_tree_search_workers: Option<usize>,
-}
-
 struct SearchVerificationResult {
     rows: Vec<String>,
     verified_checked: usize,
@@ -2054,86 +2008,6 @@ impl LocalSearchContext {
     fn clear_search_caches(&mut self) {
         clear_local_forest_search_caches(&mut self.tree_groups);
     }
-}
-
-struct BatchSearchRecordStream {
-    json_out: PathBuf,
-    partial_json_out: PathBuf,
-    json_writer: BufWriter<File>,
-    jsonl_out: PathBuf,
-    jsonl_writer: BufWriter<File>,
-    first_record: bool,
-    count: usize,
-}
-
-impl BatchSearchRecordStream {
-    /// Opens the JSON and JSONL outputs used by `search-batch`, writing JSON
-    /// records atomically via a temporary file.
-    fn new(json_out: &Path) -> Result<Self> {
-        if let Some(parent) = json_out.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let partial_json_out = append_path_suffix(json_out, ".partial.json");
-        let jsonl_out = append_path_suffix(json_out, ".jsonl");
-        let mut json_writer = BufWriter::new(File::create(&partial_json_out)?);
-        json_writer.write_all(b"[\n")?;
-        let jsonl_writer = BufWriter::new(File::create(&jsonl_out)?);
-        Ok(Self {
-            json_out: json_out.to_path_buf(),
-            partial_json_out,
-            json_writer,
-            jsonl_out,
-            jsonl_writer,
-            first_record: true,
-            count: 0,
-        })
-    }
-
-    /// Appends one completed batch-search record to both JSON outputs.
-    fn push(&mut self, record: &BatchSearchRecord) -> Result<()> {
-        if !self.first_record {
-            self.json_writer.write_all(b",\n")?;
-        } else {
-            self.first_record = false;
-        }
-        serde_json::to_writer_pretty(&mut self.json_writer, record)?;
-        self.json_writer.write_all(b"\n")?;
-        self.json_writer.flush()?;
-
-        serde_json::to_writer(&mut self.jsonl_writer, record)?;
-        self.jsonl_writer.write_all(b"\n")?;
-        self.jsonl_writer.flush()?;
-        self.count += 1;
-        Ok(())
-    }
-
-    /// Finalizes the JSON array output and atomically promotes the partial file
-    /// into place.
-    fn finish(mut self) -> Result<usize> {
-        self.json_writer.write_all(b"]\n")?;
-        self.json_writer.flush()?;
-        self.jsonl_writer.flush()?;
-        drop(self.json_writer);
-        drop(self.jsonl_writer);
-        fs::rename(&self.partial_json_out, &self.json_out)?;
-        Ok(self.count)
-    }
-
-    /// Returns the sidecar JSONL path used for incremental batch-search
-    /// consumption.
-    fn jsonl_out(&self) -> &Path {
-        &self.jsonl_out
-    }
-}
-
-/// Appends a suffix to the final path component while preserving the parent
-/// directory.
-fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("output");
-    path.with_file_name(format!("{file_name}{suffix}"))
 }
 
 /// Returns the searchable tree roots within a forest or falls back to the
@@ -2261,60 +2135,6 @@ fn query_store_group_all_candidates(
     Ok(out)
 }
 
-/// Merges one local tree aggregate into another while preserving first-seen
-/// external ids and saturating query timing counters.
-fn merge_local_tree_query_aggregate(
-    target: &mut LocalTreeQueryAggregate,
-    source: LocalTreeQueryAggregate,
-) {
-    target.hashes.extend(source.hashes);
-    target.tier_used.extend(source.tier_used);
-    target.query_profile.merge_from(&source.query_profile);
-    target.query_eval_nanos = target
-        .query_eval_nanos
-        .saturating_add(source.query_eval_nanos);
-    for (sha256, external_id) in source.external_ids {
-        target.external_ids.entry(sha256).or_insert(external_id);
-    }
-}
-
-/// Executes a full candidate scan across one tree group's stores for multiple
-/// plans, scanning each document at most once per store lane.
-fn query_store_group_all_candidates_batch(
-    stores: &mut [CandidateStore],
-    plans: &[crate::candidate::CompiledQueryPlan],
-    runtime: &[Arc<RuntimeQueryArtifacts>],
-    include_external_ids: bool,
-) -> Result<Vec<LocalTreeQueryAggregate>> {
-    let mut out = (0..plans.len())
-        .map(|_| LocalTreeQueryAggregate::default())
-        .collect::<Vec<_>>();
-    for store in stores {
-        for (index, (hits, tier_used, query_profile, eval_nanos)) in store
-            .collect_query_hits_with_runtime_hash_batch(plans, runtime)?
-            .into_iter()
-            .enumerate()
-        {
-            let Some(aggregate) = out.get_mut(index) else {
-                continue;
-            };
-            if include_external_ids {
-                let external_ids = store.external_ids_for_sha256(&hits);
-                for (sha256, external_id) in hits.into_iter().zip(external_ids.into_iter()) {
-                    aggregate.hashes.insert(sha256.clone());
-                    aggregate.external_ids.entry(sha256).or_insert(external_id);
-                }
-            } else {
-                aggregate.hashes.extend(hits);
-            }
-            aggregate.tier_used.push(tier_used);
-            aggregate.query_profile.merge_from(&query_profile);
-            aggregate.query_eval_nanos = aggregate.query_eval_nanos.saturating_add(eval_nanos);
-        }
-    }
-    Ok(out)
-}
-
 /// Executes a candidate search across all trees in the forest and combines the
 /// results into one local aggregate.
 fn query_local_forest_all_candidates(
@@ -2379,12 +2199,10 @@ fn query_local_forest_all_candidates(
     let mut external_id_map = HashMap::<String, Option<String>>::new();
     let mut tier_used = Vec::<String>::new();
     let mut query_profile = crate::candidate::CandidateQueryProfile::default();
-    let mut query_eval_nanos = 0u128;
     for partial in partials {
         hashes.extend(partial.hashes);
         tier_used.extend(partial.tier_used);
         query_profile.merge_from(&partial.query_profile);
-        query_eval_nanos = query_eval_nanos.saturating_add(partial.query_eval_nanos);
         for (sha256, external_id) in partial.external_ids {
             external_id_map.entry(sha256).or_insert(external_id);
         }
@@ -2411,127 +2229,8 @@ fn query_local_forest_all_candidates(
         tier_used: merge_tier_used(tier_used),
         query_profile,
         external_ids,
-        query_eval_nanos,
         hashes,
     })
-}
-
-/// Executes a candidate search across all trees in the forest for multiple
-/// plans, evaluating every store row at most once per shared batch pass.
-fn query_local_forest_all_candidates_batch(
-    tree_groups: &mut Vec<TreeStoreGroup>,
-    plans: &[crate::candidate::CompiledQueryPlan],
-    include_external_ids: bool,
-    tree_search_workers: usize,
-) -> Result<Vec<LocalForestQueryAggregate>> {
-    if plans.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let searchable_doc_count = tree_groups
-        .iter()
-        .flat_map(|group| group.stores.iter())
-        .map(CandidateStore::live_doc_count)
-        .sum::<usize>();
-    let resolved_limits = plans
-        .iter()
-        .map(|plan| resolve_max_candidates(searchable_doc_count, plan.max_candidates))
-        .collect::<Vec<_>>();
-    let runtime = plans
-        .iter()
-        .map(build_runtime_query_artifacts)
-        .collect::<Result<Vec<_>>>()?;
-    let worker_count = tree_search_workers.max(1).min(tree_groups.len().max(1));
-    let mut partials = Vec::<Vec<LocalTreeQueryAggregate>>::new();
-
-    if tree_groups.len() <= 1 || worker_count <= 1 {
-        for group in tree_groups {
-            partials.push(query_store_group_all_candidates_batch(
-                &mut group.stores,
-                plans,
-                &runtime,
-                include_external_ids,
-            )?);
-        }
-    } else {
-        let chunk_size = tree_groups.len().div_ceil(worker_count);
-        let scoped = thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk in tree_groups.chunks_mut(chunk_size) {
-                let runtime = runtime.clone();
-                handles.push(
-                    scope.spawn(move || -> Result<Vec<LocalTreeQueryAggregate>> {
-                        let mut merged = (0..plans.len())
-                            .map(|_| LocalTreeQueryAggregate::default())
-                            .collect::<Vec<_>>();
-                        for group in chunk {
-                            let partial = query_store_group_all_candidates_batch(
-                                &mut group.stores,
-                                plans,
-                                &runtime,
-                                include_external_ids,
-                            )?;
-                            for (target, source) in merged.iter_mut().zip(partial.into_iter()) {
-                                merge_local_tree_query_aggregate(target, source);
-                            }
-                        }
-                        Ok(merged)
-                    }),
-                );
-            }
-            let mut merged = Vec::with_capacity(handles.len());
-            for handle in handles {
-                merged.push(
-                    handle
-                        .join()
-                        .map_err(|_| SspryError::from("Forest batch search worker panicked."))??,
-                );
-            }
-            Ok::<Vec<Vec<LocalTreeQueryAggregate>>, SspryError>(merged)
-        })?;
-        partials = scoped;
-    }
-
-    let mut merged = (0..plans.len())
-        .map(|_| LocalTreeQueryAggregate::default())
-        .collect::<Vec<_>>();
-    for partial in partials {
-        for (target, source) in merged.iter_mut().zip(partial.into_iter()) {
-            merge_local_tree_query_aggregate(target, source);
-        }
-    }
-
-    Ok(merged
-        .into_iter()
-        .zip(resolved_limits.into_iter())
-        .map(|(partial, resolved_limit)| {
-            let mut hashes = partial.hashes.into_iter().collect::<Vec<_>>();
-            let truncated = resolved_limit != usize::MAX && hashes.len() > resolved_limit;
-            if truncated {
-                hashes.truncate(resolved_limit);
-            }
-            let external_ids = if include_external_ids {
-                Some(
-                    hashes
-                        .iter()
-                        .map(|sha256| partial.external_ids.get(sha256).cloned().flatten())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            };
-            LocalForestQueryAggregate {
-                total_candidates: hashes.len(),
-                truncated,
-                truncated_limit: truncated.then_some(resolved_limit),
-                tier_used: merge_tier_used(partial.tier_used),
-                query_profile: partial.query_profile,
-                external_ids,
-                query_eval_nanos: partial.query_eval_nanos,
-                hashes,
-            }
-        })
-        .collect())
 }
 
 /// Clears all per-store search caches for the currently opened forest.
@@ -3561,7 +3260,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             })
             .transpose()?
             .unwrap_or((GramSizes::new(3, 4)?, None));
-        let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+        let plan = crate::candidate::compile_query_plan_from_file_with_gram_sizes_and_identity_source(
             &args.rule,
             gram_sizes,
             active_identity_source.as_deref(),
@@ -3945,7 +3644,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
     }
 }
 
-/// Converts `local-index` arguments into the shared `init` argument shape used
+/// Converts `local index` arguments into the shared `init` argument shape used
 /// by store initialization helpers.
 fn init_args_from_local_index(args: &LocalIndexArgs) -> InitArgs {
     InitArgs {
@@ -5261,383 +4960,6 @@ fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
     }
 }
 
-/// Resolves the search-batch rule list from either a directory scan or a
-/// manifest file.
-fn collect_rules_from_args(
-    rules_dir: &Option<String>,
-    rule_manifest: &Option<String>,
-) -> Result<Vec<PathBuf>> {
-    let mut rules = if let Some(dir) = rules_dir {
-        let mut values = fs::read_dir(dir)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("yar"))
-            .collect::<Vec<_>>();
-        values.sort();
-        values
-    } else if let Some(manifest) = rule_manifest {
-        fs::read_to_string(manifest)?
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    if rules.is_empty() {
-        return Err(SspryError::from(
-            "search-batch requires at least one rule from --rules-dir or --rule-manifest",
-        ));
-    }
-    rules.sort();
-    Ok(rules)
-}
-
-/// Executes `search-batch`, writing one JSON record per rule plus a JSONL
-/// stream for incremental consumption.
-fn cmd_search_batch(args: &SearchBatchArgs) -> i32 {
-    match (|| -> Result<i32> {
-        let root = Path::new(&args.root);
-        let rules = collect_rules_from_args(&args.rules_dir, &args.rule_manifest)?;
-        let mut tree_groups = open_forest_tree_groups(root)?;
-        let tree_count = tree_groups.len();
-        let (gram_sizes, active_identity_source, _) = validate_forest_search_policy(&tree_groups)?;
-        let tree_search_workers = args.tree_search_workers.max(1).min(tree_count.max(1));
-        eprintln!(
-            "search.batch.start rules={} trees={} tree_workers={}",
-            rules.len(),
-            tree_count,
-            tree_search_workers
-        );
-        let mut out = BatchSearchRecordStream::new(Path::new(&args.json_out))?;
-        eprintln!(
-            "search.batch.stream json_out={} jsonl_out={}",
-            args.json_out,
-            out.jsonl_out().display()
-        );
-        struct PreparedBatchRule {
-            index: usize,
-            rule_path: PathBuf,
-            rule_name: String,
-            plan: CompiledQueryPlan,
-            plan_ms: f64,
-        }
-
-        let mut records = (0..rules.len()).map(|_| None).collect::<Vec<_>>();
-        let mut prepared = Vec::<PreparedBatchRule>::new();
-
-        for (index, rule) in rules.into_iter().enumerate() {
-            let started_plan = Instant::now();
-            let rule_name = rule
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_owned();
-            eprintln!("search.batch.rule.start rule={rule_name}");
-            match compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-                &rule,
-                gram_sizes,
-                active_identity_source.as_deref(),
-                args.max_anchors_per_pattern,
-                false,
-                true,
-                args.max_candidates,
-            ) {
-                Ok(plan) => prepared.push(PreparedBatchRule {
-                    index,
-                    rule_path: rule,
-                    rule_name,
-                    plan,
-                    plan_ms: started_plan.elapsed().as_secs_f64() * 1000.0,
-                }),
-                Err(err) => {
-                    let record = BatchSearchRecord {
-                        rule: rule_name.clone(),
-                        rule_path: rule.display().to_string(),
-                        exit_code: 1,
-                        elapsed_ms_wall: started_plan.elapsed().as_secs_f64() * 1000.0,
-                        error: Some(err.to_string()),
-                        candidates: None,
-                        truncated: None,
-                        truncated_limit: None,
-                        tier_used: None,
-                        verified_checked: None,
-                        verified_matched: None,
-                        verified_skipped: None,
-                        verbose_search_total_ms: None,
-                        verbose_search_plan_ms: None,
-                        verbose_search_query_ms: None,
-                        verbose_search_verify_ms: None,
-                        verbose_search_docs_scanned: None,
-                        verbose_search_metadata_loads: None,
-                        verbose_search_metadata_bytes: None,
-                        verbose_search_tier1_bloom_loads: None,
-                        verbose_search_tier1_bloom_bytes: None,
-                        verbose_search_tier2_bloom_loads: None,
-                        verbose_search_tier2_bloom_bytes: None,
-                        verbose_search_max_candidates: Some(args.max_candidates),
-                        verbose_search_max_anchors_per_pattern: Some(args.max_anchors_per_pattern),
-                        verbose_search_candidates: None,
-                        verbose_search_verify_enabled: Some(args.verify_yara_files),
-                        verbose_search_client_current_rss_kb: None,
-                        verbose_search_client_peak_rss_kb: None,
-                        verbose_search_client_smaps_rss_kb: None,
-                        verbose_search_client_anonymous_kb: None,
-                        verbose_search_client_private_clean_kb: None,
-                        verbose_search_client_private_dirty_kb: None,
-                        verbose_search_client_shared_clean_kb: None,
-                        verbose_search_server_current_rss_kb: None,
-                        verbose_search_server_peak_rss_kb: None,
-                        verbose_search_tree_count: Some(tree_count),
-                        verbose_search_tree_search_workers: Some(tree_search_workers),
-                    };
-                    eprintln!(
-                        "search.batch.rule.done rule={} exit={} wall_ms={:.3}",
-                        record.rule, record.exit_code, record.elapsed_ms_wall
-                    );
-                    records[index] = Some(record);
-                }
-            }
-        }
-
-        if !prepared.is_empty() {
-            let plans = prepared
-                .iter()
-                .map(|rule| rule.plan.clone())
-                .collect::<Vec<_>>();
-            eprintln!(
-                "search.batch.query.start rules={} trees={} tree_workers={}",
-                plans.len(),
-                tree_count,
-                tree_search_workers
-            );
-            let started_batch_query = Instant::now();
-            let locals = query_local_forest_all_candidates_batch(
-                &mut tree_groups,
-                &plans,
-                args.verify_yara_files,
-                tree_search_workers,
-            );
-            let batch_query_ms = started_batch_query.elapsed().as_secs_f64() * 1000.0;
-            clear_local_forest_search_caches(&mut tree_groups);
-
-            match locals {
-                Ok(locals) => {
-                    eprintln!(
-                        "search.batch.query.done rules={} wall_ms={:.3}",
-                        locals.len(),
-                        batch_query_ms
-                    );
-                    for (prepared_rule, local) in prepared.into_iter().zip(locals.into_iter()) {
-                        let started_verify = Instant::now();
-                        let verification = verify_search_candidates(
-                            &prepared_rule.rule_path,
-                            None,
-                            &prepared_rule.plan,
-                            local.hashes,
-                            local.external_ids.unwrap_or_default(),
-                            args.verify_yara_files,
-                        );
-                        let verify_ms = started_verify.elapsed().as_secs_f64() * 1000.0;
-                        let record = match verification {
-                            Ok(verification) => {
-                                let query_ms = local.query_eval_nanos as f64 / 1_000_000.0;
-                                let total_ms = prepared_rule.plan_ms + query_ms + verify_ms;
-                                let (client_current_rss_kb, client_peak_rss_kb) =
-                                    current_process_memory_kb();
-                                let smaps_rollup = current_process_smaps_rollup_kb();
-                                BatchSearchRecord {
-                                    rule: prepared_rule.rule_name.clone(),
-                                    rule_path: prepared_rule.rule_path.display().to_string(),
-                                    exit_code: 0,
-                                    elapsed_ms_wall: total_ms,
-                                    error: None,
-                                    candidates: Some(local.total_candidates),
-                                    truncated: Some(local.truncated),
-                                    truncated_limit: local.truncated_limit,
-                                    tier_used: Some(local.tier_used),
-                                    verified_checked: Some(verification.verified_checked),
-                                    verified_matched: Some(verification.verified_matched),
-                                    verified_skipped: Some(verification.verified_skipped),
-                                    verbose_search_total_ms: Some(total_ms),
-                                    verbose_search_plan_ms: Some(prepared_rule.plan_ms),
-                                    verbose_search_query_ms: Some(query_ms),
-                                    verbose_search_verify_ms: Some(verify_ms),
-                                    verbose_search_docs_scanned: Some(
-                                        local.query_profile.docs_scanned,
-                                    ),
-                                    verbose_search_metadata_loads: Some(
-                                        local.query_profile.metadata_loads,
-                                    ),
-                                    verbose_search_metadata_bytes: Some(
-                                        local.query_profile.metadata_bytes,
-                                    ),
-                                    verbose_search_tier1_bloom_loads: Some(
-                                        local.query_profile.tier1_bloom_loads,
-                                    ),
-                                    verbose_search_tier1_bloom_bytes: Some(
-                                        local.query_profile.tier1_bloom_bytes,
-                                    ),
-                                    verbose_search_tier2_bloom_loads: Some(
-                                        local.query_profile.tier2_bloom_loads,
-                                    ),
-                                    verbose_search_tier2_bloom_bytes: Some(
-                                        local.query_profile.tier2_bloom_bytes,
-                                    ),
-                                    verbose_search_max_candidates: Some(args.max_candidates),
-                                    verbose_search_max_anchors_per_pattern: Some(
-                                        args.max_anchors_per_pattern,
-                                    ),
-                                    verbose_search_candidates: Some(local.total_candidates),
-                                    verbose_search_verify_enabled: Some(args.verify_yara_files),
-                                    verbose_search_client_current_rss_kb: Some(
-                                        client_current_rss_kb,
-                                    ),
-                                    verbose_search_client_peak_rss_kb: Some(client_peak_rss_kb),
-                                    verbose_search_client_smaps_rss_kb: Some(smaps_rollup.rss_kb),
-                                    verbose_search_client_anonymous_kb: Some(
-                                        smaps_rollup.anonymous_kb,
-                                    ),
-                                    verbose_search_client_private_clean_kb: Some(
-                                        smaps_rollup.private_clean_kb,
-                                    ),
-                                    verbose_search_client_private_dirty_kb: Some(
-                                        smaps_rollup.private_dirty_kb,
-                                    ),
-                                    verbose_search_client_shared_clean_kb: Some(
-                                        smaps_rollup.shared_clean_kb,
-                                    ),
-                                    verbose_search_server_current_rss_kb: None,
-                                    verbose_search_server_peak_rss_kb: None,
-                                    verbose_search_tree_count: Some(tree_count),
-                                    verbose_search_tree_search_workers: Some(tree_search_workers),
-                                }
-                            }
-                            Err(err) => BatchSearchRecord {
-                                rule: prepared_rule.rule_name.clone(),
-                                rule_path: prepared_rule.rule_path.display().to_string(),
-                                exit_code: 1,
-                                elapsed_ms_wall: prepared_rule.plan_ms + verify_ms,
-                                error: Some(err.to_string()),
-                                candidates: None,
-                                truncated: None,
-                                truncated_limit: None,
-                                tier_used: None,
-                                verified_checked: None,
-                                verified_matched: None,
-                                verified_skipped: None,
-                                verbose_search_total_ms: None,
-                                verbose_search_plan_ms: Some(prepared_rule.plan_ms),
-                                verbose_search_query_ms: None,
-                                verbose_search_verify_ms: Some(verify_ms),
-                                verbose_search_docs_scanned: None,
-                                verbose_search_metadata_loads: None,
-                                verbose_search_metadata_bytes: None,
-                                verbose_search_tier1_bloom_loads: None,
-                                verbose_search_tier1_bloom_bytes: None,
-                                verbose_search_tier2_bloom_loads: None,
-                                verbose_search_tier2_bloom_bytes: None,
-                                verbose_search_max_candidates: Some(args.max_candidates),
-                                verbose_search_max_anchors_per_pattern: Some(
-                                    args.max_anchors_per_pattern,
-                                ),
-                                verbose_search_candidates: None,
-                                verbose_search_verify_enabled: Some(args.verify_yara_files),
-                                verbose_search_client_current_rss_kb: None,
-                                verbose_search_client_peak_rss_kb: None,
-                                verbose_search_client_smaps_rss_kb: None,
-                                verbose_search_client_anonymous_kb: None,
-                                verbose_search_client_private_clean_kb: None,
-                                verbose_search_client_private_dirty_kb: None,
-                                verbose_search_client_shared_clean_kb: None,
-                                verbose_search_server_current_rss_kb: None,
-                                verbose_search_server_peak_rss_kb: None,
-                                verbose_search_tree_count: Some(tree_count),
-                                verbose_search_tree_search_workers: Some(tree_search_workers),
-                            },
-                        };
-                        eprintln!(
-                            "search.batch.rule.done rule={} exit={} wall_ms={:.3}",
-                            record.rule, record.exit_code, record.elapsed_ms_wall
-                        );
-                        records[prepared_rule.index] = Some(record);
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "search.batch.query.done rules={} wall_ms={:.3} exit=1",
-                        prepared.len(),
-                        batch_query_ms
-                    );
-                    for prepared_rule in prepared {
-                        let record = BatchSearchRecord {
-                            rule: prepared_rule.rule_name.clone(),
-                            rule_path: prepared_rule.rule_path.display().to_string(),
-                            exit_code: 1,
-                            elapsed_ms_wall: prepared_rule.plan_ms + batch_query_ms,
-                            error: Some(err.to_string()),
-                            candidates: None,
-                            truncated: None,
-                            truncated_limit: None,
-                            tier_used: None,
-                            verified_checked: None,
-                            verified_matched: None,
-                            verified_skipped: None,
-                            verbose_search_total_ms: None,
-                            verbose_search_plan_ms: Some(prepared_rule.plan_ms),
-                            verbose_search_query_ms: Some(batch_query_ms),
-                            verbose_search_verify_ms: None,
-                            verbose_search_docs_scanned: None,
-                            verbose_search_metadata_loads: None,
-                            verbose_search_metadata_bytes: None,
-                            verbose_search_tier1_bloom_loads: None,
-                            verbose_search_tier1_bloom_bytes: None,
-                            verbose_search_tier2_bloom_loads: None,
-                            verbose_search_tier2_bloom_bytes: None,
-                            verbose_search_max_candidates: Some(args.max_candidates),
-                            verbose_search_max_anchors_per_pattern: Some(
-                                args.max_anchors_per_pattern,
-                            ),
-                            verbose_search_candidates: None,
-                            verbose_search_verify_enabled: Some(args.verify_yara_files),
-                            verbose_search_client_current_rss_kb: None,
-                            verbose_search_client_peak_rss_kb: None,
-                            verbose_search_client_smaps_rss_kb: None,
-                            verbose_search_client_anonymous_kb: None,
-                            verbose_search_client_private_clean_kb: None,
-                            verbose_search_client_private_dirty_kb: None,
-                            verbose_search_client_shared_clean_kb: None,
-                            verbose_search_server_current_rss_kb: None,
-                            verbose_search_server_peak_rss_kb: None,
-                            verbose_search_tree_count: Some(tree_count),
-                            verbose_search_tree_search_workers: Some(tree_search_workers),
-                        };
-                        eprintln!(
-                            "search.batch.rule.done rule={} exit={} wall_ms={:.3}",
-                            record.rule, record.exit_code, record.elapsed_ms_wall
-                        );
-                        records[prepared_rule.index] = Some(record);
-                    }
-                }
-            }
-        }
-
-        for record in records.into_iter().flatten() {
-            out.push(&record)?;
-        }
-        let count = out.finish()?;
-        eprintln!("search.batch.done rules={count}");
-        Ok(0)
-    })() {
-        Ok(code) => code,
-        Err(err) => {
-            println!("{err}");
-            1
-        }
-    }
-}
-
 /// Default `info` entrypoint, currently routed through the gRPC client path.
 fn cmd_info(args: &InfoCommandArgs) -> i32 {
     cmd_grpc_info(args)
@@ -5734,6 +5056,7 @@ mod tests;
 /// command, and flushes perf output before exiting.
 pub fn main(argv: Option<Vec<String>>) -> i32 {
     let argv_values = argv.unwrap_or_else(|| std::env::args().collect::<Vec<_>>());
+    let argv_values = rewrite_default_yara_argv(argv_values);
     let cli = Cli::parse_from(argv_values.clone());
     perf::configure(cli.perf_report.as_ref().map(PathBuf::from), cli.perf_stdout);
 
@@ -5742,15 +5065,16 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
             cmd_serve_with_sources(&args, serve_init_option_sources_from_argv(&argv_values))
         }
         Commands::Index(args) => cmd_index(&args),
-        Commands::LocalIndex(args) => cmd_local_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
-        Commands::LocalDelete(args) => cmd_local_delete(&args),
         Commands::RuleCheck(args) => cmd_rule_check(&args),
         Commands::Search(args) => cmd_search(&args),
-        Commands::LocalSearch(args) => cmd_local_search(&args),
-        Commands::SearchBatch(args) => cmd_search_batch(&args),
         Commands::Info(args) => cmd_info(&args),
-        Commands::LocalInfo(args) => cmd_local_info(&args),
+        Commands::Local(args) => match args.command {
+            LocalCommands::Index(args) => cmd_local_index(&args),
+            LocalCommands::Delete(args) => cmd_local_delete(&args),
+            LocalCommands::Search(args) => cmd_local_search(&args),
+            LocalCommands::Info(args) => cmd_local_info(&args),
+        },
         Commands::Shutdown(args) => cmd_shutdown(&args),
         Commands::Yara(args) => cmd_yara(&args),
     };

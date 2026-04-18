@@ -194,7 +194,8 @@ fn rule_check_uses_local_root_policy() {
     let sample = tmp.path().join("sample.bin");
     fs::write(&sample, b"sample local root rule check").expect("write sample");
     let _ = run_ok(&[
-        "local-index",
+        "local",
+        "index",
         "--root",
         root.to_str().expect("root"),
         sample.to_str().expect("sample"),
@@ -1021,7 +1022,6 @@ fn yara_reports_match_and_tags() {
     fs::write(&hit_path, b"well hello there").expect("hit");
 
     let out = run_ok(&[
-        "yara",
         "--rule",
         rule_path.to_str().expect("rule"),
         "--show-tags",
@@ -1039,7 +1039,6 @@ fn yara_reports_missing_inputs() {
     fs::write(&hit_path, b"hello").expect("hit");
 
     let rule_err = run_fail(&[
-        "yara",
         "--rule",
         tmp.path().join("missing.yar").to_str().expect("rule"),
         hit_path.to_str().expect("hit"),
@@ -1047,7 +1046,6 @@ fn yara_reports_missing_inputs() {
     assert!(rule_err.contains("Rule file not found"));
 
     let file_err = run_fail(&[
-        "yara",
         "--rule",
         hit_path.to_str().expect("rule"),
         tmp.path().join("missing.bin").to_str().expect("file"),
@@ -1091,7 +1089,6 @@ rule NumericReads {
     .expect("write rule");
 
     let out = run_ok(&[
-        "yara",
         "--rule",
         rule_path.to_str().expect("rule"),
         hit_path.to_str().expect("hit"),

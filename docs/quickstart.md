@@ -2,7 +2,7 @@
 
 This is the shortest path from zero to a working `sspry` instance.
 
-This page shows the normal RPC workflow. If you want direct local operation without a server, use `local-index`, `local-search`, `local-info`, and `local-delete`.
+This page shows the normal RPC workflow. If you want direct local operation without a server, use `local index`, `local search`, `local info`, and `local delete`.
 
 ## 1. Build
 
@@ -106,4 +106,4 @@ Signals:
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
 - Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with the default `8` keeps open and publish fanout low.
 - If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 8-shard layout.
-- For repeated local tuning against a preserved forest, prefer `search-batch` over reopening the forest for every rule.
+- For repeated local tuning against a preserved forest, prefer `local search` so the forest is opened once per invocation and reused across rules from one top-level file.

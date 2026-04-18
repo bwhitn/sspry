@@ -183,32 +183,22 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
 
     let cli = Cli::try_parse_from([
         "sspry",
-        "local-search",
+        "local",
+        "search",
         "--root",
         "db",
         "--rule",
         "rule.yar",
     ])
-    .expect("parse local-search");
+    .expect("parse local search");
     match cli.command {
-        Commands::LocalSearch(args) => {
-            assert_eq!(args.rule, "rule.yar".to_owned());
-            assert_eq!(args.max_candidates, 10.0);
+        Commands::Local(args) => match args.command {
+            LocalCommands::Search(args) => {
+                assert_eq!(args.rule, "rule.yar".to_owned());
+                assert_eq!(args.max_candidates, 10.0);
+            }
+            other => panic!("unexpected local command: {other:?}"),
         }
-        other => panic!("unexpected command: {other:?}"),
-    }
-
-    let cli = Cli::try_parse_from([
-        "sspry",
-        "search-batch",
-        "--root",
-        "db",
-        "--json-out",
-        "out.json",
-    ])
-    .expect("parse search-batch");
-    match cli.command {
-        Commands::SearchBatch(args) => assert_eq!(args.max_candidates, 10.0),
         other => panic!("unexpected command: {other:?}"),
     }
 }
@@ -1175,7 +1165,6 @@ fn yara_check_and_main_dispatch_work() {
     assert_eq!(
         main(Some(vec![
             "sspry".to_owned(),
-            "yara".to_owned(),
             "--rule".to_owned(),
             rule_path.display().to_string(),
             hit_path.display().to_string(),
@@ -1446,7 +1435,6 @@ fn main_returns_error_when_perf_report_path_is_unwritable() {
             "sspry".to_owned(),
             "--perf-report".to_owned(),
             perf_dir.display().to_string(),
-            "yara".to_owned(),
             "--rule".to_owned(),
             rule_path.display().to_string(),
             hit_path.display().to_string(),
@@ -1753,10 +1741,6 @@ fn batch_search_helper_functions_cover_local_forest_paths() {
     assert!(!is_retryable_remote_index_rotation_error(
         &SspryError::from("fatal publish failure")
     ));
-    assert_eq!(
-        append_path_suffix(Path::new("/tmp/out.json"), ".jsonl"),
-        PathBuf::from("/tmp/out.json.jsonl")
-    );
     assert!(is_wide_word_unit(b"A\0"));
     assert!(!is_wide_word_unit(b"A"));
     assert!(!is_wide_word_unit(&[0xff, 0x00]));
@@ -1877,348 +1861,4 @@ fn internal_local_only_commands_reject_removed_remote_paths() {
         }),
         1
     );
-}
-
-#[test]
-fn batch_search_record_stream_roundtrips_json_outputs() {
-    let tmp = tempdir().expect("tmp");
-    let json_out = tmp.path().join("batch").join("search_summary.json");
-    let partial_json_out = append_path_suffix(&json_out, ".partial.json");
-    let jsonl_out = append_path_suffix(&json_out, ".jsonl");
-    let mut stream = BatchSearchRecordStream::new(&json_out).expect("stream");
-    assert_eq!(stream.jsonl_out(), jsonl_out.as_path());
-
-    let record_a = BatchSearchRecord {
-        rule: "rule_a".to_owned(),
-        rule_path: "/tmp/rule_a.yar".to_owned(),
-        exit_code: 0,
-        elapsed_ms_wall: 12.5,
-        error: None,
-        candidates: Some(2),
-        truncated: Some(false),
-        truncated_limit: None,
-        tier_used: Some("tier1+tier2".to_owned()),
-        verified_checked: Some(0),
-        verified_matched: Some(0),
-        verified_skipped: Some(0),
-        verbose_search_total_ms: Some(12.5),
-        verbose_search_plan_ms: Some(1.0),
-        verbose_search_query_ms: Some(11.0),
-        verbose_search_verify_ms: Some(0.5),
-        verbose_search_docs_scanned: Some(2),
-        verbose_search_metadata_loads: Some(0),
-        verbose_search_metadata_bytes: Some(0),
-        verbose_search_tier1_bloom_loads: Some(2),
-        verbose_search_tier1_bloom_bytes: Some(128),
-        verbose_search_tier2_bloom_loads: Some(1),
-        verbose_search_tier2_bloom_bytes: Some(64),
-        verbose_search_max_candidates: Some(100.0),
-        verbose_search_max_anchors_per_pattern: Some(8),
-        verbose_search_candidates: Some(2),
-        verbose_search_verify_enabled: Some(false),
-        verbose_search_client_current_rss_kb: Some(1024),
-        verbose_search_client_peak_rss_kb: Some(2048),
-        verbose_search_client_smaps_rss_kb: Some(1024),
-        verbose_search_client_anonymous_kb: Some(512),
-        verbose_search_client_private_clean_kb: Some(64),
-        verbose_search_client_private_dirty_kb: Some(128),
-        verbose_search_client_shared_clean_kb: Some(256),
-        verbose_search_server_current_rss_kb: Some(4096),
-        verbose_search_server_peak_rss_kb: Some(8192),
-        verbose_search_tree_count: Some(2),
-        verbose_search_tree_search_workers: Some(2),
-    };
-    let record_b = BatchSearchRecord {
-        rule: "rule_b".to_owned(),
-        rule_path: "/tmp/rule_b.yar".to_owned(),
-        exit_code: 1,
-        elapsed_ms_wall: 3.5,
-        error: Some("boom".to_owned()),
-        candidates: None,
-        truncated: None,
-        truncated_limit: None,
-        tier_used: None,
-        verified_checked: None,
-        verified_matched: None,
-        verified_skipped: None,
-        verbose_search_total_ms: None,
-        verbose_search_plan_ms: None,
-        verbose_search_query_ms: None,
-        verbose_search_verify_ms: None,
-        verbose_search_docs_scanned: None,
-        verbose_search_metadata_loads: None,
-        verbose_search_metadata_bytes: None,
-        verbose_search_tier1_bloom_loads: None,
-        verbose_search_tier1_bloom_bytes: None,
-        verbose_search_tier2_bloom_loads: None,
-        verbose_search_tier2_bloom_bytes: None,
-        verbose_search_max_candidates: None,
-        verbose_search_max_anchors_per_pattern: None,
-        verbose_search_candidates: None,
-        verbose_search_verify_enabled: None,
-        verbose_search_client_current_rss_kb: None,
-        verbose_search_client_peak_rss_kb: None,
-        verbose_search_client_smaps_rss_kb: None,
-        verbose_search_client_anonymous_kb: None,
-        verbose_search_client_private_clean_kb: None,
-        verbose_search_client_private_dirty_kb: None,
-        verbose_search_client_shared_clean_kb: None,
-        verbose_search_server_current_rss_kb: None,
-        verbose_search_server_peak_rss_kb: None,
-        verbose_search_tree_count: None,
-        verbose_search_tree_search_workers: None,
-    };
-
-    stream.push(&record_a).expect("push record a");
-    stream.push(&record_b).expect("push record b");
-    assert_eq!(stream.finish().expect("finish"), 2);
-
-    let json_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&fs::read(&json_out).expect("json output")).expect("json rows");
-    assert_eq!(json_rows.len(), 2);
-
-    let jsonl_lines = fs::read_to_string(&jsonl_out)
-        .expect("jsonl output")
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    assert_eq!(jsonl_lines.len(), 2);
-    assert!(!partial_json_out.exists());
-}
-
-#[test]
-fn local_forest_search_wrappers_and_cmd_search_batch_work() {
-    let _guard = crate::perf::test_lock().lock().expect("perf lock");
-    crate::perf::configure(None, false);
-    let tmp = tempdir().expect("tmp");
-    let base = tmp.path();
-    let forest_root = base.join("forest");
-    let rules_dir = base.join("rules");
-    fs::create_dir_all(&forest_root).expect("forest root");
-    fs::create_dir_all(&rules_dir).expect("rules dir");
-
-    for (tree_idx, files) in [
-        (
-            0usize,
-            vec![
-                ("match_a.bin", b"tree zero ABCD hit one".as_slice()),
-                ("miss_a.bin", b"tree zero miss".as_slice()),
-            ],
-        ),
-        (
-            1usize,
-            vec![
-                ("match_b.bin", b"tree one prefix ABCD hit two".as_slice()),
-                ("miss_b.bin", b"tree one miss".as_slice()),
-            ],
-        ),
-    ] {
-        let tree_root = forest_root
-            .join(format!("tree_{tree_idx:02}"))
-            .join("current");
-        let sample_dir = base.join(format!("tree_{tree_idx:02}_samples"));
-        fs::create_dir_all(&sample_dir).expect("sample dir");
-        for (name, bytes) in files {
-            fs::write(sample_dir.join(name), bytes).expect("sample file");
-        }
-        assert_eq!(
-            cmd_init(&default_internal_init_args(&tree_root, 1, true)),
-            0
-        );
-        assert_eq!(
-            cmd_internal_index_batch(&InternalIndexBatchArgs {
-                paths: vec![sample_dir.display().to_string()],
-                path_list: false,
-                root: Some(tree_root.display().to_string()),
-                batch_size: 1,
-                workers: 1,
-                chunk_size: 1024,
-                verbose: false,
-            }),
-            0
-        );
-    }
-
-    let match_rule = rules_dir.join("0001_match.yar");
-    let miss_rule = rules_dir.join("0002_miss.yar");
-    fs::write(
-        &match_rule,
-        r#"
-rule match_rule {
-  strings:
-    $a = "ABCD"
-  condition:
-    $a
-}
-"#,
-    )
-    .expect("match rule");
-    fs::write(
-        &miss_rule,
-        r#"
-rule miss_rule {
-  strings:
-    $a = "WXYZ"
-  condition:
-    $a
-}
-"#,
-    )
-    .expect("miss rule");
-
-    let manifest = base.join("rules.txt");
-    fs::write(
-        &manifest,
-        format!("{}\n{}\n", miss_rule.display(), match_rule.display()),
-    )
-    .expect("manifest");
-    assert_eq!(
-        collect_rules_from_args(&Some(rules_dir.display().to_string()), &None).expect("rules dir"),
-        vec![match_rule.clone(), miss_rule.clone()]
-    );
-    assert_eq!(
-        collect_rules_from_args(&None, &Some(manifest.display().to_string()))
-            .expect("manifest rules"),
-        vec![match_rule.clone(), miss_rule.clone()]
-    );
-    assert!(collect_rules_from_args(&None, &None).is_err());
-
-    assert_eq!(
-        forest_tree_roots(&forest_root).expect("forest tree roots"),
-        vec![
-            forest_root.join("tree_00").join("current"),
-            forest_root.join("tree_01").join("current")
-        ]
-    );
-
-    let mut tree_groups = open_forest_tree_groups(&forest_root).expect("open forest");
-    assert_eq!(tree_groups.len(), 2);
-    let (gram_sizes, active_identity_source, summary_cap_bytes) =
-        validate_forest_search_policy(&tree_groups).expect("search policy");
-    assert_eq!(gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
-    assert_eq!(active_identity_source.as_deref(), Some("sha256"));
-    assert_eq!(summary_cap_bytes, 0);
-
-    let plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-        &match_rule,
-        gram_sizes,
-        active_identity_source.as_deref(),
-        8,
-        false,
-        true,
-        100,
-    )
-    .expect("compile plan");
-    let miss_plan = compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-        &miss_rule,
-        gram_sizes,
-        active_identity_source.as_deref(),
-        8,
-        false,
-        true,
-        100,
-    )
-    .expect("compile miss plan");
-    assert_eq!(summary_cap_bytes, 0);
-
-    let local_tree = query_store_group_all_candidates(&mut tree_groups[0].stores, &plan, true)
-        .expect("local tree query");
-    assert_eq!(local_tree.hashes.len(), 1);
-    assert_eq!(local_tree.external_ids.len(), 1);
-
-    let local_forest =
-        query_local_forest_all_candidates(&mut tree_groups, &plan, true, 2).expect("forest query");
-    assert_eq!(local_forest.total_candidates, 2);
-    assert_eq!(local_forest.hashes.len(), 2);
-    assert_eq!(
-        local_forest
-            .external_ids
-            .as_ref()
-            .expect("external ids")
-            .len(),
-        2
-    );
-    assert!(local_forest.query_profile.docs_scanned >= 2);
-    assert!(!local_forest.tier_used.is_empty());
-
-    clear_local_forest_search_caches(&mut tree_groups);
-    let after_clear = query_local_forest_all_candidates(&mut tree_groups, &plan, false, 2)
-        .expect("forest query after clear");
-    assert_eq!(after_clear.total_candidates, 2);
-    assert!(after_clear.external_ids.is_none());
-
-    clear_local_forest_search_caches(&mut tree_groups);
-    let sequential_match =
-        query_local_forest_all_candidates(&mut tree_groups, &plan, false, 2).expect("match seq");
-    let sequential_miss = query_local_forest_all_candidates(&mut tree_groups, &miss_plan, false, 2)
-        .expect("miss seq");
-    let sequential_tier1_loads = sequential_match
-        .query_profile
-        .tier1_bloom_loads
-        .saturating_add(sequential_miss.query_profile.tier1_bloom_loads);
-
-    clear_local_forest_search_caches(&mut tree_groups);
-    let batched = query_local_forest_all_candidates_batch(
-        &mut tree_groups,
-        &[plan.clone(), miss_plan.clone()],
-        false,
-        2,
-    )
-    .expect("batched forest query");
-    assert_eq!(batched.len(), 2);
-    assert_eq!(batched[0].total_candidates, 2);
-    assert_eq!(batched[1].total_candidates, 0);
-    let batched_tier1_loads = batched
-        .iter()
-        .map(|aggregate| aggregate.query_profile.tier1_bloom_loads)
-        .sum::<u64>();
-    assert!(
-        batched_tier1_loads < sequential_tier1_loads,
-        "bundled local search should reuse tier1 bloom loads across rules"
-    );
-
-    let json_out = base.join("batch_results.json");
-    assert_eq!(
-        cmd_search_batch(&SearchBatchArgs {
-            root: forest_root.display().to_string(),
-            rules_dir: Some(rules_dir.display().to_string()),
-            rule_manifest: None,
-            json_out: json_out.display().to_string(),
-            tree_search_workers: 2,
-            max_anchors_per_pattern: 8,
-            max_candidates: 100.0,
-            verify_yara_files: false,
-        }),
-        0
-    );
-
-    let batch_rows: Vec<serde_json::Value> =
-        serde_json::from_slice(&fs::read(&json_out).expect("batch json")).expect("batch rows");
-    assert_eq!(batch_rows.len(), 2);
-    let candidates_by_rule = batch_rows
-        .iter()
-        .map(|row| {
-            (
-                row.get("rule")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("rule name")
-                    .to_owned(),
-                row.get("candidates")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    assert_eq!(candidates_by_rule.get("0001_match.yar"), Some(&2));
-    assert_eq!(candidates_by_rule.get("0002_miss.yar"), Some(&0));
-    let batch_tier1_loads = batch_rows
-        .iter()
-        .map(|row| {
-            row.get("verbose_search_tier1_bloom_loads")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-        })
-        .sum::<u64>();
-    assert_eq!(batch_tier1_loads, batched_tier1_loads);
-    assert!(append_path_suffix(&json_out, ".jsonl").exists());
 }

@@ -12,29 +12,25 @@ Usage: sspry [OPTIONS] <COMMAND>
 Commands:
   serve
   index
-  local-index
   delete
-  local-delete
   rule-check
   search
-  local-search
-  search-batch
   info
-  local-info
+  local
   shutdown
-  yara
   help
+
+Default scan mode: sspry --rule <RULE> <FILE>
 ```
 
 ## Shared Notes
 
 - `SSPRY_ADDR` sets the default server address for remote client commands.
 - `serve` is the only public server command.
-- `index`, `delete`, `search`, `info`, and `shutdown` are the public remote client commands.
+- `index`, `delete`, `search`, `info`, and `shutdown` are the public remote gRPC client commands.
 - `rule-check` validates a rule against a live server policy, a local root, or explicit offline assumptions.
-- the public remote transport is gRPC
-- `local-index`, `local-delete`, `local-search`, and `local-info` operate directly on disk without RPC.
-- `search-batch` is the long-lived local forest runner for repeated sweeps.
+- `local` groups the direct on-disk commands and does not use RPC.
+- direct YARA scanning is the default mode when the first non-global token is not a known subcommand.
 
 ## `serve`
 
@@ -48,8 +44,8 @@ Key options:
 - `--max-message-bytes <BYTES>`
 - `--search-workers <N>`
   - one active top-level search per server
-  - direct/workspace mode fans out across shards
-  - forest mode fans out across shard/tree work units
+  - direct/workspace mode fans out over shard work units
+  - forest mode fans out over `(tree, shard)` work units
   - default is `max(1, cpus/4)`
 - `--root <ROOT>`
   - workspace root, direct store root, or forest root
@@ -89,27 +85,6 @@ Behavior:
 - only one active indexing session is allowed per server at a time
 - when the target server is in workspace mode, `index` auto-publishes after ingest so new documents become searchable
 
-## `local-index`
-
-```text
-Usage: sspry local-index [OPTIONS] --root <ROOT> <PATHS>...
-```
-
-Local ingest options:
-
-- `--root <ROOT>`
-- `--candidate-shards <N>` default `1`
-- `--force`
-- `--tier1-set-fp <P>` default `0.38`
-- `--tier2-set-fp <P>` default `0.18`
-- `--gram-sizes <tier1,tier2>` default `3,4`
-- supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
-- `--compaction-idle-cooldown-s <SECONDS>` default `5`
-- `--path-list`
-- `--batch-size <N>`
-- `--workers <N>`
-- `--verbose`
-
 ## `delete`
 
 ```text
@@ -120,43 +95,20 @@ Usage: sspry delete [OPTIONS] <VALUES>...
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
 
-Behavior:
-
-- delete only targets published `current/`
-- `missing` is a normal non-error outcome for multi-server fanout
-- reclaim happens later through background compaction of `current/`
-
-## `local-delete`
-
-```text
-Usage: sspry local-delete [OPTIONS] --root <ROOT> <VALUES>...
-```
-
-- `--root <ROOT>`
-
 ## `rule-check`
 
 ```text
 Usage: sspry rule-check [OPTIONS] --rule <RULE>
 ```
 
+Key options:
+
 - `--rule <RULE>`
-- `--addr <ADDR>`
-- `--timeout <SECONDS>` when using `--addr`
-- `--max-message-bytes <BYTES>` when using `--addr`
-- `--root <ROOT>`
-- `--id-source <sha256|md5|sha1|sha512>`
-- `--gram-sizes <tier1,tier2>`
-- `--max-anchors-per-pattern <N>` default `16`
+- `--addr <ADDR>` to validate against a live server policy
+- `--root <ROOT>` to validate against a local store or forest policy
+- `--id-source <MODE>` and `--gram-sizes <PAIR>` for offline assumptions
+- `--max-anchors-per-pattern <N>`
 - `--json`
-
-Behavior:
-
-- returns `searchable`, `searchable-needs-verify`, or `unsupported`
-- uses live server policy with `--addr`
-- uses on-disk store or forest policy with `--root`
-- otherwise falls back to explicit or default offline assumptions
-- warns about verifier-only constraints and ignored indexed-search module predicates
 
 ## `search`
 
@@ -170,71 +122,16 @@ Remote search options:
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
 - `--rule <RULE>`
-  - path to one top-level YARA file
-  - normal YARA `include "..."` directives are expanded before search
-- `--max-anchors-per-pattern <N>` default `16`
+- `--max-anchors-per-pattern <N>`
 - `--max-candidates <PERCENT>` default `10`
 - `--verify`
 - `--verbose`
 
 Behavior:
 
-- client sends validated YARA source
-- server compiles and executes the search plan
-- server serializes top-level searches and queues later requests
-- client deduplicates across the forest and applies the final percentage cap
-- if the expanded source contains multiple searchable rules, the remote path sends one bundled gRPC request covering all named rules in source order
-- single-rule output stays unchanged
-- multi-rule output is emitted as one labeled block per rule identifier as each rule completes
-- the command returns nonzero if any rule in the expanded source fails
-
-## `local-search`
-
-```text
-Usage: sspry local-search [OPTIONS] --root <ROOT> --rule <RULE>
-```
-
-Local forest search options:
-
-- `--root <ROOT>`
-- `--rule <RULE>`
-  - path to one top-level YARA file
-  - normal YARA `include "..."` directives are expanded before search
-- `--tree-search-workers <N>` default `0`
-- `--max-anchors-per-pattern <N>` default `16`
-- `--max-candidates <PERCENT>` default `10`
-- `--verify`
-- `--verbose`
-
-Behavior:
-
-- opens `tree_*/current` directly and searches the forest in-process
-- `--tree-search-workers 0` means auto up to the tree count
-- if the expanded source contains multiple searchable rules, the command reuses one opened forest but still executes one rule at a time in source order
-- single-rule output stays unchanged
-- multi-rule output is emitted as one labeled block per rule identifier from the expanded source
-- the command returns nonzero if any rule in the expanded source fails
-
-## `search-batch`
-
-```text
-Usage: sspry search-batch --root <ROOT> --json-out <JSON_OUT> [OPTIONS]
-```
-
-- `--root <ROOT>`
-- `--rules-dir <DIR>` or `--rule-manifest <FILE>`
-- `--json-out <FILE>`
-- `--tree-search-workers <N>` default `0`
-- `--max-anchors-per-pattern <N>` default `16`
-- `--max-candidates <PERCENT>` default `10`
-- `--verify`
-
-Behavior:
-
-- opens the forest once and reuses it across the whole rule sweep
-- compiles the rule files from `--rules-dir` / `--rule-manifest` once, then evaluates them in one bundled local forest sweep
-- writes both the final JSON file and an incremental `.jsonl` companion stream beside it
-- `--tree-search-workers 0` means auto up to the tree count
+- expands one top-level rule file, including nested `include` directives
+- if the expanded source contains multiple searchable rules, `search` runs one execution per rule
+- `--max-candidates` is a percentage of searchable documents; `0` disables the cap
 
 ## `info`
 
@@ -247,14 +144,76 @@ Usage: sspry info [OPTIONS]
 - `--max-message-bytes <BYTES>`
 - `--light`
 
-## `local-info`
+## `local`
 
 ```text
-Usage: sspry local-info --root <ROOT>
+Usage: sspry local [OPTIONS] <COMMAND>
+
+Commands:
+  index
+  delete
+  search
+  info
+  help
+```
+
+Shared note:
+
+- these commands operate directly on a local store or forest root without RPC
+
+### `local index`
+
+```text
+Usage: sspry local index [OPTIONS] --root <ROOT> <PATHS>...
 ```
 
 - `--root <ROOT>`
-  - direct local store root or forest root
+- `--candidate-shards <N>` default `1`
+- `--force`
+- `--tier1-set-fp <P>` default `0.38`
+- `--tier2-set-fp <P>` default `0.18`
+- `--gram-sizes <tier1,tier2>` default `3,4`
+- `--compaction-idle-cooldown-s <SECONDS>` default `5`
+- `--path-list`
+- `--batch-size <N>`
+- `--workers <N>`
+- `--verbose`
+
+### `local delete`
+
+```text
+Usage: sspry local delete --root <ROOT> <VALUES>...
+```
+
+- `--root <ROOT>`
+
+### `local search`
+
+```text
+Usage: sspry local search [OPTIONS] --root <ROOT> --rule <RULE>
+```
+
+- `--root <ROOT>`
+- `--rule <RULE>`
+- `--tree-search-workers <N>` where `0` means auto up to tree count
+- `--max-anchors-per-pattern <N>`
+- `--max-candidates <PERCENT>` default `10`
+- `--verify`
+- `--verbose`
+
+Behavior:
+
+- opens a forest or direct local root in-process
+- expands the top-level rule file once, including `include` directives
+- if the expanded source contains multiple searchable rules, the opened forest is reused across the rule bundle
+
+### `local info`
+
+```text
+Usage: sspry local info --root <ROOT>
+```
+
+- `--root <ROOT>`
 
 ## `shutdown`
 
@@ -266,12 +225,19 @@ Usage: sspry shutdown [OPTIONS]
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
 
-## `yara`
+## Default Scan Mode
 
 ```text
-Usage: sspry yara [OPTIONS] --rule <RULE> <FILE>
+Usage: sspry [OPTIONS] --rule <RULE> <FILE>
 ```
 
+This is the direct `yara-x` scan path. The public help does not show a top-level
+`yara` command, but the default invocation is equivalent to the hidden internal
+YARA scan command.
+
+Key options:
+
 - `--rule <RULE>`
-- `--scan-timeout <SECONDS>`
+- `<FILE>`
+- `--scan-timeout <SECONDS>` default `60`
 - `--show-tags`

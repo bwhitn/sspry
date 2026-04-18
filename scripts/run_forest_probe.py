@@ -592,7 +592,8 @@ def run_search_one_local_forest(
         proc = run(
             [
                 str(sspry),
-                'local-search',
+                'local',
+                'search',
                 '--root',
                 str(db_root),
                 '--rule',
@@ -603,43 +604,6 @@ def run_search_one_local_forest(
             ],
             capture_output=True,
             timeout=timeout_s + 30,
-        )
-    except subprocess.TimeoutExpired as e:
-        proc = subprocess.CompletedProcess(
-            e.cmd,
-            124,
-            timeout_text(e.stdout),
-            timeout_text(e.stderr) + '\nTIMEOUT',
-        )
-    return proc, (time.time() - started) * 1000.0
-
-
-def run_search_batch_local_forest(
-    sspry: Path,
-    db_root: Path,
-    rule_manifest: Path,
-    json_out: Path,
-    timeout_s: int,
-    tree_search_workers: int,
-) -> tuple[subprocess.CompletedProcess, float]:
-    started = time.time()
-    proc = None
-    try:
-        proc = run(
-            [
-                str(sspry),
-                'search-batch',
-                '--root',
-                str(db_root),
-                '--rule-manifest',
-                str(rule_manifest),
-                '--json-out',
-                str(json_out),
-                '--tree-search-workers',
-                str(tree_search_workers),
-            ],
-            capture_output=True,
-            timeout=timeout_s + 60,
         )
     except subprocess.TimeoutExpired as e:
         proc = subprocess.CompletedProcess(
@@ -878,7 +842,7 @@ def main() -> int:
             started = time.monotonic()
             index_cmd = [
                 str(sspry),
-                'local-index', '--root', str(current_root),
+                'local', 'index', '--root', str(current_root),
                 '--candidate-shards', str(args.shards or 1),
                 '--gram-sizes', args.gram_sizes,
                 *fp_args,
@@ -1077,22 +1041,40 @@ def main() -> int:
         forest_summary['rule_count'] = len(rule_files)
         forest_summary['rules_manifest'] = str(rule_manifest)
         if args.search_mode == 'local-forest':
-            batch_json = run_dir / 'search_summary.json'
-            proc, elapsed_ms = run_search_batch_local_forest(
-                sspry,
-                db_base,
-                rule_manifest,
-                batch_json,
-                effective_search_timeout_s * max(1, len(rule_files)),
-                tree_search_workers,
-            )
-            (run_dir / 'search_batch.stdout').write_text(proc.stdout or '')
-            (run_dir / 'search_batch.stderr').write_text(proc.stderr or '')
-            if proc.returncode != 0:
-                raise SystemExit(
-                    f'local-forest batch search failed exit={proc.returncode} elapsed_ms={elapsed_ms:.3f}'
+            for rule in rule_files:
+                started = time.time()
+                print(
+                    f'search.rule.start rule={rule.name} tree_workers={tree_search_workers} '
+                    f'tree_batches={tree_batches} timeout_s={effective_search_timeout_s}',
+                    flush=True,
                 )
-            search_summary = json.loads(batch_json.read_text())
+                rule_dir = searches_dir / rule.stem
+                rule_dir.mkdir(parents=True, exist_ok=True)
+                proc, elapsed_ms = run_search_one_local_forest(
+                    sspry,
+                    db_base,
+                    rule,
+                    effective_search_timeout_s,
+                    tree_search_workers,
+                )
+                (rule_dir / 'local_forest.stdout').write_text(proc.stdout or '')
+                (rule_dir / 'local_forest.stderr').write_text(proc.stderr or '')
+                local_record = parse_search_result(rule, proc, elapsed_ms)
+                local_record['tree'] = 'local_forest'
+                aggregated = aggregate_rule_results(
+                    rule,
+                    [local_record],
+                    (time.time() - started) * 1000.0,
+                )
+                aggregated['tree_workers'] = tree_search_workers
+                aggregated['tree_batches'] = tree_batches
+                aggregated['effective_timeout_s'] = effective_search_timeout_s
+                search_summary.append(aggregated)
+                print(
+                    f"search.rule.done rule={rule.name} exit={aggregated['exit_code']} "
+                    f"wall_ms={aggregated['elapsed_ms_wall_parallel']:.3f}",
+                    flush=True,
+                )
         else:
             for rule in rule_files:
                 started = time.time()

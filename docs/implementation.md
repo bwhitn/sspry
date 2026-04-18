@@ -14,14 +14,14 @@ At a high level:
    - per-document Tier1 bloom filters
    - per-document Tier2 bloom filters
    - metadata and optional stored file paths
-4. `search` or `local-search` compiles restricted YARA into one or more named query plans from the top-level expanded source.
+4. `search` or `local search` compiles restricted YARA into one or more named query plans from the top-level expanded source.
 5. The store returns candidate digests.
 6. If `--verify` is enabled, the client reopens stored file paths and verifies matches locally with `yara-x`.
 
 Public interactive search now has two execution modes:
 
 - RPC mode: query one running `serve` process via `--addr`
-- local forest mode: query one forest root in-process via `local-search --root`
+- local forest mode: query one forest root in-process via `local search --root`
 
 RPC mode itself now has two useful server shapes:
 
@@ -31,13 +31,6 @@ RPC mode itself now has two useful server shapes:
 Local forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
 
 RPC `serve --search-workers` uses a different scheduler than local forest mode: it fans out over concrete search work units, one per shard in direct/workspace mode and one per `(tree, shard)` pair in forest mode.
-
-`search-batch` is the long-lived variant of local forest mode:
-
-- open the forest once
-- compile many rule files up front
-- evaluate them against the same live tree set in one bundled local sweep
-- emit per-rule JSON records for profiling
 
 ## Query Flow
 
@@ -63,7 +56,7 @@ In local forest mode, the query path adds one layer above shard search:
 4. fan out the query across trees with up to `tree_search_workers`
 5. merge candidate hashes, query profiles, and optional external ids
 
-In `search-batch`, that forest-open/validation work is done once for the whole sweep instead of once per rule, and the bundled local evaluator walks the forest once for the active rule set rather than reopening the forest per rule file.
+When one top-level rule file expands to multiple searchable rules, `local search` still opens the forest once, validates shared policy once, and then reuses that opened forest while executing each named rule in source order.
 
 ## Storage Layout
 

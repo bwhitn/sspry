@@ -473,7 +473,8 @@ rule rule_c {
     .expect("write bundle");
 
     let ingest_a = run_ok(&[
-        "local-index",
+        "local",
+        "index",
         "--root",
         tree_a_root.to_str().expect("tree a root"),
         "--candidate-shards",
@@ -487,7 +488,8 @@ rule rule_c {
     assert!(ingest_a.contains("submitted_documents: 2"), "{ingest_a}");
 
     let ingest_b = run_ok(&[
-        "local-index",
+        "local",
+        "index",
         "--root",
         tree_b_root.to_str().expect("tree b root"),
         "--candidate-shards",
@@ -596,7 +598,8 @@ rule rule_b {
     .expect("write bundle");
 
     let ingest = run_ok(&[
-        "local-index",
+        "local",
+        "index",
         "--root",
         candidate_root.to_str().expect("candidate root"),
         "--batch-size",
@@ -609,7 +612,8 @@ rule rule_b {
 
     let output = Command::new(bin_path())
         .args([
-            "local-search",
+            "local",
+            "search",
             "--root",
             candidate_root.to_str().expect("candidate root"),
             "--rule",
@@ -640,17 +644,13 @@ fn help_surface_has_only_public_commands() {
     assert!(out.contains("Scalable Screening and Prefiltering of Rules for YARA"));
     assert!(out.contains("serve"));
     assert!(out.contains("index"));
-    assert!(out.contains("local-index"));
+    assert!(out.contains("local"));
     assert!(out.contains("delete"));
-    assert!(out.contains("local-delete"));
     assert!(out.contains("rule-check"));
     assert!(out.contains("search"));
-    assert!(out.contains("local-search"));
-    assert!(out.contains("search-batch"));
     assert!(out.contains("info"));
-    assert!(out.contains("local-info"));
     assert!(out.contains("shutdown"));
-    assert!(out.contains("yara"));
+    assert!(out.contains("Default scan mode: sspry --rule <RULE> <FILE>"));
     assert!(!out.contains("publish"));
     assert!(!out.contains("candidate-init"));
     assert!(!out.contains("candidate-ingest"));

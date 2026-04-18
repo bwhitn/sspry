@@ -9,12 +9,12 @@
    - `index`, `delete`, `search`, `info`, and `shutdown` talk to that server over gRPC.
    - `rule-check` can pull the active scan policy from a live server with `--addr`.
 2. Local/direct mode:
-   - `local-index` writes directly to a local store root and auto-initializes it if needed.
-   - `local-delete` operates directly on a local store.
-   - `local-info` reports direct local store stats and can also aggregate a forest root.
-   - `local-search` and `search-batch` open a forest locally in-process.
+   - `local index` writes directly to a local store root and auto-initializes it if needed.
+   - `local delete` operates directly on a local store.
+   - `local info` reports direct local store stats and can also aggregate a forest root.
+   - `local search` opens a forest locally in-process.
 3. Direct YARA scan mode:
-   - `yara` scans one file directly with `yara-x` and does not use the database.
+   - `sspry --rule <rule.yar> <file>` scans one file directly with `yara-x` and does not use the database.
    - `rule-check` can also validate a rule offline with explicit `--id-source` / `--gram-sizes` or against a local root with `--root`.
 
 ## Global Options
@@ -125,12 +125,12 @@ Notes:
 - large documents are chunked across multiple frames; they are not treated as one capped request
 - only one active indexing session is allowed per server at a time
 - when the target server is running in workspace mode, `index` auto-publishes after ingest so newly indexed documents become searchable
-- use `local-index` for direct local ingest without a running server
+- use `local index` for direct local ingest without a running server
 
-## local-index
+## local index
 
 ```bash
-./target/release/sspry local-index [options] --root <path> <paths>...
+./target/release/sspry local index [options] --root <path> <paths>...
 ```
 
 Options:
@@ -155,7 +155,7 @@ Options:
 - `--workers <n>`
 - `--verbose`
 
-Use `local-index` when you want direct local ingest without a running server.
+Use `local index` when you want direct local ingest without a running server.
 
 ## delete
 
@@ -182,10 +182,10 @@ Behavior:
 - logical delete is immediate for search against `current/`
 - physical reclaim happens later through background compaction of `current/`
 
-## local-delete
+## local delete
 
 ```bash
-./target/release/sspry local-delete [options] --root <path> <values>...
+./target/release/sspry local delete [options] --root <path> <values>...
 ```
 
 Options:
@@ -270,10 +270,10 @@ Behavior:
 - multi-rule stdout is grouped into one labeled block per rule identifier
 - the command exits nonzero if any rule in the expanded source fails to compile or execute
 
-## local-search
+## local search
 
 ```bash
-./target/release/sspry local-search [options] --root <root> --rule <rule.yar>
+./target/release/sspry local search [options] --root <root> --rule <rule.yar>
 ```
 
 Options:
@@ -294,9 +294,9 @@ Options:
 
 Behavior:
 
-- `local-search` opens `tree_*/current` directly and searches the forest in-process
-- `--tree-search-workers` is the local forest concurrency knob shared by `local-search` and `search-batch`
-- if the expanded source contains multiple searchable rules, `local-search` still executes them one rule at a time while reusing the opened forest
+- `local search` opens `tree_*/current` directly and searches the forest in-process
+- `--tree-search-workers` is the local forest concurrency knob
+- if the expanded source contains multiple searchable rules, `local search` still executes them one rule at a time while reusing the opened forest
 - if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
 - the command exits nonzero if any rule in the expanded source fails to compile or execute
 
@@ -338,37 +338,6 @@ Numeric read equality is also accepted for literal `==` comparisons over the bui
 - some offset-`0` cases can be screened from stored first-byte metadata before verification
 - numeric equality only supports literal constants, not expressions such as `uint32(0) == filesize`
 - without `--verify`, candidate results may still include extra false positives
-
-## search-batch
-
-```bash
-./target/release/sspry search-batch [options] --root <root> --json-out <results.json>
-```
-
-Options:
-
-- `--root <path>`
-  - required forest root
-- `--rules-dir <path>`
-  - directory of `.yar` files in sorted filename order
-- `--rule-manifest <path>`
-  - newline-delimited rule path list
-- `--json-out <path>`
-  - required output JSON path
-- `--tree-search-workers <n>`
-  - forest-level tree concurrency
-  - `0` means auto up to the tree count
-- `--max-anchors-per-pattern <n>`
-- `--max-candidates <p>` default `10`
-  - percentage of searchable documents
-- `--verify`
-
-Behavior:
-
-- opens the forest once and reuses it across the whole rule sweep
-- compiles the requested rule files first, then evaluates the whole set in one bundled local forest pass
-- writes the final JSON file plus an incremental `.jsonl` stream beside it for long-running sweeps
-- intended for repeated benchmark and profiling passes on a preserved forest
 
 ## server_search_bench helper
 
@@ -439,10 +408,10 @@ Returns JSON describing:
 - startup cleanup counts for abandoned compaction roots
 - compaction runtime counters and reclaimed bytes
 
-## local-info
+## local info
 
 ```bash
-./target/release/sspry local-info --root <path>
+./target/release/sspry local info --root <path>
 ```
 
 Returns JSON describing a direct local store or aggregated stats for a local forest root.
@@ -466,10 +435,10 @@ Behavior:
 - in-flight active search is allowed to finish
 - queued searches do not start once drain begins
 
-## yara
+## default scan mode
 
 ```bash
-./target/release/sspry yara [options] --rule ./rule.yar <file>
+./target/release/sspry [options] --rule ./rule.yar <file>
 ```
 
 Options:
@@ -493,7 +462,7 @@ This bypasses the database and scans one file directly with `yara-x`.
 - use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
 - use `--search-workers` to control how many shard/tree work units the active search runs across at once
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change
-- use `search-batch` when you want one-open bundled local sweeps and machine-readable JSON/JSONL output over a preserved forest
+- use `local search` for direct in-process forest search without a server
 - expect delete to be immediate logically in `current/`, return `missing` when the value is not present there, and be reclaimed physically later by background compaction of `current/`
 - `SIGINT` and `SIGTERM` trigger graceful drain and shutdown
 - `SIGUSR1` prints a live `info` snapshot to `stderr`
