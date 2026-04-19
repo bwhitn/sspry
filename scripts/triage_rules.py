@@ -260,7 +260,6 @@ def start_server(sspry: Path, addr: str, db_root: Path, search_workers: int, run
             addr,
             "--root",
             str(db_root),
-            "--store-path",
             "--search-workers",
             str(search_workers),
         ],

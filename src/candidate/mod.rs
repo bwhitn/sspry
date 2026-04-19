@@ -40,8 +40,7 @@ pub use query_plan::{
 };
 pub use store::{
     CandidateConfig, CandidateDeleteResult, CandidateInsertResult, CandidateQueryProfile,
-    CandidateQueryResult, CandidateStats, CandidateStore,
-    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, candidate_shard_index,
-    candidate_shard_manifest_path, candidate_shard_root, read_candidate_shard_count,
-    write_candidate_shard_count,
+    CandidateQueryResult, CandidateStats, CandidateStore, DEFAULT_TIER1_FILTER_TARGET_FP,
+    DEFAULT_TIER2_FILTER_TARGET_FP, candidate_shard_index, candidate_shard_manifest_path,
+    candidate_shard_root, read_candidate_shard_count, write_candidate_shard_count,
 };

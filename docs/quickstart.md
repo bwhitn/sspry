@@ -10,7 +10,18 @@ This page shows the normal RPC workflow. If you want direct local operation with
 cargo build --release
 ```
 
-## 2. Start the Server
+## 2. Initialize the Store
+
+```bash
+./target/release/sspry init \
+  --root ./candidate_db
+```
+
+That creates a workspace root with the default DB policy.
+
+If you want later verified searches to reopen the original files, enable `--store-path` here.
+
+## 3. Start the Server
 
 ```bash
 ./target/release/sspry serve \
@@ -18,11 +29,9 @@ cargo build --release
   --root ./candidate_db
 ```
 
-That initializes the store if it does not exist yet.
-
 In the normal RPC workflow, `--root` is a workspace root. `sspry` manages `current/` under that path and creates `work_a/` / `work_b/` lazily when publish or remote ingest needs them.
 
-## 3. Ingest Files
+## 4. Ingest Files
 
 ```bash
 ./target/release/sspry index \
@@ -30,15 +39,13 @@ In the normal RPC workflow, `--root` is a workspace root. `sspry` manages `curre
   ./samples ./more-samples
 ```
 
-If you want later verified searches to reopen the original files, start the server with `--store-path`.
-
-## 4. Check Store State
+## 5. Check Store State
 
 ```bash
 ./target/release/sspry info --addr 127.0.0.1:17653
 ```
 
-## 5. Run a Search
+## 6. Run a Search
 
 Unverified candidate search:
 
@@ -61,7 +68,7 @@ Verified search:
   --verify
 ```
 
-## 6. Delete Documents
+## 7. Delete Documents
 
 Delete one or more documents by digest or original file path:
 
@@ -71,7 +78,7 @@ Delete one or more documents by digest or original file path:
   <digest-or-file-path> <digest-or-file-path>
 ```
 
-## 7. Shut The Server Down
+## 8. Shut The Server Down
 
 Graceful remote shutdown:
 
@@ -87,8 +94,7 @@ Signals:
 ## Recommended First Server Config
 
 ```bash
-./target/release/sspry serve \
-  --addr 127.0.0.1:17653 \
+./target/release/sspry init \
   --root ./candidate_db \
   --shards 8 \
   --tier1-set-fp 0.35 \
@@ -96,14 +102,17 @@ Signals:
   --id-source sha256 \
   --gram-sizes 3,4 \
   --store-path
+
+./target/release/sspry serve \
+  --addr 127.0.0.1:17653 \
+  --root ./candidate_db
 ```
 
 ## When To Change Defaults
 
-- Change `--gram-sizes` if you want a different recall/precision/storage tradeoff.
+- Change `--gram-sizes` on `init` if you want a different recall/precision/storage tradeoff.
 - Supported gram-size pairs are `3,4`, `4,5`, `5,6`, and `7,8`.
-- Change `--tier1-set-fp` and `--tier2-set-fp` if you want smaller or larger bloom filters.
+- Change `--tier1-set-fp` and `--tier2-set-fp` on `init` if you want smaller or larger bloom filters.
 - Change `--id-source` only before you build a store; it is DB-wide behavior.
-- Increase `--shards` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with the default `8` keeps open and publish fanout low.
-- If you prefer profile-based layout instead of an explicit shard count, `--layout-profile incremental` starts with a denser 8-shard layout.
+- Increase `--shards` on `init` only after measuring ingest/publish contention. For smaller alpha-scale trees, starting with the default `8` keeps open and publish fanout low.
 - For repeated local tuning against a preserved forest, prefer `local search` so the forest is opened once per invocation and reused across rules from one top-level file.

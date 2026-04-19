@@ -242,6 +242,7 @@ rule q {
     )
     .expect("write rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -251,7 +252,7 @@ rule q {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("submitted_documents: 2"));
@@ -356,6 +357,7 @@ rule rule_c {
     )
     .expect("write bundle");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -365,7 +367,7 @@ rule rule_c {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("submitted_documents: 2"));
@@ -472,14 +474,13 @@ rule rule_c {
     )
     .expect("write bundle");
 
+    init_root(&tree_a_root, "local", &["--shards", "2"]);
     let ingest_a = run_ok(&[
         "local",
         "index",
         "--root",
         tree_a_root.to_str().expect("tree a root"),
-        "--candidate-shards",
-        "2",
-        "--batch-size",
+        "--batch-docs",
         "1",
         "--workers",
         "1",
@@ -487,14 +488,13 @@ rule rule_c {
     ]);
     assert!(ingest_a.contains("submitted_documents: 2"), "{ingest_a}");
 
+    init_root(&tree_b_root, "local", &["--shards", "2"]);
     let ingest_b = run_ok(&[
         "local",
         "index",
         "--root",
         tree_b_root.to_str().expect("tree b root"),
-        "--candidate-shards",
-        "2",
-        "--batch-size",
+        "--batch-docs",
         "1",
         "--workers",
         "1",
@@ -597,12 +597,13 @@ rule rule_b {
     )
     .expect("write bundle");
 
+    init_root(&candidate_root, "local", &[]);
     let ingest = run_ok(&[
         "local",
         "index",
         "--root",
         candidate_root.to_str().expect("candidate root"),
-        "--batch-size",
+        "--batch-docs",
         "1",
         "--workers",
         "1",
@@ -643,6 +644,7 @@ fn help_surface_has_only_public_commands() {
     let out = run_ok(&["--help"]);
     assert!(out.contains("Scalable Screening and Prefiltering of Rules for YARA"));
     assert!(out.contains("serve"));
+    assert!(out.contains("init"));
     assert!(out.contains("index"));
     assert!(out.contains("local"));
     assert!(out.contains("delete"));
@@ -662,7 +664,6 @@ fn help_surface_has_only_public_commands() {
     assert!(!out.contains("grpc-search"));
     assert!(!out.contains("grpc-info"));
     assert!(!out.contains("grpc-shutdown"));
-    assert!(!out.contains("init\n"));
 }
 
 #[test]
@@ -672,7 +673,8 @@ fn info_uses_sspry_addr_env() {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     wait_for_info(&addr);
 
     let info = run_ok_env(&["info"], &[("SSPRY_ADDR", &addr)]);
@@ -693,13 +695,51 @@ fn serve_help_uses_sspry_env() {
 }
 
 #[test]
+fn init_help_surfaces_db_policy_flags() {
+    let out = run_ok(&["init", "--help"]);
+    assert!(out.contains("--mode"));
+    assert!(out.contains("--shards"));
+    assert!(out.contains("--tier1-set-fp"));
+    assert!(out.contains("--tier2-set-fp"));
+    assert!(out.contains("--id-source"));
+    assert!(out.contains("--store-path"));
+    assert!(out.contains("--gram-sizes"));
+}
+
+#[test]
+fn serve_and_local_index_help_hide_init_only_flags() {
+    let serve = run_ok(&["serve", "--help"]);
+    assert!(!serve.contains("--shards"));
+    assert!(!serve.contains("--tier1-set-fp"));
+    assert!(!serve.contains("--tier2-set-fp"));
+    assert!(!serve.contains("--id-source"));
+    assert!(!serve.contains("--store-path"));
+    assert!(!serve.contains("--gram-sizes"));
+
+    let local_index = run_ok(&["local", "index", "--help"]);
+    assert!(!local_index.contains("--candidate-shards"));
+    assert!(!local_index.contains("--force"));
+    assert!(!local_index.contains("--tier1-set-fp"));
+    assert!(!local_index.contains("--tier2-set-fp"));
+    assert!(!local_index.contains("--gram-sizes"));
+    assert!(!local_index.contains("--compaction-idle-cooldown-s"));
+    assert!(local_index.contains("--batch-docs"));
+    assert!(!local_index.contains("--batch-size"));
+
+    let local_search = run_ok(&["local", "search", "--help"]);
+    assert!(local_search.contains("--search-workers"));
+    assert!(!local_search.contains("--tree-search-workers"));
+}
+
+#[test]
 fn info_light_exposes_adaptive_publish_status() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("candidate_db");
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     wait_for_info(&addr);
 
     let info = run_ok(&["info", "--addr", &addr, "--light"]);
@@ -730,7 +770,8 @@ fn info_exposes_compaction_cooldown_fields() {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     wait_for_info(&addr);
 
     let info = run_ok(&["info", "--addr", &addr]);
@@ -785,7 +826,8 @@ rule q {
     )
     .expect("write rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -794,7 +836,7 @@ rule q {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 2"));
@@ -846,6 +888,7 @@ rule q {
     )
     .expect("write rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -855,7 +898,7 @@ rule q {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 1"));
@@ -908,6 +951,7 @@ rule q {
     )
     .expect("write rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -917,7 +961,7 @@ rule q {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 2"));
@@ -1023,6 +1067,7 @@ rule ModuleLnk {{
     )
     .expect("write lnk rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -1032,7 +1077,7 @@ rule ModuleLnk {{
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 5"));
@@ -1124,6 +1169,7 @@ rule ModuleMacho {
     )
     .expect("write macho rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -1133,7 +1179,7 @@ rule ModuleMacho {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 4"));
@@ -1223,6 +1269,7 @@ rule MagicZip {
     )
     .expect("write zip rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -1232,7 +1279,7 @@ rule MagicZip {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 4"));
@@ -1266,7 +1313,8 @@ fn index_verbose_emits_server_telemetry() {
     fs::write(sample_dir.join("a.bin"), b"alpha NEEDLE").expect("write a");
     fs::write(sample_dir.join("b.bin"), b"beta NEEDLE").expect("write b");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1275,7 +1323,7 @@ fn index_verbose_emits_server_telemetry() {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
         "--verbose",
     ]);
@@ -1315,7 +1363,8 @@ rule q {
     )
     .expect("write rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1324,7 +1373,7 @@ rule q {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 2"));
@@ -1385,7 +1434,8 @@ rule NumericSearch {
     )
     .expect("write rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1394,7 +1444,7 @@ rule NumericSearch {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 2"));
@@ -1490,7 +1540,8 @@ fn search_verify_supports_numeric_read_equality_variants() {
     )
     .expect("write f64be miss");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1499,7 +1550,7 @@ fn search_verify_supports_numeric_read_equality_variants() {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 12"));
@@ -1703,7 +1754,8 @@ rule CountRule {
     )
     .expect("write count rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1712,7 +1764,7 @@ rule CountRule {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 4"));
@@ -1795,7 +1847,8 @@ rule FilesizeNotRule {
     )
     .expect("write rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1804,7 +1857,7 @@ rule FilesizeNotRule {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 3"));
@@ -1854,7 +1907,8 @@ rule RangeRule {
     )
     .expect("write range rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1863,7 +1917,7 @@ rule RangeRule {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 3"));
@@ -1932,7 +1986,8 @@ rule NocaseRule {
     )
     .expect("write nocase rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -1941,7 +1996,7 @@ rule NocaseRule {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 2"));
@@ -2030,6 +2085,7 @@ rule AsciiLiteral {
     )
     .expect("write ascii rule");
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
@@ -2039,7 +2095,7 @@ rule AsciiLiteral {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 3"));
@@ -2161,7 +2217,8 @@ rule GroupedRegexLiteral {
     )
     .expect("write grouped regex rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -2170,7 +2227,7 @@ rule GroupedRegexLiteral {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 6"));
@@ -2278,7 +2335,8 @@ rule SetSupport {
     )
     .expect("write rule");
 
-    let mut child = spawn_serve_tcp(port, &candidate_root, &["--store-path"]);
+    init_root(&candidate_root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     let addr = tcp_addr(port);
     wait_for_info(&addr);
 
@@ -2287,7 +2345,7 @@ rule SetSupport {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 3"));
@@ -2319,6 +2377,7 @@ fn shutdown_command_drains_server() {
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
 
+    init_root(&candidate_root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &candidate_root, &[]);
     wait_for_info(&addr);
 

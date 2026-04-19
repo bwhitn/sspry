@@ -19,6 +19,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Init(InitArgs),
     Serve(ServeArgs),
     Index(IndexArgs),
     Delete(DeleteArgs),
@@ -63,7 +64,8 @@ fn rewrite_default_yara_argv(argv: Vec<String>) -> Vec<String> {
     }
     let is_named_command = matches!(
         token.as_str(),
-        "serve"
+        "init"
+            | "serve"
             | "index"
             | "delete"
             | "rule-check"
@@ -112,17 +114,11 @@ struct IndexArgs {
     )]
     path_list: bool,
     #[arg(
-        long = "batch-size",
-        default_value_t = 64,
-        help = "Documents per insert_batch request."
-    )]
-    batch_size: usize,
-    #[arg(
-        long = "remote-batch-soft-limit-bytes",
+        long = "batch-bytes",
         default_value_t = REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
         help = "Client-side soft payload cap in bytes for remote insert_batch requests."
     )]
-    remote_batch_soft_limit_bytes: usize,
+    batch_bytes: usize,
     #[arg(
         long = "insert-chunk-bytes",
         default_value_t = grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
@@ -150,40 +146,6 @@ struct LocalIndexArgs {
         help = "Direct local store root directory."
     )]
     root: String,
-    #[arg(
-        long = "candidate-shards",
-        default_value_t = 1,
-        help = "Number of independent candidate shards (lock stripes) to initialize when creating a new local store."
-    )]
-    candidate_shards: usize,
-    #[arg(
-        long = "force",
-        action = ArgAction::SetTrue,
-        help = "Reinitialize an existing local store before indexing."
-    )]
-    force: bool,
-    #[arg(
-        long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate for a newly created local store. Defaults to 0.38 when omitted."
-    )]
-    tier1_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate for a newly created local store. Defaults to 0.18 when omitted."
-    )]
-    tier2_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "gram-sizes",
-        default_value = "3,4",
-        help = "DB-wide gram-size pair as tier1,tier2 for a newly created local store. Supported pairs: 3,4 4,5 5,6 7,8."
-    )]
-    gram_sizes: String,
-    #[arg(
-        long = "compaction-idle-cooldown-s",
-        default_value_t = 5.0,
-        help = "Minimum idle time after writes before compaction is allowed to run for a newly created local store."
-    )]
-    compaction_idle_cooldown_s: f64,
     #[arg(required = true, help = "File or directory paths.")]
     paths: Vec<String>,
     #[arg(
@@ -193,7 +155,7 @@ struct LocalIndexArgs {
     )]
     path_list: bool,
     #[arg(
-        long = "batch-size",
+        long = "batch-docs",
         default_value_t = 64,
         help = "Documents per local insert batch."
     )]
@@ -247,20 +209,6 @@ struct RuleCheckArgs {
         help = "Use the active scan policy from a live server at host:port."
     )]
     addr: Option<String>,
-    #[arg(
-        long = "timeout",
-        default_value_t = DEFAULT_RPC_TIMEOUT,
-        requires = "addr",
-        help = "Connection/read timeout in seconds when --addr is used."
-    )]
-    timeout: f64,
-    #[arg(
-        long = "max-message-bytes",
-        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
-        requires = "addr",
-        help = "Maximum remote message size in bytes when --addr is used."
-    )]
-    max_message_bytes: usize,
     #[arg(
         long = "root",
         conflicts_with = "addr",
@@ -329,17 +277,18 @@ struct LocalSearchArgs {
     #[arg(
         long = "root",
         required = true,
-        help = "Candidate forest root for in-process search."
+        help = "Direct local store or forest root for in-process search."
     )]
     root: String,
     #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
     rule: String,
     #[arg(
-        long = "tree-search-workers",
+        long = "search-workers",
+        alias = "tree-search-workers",
         default_value_t = 0,
-        help = "Forest-level tree search workers. 0 means auto up to the tree count."
+        help = "Local search workers. 0 means auto up to the tree count."
     )]
-    tree_search_workers: usize,
+    search_workers: usize,
     #[arg(
         long = "max-anchors-per-pattern",
         default_value_t = 16,
@@ -365,9 +314,26 @@ struct LocalSearchArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct InfoConnectionArgs {
+    #[arg(
+        long = "addr",
+        env = "SSPRY_ADDR",
+        default_value = DEFAULT_RPC_ADDR,
+        help = "Server address as host:port."
+    )]
+    addr: String,
+    #[arg(
+        long = "timeout",
+        default_value_t = DEFAULT_RPC_TIMEOUT,
+        help = "Connection/read timeout in seconds."
+    )]
+    timeout: f64,
+}
+
+#[derive(Debug, clap::Args)]
 struct InfoCommandArgs {
     #[command(flatten)]
-    connection: ClientConnectionArgs,
+    connection: InfoConnectionArgs,
     #[arg(
         long = "light",
         action = ArgAction::SetTrue,
@@ -430,21 +396,51 @@ struct ServeCommonArgs {
     #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
-        help = "Workspace root directory. SSPRY will manage current/, work_a/, work_b/, and retired/ under this path."
+        help = "Workspace root, direct local store root, or forest root directory."
+    )]
+    root: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    #[command(flatten)]
+    common: ServeCommonArgs,
+    #[arg(
+        long = "max-message-bytes",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
+        help = "Maximum accepted remote message size in bytes."
+    )]
+    max_message_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum InitMode {
+    Workspace,
+    Local,
+}
+
+#[derive(Debug, clap::Args)]
+struct InitArgs {
+    #[arg(
+        long = "root",
+        default_value = DEFAULT_CANDIDATE_ROOT,
+        help = "Workspace root or direct local store root to initialize."
     )]
     root: String,
     #[arg(
-        long = "layout-profile",
+        long = "mode",
         value_enum,
-        default_value_t = ServeLayoutProfile::Standard,
-        help = "Shard-layout profile. `standard` defaults to 8 shards; `incremental` defaults to 8 shards for denser ingest batches and lower publish fanout."
+        default_value_t = InitMode::Workspace,
+        help = "Initialization target. `workspace` creates/uses <root>/current for serve. `local` creates a direct store at <root> for local index/search/info."
     )]
-    layout_profile: ServeLayoutProfile,
+    mode: InitMode,
     #[arg(
         long = "shards",
-        help = "Number of independent candidate shards (lock stripes) for ingest/write paths. Overrides --layout-profile when set."
+        help = "Number of independent candidate shards (lock stripes) to initialize. Defaults to 8 for workspace mode and 1 for local mode."
     )]
     shards: Option<usize>,
+    #[arg(long = "force", action = ArgAction::SetTrue, help = "Overwrite an existing candidate store.")]
+    force: bool,
     #[arg(
         long = "tier1-set-fp",
         help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
@@ -468,48 +464,6 @@ struct ServeCommonArgs {
         help = "Store the canonical file path as external_id for each inserted document."
     )]
     store_path: bool,
-    #[arg(
-        long = "gram-sizes",
-        default_value = "3,4",
-        help = "DB-wide gram-size pair as tier1,tier2. Supported pairs: 3,4 4,5 5,6 7,8."
-    )]
-    gram_sizes: String,
-}
-
-#[derive(Debug, clap::Args)]
-struct ServeArgs {
-    #[command(flatten)]
-    common: ServeCommonArgs,
-    #[arg(
-        long = "max-message-bytes",
-        default_value_t = DEFAULT_MAX_REQUEST_BYTES,
-        help = "Maximum accepted remote message size in bytes."
-    )]
-    max_message_bytes: usize,
-}
-
-#[derive(Debug, clap::Args)]
-struct InitArgs {
-    #[arg(long = "root", default_value = DEFAULT_CANDIDATE_ROOT, help = "Candidate store root directory.")]
-    root: String,
-    #[arg(
-        long = "candidate-shards",
-        default_value_t = 1,
-        help = "Number of independent candidate shards (lock stripes) to initialize."
-    )]
-    candidate_shards: usize,
-    #[arg(long = "force", action = ArgAction::SetTrue, help = "Overwrite an existing candidate store.")]
-    force: bool,
-    #[arg(
-        long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
-    )]
-    tier1_filter_target_fp: Option<f64>,
-    #[arg(
-        long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to 0.18 when omitted."
-    )]
-    tier2_filter_target_fp: Option<f64>,
     #[arg(
         long = "gram-sizes",
         default_value = "3,4",

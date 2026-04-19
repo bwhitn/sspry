@@ -5,14 +5,16 @@
 `sspry` has three operating styles:
 
 1. Remote/server mode:
+   - `init` creates a workspace root and persists DB-wide format/layout policy.
    - `serve` starts the long-lived remote server.
    - `index`, `delete`, `search`, `info`, and `shutdown` talk to that server over gRPC.
    - `rule-check` can pull the active scan policy from a live server with `--addr`.
 2. Local/direct mode:
-   - `local index` writes directly to a local store root and auto-initializes it if needed.
+   - `init --mode local` creates a direct local store and persists DB-wide format/layout policy.
+   - `local index` writes directly to an already initialized local store root.
    - `local delete` operates directly on a local store.
    - `local info` reports direct local store stats and can also aggregate a forest root.
-   - `local search` opens a forest locally in-process.
+   - `local search` opens a direct local store or forest locally in-process.
 3. Direct YARA scan mode:
    - `sspry --rule <rule.yar> <file>` scans one file directly with `yara-x` and does not use the database.
    - `rule-check` can also validate a rule offline with explicit `--id-source` / `--gram-sizes` or against a local root with `--root`.
@@ -21,6 +23,48 @@
 
 - `--perf-report <path>`: write a JSON perf report
 - `--perf-stdout`: print the perf report to stdout on exit
+
+## init
+
+```bash
+./target/release/sspry init [options]
+```
+
+Options:
+
+- `--root <path>`
+  - target root to initialize
+  - defaults to `candidate_db`
+- `--mode <workspace|local>`
+  - `workspace` creates/uses `<root>/current` for remote `serve`
+  - `local` creates a direct local store at `<root>`
+  - default is `workspace`
+- `--shards <n>`
+  - shard count to initialize
+  - default is `8` for `workspace` and `1` for `local`
+- `--force`
+  - replace an existing initialized root
+- `--tier1-set-fp <p>`
+  - Tier1 false-positive rate
+- `--tier2-set-fp <p>`
+  - Tier2 false-positive rate
+- `--id-source <sha256|md5|sha1|sha512>`
+  - DB-wide identity mode
+- `--store-path`
+  - store canonical file path as `external_id`
+- `--gram-sizes <tier1,tier2>`
+  - DB-wide gram-size pair
+  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
+- `--compaction-idle-cooldown-s <seconds>`
+  - minimum idle time before compaction may run
+
+Behavior:
+
+- `init` is the single place to choose DB-wide format/layout policy
+- `serve` and `local index` require an explicitly initialized root
+- use `init` first for all workspace and direct-local-store creation
+- workspace mode keeps shared policy in root-level `meta.json`
+- shard-local state stays in each shard's `store_meta.json`
 
 ## serve
 
@@ -48,32 +92,13 @@ Options:
     - direct published store root
     - forest root containing `tree_*/current`
   - forest-root servers are read-only and intended for search/info
-- `--layout-profile <standard|incremental>`
-  - shard-layout preset
-  - `standard` defaults to 8 shards
-  - `incremental` defaults to 8 shards
-- `--shards <n>`
-  - explicit shard count override for a new DB
-  - both layout profiles currently default new DBs to `8` shards
-- `--tier1-set-fp <p>`
-  - Tier1 false-positive rate override for a new DB
-- `--tier2-set-fp <p>`
-  - Tier2 false-positive rate override for a new DB
-- `--id-source <sha256|md5|sha1|sha512>`
-  - DB-wide identity mode for a new DB
-- `--store-path`
-  - store canonical path as `external_id` for a new DB
-- `--gram-sizes <tier1,tier2>`
-  - DB-wide gram-size pair for a new DB
-  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 
 Behavior:
 
 - mutable workspace/direct-store roots support ingest, delete, publish, and search
 - forest-root servers open all published `tree_*/current` stores once and answer search/info requests across the forest
 - forest-root servers are read-only; use them for persistent remote search over a finished forest, not for remote ingest
-- if `serve` opens an existing DB, init-only flags are ignored and the on-disk policy wins
-- if conflicting init-only flags are passed for an existing DB, startup warns and continues
+- `serve` requires an explicitly initialized workspace root, direct local store root, or forest root
 - workspace mode keeps shared policy in root-level `meta.json`
 - shard-local state stays in each shard's `store_meta.json`
 - `current/` is always present in a workspace; `work_a/` and `work_b/` are created lazily when publish/indexing needs them
@@ -81,8 +106,7 @@ Behavior:
 Example:
 
 ```bash
-./target/release/sspry serve \
-  --addr 127.0.0.1:17653 \
+./target/release/sspry init \
   --root ./candidate_db \
   --shards 8 \
   --tier1-set-fp 0.39 \
@@ -90,6 +114,10 @@ Example:
   --id-source sha256 \
   --gram-sizes 3,4 \
   --store-path
+
+./target/release/sspry serve \
+  --addr 127.0.0.1:17653 \
+  --root ./candidate_db
 ```
 
 ## index
@@ -106,9 +134,7 @@ Options:
   - client-side remote message cap
 - `--path-list`
   - treat each input path as a newline-delimited manifest of file paths
-- `--batch-size <n>`
-  - documents per remote flush target
-- `--remote-batch-soft-limit-bytes <bytes>`
+- `--batch-bytes <bytes>`
   - client-side soft payload cap for buffered remote rows before flushing
 - `--insert-chunk-bytes <bytes>`
   - per-frame remote insert chunk size
@@ -137,25 +163,16 @@ Options:
 
 - `--root <path>`
   - direct local store root
-- `--candidate-shards <n>`
-  - shard count to create when initializing a new local store
-- `--force`
-  - reinitialize an existing local store before indexing
-- `--tier1-set-fp <p>`
-  - Tier1 false-positive rate for a newly created local store
-- `--tier2-set-fp <p>`
-  - Tier2 false-positive rate for a newly created local store
-- `--gram-sizes <tier1,tier2>`
-  - DB-wide gram-size pair for a newly created local store
-  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
-- `--compaction-idle-cooldown-s <seconds>`
-  - minimum idle time before shard-local compaction is allowed to run for a newly created local store
 - `--path-list`
-- `--batch-size <n>`
+- `--batch-docs <n>`
 - `--workers <n>`
 - `--verbose`
 
-Use `local index` when you want direct local ingest without a running server.
+Behavior:
+
+- `local index` writes directly without RPC
+- `local index` requires an explicitly initialized direct local store root
+- use `init --mode local` first before local ingest
 
 ## delete
 
@@ -208,10 +225,6 @@ Options:
 - `--rule <path>`
 - `--addr <host:port>`
   - use a live server's active scan policy
-- `--timeout <seconds>`
-  - only used with `--addr`
-- `--max-message-bytes <bytes>`
-  - only used with `--addr`
 - `--root <path>`
   - use a local store or forest root's active scan policy
 - `--id-source <sha256|md5|sha1|sha512>`
@@ -283,9 +296,10 @@ Options:
 - `--rule <path>`
   - path to one top-level YARA file
   - normal YARA `include "..."` directives are expanded before search
-- `--tree-search-workers <n>`
-  - forest-level tree concurrency
+- `--search-workers <n>`
+  - local search concurrency
   - `0` means auto up to the tree count
+  - `--tree-search-workers` remains accepted as a compatibility alias
 - `--max-anchors-per-pattern <n>`
 - `--max-candidates <p>` default `10`; `0` means unlimited
   - percentage of searchable documents
@@ -294,9 +308,9 @@ Options:
 
 Behavior:
 
-- `local search` opens `tree_*/current` directly and searches the forest in-process
-- `--tree-search-workers` is the local forest concurrency knob
-- if the expanded source contains multiple searchable rules, `local search` still executes them one rule at a time while reusing the opened forest
+- `local search` opens a direct local store or `tree_*/current` forest in-process
+- `--search-workers` is the local in-process search concurrency knob
+- if the expanded source contains multiple searchable rules, `local search` still executes them one rule at a time while reusing the opened local root
 - if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
 - the command exits nonzero if any rule in the expanded source fails to compile or execute
 
@@ -388,7 +402,6 @@ Options:
 
 - `--addr <host:port>`
 - `--timeout <seconds>`
-- `--max-message-bytes <bytes>`
 - `--light`
   - return lightweight server status without walking shard stats
 
@@ -456,10 +469,10 @@ This bypasses the database and scans one file directly with `yara-x`.
 
 ## Operational Guidance
 
-- keep `--store-path` enabled if verified search matters
+- keep `--store-path` enabled at `init` time if verified search matters
 - treat `--gram-sizes` as a format choice, not a casual runtime knob
-- use `--tier1-set-fp` and `--tier2-set-fp` to control the disk-size vs candidate-quality tradeoff
-- use `--layout-profile incremental` or a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
+- use `init` to control `--tier1-set-fp`, `--tier2-set-fp`, `--id-source`, `--gram-sizes`, `--store-path`, and `--shards`
+- use a small explicit `--shards` count when you want lower publish and open fanout on smaller alpha-scale trees
 - use `--search-workers` to control how many shard/tree work units the active search runs across at once
 - for repeated search tuning, prefer reusing an existing published DB instead of rebuilding it for every planner change
 - use `local search` for direct in-process forest search without a server

@@ -188,7 +188,7 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("submitted_documents: 2"));
@@ -297,7 +297,7 @@ fn grpc_cli_bundle_search_uses_one_rpc_request_for_multiple_rules() {
         "--addr",
         &addr,
         sample_dir.to_str().expect("sample dir"),
-        "--batch-size",
+        "--batch-bytes",
         "1",
     ]);
     assert!(ingest.contains("processed_documents: 2"));

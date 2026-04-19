@@ -10,6 +10,7 @@ Scalable Screening and Prefiltering of Rules for YARA.
 Usage: sspry [OPTIONS] <COMMAND>
 
 Commands:
+  init
   serve
   index
   delete
@@ -27,10 +28,39 @@ Default scan mode: sspry --rule <RULE> <FILE>
 
 - `SSPRY_ADDR` sets the default server address for remote client commands.
 - `serve` is the only public server command.
+- `init` is the public DB/workspace initialization command.
 - `index`, `delete`, `search`, `info`, and `shutdown` are the public remote gRPC client commands.
 - `rule-check` validates a rule against a live server policy, a local root, or explicit offline assumptions.
 - `local` groups the direct on-disk commands and does not use RPC.
 - direct YARA scanning is the default mode when the first non-global token is not a known subcommand.
+
+## `init`
+
+```text
+Usage: sspry init [OPTIONS]
+```
+
+Key options:
+
+- `--root <ROOT>` default `candidate_db`
+- `--mode <workspace|local>` default `workspace`
+- `--shards <N>`
+  - defaults to `8` for `workspace`
+  - defaults to `1` for `local`
+- `--force`
+- `--tier1-set-fp <P>` default `0.38`
+- `--tier2-set-fp <P>` default `0.18`
+- `--id-source <sha256|md5|sha1|sha512>` default `sha256`
+- `--store-path`
+- `--gram-sizes <tier1,tier2>` default `3,4`
+  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
+- `--compaction-idle-cooldown-s <SECONDS>` default `5`
+
+Behavior:
+
+- `workspace` mode initializes `<root>/current` for remote `serve`
+- `local` mode initializes a direct store at `<root>` for `local index/search/info`
+- this is where DB-wide format/layout policy is chosen
 
 ## `serve`
 
@@ -50,15 +80,12 @@ Key options:
 - `--root <ROOT>`
   - workspace root, direct store root, or forest root
   - default `candidate_db`
-- `--layout-profile <standard|incremental>`
-- `--shards <N>`
-  - both layout profiles currently default new DBs to `8` shards
-- `--tier1-set-fp <P>` default `0.38`
-- `--tier2-set-fp <P>` default `0.18`
-- `--id-source <sha256|md5|sha1|sha512>`
-- `--store-path`
-- `--gram-sizes <tier1,tier2>` default `3,4`
-  - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
+
+Behavior:
+
+- opens an existing initialized root
+- requires an explicitly initialized workspace root, direct local store root, or forest root
+- use `init` first before starting a new workspace or direct local store
 
 ## `index`
 
@@ -72,8 +99,7 @@ Remote ingest options:
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
 - `--path-list`
-- `--batch-size <N>`
-- `--remote-batch-soft-limit-bytes <BYTES>`
+- `--batch-bytes <BYTES>`
 - `--insert-chunk-bytes <BYTES>`
 - `--workers <N>`
 - `--verbose`
@@ -141,7 +167,6 @@ Usage: sspry info [OPTIONS]
 
 - `--addr <ADDR>`
 - `--timeout <SECONDS>`
-- `--max-message-bytes <BYTES>`
 - `--light`
 
 ## `local`
@@ -168,16 +193,16 @@ Usage: sspry local index [OPTIONS] --root <ROOT> <PATHS>...
 ```
 
 - `--root <ROOT>`
-- `--candidate-shards <N>` default `1`
-- `--force`
-- `--tier1-set-fp <P>` default `0.38`
-- `--tier2-set-fp <P>` default `0.18`
-- `--gram-sizes <tier1,tier2>` default `3,4`
-- `--compaction-idle-cooldown-s <SECONDS>` default `5`
 - `--path-list`
-- `--batch-size <N>`
+- `--batch-docs <N>`
 - `--workers <N>`
 - `--verbose`
+
+Behavior:
+
+- writes directly without RPC
+- requires an explicitly initialized direct local store root
+- use `init --mode local` first before local ingest
 
 ### `local delete`
 
@@ -195,7 +220,8 @@ Usage: sspry local search [OPTIONS] --root <ROOT> --rule <RULE>
 
 - `--root <ROOT>`
 - `--rule <RULE>`
-- `--tree-search-workers <N>` where `0` means auto up to tree count
+- `--search-workers <N>` where `0` means auto up to tree count
+  - `--tree-search-workers` remains accepted as a compatibility alias
 - `--max-anchors-per-pattern <N>`
 - `--max-candidates <PERCENT>` default `10`
 - `--verify`
@@ -203,9 +229,9 @@ Usage: sspry local search [OPTIONS] --root <ROOT> --rule <RULE>
 
 Behavior:
 
-- opens a forest or direct local root in-process
+- opens a direct local store or forest root in-process
 - expands the top-level rule file once, including `include` directives
-- if the expanded source contains multiple searchable rules, the opened forest is reused across the rule bundle
+- if the expanded source contains multiple searchable rules, the opened local root is reused across the rule bundle
 
 ### `local info`
 

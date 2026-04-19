@@ -12,13 +12,16 @@ fn default_connection() -> ClientConnectionArgs {
     }
 }
 
-fn default_internal_init_args(root: &Path, candidate_shards: usize, force: bool) -> InitArgs {
+fn default_internal_init_args(root: &Path, shards: usize, force: bool) -> InitArgs {
     InitArgs {
         root: root.display().to_string(),
-        candidate_shards,
+        mode: InitMode::Local,
+        shards: Some(shards),
         force,
         tier1_filter_target_fp: None,
         tier2_filter_target_fp: None,
+        id_source: CandidateIdSource::Sha256,
+        store_path: false,
         gram_sizes: "3,4".to_owned(),
         compaction_idle_cooldown_s: 5.0,
     }
@@ -108,13 +111,6 @@ fn default_serve_common_args() -> ServeCommonArgs {
         addr: DEFAULT_RPC_ADDR.to_owned(),
         search_workers: default_search_workers_for(4),
         root: DEFAULT_CANDIDATE_ROOT.to_owned(),
-        layout_profile: ServeLayoutProfile::Standard,
-        shards: None,
-        tier1_filter_target_fp: None,
-        tier2_filter_target_fp: None,
-        id_source: CandidateIdSource::Sha256,
-        store_path: false,
-        gram_sizes: "3,4".to_owned(),
     }
 }
 
@@ -126,21 +122,29 @@ fn default_serve_args() -> ServeArgs {
 }
 
 #[test]
-fn serve_candidate_shard_count_uses_profile_default() {
-    let mut args = default_serve_common_args();
-    args.layout_profile = ServeLayoutProfile::Incremental;
+fn init_candidate_shard_count_uses_mode_defaults() {
+    let workspace = InitArgs {
+        root: DEFAULT_CANDIDATE_ROOT.to_owned(),
+        mode: InitMode::Workspace,
+        shards: None,
+        force: false,
+        tier1_filter_target_fp: None,
+        tier2_filter_target_fp: None,
+        id_source: CandidateIdSource::Sha256,
+        store_path: false,
+        gram_sizes: "3,4".to_owned(),
+        compaction_idle_cooldown_s: 5.0,
+    };
     assert_eq!(
-        serve_candidate_shard_count(&args),
-        DEFAULT_INCREMENTAL_SHARDS
+        init_candidate_shard_count(&workspace),
+        DEFAULT_CANDIDATE_SHARDS
     );
-}
 
-#[test]
-fn serve_candidate_shard_count_explicit_override_wins() {
-    let mut args = default_serve_common_args();
-    args.layout_profile = ServeLayoutProfile::Incremental;
-    args.shards = Some(17);
-    assert_eq!(serve_candidate_shard_count(&args), 17);
+    let local = InitArgs {
+        mode: InitMode::Local,
+        ..workspace
+    };
+    assert_eq!(init_candidate_shard_count(&local), 1);
 }
 
 #[test]
@@ -163,11 +167,20 @@ fn resolve_serve_runtime_settings_prefers_existing_forest_tree_roots() {
 
     let mut args = default_serve_common_args();
     args.root = forest_root.display().to_string();
-    let resolved = resolve_serve_runtime_settings(&args, ServeInitOptionSources::default())
-        .expect("resolved serve settings");
+    let resolved = resolve_serve_runtime_settings(&args).expect("resolved serve settings");
     assert_eq!(resolved.candidate_shards, 2);
     assert!(!resolved.workspace_mode);
     assert_eq!(resolved.candidate_config.root, forest_root);
+}
+
+#[test]
+fn resolve_serve_runtime_settings_requires_initialized_root() {
+    let tmp = tempdir().expect("tmp");
+    let mut args = default_serve_common_args();
+    args.root = tmp.path().join("missing_root").display().to_string();
+    let err = resolve_serve_runtime_settings(&args).expect_err("missing root should fail");
+    assert!(err.to_string().contains("is not initialized"));
+    assert!(err.to_string().contains("sspry init --root"));
 }
 
 #[test]
@@ -182,13 +195,7 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
     }
 
     let cli = Cli::try_parse_from([
-        "sspry",
-        "local",
-        "search",
-        "--root",
-        "db",
-        "--rule",
-        "rule.yar",
+        "sspry", "local", "search", "--root", "db", "--rule", "rule.yar",
     ])
     .expect("parse local search");
     match cli.command {
@@ -196,9 +203,50 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
             LocalCommands::Search(args) => {
                 assert_eq!(args.rule, "rule.yar".to_owned());
                 assert_eq!(args.max_candidates, 10.0);
+                assert_eq!(args.search_workers, 0);
             }
             other => panic!("unexpected local command: {other:?}"),
-        }
+        },
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "sspry",
+        "local",
+        "search",
+        "--root",
+        "db",
+        "--rule",
+        "rule.yar",
+        "--search-workers",
+        "3",
+    ])
+    .expect("parse local search with search-workers");
+    match cli.command {
+        Commands::Local(args) => match args.command {
+            LocalCommands::Search(args) => assert_eq!(args.search_workers, 3),
+            other => panic!("unexpected local command: {other:?}"),
+        },
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "sspry",
+        "local",
+        "search",
+        "--root",
+        "db",
+        "--rule",
+        "rule.yar",
+        "--tree-search-workers",
+        "2",
+    ])
+    .expect("parse local search with tree-search-workers alias");
+    match cli.command {
+        Commands::Local(args) => match args.command {
+            LocalCommands::Search(args) => assert_eq!(args.search_workers, 2),
+            other => panic!("unexpected local command: {other:?}"),
+        },
         other => panic!("unexpected command: {other:?}"),
     }
 }
@@ -605,10 +653,12 @@ fn file_path_collection_and_hash_helpers_work() {
         file_digest,
         path_identity_sha256(&sample).expect("path digest")
     );
-    assert!(sha256_file(&sample, 0)
-        .expect_err("zero chunk size")
-        .to_string()
-        .contains("positive integer"));
+    assert!(
+        sha256_file(&sample, 0)
+            .expect_err("zero chunk size")
+            .to_string()
+            .contains("positive integer")
+    );
 
     let mut files = Vec::new();
     collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -1218,12 +1268,6 @@ rule q {
     assert_eq!(
         cmd_local_index(&LocalIndexArgs {
             root: candidate_root.display().to_string(),
-            candidate_shards: 2,
-            force: false,
-            tier1_filter_target_fp: None,
-            tier2_filter_target_fp: None,
-            gram_sizes: "3,4".to_owned(),
-            compaction_idle_cooldown_s: 5.0,
             paths: vec![
                 sample_dir.display().to_string(),
                 base.join("missing").display().to_string(),
@@ -1289,7 +1333,7 @@ rule q {
         cmd_local_search(&LocalSearchArgs {
             root: candidate_root.display().to_string(),
             rule: rule_path.display().to_string(),
-            tree_search_workers: 2,
+            search_workers: 2,
             max_anchors_per_pattern: 4,
             max_candidates: 8.0,
             verify_yara_files: false,
@@ -1358,8 +1402,7 @@ rule remote_q {
                 sample_c.display().to_string()
             ],
             path_list: false,
-            batch_size: 1,
-            remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
+            batch_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
             grpc_insert_chunk_bytes: grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
             workers: Some(2),
             verbose: false,
@@ -1390,7 +1433,10 @@ rule remote_q {
     );
     assert_eq!(
         cmd_info(&InfoCommandArgs {
-            connection: connection.clone(),
+            connection: InfoConnectionArgs {
+                addr: connection.addr.clone(),
+                timeout: connection.timeout,
+            },
             light: false,
         }),
         0
@@ -1448,10 +1494,17 @@ fn main_returns_error_when_perf_report_path_is_unwritable() {
 fn cmd_serve_reports_tcp_bind_errors() {
     let _guard = crate::perf::test_lock().lock().expect("perf lock");
     crate::perf::configure(None, false);
+    let tmp = tempdir().expect("tmp");
+    let serve_root = tmp.path().join("candidate_db");
+    assert_eq!(
+        cmd_init(&default_internal_init_args(&serve_root, 1, true)),
+        0
+    );
     let listener = std::net::TcpListener::bind((DEFAULT_RPC_HOST, 0)).expect("bind occupied port");
     let port = listener.local_addr().expect("listener addr").port();
     let mut args = default_serve_args();
     args.common.addr = format!("{DEFAULT_RPC_HOST}:{port}");
+    args.common.root = serve_root.display().to_string();
     assert_eq!(cmd_serve(&args), 1);
 }
 
@@ -1485,10 +1538,21 @@ fn local_command_error_paths_report_failures() {
         cmd_local_search(&LocalSearchArgs {
             root: missing_root.display().to_string(),
             rule: missing_rule.display().to_string(),
-            tree_search_workers: 0,
+            search_workers: 0,
             max_anchors_per_pattern: 1,
             max_candidates: 1.0,
             verify_yara_files: false,
+            verbose: false,
+        }),
+        1
+    );
+    assert_eq!(
+        cmd_local_index(&LocalIndexArgs {
+            root: missing_root.display().to_string(),
+            paths: vec![sample.display().to_string()],
+            path_list: false,
+            batch_size: 1,
+            workers: Some(1),
             verbose: false,
         }),
         1
@@ -1538,8 +1602,7 @@ fn public_ingest_and_delete_follow_server_identity_source() {
             connection: connection.clone(),
             paths: vec![sample.display().to_string()],
             path_list: false,
-            batch_size: 1,
-            remote_batch_soft_limit_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
+            batch_bytes: REMOTE_INSERT_BATCH_SOFT_LIMIT_BYTES,
             grpc_insert_chunk_bytes: grpc::DEFAULT_GRPC_INSERT_CHUNK_BYTES,
             workers: Some(1),
             verbose: false,
@@ -1600,18 +1663,24 @@ fn digest_helpers_and_delete_resolution_cover_remaining_branches() {
     let sample = tmp.path().join("sample.bin");
     fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-    assert!(md5_file(&sample, 0)
-        .expect_err("md5 zero chunk")
-        .to_string()
-        .contains("positive integer"));
-    assert!(sha1_file(&sample, 0)
-        .expect_err("sha1 zero chunk")
-        .to_string()
-        .contains("positive integer"));
-    assert!(sha512_file(&sample, 0)
-        .expect_err("sha512 zero chunk")
-        .to_string()
-        .contains("positive integer"));
+    assert!(
+        md5_file(&sample, 0)
+            .expect_err("md5 zero chunk")
+            .to_string()
+            .contains("positive integer")
+    );
+    assert!(
+        sha1_file(&sample, 0)
+            .expect_err("sha1 zero chunk")
+            .to_string()
+            .contains("positive integer")
+    );
+    assert!(
+        sha512_file(&sample, 0)
+            .expect_err("sha512 zero chunk")
+            .to_string()
+            .contains("positive integer")
+    );
 
     assert_eq!(
         detect_digest_identity_source(&"aa".repeat(16)),
@@ -1765,19 +1834,12 @@ fn grpc_batch_helper_functions_cover_limits_and_oversize_rows() {
     let empty_payload_size = empty_remote_batch_payload_size().expect("empty payload size");
     let minimum_soft_limit = empty_payload_size.saturating_add(1);
 
-    assert_eq!(grpc_remote_batch_size(0), 1);
-    assert_eq!(grpc_remote_batch_size(3), 3);
     assert_eq!(
-        grpc_remote_batch_size(GRPC_REMOTE_BATCH_MAX_ROWS + 5),
-        GRPC_REMOTE_BATCH_MAX_ROWS
-    );
-
-    assert_eq!(
-        grpc_remote_batch_soft_limit_bytes(1, empty_payload_size),
+        grpc_remote_batch_bytes(1, empty_payload_size),
         minimum_soft_limit
     );
     assert_eq!(
-        grpc_remote_batch_soft_limit_bytes(usize::MAX, empty_payload_size),
+        grpc_remote_batch_bytes(usize::MAX, empty_payload_size),
         GRPC_REMOTE_BATCH_SOFT_LIMIT_BYTES.max(minimum_soft_limit)
     );
 
@@ -1799,38 +1861,46 @@ fn grpc_batch_helper_functions_cover_limits_and_oversize_rows() {
         payload_size: empty_payload_size + 3,
     };
 
-    assert!(!prepare_serialized_remote_batch_row(
-        &pending_empty,
-        16,
-        empty_payload_size,
-        empty_payload_size + 32,
-        false,
-    )
-    .expect("fits empty batch"));
-    assert!(prepare_serialized_remote_batch_row(
-        &pending_non_empty,
-        4,
-        empty_payload_size,
-        empty_payload_size + 7,
-        false,
-    )
-    .expect("flush before oversize append"));
-    assert!(prepare_serialized_remote_batch_row(
-        &pending_non_empty,
-        64,
-        empty_payload_size,
-        empty_payload_size + 32,
-        true,
-    )
-    .expect("flush before oversize single row"));
-    assert!(prepare_serialized_remote_batch_row(
-        &pending_empty,
-        64,
-        empty_payload_size,
-        empty_payload_size + 32,
-        false,
-    )
-    .is_err());
+    assert!(
+        !prepare_serialized_remote_batch_row(
+            &pending_empty,
+            16,
+            empty_payload_size,
+            empty_payload_size + 32,
+            false,
+        )
+        .expect("fits empty batch")
+    );
+    assert!(
+        prepare_serialized_remote_batch_row(
+            &pending_non_empty,
+            4,
+            empty_payload_size,
+            empty_payload_size + 7,
+            false,
+        )
+        .expect("flush before oversize append")
+    );
+    assert!(
+        prepare_serialized_remote_batch_row(
+            &pending_non_empty,
+            64,
+            empty_payload_size,
+            empty_payload_size + 32,
+            true,
+        )
+        .expect("flush before oversize single row")
+    );
+    assert!(
+        prepare_serialized_remote_batch_row(
+            &pending_empty,
+            64,
+            empty_payload_size,
+            empty_payload_size + 32,
+            false,
+        )
+        .is_err()
+    );
 }
 
 #[test]

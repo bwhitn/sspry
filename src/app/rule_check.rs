@@ -42,8 +42,8 @@ fn rule_check_policy(args: &RuleCheckArgs) -> Result<RuleCheckPolicy> {
     if let Some(addr) = &args.addr {
         let server_policy = server_scan_policy(&ClientConnectionArgs {
             addr: addr.clone(),
-            timeout: args.timeout,
-            max_message_bytes: args.max_message_bytes,
+            timeout: DEFAULT_RPC_TIMEOUT,
+            max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
         })?;
         return Ok(RuleCheckPolicy {
             source: RuleCheckPolicySource::Server,

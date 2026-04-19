@@ -105,10 +105,7 @@ fn non_exact_patterns_use_any_lane_masks() {
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
     let runtime = build_runtime_query_artifacts(&plan).expect("runtime query artifacts");
-    let runtime_pattern = runtime
-        .runtime_patterns
-        .get("$a")
-        .expect("runtime pattern");
+    let runtime_pattern = runtime.runtime_patterns.get("$a").expect("runtime pattern");
     assert!(runtime_pattern.tier1[0].use_any_lane);
     assert!(runtime_pattern.tier1[0].lane_variants.is_empty());
 
@@ -165,10 +162,7 @@ fn ambiguous_exact_patterns_fall_back_to_any_lane_masks() {
         tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
     };
     let runtime = build_runtime_query_artifacts(&plan).expect("runtime query artifacts");
-    let runtime_pattern = runtime
-        .runtime_patterns
-        .get("$a")
-        .expect("runtime pattern");
+    let runtime_pattern = runtime.runtime_patterns.get("$a").expect("runtime pattern");
     assert!(!runtime_pattern.tier1[0].use_any_lane);
     assert!(!runtime_pattern.tier1[0].lane_variants.is_empty());
 }

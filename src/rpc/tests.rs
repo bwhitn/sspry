@@ -2994,7 +2994,11 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
     .expect("emit first bundled partial");
 
     assert_eq!(frames.len(), 3);
-    assert!(frames.iter().all(|frame| !frame.stream_complete && !frame.rule_complete));
+    assert!(
+        frames
+            .iter()
+            .all(|frame| !frame.stream_complete && !frame.rule_complete)
+    );
     assert_eq!(frames[0].target_rule_name, "rule_one");
     assert_eq!(frames[0].sha256, vec!["hash-a".to_owned()]);
     assert_eq!(frames[1].target_rule_name, "rule_two");
@@ -3045,7 +3049,10 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
     .expect("emit second bundled partial");
 
     assert_eq!(frames.len(), prior_frame_count + 1);
-    assert_eq!(frames.last().expect("second partial frame").sha256, vec!["hash-d"]);
+    assert_eq!(
+        frames.last().expect("second partial frame").sha256,
+        vec!["hash-d"]
+    );
     assert_eq!(
         accumulators[0].tier_used,
         vec!["tier1".to_owned(), "tier1".to_owned()]

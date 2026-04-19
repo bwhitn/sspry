@@ -10,14 +10,12 @@ mod common;
 use common::*;
 
 #[test]
-fn serve_validation_errors_are_reported() {
+fn init_validation_errors_are_reported() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("candidate_db");
 
     let err = run_fail(&[
-        "serve",
-        "--addr",
-        &tcp_addr(reserve_tcp_port()),
+        "init",
         "--root",
         candidate_root.to_str().expect("root"),
         "--tier1-set-fp",
@@ -27,11 +25,12 @@ fn serve_validation_errors_are_reported() {
 }
 
 #[test]
-fn info_over_tcp_returns_json_after_auto_init() {
+fn info_over_tcp_returns_json_after_explicit_init() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
     let port = reserve_tcp_port();
 
+    init_root(&root, "workspace", &[]);
     let mut child = spawn_serve_tcp(port, &root, &[]);
     let addr = tcp_addr(port);
     wait_for_info_quick(&addr);
@@ -49,6 +48,71 @@ fn info_over_tcp_returns_json_after_auto_init() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn serve_requires_explicit_init() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("candidate_db");
+    let port = reserve_tcp_port();
+    let output = Command::new(bin_path())
+        .args([
+            "serve",
+            "--addr",
+            &tcp_addr(port),
+            "--root",
+            root.to_str().expect("root"),
+        ])
+        .output()
+        .expect("run serve");
+    assert!(!output.status.success(), "serve should fail without init");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("is not initialized"), "{text}");
+    assert!(text.contains("sspry init --root"), "{text}");
+}
+
+#[test]
+fn local_index_requires_explicit_init() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("local_db");
+    let sample = tmp.path().join("sample.bin");
+    fs::write(&sample, b"sample local index").expect("write sample");
+
+    let err = run_fail(&[
+        "local",
+        "index",
+        "--root",
+        root.to_str().expect("root"),
+        sample.to_str().expect("sample"),
+    ]);
+    assert!(
+        err.contains("is not initialized as a direct local store"),
+        "{err}"
+    );
+    assert!(err.contains("sspry init --root"), "{err}");
+}
+
+#[test]
+fn local_index_rejects_removed_batch_size_flag() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("local_db");
+    let sample = tmp.path().join("sample.bin");
+    fs::write(&sample, b"sample local index").expect("write sample");
+
+    let err = run_fail(&[
+        "local",
+        "index",
+        "--root",
+        root.to_str().expect("root"),
+        "--batch-size",
+        "1",
+        sample.to_str().expect("sample"),
+    ]);
+    assert!(err.contains("unexpected argument '--batch-size'"), "{err}");
 }
 
 #[test]
@@ -134,7 +198,8 @@ fn rule_check_uses_server_policy_from_live_addr() {
     let root = tmp.path().join("candidate_db");
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
-    let mut child = spawn_serve_tcp(port, &root, &["--id-source", "md5"]);
+    init_root(&root, "workspace", &["--id-source", "md5"]);
+    let mut child = spawn_serve_tcp(port, &root, &[]);
     wait_for_info_quick(&addr);
 
     let rule_path = tmp.path().join("rule.yar");
@@ -193,6 +258,7 @@ fn rule_check_uses_local_root_policy() {
     let root = tmp.path().join("local_db");
     let sample = tmp.path().join("sample.bin");
     fs::write(&sample, b"sample local root rule check").expect("write sample");
+    init_root(&root, "local", &[]);
     let _ = run_ok(&[
         "local",
         "index",
@@ -828,7 +894,8 @@ fn serve_persists_candidate_shards() {
     let root = tmp.path().join("candidate_db");
     let port = reserve_tcp_port();
 
-    let mut child = spawn_serve_tcp(port, &root, &["--shards", "2"]);
+    init_root(&root, "workspace", &["--shards", "2"]);
+    let mut child = spawn_serve_tcp(port, &root, &[]);
     let addr = tcp_addr(port);
     wait_for_info_quick(&addr);
 
@@ -863,15 +930,13 @@ fn serve_persists_candidate_shards() {
 }
 
 #[test]
-fn serve_ignores_init_only_options_for_existing_db_with_warning() {
+fn serve_reuses_initialized_policy() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
 
-    let init_port = reserve_tcp_port();
-    let init_addr = tcp_addr(init_port);
-    let mut init_child = spawn_serve_tcp(
-        init_port,
+    init_root(
         &root,
+        "workspace",
         &[
             "--shards",
             "2",
@@ -885,31 +950,10 @@ fn serve_ignores_init_only_options_for_existing_db_with_warning() {
             "4,5",
         ],
     );
-    wait_for_info_quick(&init_addr);
-    let _ = init_child.kill();
-    let _ = init_child.wait();
 
     let restart_port = reserve_tcp_port();
     let restart_addr = tcp_addr(restart_port);
-    let mut restart_child = spawn_serve_tcp_capture_stderr(
-        restart_port,
-        &root,
-        &[
-            "--layout-profile",
-            "incremental",
-            "--shards",
-            "9",
-            "--tier1-set-fp",
-            "0.99",
-            "--tier2-set-fp",
-            "0.88",
-            "--id-source",
-            "sha1",
-            "--store-path",
-            "--gram-sizes",
-            "5,6",
-        ],
-    );
+    let mut restart_child = spawn_serve_tcp_capture_stderr(restart_port, &root, &[]);
     wait_for_info_quick(&restart_addr);
 
     let info = run_ok(&["info", "--addr", &restart_addr]);
@@ -943,27 +987,17 @@ fn serve_ignores_init_only_options_for_existing_db_with_warning() {
     let _ = restart_child.kill();
     let output = restart_child.wait_with_output().expect("restart output");
     let stderr = String::from_utf8(output.stderr).expect("stderr");
-    assert!(stderr.contains("warning:"));
-    assert!(stderr.contains("ignoring serve initialization options"));
-    assert!(stderr.contains("--layout-profile"));
-    assert!(stderr.contains("--shards"));
-    assert!(stderr.contains("--tier1-set-fp"));
-    assert!(stderr.contains("--tier2-set-fp"));
-    assert!(stderr.contains("--id-source"));
-    assert!(stderr.contains("--store-path"));
-    assert!(stderr.contains("--gram-sizes"));
+    assert!(!stderr.contains("ignoring serve initialization options"));
 }
 
 #[test]
-fn serve_does_not_warn_when_explicit_existing_values_match() {
+fn serve_reuses_initialized_store_path() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
 
-    let init_port = reserve_tcp_port();
-    let init_addr = tcp_addr(init_port);
-    let mut init_child = spawn_serve_tcp(
-        init_port,
+    init_root(
         &root,
+        "workspace",
         &[
             "--shards",
             "2",
@@ -978,30 +1012,19 @@ fn serve_does_not_warn_when_explicit_existing_values_match() {
             "4,5",
         ],
     );
-    wait_for_info_quick(&init_addr);
-    let _ = init_child.kill();
-    let _ = init_child.wait();
 
     let restart_port = reserve_tcp_port();
     let restart_addr = tcp_addr(restart_port);
-    let mut restart_child = spawn_serve_tcp_capture_stderr(
-        restart_port,
-        &root,
-        &[
-            "--shards",
-            "2",
-            "--tier1-set-fp",
-            "0.31",
-            "--tier2-set-fp",
-            "0.17",
-            "--id-source",
-            "md5",
-            "--store-path",
-            "--gram-sizes",
-            "4,5",
-        ],
-    );
+    let mut restart_child = spawn_serve_tcp_capture_stderr(restart_port, &root, &[]);
     wait_for_info_quick(&restart_addr);
+
+    let info = run_ok(&["info", "--addr", &restart_addr]);
+    let parsed: Value = serde_json::from_str(&info).expect("stats json");
+    assert_eq!(parsed.get("id_source").and_then(Value::as_str), Some("md5"));
+    assert_eq!(
+        parsed.get("store_path").and_then(Value::as_bool),
+        Some(true)
+    );
 
     let _ = restart_child.kill();
     let output = restart_child.wait_with_output().expect("restart output");
@@ -1128,7 +1151,8 @@ rule q {
 
     let port = reserve_tcp_port();
     let addr = tcp_addr(port);
-    let mut child = spawn_serve_tcp(port, &root, &["--store-path"]);
+    init_root(&root, "workspace", &["--store-path"]);
+    let mut child = spawn_serve_tcp(port, &root, &[]);
     wait_for_info_quick(&addr);
 
     let index_output = Command::new(bin_path())

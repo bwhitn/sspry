@@ -28,7 +28,7 @@ RPC mode itself now has two useful server shapes:
 - mutable workspace/direct-store servers for remote ingest and query
 - forest-root servers that open `tree_*/current` read-only and answer one RPC query across the whole forest
 
-Local forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--tree-search-workers`.
+Local forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--search-workers`.
 
 RPC `serve --search-workers` uses a different scheduler than local forest mode: it fans out over concrete search work units, one per shard in direct/workspace mode and one per `(tree, shard)` pair in forest mode.
 
@@ -223,7 +223,7 @@ Candidate order is not part of the search contract. The current runtime preserve
 
 Search with `--verify`:
 
-1. requires stored paths (`--store-path` at `serve` time)
+1. requires stored paths (`--store-path` at `init` time)
 2. reopens candidate files locally
 3. runs `yara-x` verification
 4. returns verified matches as an unordered set

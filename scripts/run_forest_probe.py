@@ -66,6 +66,35 @@ def wait_for_publish(sspry: Path, addr: str, out_path: Path, attempts: int = 180
     raise RuntimeError(f'publish did not complete on {addr}')
 
 
+def build_init_cmd(
+    sspry: Path,
+    root: Path,
+    mode: str,
+    args: argparse.Namespace,
+    *,
+    store_path: bool = False,
+) -> list[str]:
+    cmd = [
+        str(sspry),
+        'init',
+        '--root',
+        str(root),
+        '--mode',
+        mode,
+        '--gram-sizes',
+        args.gram_sizes,
+    ]
+    if args.shards is not None:
+        cmd.extend(['--shards', str(args.shards)])
+    if args.tier1_set_fp is not None:
+        cmd.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
+    if args.tier2_set_fp is not None:
+        cmd.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
+    if store_path:
+        cmd.append('--store-path')
+    return cmd
+
+
 def shutdown_server(sspry: Path, addr: str, proc: subprocess.Popen, run_dir: Path) -> None:
     try:
         run([str(sspry), 'shutdown', '--addr', addr], capture_output=True, timeout=10)
@@ -598,7 +627,7 @@ def run_search_one_local_forest(
                 str(db_root),
                 '--rule',
                 str(rule),
-                '--tree-search-workers',
+                '--search-workers',
                 str(tree_search_workers),
                 '--verbose',
             ],
@@ -831,23 +860,21 @@ def main() -> int:
             f"files={manifest['files']} bytes={manifest['bytes']}",
             flush=True,
         )
-        fp_args = []
-        if args.tier1_set_fp is not None:
-            fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
-        if args.tier2_set_fp is not None:
-            fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
         if args.index_mode == 'local-root':
             current_root = db_root / 'current'
-            current_root.parent.mkdir(parents=True, exist_ok=True)
+            init_proc = run(
+                build_init_cmd(sspry, current_root, 'local', args),
+                stdout=(tree_run_dir / 'init.stdout').open('w'),
+                stderr=(tree_run_dir / 'init.stderr').open('w'),
+            )
+            if init_proc.returncode != 0:
+                raise RuntimeError(f'init failed for {tree_name} with exit {init_proc.returncode}')
             started = time.monotonic()
             index_cmd = [
                 str(sspry),
                 'local', 'index', '--root', str(current_root),
-                '--candidate-shards', str(args.shards or 1),
-                '--gram-sizes', args.gram_sizes,
-                *fp_args,
                 '--path-list', str(manifest['path']),
-                '--batch-size', '64',
+                '--batch-docs', '64',
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
             ]
@@ -891,13 +918,17 @@ def main() -> int:
                 flush=True,
             )
             continue
+        init_proc = run(
+            build_init_cmd(sspry, db_root, 'workspace', args, store_path=True),
+            stdout=(tree_run_dir / 'init.stdout').open('w'),
+            stderr=(tree_run_dir / 'init.stderr').open('w'),
+        )
+        if init_proc.returncode != 0:
+            raise RuntimeError(f'init failed for {tree_name} with exit {init_proc.returncode}')
         server = subprocess.Popen(
             [
-                str(sspry), 'serve', '--addr', addr, '--root', str(db_root), '--store-path',
-                '--gram-sizes', args.gram_sizes,
+                str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
                 '--search-workers', str(args.search_workers),
-                *fp_args,
-                *(['--shards', str(args.shards)] if args.shards else []),
             ],
             stdout=(tree_run_dir / 'server.stdout').open('w'),
             stderr=(tree_run_dir / 'server.stderr').open('w'),
@@ -916,7 +947,7 @@ def main() -> int:
             started = time.monotonic()
             index_cmd = [
                 str(sspry),
-                'index', '--addr', addr, '--path-list', str(manifest['path']), '--batch-size', '64',
+                'index', '--addr', addr, '--path-list', str(manifest['path']),
                 '--timeout', str(args.index_timeout_s),
                 *(['--workers', str(args.index_workers)] if args.index_workers else []),
                 '--verbose',
@@ -986,17 +1017,10 @@ def main() -> int:
                 tree_run_dir = trees_dir / tree_name
                 db_root = db_base / tree_name
                 addr = f'127.0.0.1:{args.base_port + idx}'
-                fp_args = []
-                if args.tier1_set_fp is not None:
-                    fp_args.extend(['--tier1-set-fp', str(args.tier1_set_fp)])
-                if args.tier2_set_fp is not None:
-                    fp_args.extend(['--tier2-set-fp', str(args.tier2_set_fp)])
                 server = subprocess.Popen(
                     [
                         str(sspry), 'serve', '--addr', addr, '--root', str(db_root),
                         '--search-workers', str(args.search_workers),
-                        *fp_args,
-                        *(['--shards', str(args.shards)] if args.shards else []),
                     ],
                     stdout=(tree_run_dir / 'search.server.stdout').open('w'),
                     stderr=(tree_run_dir / 'search.server.stderr').open('w'),

@@ -19,8 +19,27 @@ fn run_output(args: &[&str]) -> Output {
         .expect("run command")
 }
 
+fn run_output_owned(args: &[String]) -> Output {
+    Command::new(bin_path())
+        .args(args)
+        .output()
+        .expect("run command")
+}
+
 pub fn run_ok(args: &[&str]) -> String {
     let output = run_output(args);
+    assert!(
+        output.status.success(),
+        "command failed: {:?}\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+pub fn run_ok_owned(args: &[String]) -> String {
+    let output = run_output_owned(args);
     assert!(
         output.status.success(),
         "command failed: {:?}\nstdout={}\nstderr={}",
@@ -199,4 +218,16 @@ pub fn spawn_serve_tcp_capture_stderr(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     command.spawn().expect("spawn serve")
+}
+
+pub fn init_root(root: &Path, mode: &str, extra_args: &[&str]) -> String {
+    let mut args = vec![
+        "init".to_owned(),
+        "--root".to_owned(),
+        root.to_string_lossy().into_owned(),
+        "--mode".to_owned(),
+        mode.to_owned(),
+    ];
+    args.extend(extra_args.iter().map(|value| (*value).to_owned()));
+    run_ok_owned(&args)
 }

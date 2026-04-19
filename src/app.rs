@@ -21,20 +21,21 @@ use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanne
 use crate::candidate::features::AdditionalDigestKind;
 use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
-    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
+    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
+    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
+    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes,
+    HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
+    choose_filter_bytes_for_file_size,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
-    compile_query_plan_from_file_with_gram_sizes,
-    derive_document_bloom_hash_count, estimate_unique_grams_for_size_hll,
-    estimate_unique_grams_pair_hll, extract_compact_document_metadata_with_entropy,
-    load_rule_file_with_includes, read_candidate_shard_count, resolve_max_candidates,
+    compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
+    estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
+    extract_compact_document_metadata_with_entropy, load_rule_file_with_includes,
+    read_candidate_shard_count, resolve_max_candidates,
     rule_check_all_from_file_with_gram_sizes_and_identity_source,
-    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names, BoundedCache,
-    CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan, GramSizes,
-    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, HLL_DEFAULT_PRECISION,
+    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names,
 };
 use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
@@ -54,8 +55,7 @@ pub const DEFAULT_SEARCH_RESULT_CHUNK_SIZE: usize = 1024;
 pub const DEFAULT_FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_GB: u64 = 16;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_GB * 1024 * 1024 * 1024;
-pub const DEFAULT_STANDARD_SHARDS: usize = 8;
-pub const DEFAULT_INCREMENTAL_SHARDS: usize = 8;
+pub const DEFAULT_CANDIDATE_SHARDS: usize = 8;
 const ESTIMATED_INDEX_QUEUE_ITEM_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_QUEUE_CAPACITY: usize = 256;
 const STORAGE_CLASS_SAMPLE_LIMIT: usize = 16;
@@ -328,61 +328,18 @@ fn default_search_workers() -> usize {
     )
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-enum ServeLayoutProfile {
-    Standard,
-    Incremental,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ServeInitOptionSources {
-    layout_profile: bool,
-    shards: bool,
-    tier1_filter_target_fp: bool,
-    tier2_filter_target_fp: bool,
-    id_source: bool,
-    store_path: bool,
-    gram_sizes: bool,
-}
-
-/// Returns whether the CLI argv contains the requested long flag, including the
-/// `--flag=value` form.
-fn argv_has_long_flag(argv: &[String], flag: &str) -> bool {
-    argv.iter().any(|arg| {
-        arg == flag
-            || arg
-                .strip_prefix(flag)
-                .is_some_and(|suffix| suffix.starts_with('='))
-    })
-}
-
-/// Records which serve-time initialization options were explicitly supplied on
-/// the command line.
-fn serve_init_option_sources_from_argv(argv: &[String]) -> ServeInitOptionSources {
-    ServeInitOptionSources {
-        layout_profile: argv_has_long_flag(argv, "--layout-profile"),
-        shards: argv_has_long_flag(argv, "--shards"),
-        tier1_filter_target_fp: argv_has_long_flag(argv, "--tier1-set-fp"),
-        tier2_filter_target_fp: argv_has_long_flag(argv, "--tier2-set-fp"),
-        id_source: argv_has_long_flag(argv, "--id-source"),
-        store_path: argv_has_long_flag(argv, "--store-path"),
-        gram_sizes: argv_has_long_flag(argv, "--gram-sizes"),
+/// Returns the default shard count for the requested initialization mode.
+fn default_candidate_shards_for_mode(mode: InitMode) -> usize {
+    match mode {
+        InitMode::Workspace => DEFAULT_CANDIDATE_SHARDS,
+        InitMode::Local => 1,
     }
 }
 
-/// Returns the default shard count associated with the chosen serve layout
-/// profile.
-fn default_shards_for_profile(profile: ServeLayoutProfile) -> usize {
-    match profile {
-        ServeLayoutProfile::Standard => DEFAULT_STANDARD_SHARDS,
-        ServeLayoutProfile::Incremental => DEFAULT_INCREMENTAL_SHARDS,
-    }
-}
-
-/// Resolves the effective candidate shard count for a serve invocation.
-fn serve_candidate_shard_count(args: &ServeCommonArgs) -> usize {
+/// Resolves the effective shard count for one initialization request.
+fn init_candidate_shard_count(args: &InitArgs) -> usize {
     args.shards
-        .unwrap_or_else(|| default_shards_for_profile(args.layout_profile))
+        .unwrap_or_else(|| default_candidate_shards_for_mode(args.mode))
         .max(1)
 }
 
@@ -1335,17 +1292,9 @@ fn empty_remote_batch_payload_size() -> Result<usize> {
     Ok(rpc::serialized_candidate_insert_binary_batch_payload(&[]).len())
 }
 
-/// Clamps the effective gRPC remote batch row count.
-fn grpc_remote_batch_size(batch_size: usize) -> usize {
-    batch_size.max(1).min(GRPC_REMOTE_BATCH_MAX_ROWS)
-}
-
 /// Clamps the effective remote batch payload limit to both the configured limit
 /// and the gRPC transport ceiling.
-fn grpc_remote_batch_soft_limit_bytes(
-    configured_limit_bytes: usize,
-    empty_payload_size: usize,
-) -> usize {
+fn grpc_remote_batch_bytes(configured_limit_bytes: usize, empty_payload_size: usize) -> usize {
     configured_limit_bytes
         .max(empty_payload_size.saturating_add(1))
         .min(GRPC_REMOTE_BATCH_SOFT_LIMIT_BYTES.max(empty_payload_size.saturating_add(1)))
@@ -1630,36 +1579,17 @@ fn resolve_filter_target_fps(
     )
 }
 
-/// Converts serve arguments into the candidate-store configuration used at
-/// startup.
-fn store_config_from_serve_args(args: &ServeCommonArgs) -> CandidateConfig {
-    let gram_sizes =
-        GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible serve args");
-    let (tier1_filter_target_fp, tier2_filter_target_fp) =
-        resolve_filter_target_fps(args.tier1_filter_target_fp, args.tier2_filter_target_fp);
-    store_config_from_parts(
-        PathBuf::from(&args.root),
-        args.id_source,
-        args.store_path,
-        tier1_filter_target_fp,
-        tier2_filter_target_fp,
-        gram_sizes.tier2,
-        gram_sizes.tier1,
-        CandidateConfig::default().compaction_idle_cooldown_s,
-    )
-}
-
 /// Converts init arguments into the candidate-store configuration used for
 /// local initialization.
-fn store_config_from_init_args(args: &InitArgs) -> CandidateConfig {
+fn store_config_from_init_args(args: &InitArgs, root: PathBuf) -> CandidateConfig {
     let gram_sizes =
         GramSizes::parse(&args.gram_sizes).expect("validated by clap-compatible init args");
     let (tier1_filter_target_fp, tier2_filter_target_fp) =
         resolve_filter_target_fps(args.tier1_filter_target_fp, args.tier2_filter_target_fp);
     store_config_from_parts(
-        PathBuf::from(&args.root),
-        CandidateIdSource::Sha256,
-        false,
+        root,
+        args.id_source,
+        args.store_path,
         tier1_filter_target_fp,
         tier2_filter_target_fp,
         gram_sizes.tier2,
@@ -1726,28 +1656,41 @@ fn open_stores(root: &Path) -> Result<Vec<CandidateStore>> {
 
 #[allow(dead_code)]
 struct LocalInitOutcome {
+    mode: InitMode,
+    logical_root: PathBuf,
+    store_root: PathBuf,
     shard_count: usize,
     stats: crate::candidate::CandidateStats,
 }
 
-/// Ensures the local root is initialized with the requested shard layout and
-/// returns the resulting shard count and initial stats.
-fn ensure_local_root_initialized(args: &InitArgs) -> Result<LocalInitOutcome> {
-    let root = Path::new(&args.root);
-    let shard_count = args.candidate_shards.max(1);
+/// Returns the concrete store root that an init request should materialize.
+fn init_store_root(args: &InitArgs) -> PathBuf {
+    let root = PathBuf::from(&args.root);
+    match args.mode {
+        InitMode::Workspace => root.join("current"),
+        InitMode::Local => root,
+    }
+}
+
+/// Ensures one concrete direct store root is initialized with the requested
+/// policy and shard layout.
+fn ensure_store_root_initialized(
+    args: &InitArgs,
+    root: &Path,
+    shard_count: usize,
+) -> Result<crate::candidate::CandidateStats> {
     if !args.force {
         if let Some(existing) = read_candidate_shard_count(root)? {
             if existing == shard_count {
-                let stats = open_stores(root)?
+                return Ok(open_stores(root)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
-                    .stats();
-                return Ok(LocalInitOutcome { shard_count, stats });
+                    .stats());
             }
             return Err(SspryError::from(format!(
                 "{} already initialized with {existing} shard(s)",
-                args.root
+                root.display()
             )));
         }
 
@@ -1756,26 +1699,24 @@ fn ensure_local_root_initialized(args: &InitArgs) -> Result<LocalInitOutcome> {
         let first_local_meta = root.join("shard_000").join("store_meta.json");
         let first_legacy_meta = root.join("shard_000").join("meta.json");
         if shard_count == 1 && (local_meta_path.exists() || legacy_meta_path.exists()) {
-            let stats = open_stores(root)?
+            return Ok(open_stores(root)?
                 .into_iter()
                 .next()
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
-                .stats();
-            return Ok(LocalInitOutcome { shard_count, stats });
+                .stats());
         }
         if shard_count > 1 && (first_local_meta.exists() || first_legacy_meta.exists()) {
-            let stats = open_stores(root)?
+            return Ok(open_stores(root)?
                 .into_iter()
                 .next()
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
-                .stats();
-            return Ok(LocalInitOutcome { shard_count, stats });
+                .stats());
         }
     }
 
     let mut stats = None;
     for shard_idx in 0..shard_count {
-        let mut config = store_config_from_init_args(args);
+        let mut config = store_config_from_init_args(args, root.to_path_buf());
         config.root = candidate_shard_root(root, shard_count, shard_idx);
         let store = ensure_store(config, args.force)?;
         if stats.is_none() {
@@ -1783,9 +1724,40 @@ fn ensure_local_root_initialized(args: &InitArgs) -> Result<LocalInitOutcome> {
         }
     }
     write_candidate_shard_count(root, shard_count)?;
+    Ok(stats.expect("candidate init must create at least one shard"))
+}
+
+/// Ensures the requested logical root is initialized and returns the resulting
+/// store configuration summary.
+fn ensure_initialized_root(args: &InitArgs) -> Result<LocalInitOutcome> {
+    let logical_root = PathBuf::from(&args.root);
+    let store_root = init_store_root(args);
+    let shard_count = init_candidate_shard_count(args);
+    if args.mode == InitMode::Workspace {
+        if !logical_root.join("current").is_dir()
+            && !logical_root.join("work_a").is_dir()
+            && !logical_root.join("work_b").is_dir()
+            && store_root_has_markers(&logical_root)
+        {
+            return Err(SspryError::from(format!(
+                "{} contains a direct store; initialize a fresh workspace root or use --mode local.",
+                logical_root.display()
+            )));
+        }
+        if logical_root.join("work").exists() {
+            return Err(SspryError::from(format!(
+                "{} contains the retired workspace work/ root; move or remove it before initializing.",
+                logical_root.display()
+            )));
+        }
+    }
+    let stats = ensure_store_root_initialized(args, &store_root, shard_count)?;
     Ok(LocalInitOutcome {
+        mode: args.mode,
+        logical_root,
+        store_root,
         shard_count,
-        stats: stats.expect("candidate init must create at least one shard"),
+        stats,
     })
 }
 
@@ -1846,7 +1818,7 @@ struct SearchExecution {
     query_profile: CandidateQueryProfile,
     external_ids: Vec<Option<String>>,
     tree_count: Option<usize>,
-    tree_search_workers: Option<usize>,
+    search_workers: Option<usize>,
     server_rss_kb: Option<(u64, u64)>,
     plan_time: Duration,
     query_time: Duration,
@@ -1944,7 +1916,7 @@ impl SearchExecutionAccumulator {
             query_profile: self.query_profile,
             external_ids: self.external_ids,
             tree_count: None,
-            tree_search_workers: None,
+            search_workers: None,
             server_rss_kb,
             plan_time,
             query_time,
@@ -1983,7 +1955,7 @@ struct LocalSearchContext {
     tree_count: usize,
     gram_sizes: GramSizes,
     active_identity_source: Option<String>,
-    tree_search_workers: usize,
+    search_workers: usize,
 }
 
 impl LocalSearchContext {
@@ -1993,13 +1965,13 @@ impl LocalSearchContext {
         let tree_groups = open_forest_tree_groups(Path::new(&args.root))?;
         let tree_count = tree_groups.len();
         let (gram_sizes, active_identity_source, _) = validate_forest_search_policy(&tree_groups)?;
-        let tree_search_workers = args.tree_search_workers.max(1).min(tree_count.max(1));
+        let search_workers = args.search_workers.max(1).min(tree_count.max(1));
         Ok(Self {
             tree_groups,
             tree_count,
             gram_sizes,
             active_identity_source,
-            tree_search_workers,
+            search_workers,
         })
     }
 
@@ -2022,11 +1994,7 @@ fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
         .map(|entry| {
             let path = entry.path();
             let current = path.join("current");
-            if current.is_dir() {
-                current
-            } else {
-                path
-            }
+            if current.is_dir() { current } else { path }
         })
         .filter(|path| {
             path.is_dir()
@@ -2141,7 +2109,7 @@ fn query_local_forest_all_candidates(
     tree_groups: &mut Vec<TreeStoreGroup>,
     plan: &crate::candidate::CompiledQueryPlan,
     include_external_ids: bool,
-    tree_search_workers: usize,
+    search_workers: usize,
 ) -> Result<LocalForestQueryAggregate> {
     let searchable_doc_count = tree_groups
         .iter()
@@ -2149,7 +2117,7 @@ fn query_local_forest_all_candidates(
         .map(CandidateStore::live_doc_count)
         .sum::<usize>();
     let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
-    let worker_count = tree_search_workers.max(1).min(tree_groups.len().max(1));
+    let worker_count = search_workers.max(1).min(tree_groups.len().max(1));
     let mut partials = Vec::<LocalTreeQueryAggregate>::new();
     if tree_groups.len() <= 1 || worker_count <= 1 {
         for group in tree_groups {
@@ -2809,25 +2777,13 @@ fn cmd_yara(args: &YaraArgs) -> i32 {
     }
 }
 
-#[cfg(test)]
-/// Test wrapper around `cmd_serve_with_sources` with no explicit init-option
-/// provenance.
 fn cmd_serve(args: &ServeArgs) -> i32 {
-    cmd_serve_with_sources(args, ServeInitOptionSources::default())
-}
-
-/// Implements the `serve` command, resolving startup settings and running the
-/// gRPC server until shutdown.
-fn cmd_serve_with_sources(args: &ServeArgs, option_sources: ServeInitOptionSources) -> i32 {
     match (|| -> Result<i32> {
         let (host, port) = parse_host_port(&args.common.addr)?;
-        let resolved = resolve_serve_runtime_settings(&args.common, option_sources)?;
+        let resolved = resolve_serve_runtime_settings(&args.common)?;
         let (auto_publish_storage_class, auto_publish_initial_idle_ms) =
             adaptive_publish_prior_for_root(Path::new(&args.common.root));
         let signals = serve_signal_flags()?;
-        for warning in &resolved.warnings {
-            eprintln!("{warning}");
-        }
         rpc::serve_grpc_with_signal_flags(
             &host,
             port,
@@ -2888,7 +2844,6 @@ struct ResolvedServeRuntimeSettings {
     candidate_config: CandidateConfig,
     candidate_shards: usize,
     workspace_mode: bool,
-    warnings: Vec<String>,
 }
 
 /// Returns the existing store root that a serve command should reuse, if one is
@@ -2914,12 +2869,19 @@ fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option
     Ok(None)
 }
 
+/// Returns a stable user-facing error when a serve target does not point at an
+/// initialized workspace, direct local store, or forest root.
+fn missing_serve_root_error(root: &Path) -> SspryError {
+    SspryError::from(format!(
+        "{} is not initialized. Run `sspry init --root {}` first, or point `serve --root` at an existing direct local store or forest root.",
+        root.display(),
+        root.display(),
+    ))
+}
+
 /// Resolves the effective serve-time runtime settings, reusing on-disk store
 /// configuration when the target root already exists.
-fn resolve_serve_runtime_settings(
-    args: &ServeCommonArgs,
-    option_sources: ServeInitOptionSources,
-) -> Result<ResolvedServeRuntimeSettings> {
+fn resolve_serve_runtime_settings(args: &ServeCommonArgs) -> Result<ResolvedServeRuntimeSettings> {
     let root = Path::new(&args.root);
     let workspace_mode = serve_uses_workspace_mode(root);
     if let Some(existing_root) = existing_serve_store_root(root, workspace_mode)? {
@@ -2943,117 +2905,32 @@ fn resolve_serve_runtime_settings(
             stats.tier1_gram_size,
             stats.compaction_idle_cooldown_s,
         );
-        let mut ignored = Vec::<String>::new();
-        if option_sources.shards && serve_candidate_shard_count(args) != stores.len().max(1) {
-            ignored.push(format!(
-                "--shards {} (using existing candidate_shards={})",
-                serve_candidate_shard_count(args),
-                stores.len().max(1)
-            ));
-        }
-        if option_sources.layout_profile
-            && default_shards_for_profile(args.layout_profile) != stores.len().max(1)
-        {
-            let layout_name = match args.layout_profile {
-                ServeLayoutProfile::Standard => "standard",
-                ServeLayoutProfile::Incremental => "incremental",
-            };
-            ignored.push(format!(
-                "--layout-profile {} (using existing candidate_shards={})",
-                layout_name,
-                stores.len().max(1)
-            ));
-        }
-        if option_sources.tier1_filter_target_fp
-            && args.tier1_filter_target_fp
-                != Some(
-                    stats
-                        .tier1_filter_target_fp
-                        .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP),
-                )
-        {
-            let value = args
-                .tier1_filter_target_fp
-                .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP);
-            ignored.push(format!(
-                "--tier1-set-fp {} (using existing {})",
-                value,
-                stats
-                    .tier1_filter_target_fp
-                    .unwrap_or(DEFAULT_TIER1_FILTER_TARGET_FP)
-            ));
-        }
-        if option_sources.tier2_filter_target_fp
-            && args.tier2_filter_target_fp
-                != Some(
-                    stats
-                        .tier2_filter_target_fp
-                        .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP),
-                )
-        {
-            let value = args
-                .tier2_filter_target_fp
-                .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP);
-            ignored.push(format!(
-                "--tier2-set-fp {} (using existing {})",
-                value,
-                stats
-                    .tier2_filter_target_fp
-                    .unwrap_or(DEFAULT_TIER2_FILTER_TARGET_FP)
-            ));
-        }
-        if option_sources.id_source && args.id_source.as_str() != stats.id_source {
-            ignored.push(format!(
-                "--id-source {} (using existing {})",
-                args.id_source.as_str(),
-                stats.id_source
-            ));
-        }
-        if option_sources.store_path && !stats.store_path {
-            ignored.push(format!(
-                "--store-path (using existing store_path={})",
-                stats.store_path
-            ));
-        }
-        let existing_gram_sizes = format!("{},{}", stats.tier1_gram_size, stats.tier2_gram_size);
-        if option_sources.gram_sizes && args.gram_sizes != existing_gram_sizes {
-            ignored.push(format!(
-                "--gram-sizes {} (using existing {},{})",
-                args.gram_sizes, stats.tier1_gram_size, stats.tier2_gram_size
-            ));
-        }
-        let warnings = if ignored.is_empty() {
-            Vec::new()
-        } else {
-            vec![format!(
-                "warning: {} already exists; ignoring serve initialization options for this startup: {}",
-                root.display(),
-                ignored.join(", ")
-            )]
-        };
         return Ok(ResolvedServeRuntimeSettings {
             candidate_config,
             candidate_shards: stores.len().max(1),
             workspace_mode,
-            warnings,
         });
     }
-    Ok(ResolvedServeRuntimeSettings {
-        candidate_config: store_config_from_serve_args(args),
-        candidate_shards: serve_candidate_shard_count(args),
-        workspace_mode,
-        warnings: Vec::new(),
-    })
+    Err(missing_serve_root_error(root))
 }
 
-#[cfg(test)]
-/// Implements the local-only `init` command used by tests and helper flows.
 fn cmd_init(args: &InitArgs) -> i32 {
     match (|| -> Result<i32> {
-        let outcome = ensure_local_root_initialized(args)?;
+        let outcome = ensure_initialized_root(args)?;
         let shard_count = outcome.shard_count;
         let stats = outcome.stats;
-        println!("Initialized candidate store at {}", args.root);
+        println!(
+            "Initialized candidate store at {}",
+            outcome.logical_root.display()
+        );
+        println!(
+            "mode: {}",
+            match outcome.mode {
+                InitMode::Workspace => "workspace",
+                InitMode::Local => "local",
+            }
+        );
+        println!("store_root: {}", outcome.store_root.display());
         println!("candidate_shards: {shard_count}");
         println!("id_source: {}", stats.id_source);
         println!("store_path: {}", stats.store_path);
@@ -3260,15 +3137,16 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             })
             .transpose()?
             .unwrap_or((GramSizes::new(3, 4)?, None));
-        let plan = crate::candidate::compile_query_plan_from_file_with_gram_sizes_and_identity_source(
-            &args.rule,
-            gram_sizes,
-            active_identity_source.as_deref(),
-            args.max_anchors_per_pattern,
-            args.force_tier1_only,
-            !args.no_tier2_fallback,
-            args.max_candidates,
-        )?;
+        let plan =
+            crate::candidate::compile_query_plan_from_file_with_gram_sizes_and_identity_source(
+                &args.rule,
+                gram_sizes,
+                active_identity_source.as_deref(),
+                args.max_anchors_per_pattern,
+                args.force_tier1_only,
+                !args.no_tier2_fallback,
+                args.max_candidates,
+            )?;
         let result = if stores.len() == 1 {
             let mut resolved_plan = plan.clone();
             resolved_plan.max_candidates =
@@ -3644,18 +3522,26 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
     }
 }
 
-/// Converts `local index` arguments into the shared `init` argument shape used
-/// by store initialization helpers.
-fn init_args_from_local_index(args: &LocalIndexArgs) -> InitArgs {
-    InitArgs {
-        root: args.root.clone(),
-        candidate_shards: args.candidate_shards,
-        force: args.force,
-        tier1_filter_target_fp: args.tier1_filter_target_fp,
-        tier2_filter_target_fp: args.tier2_filter_target_fp,
-        gram_sizes: args.gram_sizes.clone(),
-        compaction_idle_cooldown_s: args.compaction_idle_cooldown_s,
+/// Validates that `local index` targets an explicitly initialized direct local
+/// store root rather than relying on implicit creation.
+fn ensure_local_index_root_initialized(root: &Path) -> Result<()> {
+    if read_candidate_shard_count(root)?.is_some() || store_root_has_markers(root) {
+        return Ok(());
     }
+    if root.join("current").is_dir() || root.join("work_a").is_dir() || root.join("work_b").is_dir()
+    {
+        return Err(SspryError::from(format!(
+            "{} is a workspace root. Use `sspry serve --root {}` with remote `index`, or initialize a direct local store with `sspry init --root {} --mode local`.",
+            root.display(),
+            root.display(),
+            root.display(),
+        )));
+    }
+    Err(SspryError::from(format!(
+        "{} is not initialized as a direct local store. Run `sspry init --root {} --mode local` first.",
+        root.display(),
+        root.display(),
+    )))
 }
 
 /// Default `index` entrypoint, currently routed through the gRPC client path.
@@ -3689,7 +3575,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
         let mut last_progress_reported = 0usize;
         let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
-        let batch_size = grpc_remote_batch_size(args.batch_size);
+        let batch_rows = GRPC_REMOTE_BATCH_MAX_ROWS;
         let server_policy = server_scan_policy(&args.connection)?;
         let resolved_workers =
             resolve_ingest_workers(args.workers.unwrap_or(0), total_files, &input_roots, None);
@@ -3707,12 +3593,9 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
         let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
         let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
         let empty_payload_size = empty_remote_batch_payload_size()?;
-        let remote_batch_soft_limit_bytes = grpc_remote_batch_soft_limit_bytes(
-            args.remote_batch_soft_limit_bytes,
-            empty_payload_size,
-        );
+        let batch_bytes = grpc_remote_batch_bytes(args.batch_bytes, empty_payload_size);
         let remote_upload_queue_limit_bytes =
-            remote_upload_queue_byte_limit(effective_budget_bytes, remote_batch_soft_limit_bytes);
+            remote_upload_queue_byte_limit(effective_budget_bytes, batch_bytes);
         let mut pending = RemotePendingBatch {
             rows: Vec::new(),
             payload_size: empty_payload_size,
@@ -3769,7 +3652,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                             &mut client,
                             &mut pending,
                             row_bytes,
-                            batch_size,
+                            batch_rows,
                             &mut processed,
                             &mut submit_time,
                             show_progress,
@@ -3777,7 +3660,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                             &mut last_progress_reported,
                             &mut last_progress_at,
                             empty_payload_size,
-                            remote_batch_soft_limit_bytes,
+                            batch_bytes,
                             true,
                             args.verbose,
                         )?;
@@ -3889,7 +3772,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                                         &mut client,
                                         &mut pending,
                                         upload_row.row_bytes,
-                                        batch_size,
+                                        batch_rows,
                                         &mut processed,
                                         &mut submit_time,
                                         show_progress,
@@ -3897,7 +3780,7 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
                                         &mut last_progress_reported,
                                         &mut last_progress_at,
                                         empty_payload_size,
-                                        remote_batch_soft_limit_bytes,
+                                        batch_bytes,
                                         true,
                                         args.verbose,
                                     )?;
@@ -3998,14 +3881,12 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
             eprintln!("verbose.index.encode_ms: {encode_ms:.3}");
             eprintln!("verbose.index.client_buffer_ms: {client_buffer_ms:.3}");
             eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
-            eprintln!("verbose.index.batch_size: {}", batch_size);
+            eprintln!("verbose.index.remote_batch_max_rows: {batch_rows}");
             eprintln!("verbose.index.workers: {workers}");
             eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
             eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
             eprintln!("verbose.index.queue_capacity: {queue_capacity}");
-            eprintln!(
-                "verbose.index.remote_batch_soft_limit_bytes: {remote_batch_soft_limit_bytes}"
-            );
+            eprintln!("verbose.index.batch_bytes: {batch_bytes}");
             eprintln!(
                 "verbose.index.remote_upload_queue_limit_bytes: {}",
                 remote_upload_queue_limit_bytes
@@ -4227,10 +4108,10 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
     }
 }
 
-/// Implements the high-level local indexing command by initializing the store
-/// and delegating to batch indexing.
+/// Implements the high-level local indexing command by requiring an existing
+/// initialized direct local store and delegating to batch indexing.
 fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
-    match ensure_local_root_initialized(&init_args_from_local_index(args)) {
+    match ensure_local_index_root_initialized(Path::new(&args.root)) {
         Ok(_) => cmd_internal_index_batch(&InternalIndexBatchArgs {
             paths: args.paths.clone(),
             path_list: args.path_list,
@@ -4687,7 +4568,7 @@ fn execute_local_search_rule(
         &mut context.tree_groups,
         &plan,
         args.verify_yara_files,
-        context.tree_search_workers,
+        context.search_workers,
     )?;
     let query_time = started_query.elapsed();
     Ok(SearchExecution {
@@ -4700,7 +4581,7 @@ fn execute_local_search_rule(
         query_profile: local.query_profile,
         external_ids: local.external_ids.unwrap_or_default(),
         tree_count: Some(context.tree_count),
-        tree_search_workers: Some(context.tree_search_workers),
+        search_workers: Some(context.search_workers),
         server_rss_kb: None,
         plan_time,
         query_time,
@@ -4829,8 +4710,8 @@ fn finish_search_execution(
         if let Some(tree_count) = execution.tree_count {
             eprintln!("verbose.search.tree_count: {tree_count}");
         }
-        if let Some(tree_search_workers) = execution.tree_search_workers {
-            eprintln!("verbose.search.tree_search_workers: {tree_search_workers}");
+        if let Some(search_workers) = execution.search_workers {
+            eprintln!("verbose.search.search_workers: {search_workers}");
         }
         if verify_yara_files {
             eprintln!("verbose.search.verified_checked: {verified_checked}");
@@ -4968,7 +4849,11 @@ fn cmd_info(args: &InfoCommandArgs) -> i32 {
 /// Queries a remote server for status and prints the response as JSON.
 fn cmd_grpc_info(args: &InfoCommandArgs) -> i32 {
     match (|| -> Result<i32> {
-        let mut client = grpc_client(&args.connection)?;
+        let mut client = grpc_client(&ClientConnectionArgs {
+            addr: args.connection.addr.clone(),
+            timeout: args.connection.timeout,
+            max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        })?;
         let status = client.status()?;
         println!(
             "{}",
@@ -5061,9 +4946,8 @@ pub fn main(argv: Option<Vec<String>>) -> i32 {
     perf::configure(cli.perf_report.as_ref().map(PathBuf::from), cli.perf_stdout);
 
     let exit_code = match cli.command {
-        Commands::Serve(args) => {
-            cmd_serve_with_sources(&args, serve_init_option_sources_from_argv(&argv_values))
-        }
+        Commands::Init(args) => cmd_init(&args),
+        Commands::Serve(args) => cmd_serve(&args),
         Commands::Index(args) => cmd_index(&args),
         Commands::Delete(args) => cmd_delete(&args),
         Commands::RuleCheck(args) => cmd_rule_check(&args),

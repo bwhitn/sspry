@@ -319,20 +319,20 @@ fn ensure_candidate_stores_at_root(
     if let Some(existing) = read_candidate_shard_count(root)? {
         if existing != shard_count {
             return Err(SspryError::from(format!(
-                "{} contains a candidate shard manifest for {existing} shard(s); start with matching --candidate-shards.",
+                "{} contains a candidate shard manifest for {existing} shard(s); re-run init with matching --shards.",
                 root.display()
             )));
         }
     } else {
         if shard_count > 1 && single_meta.exists() {
             return Err(SspryError::from(format!(
-                "{} contains a single-shard store; start with --candidate-shards 1 or re-init.",
+                "{} contains a single-shard store; re-run init with --shards 1 or re-init.",
                 root.display()
             )));
         }
         if shard_count == 1 && sharded_meta.exists() {
             return Err(SspryError::from(format!(
-                "{} contains a sharded store; start with matching --candidate-shards.",
+                "{} contains a sharded store; re-run init with matching --shards.",
                 root.display()
             )));
         }

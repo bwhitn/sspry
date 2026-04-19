@@ -42,9 +42,8 @@ use crate::grpc::v1::{
     InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
     PingRequest, PingResponse, PublishRequest, PublishResponse as GrpcPublishResponse,
     PublishSummary, PublishedTier2SnapshotSealSummary, QueryProfileSummary, SearchFrame,
-    SearchRequest, ShutdownRequest,
-    ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary, StartupSummary, StatsRequest,
-    StatsResponse, StatusRequest, StatusResponse, StoreSummary,
+    SearchRequest, ShutdownRequest, ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary,
+    StartupSummary, StatsRequest, StatsResponse, StatusRequest, StatusResponse, StoreSummary,
     sspry_server::{Sspry as GrpcSspry, SspryServer},
 };
 use crate::perf::{record_counter, scope};
