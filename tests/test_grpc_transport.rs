@@ -77,10 +77,16 @@ fn run_ok(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn init_workspace_root(root: &Path) {
+    let root_text = root.to_string_lossy().into_owned();
+    run_ok(&["init", "--root", &root_text, "--mode", "workspace"]);
+}
+
 #[test]
 fn grpc_transport_covers_ping_stats_status_and_shutdown() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("grpc_candidate_db");
+    init_workspace_root(&candidate_root);
     let port = reserve_port();
     let mut server = spawn_grpc_serve(port, &candidate_root);
     let endpoint = format!("http://127.0.0.1:{port}");
@@ -142,6 +148,7 @@ fn grpc_transport_covers_ping_stats_status_and_shutdown() {
 fn grpc_cli_covers_index_search_info_and_shutdown() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("grpc_candidate_db");
+    init_workspace_root(&candidate_root);
     let sample_dir = tmp.path().join("samples");
     fs::create_dir_all(&sample_dir).expect("create samples");
     let sample_a = sample_dir.join("alpha.bin");
@@ -236,6 +243,7 @@ fn grpc_cli_covers_index_search_info_and_shutdown() {
 fn grpc_cli_bundle_search_uses_one_rpc_request_for_multiple_rules() {
     let tmp = tempdir().expect("tmp");
     let candidate_root = tmp.path().join("grpc_candidate_db");
+    init_workspace_root(&candidate_root);
     let sample_dir = tmp.path().join("samples");
     fs::create_dir_all(&sample_dir).expect("create samples");
     let sample_a = sample_dir.join("alpha.bin");
