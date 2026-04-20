@@ -3,9 +3,9 @@ use super::*;
 use std::fs;
 use std::time::Duration;
 
-use crate::candidate::BloomFilter;
 use crate::candidate::bloom::DEFAULT_BLOOM_POSITION_LANES;
-use crate::candidate::{DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, pack_exact_gram};
+use crate::candidate::BloomFilter;
+use crate::candidate::{pack_exact_gram, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE};
 use base64::Engine;
 use tempfile::tempdir;
 
@@ -128,6 +128,208 @@ fn sample_forest_server_state(base: &Path, candidate_shards: usize) -> Arc<Serve
         let _ = store.persist_meta_if_dirty().expect("persist tree meta");
     }
     state
+}
+
+fn sample_duplicate_forest_server_state(base: &Path, candidate_shards: usize) -> Arc<ServerState> {
+    let forest_root = base.join(format!("candidate_forest_duplicate_{candidate_shards}"));
+    let config = ServerConfig {
+        candidate_config: CandidateConfig {
+            root: forest_root.clone(),
+            ..CandidateConfig::default()
+        },
+        candidate_shards,
+        search_workers: 2,
+        memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+        auto_publish_initial_idle_ms: 500,
+        auto_publish_storage_class: "unknown".to_owned(),
+        workspace_mode: false,
+    };
+    for tree_idx in [0usize, 1usize] {
+        let tree_root = forest_root
+            .join(format!("tree_{tree_idx:02}"))
+            .join("current");
+        let _ = ensure_candidate_stores_at_root(&config, &tree_root).expect("tree stores");
+    }
+    let state =
+        Arc::new(ServerState::new(config, Arc::new(AtomicBool::new(false))).expect("forest state"));
+    let doc_path = base.join("forest_duplicate.bin");
+    let features = scan_features_default_grams(&doc_path).unwrap_or_else(|_| {
+        fs::write(&doc_path, b"xxFOREST_DUPLICATEyy").expect("write duplicate sample");
+        scan_features_default_grams(&doc_path).expect("duplicate features")
+    });
+    for (tree_idx, stores) in state
+        .published_query_store_sets()
+        .expect("forest query stores")
+        .into_iter()
+        .enumerate()
+    {
+        let store_lock = stores.stores.first().expect("single shard");
+        let mut store = store_lock.lock().expect("lock tree store");
+        store
+            .insert_document(
+                features.sha256.clone(),
+                features.file_size,
+                None,
+                None,
+                None,
+                None,
+                features.bloom_filter.len(),
+                &features.bloom_filter,
+                features.tier2_bloom_filter.len(),
+                &features.tier2_bloom_filter,
+                Some(format!("duplicate_tree_{tree_idx:02}.bin")),
+            )
+            .expect("insert duplicate tree doc");
+        let _ = store.persist_meta_if_dirty().expect("persist tree meta");
+    }
+    state
+}
+
+#[test]
+fn forest_tree_source_ref_maintenance_respects_threshold_and_builds_one_tree_per_cycle() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_forest_server_state(tmp.path(), 1);
+    let tree_roots = state
+        .published_query_store_sets()
+        .expect("forest stores")
+        .into_iter()
+        .map(|stores| stores.root().expect("tree root"))
+        .collect::<Vec<_>>();
+    assert_eq!(tree_roots.len(), 2);
+
+    state
+        .run_tree_source_ref_cycle_for_tests(2)
+        .expect("thresholded cycle");
+    for root in &tree_roots {
+        assert!(
+            !crate::candidate::store::tree_source_ref_path(root).exists(),
+            "threshold should block source ref build at {}",
+            root.display()
+        );
+    }
+
+    state
+        .run_tree_source_ref_cycle_for_tests(1)
+        .expect("first build cycle");
+    let first_pass = tree_roots
+        .iter()
+        .filter(|root| crate::candidate::store::tree_source_ref_path(root).exists())
+        .count();
+    assert_eq!(first_pass, 1);
+
+    state
+        .run_tree_source_ref_cycle_for_tests(1)
+        .expect("second build cycle");
+    let second_pass = tree_roots
+        .iter()
+        .filter(|root| crate::candidate::store::tree_source_ref_path(root).exists())
+        .count();
+    assert_eq!(second_pass, 2);
+}
+
+#[test]
+fn forest_source_dedup_keeps_oldest_tree_and_deletes_newer_duplicate() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_duplicate_forest_server_state(tmp.path(), 1);
+    let tree_sets = state.published_query_store_sets().expect("forest stores");
+    let tree_roots = tree_sets
+        .iter()
+        .map(|stores| stores.root().expect("tree root"))
+        .collect::<Vec<_>>();
+    assert_eq!(tree_roots.len(), 2);
+
+    state
+        .run_tree_source_ref_cycle_for_tests(1)
+        .expect("first source ref build");
+    state
+        .run_tree_source_ref_cycle_for_tests(1)
+        .expect("second source ref build");
+
+    assert!(matches!(
+        state
+            .run_forest_source_dedup_cycle_once(3)
+            .expect("thresholded dedup cycle"),
+        CompactionCycleOutcome::Idle
+    ));
+
+    let summary = state
+        .run_forest_source_dedup_cycle_for_tests(1)
+        .expect("dedup cycle");
+    assert_eq!(summary.duplicate_groups, 1);
+    assert_eq!(summary.deleted_docs, 1);
+    assert_eq!(summary.affected_trees, 1);
+    assert_eq!(summary.total_inserted_docs, 2);
+    assert_eq!(summary.tree_count, 2);
+    assert_eq!(summary.identity_bytes, 32);
+    assert_eq!(summary.id_source, "sha256");
+
+    let oldest_entries =
+        crate::candidate::store::read_tree_source_ref_entries(&tree_roots[0]).expect("oldest ref");
+    let newest_entries =
+        crate::candidate::store::read_tree_source_ref_entries(&tree_roots[1]).expect("newest ref");
+    assert_eq!(oldest_entries.len(), 1);
+    assert!(
+        newest_entries.is_empty(),
+        "newest tree ref should be rebuilt empty"
+    );
+
+    let oldest_store = tree_sets[0].stores[0].lock().expect("oldest store");
+    assert_eq!(oldest_store.stats().doc_count, 1);
+    assert_eq!(oldest_store.stats().deleted_doc_count, 0);
+    drop(oldest_store);
+
+    let newest_store = tree_sets[1].stores[0].lock().expect("newest store");
+    assert_eq!(newest_store.stats().doc_count, 0);
+    assert_eq!(newest_store.stats().deleted_doc_count, 1);
+
+    let manifest =
+        read_forest_source_dedup_manifest(&state.config.candidate_config.root).expect("manifest");
+    let manifest = manifest.expect("forest source dedup manifest");
+    assert_eq!(manifest.last_duplicate_groups, 1);
+    assert_eq!(manifest.last_deleted_docs, 1);
+    assert_eq!(manifest.last_affected_trees, 1);
+}
+
+#[test]
+fn grpc_stats_and_status_report_forest_source_dedup_state() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_duplicate_forest_server_state(tmp.path(), 1);
+
+    state
+        .run_tree_source_ref_cycle_for_tests(1)
+        .expect("first source ref build");
+    state
+        .run_tree_source_ref_cycle_for_tests(1)
+        .expect("second source ref build");
+    state
+        .run_forest_source_dedup_cycle_for_tests(1)
+        .expect("dedup cycle");
+
+    let stats = state.grpc_stats_response().expect("grpc stats");
+    let store = stats.stats.as_ref().expect("store summary");
+    assert_eq!(store.source_dedup_min_new_docs, 1_000);
+    let dedup = stats
+        .forest_source_dedup
+        .as_ref()
+        .expect("forest dedup stats");
+    assert_eq!(dedup.min_new_docs, 1_000);
+    assert_eq!(dedup.last_duplicate_groups, 1);
+    assert_eq!(dedup.last_deleted_docs, 1);
+    assert_eq!(dedup.last_affected_trees, 1);
+    assert_eq!(dedup.last_total_inserted_docs, 2);
+
+    let status = state.grpc_status_response().expect("grpc status");
+    let published = status.published.as_ref().expect("published summary");
+    assert_eq!(published.source_dedup_min_new_docs, 1_000);
+    let status_dedup = status
+        .forest_source_dedup
+        .as_ref()
+        .expect("forest dedup status");
+    assert_eq!(status_dedup.min_new_docs, 1_000);
+    assert_eq!(status_dedup.last_duplicate_groups, 1);
+    assert_eq!(status_dedup.last_deleted_docs, 1);
+    assert_eq!(status_dedup.last_affected_trees, 1);
+    assert_eq!(status_dedup.last_total_inserted_docs, 2);
 }
 
 fn exact_abc_plan(pattern_id: &str, max_candidates: f64) -> CompiledQueryPlan {
@@ -336,13 +538,11 @@ fn forest_root_server_queries_across_all_trees() {
     assert_eq!(result.total_candidates, 2);
     assert_eq!(result.returned_count, 2);
     assert_eq!(result.external_ids.as_ref().map(Vec::len), Some(2));
-    assert!(
-        result
-            .external_ids
-            .expect("external ids")
-            .iter()
-            .all(|value| value.is_some())
-    );
+    assert!(result
+        .external_ids
+        .expect("external ids")
+        .iter()
+        .all(|value| value.is_some()));
 }
 
 #[test]
@@ -433,13 +633,11 @@ fn forest_root_server_reports_forest_mode_and_stays_read_only() {
         status.get("forest_tree_count").and_then(Value::as_u64),
         Some(2)
     );
-    assert!(
-        status
-            .get("forest_root")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("candidate_forest_1")
-    );
+    assert!(status
+        .get("forest_root")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .contains("candidate_forest_1"));
 
     let stats = state.current_stats_json().expect("stats");
     assert_eq!(
@@ -767,12 +965,10 @@ fn status_json_does_not_require_shard_locks() {
         status.get("workspace_mode").and_then(Value::as_bool),
         Some(false)
     );
-    assert!(
-        status
-            .get("index_session")
-            .and_then(Value::as_object)
-            .is_some()
-    );
+    assert!(status
+        .get("index_session")
+        .and_then(Value::as_object)
+        .is_some());
 }
 
 #[test]
@@ -1096,12 +1292,10 @@ fn insert_batch_advances_active_index_session_progress() {
             .and_then(Value::as_u64),
         Some(1)
     );
-    assert!(
-        server_insert_batch_profile
-            .get("store_append_sidecars_us")
-            .and_then(Value::as_u64)
-            .is_some()
-    );
+    assert!(server_insert_batch_profile
+        .get("store_append_sidecars_us")
+        .and_then(Value::as_u64)
+        .is_some());
 }
 
 #[test]
@@ -1170,36 +1364,28 @@ fn publish_stats_show_idle_readiness_and_last_publish_metadata() {
             .unwrap_or(0)
             > 0
     );
-    assert!(
-        publish_after
-            .get("last_publish_duration_ms")
-            .and_then(Value::as_u64)
-            .is_some()
-    );
+    assert!(publish_after
+        .get("last_publish_duration_ms")
+        .and_then(Value::as_u64)
+        .is_some());
     assert_eq!(
         publish_after
             .get("last_publish_reused_work_stores")
             .and_then(Value::as_bool),
         Some(false)
     );
-    assert!(
-        publish_after
-            .get("last_publish_swap_ms")
-            .and_then(Value::as_u64)
-            .is_some()
-    );
-    assert!(
-        publish_after
-            .get("last_publish_promote_work_ms")
-            .and_then(Value::as_u64)
-            .is_some()
-    );
-    assert!(
-        publish_after
-            .get("last_publish_init_work_ms")
-            .and_then(Value::as_u64)
-            .is_some()
-    );
+    assert!(publish_after
+        .get("last_publish_swap_ms")
+        .and_then(Value::as_u64)
+        .is_some());
+    assert!(publish_after
+        .get("last_publish_promote_work_ms")
+        .and_then(Value::as_u64)
+        .is_some());
+    assert!(publish_after
+        .get("last_publish_init_work_ms")
+        .and_then(Value::as_u64)
+        .is_some());
 }
 
 #[test]
@@ -1463,10 +1649,9 @@ fn publish_requested_blocks_new_index_sessions_while_waiting_for_active_session(
     let err = state
         .handle_begin_index_session()
         .expect_err("new session should be blocked while publish is pending");
-    assert!(
-        err.to_string()
-            .contains("server is publishing; index session unavailable; retry later")
-    );
+    assert!(err
+        .to_string()
+        .contains("server is publishing; index session unavailable; retry later"));
 
     state.active_mutations.store(0, Ordering::SeqCst);
     let publish = publish_thread
@@ -2027,6 +2212,12 @@ fn candidate_stats_json_contains_current_scan_policy_fields() {
         stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
         Some(0.18)
     );
+    assert_eq!(
+        stats
+            .get("source_dedup_min_new_docs")
+            .and_then(Value::as_u64),
+        Some(1_000)
+    );
     assert_eq!(stats.get("filter_target_fp"), None);
 }
 
@@ -2285,55 +2476,49 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
         )
         .expect("query after delete");
     assert_eq!(query_after_delete.total_candidates, 1);
-    assert!(
-        state
-            .handle_candidate_insert(&CandidateDocumentWire {
-                identity: "ab".repeat(32),
-                file_size: 1,
-                bloom_filter_b64: "**".to_owned(),
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: None,
-            })
-            .expect_err("invalid bloom base64")
-            .to_string()
-            .contains("bloom_filter_b64 must be valid base64")
-    );
-    assert!(
-        state
-            .handle_candidate_insert(&CandidateDocumentWire {
-                identity: "ab".repeat(32),
-                file_size: 1,
-                bloom_filter_b64: bloom_filter_b64.clone(),
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: None,
-            })
-            .is_ok()
-    );
-    assert!(
-        state
-            .handle_candidate_insert(&CandidateDocumentWire {
-                identity: "not hex".to_owned(),
-                file_size: 1,
-                bloom_filter_b64,
-                bloom_item_estimate: None,
-                tier2_bloom_filter_b64: None,
-                tier2_bloom_item_estimate: None,
-                special_population: false,
-                metadata_b64: None,
-                external_id: None,
-            })
-            .expect_err("invalid sha")
-            .to_string()
-            .contains("64 hexadecimal characters")
-    );
+    assert!(state
+        .handle_candidate_insert(&CandidateDocumentWire {
+            identity: "ab".repeat(32),
+            file_size: 1,
+            bloom_filter_b64: "**".to_owned(),
+            bloom_item_estimate: None,
+            tier2_bloom_filter_b64: None,
+            tier2_bloom_item_estimate: None,
+            special_population: false,
+            metadata_b64: None,
+            external_id: None,
+        })
+        .expect_err("invalid bloom base64")
+        .to_string()
+        .contains("bloom_filter_b64 must be valid base64"));
+    assert!(state
+        .handle_candidate_insert(&CandidateDocumentWire {
+            identity: "ab".repeat(32),
+            file_size: 1,
+            bloom_filter_b64: bloom_filter_b64.clone(),
+            bloom_item_estimate: None,
+            tier2_bloom_filter_b64: None,
+            tier2_bloom_item_estimate: None,
+            special_population: false,
+            metadata_b64: None,
+            external_id: None,
+        })
+        .is_ok());
+    assert!(state
+        .handle_candidate_insert(&CandidateDocumentWire {
+            identity: "not hex".to_owned(),
+            file_size: 1,
+            bloom_filter_b64,
+            bloom_item_estimate: None,
+            tier2_bloom_filter_b64: None,
+            tier2_bloom_item_estimate: None,
+            special_population: false,
+            metadata_b64: None,
+            external_id: None,
+        })
+        .expect_err("invalid sha")
+        .to_string()
+        .contains("64 hexadecimal characters"));
 }
 
 #[test]
@@ -2348,23 +2533,21 @@ fn query_plan_wire_and_store_setup_cover_manifest_errors() {
         true,
     )
     .expect("init single root");
-    assert!(
-        ensure_candidate_stores(&ServerConfig {
-            candidate_config: CandidateConfig {
-                root: single_root.clone(),
-                ..CandidateConfig::default()
-            },
-            candidate_shards: 2,
-            search_workers: 1,
-            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            auto_publish_initial_idle_ms: 500,
-            auto_publish_storage_class: "unknown".to_owned(),
-            workspace_mode: false,
-        })
-        .expect_err("single-shard mismatch")
-        .to_string()
-        .contains("single-shard store")
-    );
+    assert!(ensure_candidate_stores(&ServerConfig {
+        candidate_config: CandidateConfig {
+            root: single_root.clone(),
+            ..CandidateConfig::default()
+        },
+        candidate_shards: 2,
+        search_workers: 1,
+        memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+        auto_publish_initial_idle_ms: 500,
+        auto_publish_storage_class: "unknown".to_owned(),
+        workspace_mode: false,
+    })
+    .expect_err("single-shard mismatch")
+    .to_string()
+    .contains("single-shard store"));
 
     let sharded_root = tmp.path().join("sharded");
     CandidateStore::init(
@@ -2419,23 +2602,21 @@ fn query_plan_wire_and_store_setup_cover_manifest_errors() {
         },
         2
     );
-    assert!(
-        ensure_candidate_stores(&ServerConfig {
-            candidate_config: CandidateConfig {
-                root: manifest_root,
-                ..CandidateConfig::default()
-            },
-            candidate_shards: 1,
-            search_workers: 1,
-            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            auto_publish_initial_idle_ms: 500,
-            auto_publish_storage_class: "unknown".to_owned(),
-            workspace_mode: false,
-        })
-        .expect_err("manifest mismatch")
-        .to_string()
-        .contains("candidate shard manifest")
-    );
+    assert!(ensure_candidate_stores(&ServerConfig {
+        candidate_config: CandidateConfig {
+            root: manifest_root,
+            ..CandidateConfig::default()
+        },
+        candidate_shards: 1,
+        search_workers: 1,
+        memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+        auto_publish_initial_idle_ms: 500,
+        auto_publish_storage_class: "unknown".to_owned(),
+        workspace_mode: false,
+    })
+    .expect_err("manifest mismatch")
+    .to_string()
+    .contains("candidate shard manifest"));
 }
 
 #[test]
@@ -2497,11 +2678,11 @@ fn single_shard_query_with_external_ids_and_sha_normalization_work() {
         Some(vec![Some("single-shard-id".to_owned())])
     );
     assert_eq!(
-        normalize_sha256_hex(&"AA".repeat(32)).expect("normalize"),
+        normalize_identity_hex(&"AA".repeat(32), "sha256").expect("normalize"),
         "aa".repeat(32)
     );
     assert_eq!(
-        hex::encode(decode_sha256(&"AA".repeat(32)).expect("decode")),
+        hex::encode(decode_identity(&"AA".repeat(32), "sha256").expect("decode")),
         "aa".repeat(32)
     );
 }
@@ -2994,11 +3175,9 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
     .expect("emit first bundled partial");
 
     assert_eq!(frames.len(), 3);
-    assert!(
-        frames
-            .iter()
-            .all(|frame| !frame.stream_complete && !frame.rule_complete)
-    );
+    assert!(frames
+        .iter()
+        .all(|frame| !frame.stream_complete && !frame.rule_complete));
     assert_eq!(frames[0].target_rule_name, "rule_one");
     assert_eq!(frames[0].identities, vec!["hash-a".to_owned()]);
     assert_eq!(frames[1].target_rule_name, "rule_two");

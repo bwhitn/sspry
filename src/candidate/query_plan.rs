@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::candidate::{
     GramSizes, PE_ENTRY_POINT_PREFIX_BYTES, metadata_field_is_boolean, metadata_field_is_float,
@@ -481,31 +480,14 @@ fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]>
     Ok(out)
 }
 
-/// Re-encodes a digest into the store's normalized 32-byte identity namespace.
-fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"sspry-identity\0");
-    digest.update(kind.as_bytes());
-    digest.update(b"\0");
-    digest.update(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest.finalize());
-    out
-}
-
 /// Normalizes a user-supplied hash literal into the searchable identity form
 /// used by the candidate store.
 fn normalize_identity_literal(hash_kind: &str, value: &str) -> Result<String> {
     match hash_kind {
-        "md5" => Ok(hex::encode(normalize_identity_digest(
-            "md5",
-            &decode_exact_hex::<16>(value, "md5")?,
-        ))),
-        "sha1" => Ok(hex::encode(normalize_identity_digest(
-            "sha1",
-            &decode_exact_hex::<20>(value, "sha1")?,
-        ))),
+        "md5" => Ok(hex::encode(decode_exact_hex::<16>(value, "md5")?)),
+        "sha1" => Ok(hex::encode(decode_exact_hex::<20>(value, "sha1")?)),
         "sha256" => Ok(hex::encode(decode_exact_hex::<32>(value, "sha256")?)),
+        "sha512" => Ok(hex::encode(decode_exact_hex::<64>(value, "sha512")?)),
         other => Err(SspryError::from(format!(
             "Unsupported searchable hash function: {other}"
         ))),

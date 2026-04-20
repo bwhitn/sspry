@@ -187,7 +187,7 @@ rule hashed {
 }
 
 #[test]
-fn compile_rule_with_md5_identity_normalizes_to_store_identity() {
+fn compile_rule_with_md5_identity_uses_raw_store_identity() {
     let rule = r#"
 rule hashed {
   condition:
@@ -196,12 +196,9 @@ rule hashed {
 "#;
     let plan = compile_query_plan_default_with_identity(rule, Some("md5"), 8, false, true, 100_000)
         .expect("plan");
-    let expected = hex::encode(crate::app::normalize_identity_digest(
-        "md5",
-        &hex::decode("00112233445566778899aabbccddeeff").expect("md5 bytes"),
-    ));
+    let expected = "00112233445566778899aabbccddeeff";
     assert_eq!(plan.root.kind, "identity_eq");
-    assert_eq!(plan.root.pattern_id.as_deref(), Some(expected.as_str()));
+    assert_eq!(plan.root.pattern_id.as_deref(), Some(expected));
 }
 
 #[test]

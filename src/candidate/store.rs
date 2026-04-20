@@ -1,9 +1,10 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,6 +55,7 @@ pub struct CandidateConfig {
     pub tier2_filter_target_fp: Option<f64>,
     pub filter_target_fp: Option<f64>,
     pub compaction_idle_cooldown_s: f64,
+    pub source_dedup_min_new_docs: u64,
 }
 
 impl Default for CandidateConfig {
@@ -70,6 +72,7 @@ impl Default for CandidateConfig {
             tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
             filter_target_fp: None,
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
+            source_dedup_min_new_docs: 1_000,
         }
     }
 }
@@ -170,7 +173,7 @@ struct CandidateStoreRebuildProfile {
 
 #[derive(Clone, Debug)]
 pub struct ImportedCandidateDocument {
-    pub identity: [u8; 32],
+    pub identity: Vec<u8>,
     pub identity_hex: String,
     pub file_size: u64,
     pub filter_bytes: usize,
@@ -261,6 +264,7 @@ pub struct CandidateStats {
     pub tier2_gram_size: usize,
     pub tier1_gram_size: usize,
     pub compaction_idle_cooldown_s: f64,
+    pub source_dedup_min_new_docs: u64,
     pub compaction_cooldown_remaining_s: f64,
     pub compaction_waiting_for_cooldown: bool,
     pub compaction_generation: u64,
@@ -293,6 +297,7 @@ struct ForestMeta {
     tier1_filter_target_fp: Option<f64>,
     tier2_filter_target_fp: Option<f64>,
     compaction_idle_cooldown_s: f64,
+    source_dedup_min_new_docs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -348,6 +353,7 @@ impl Default for ForestMeta {
             tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
             tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
             compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
+            source_dedup_min_new_docs: 1_000,
         }
     }
 }
@@ -409,6 +415,7 @@ impl From<&LegacyStoreMeta> for ForestMeta {
             tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
             tier2_filter_target_fp: value.tier2_filter_target_fp.or(value.filter_target_fp),
             compaction_idle_cooldown_s: value.compaction_idle_cooldown_s,
+            source_dedup_min_new_docs: 1_000,
         }
     }
 }
@@ -436,6 +443,19 @@ struct CandidateDoc {
     deleted: bool,
 }
 
+/// Validates and normalizes a candidate identity hex string using the expected
+/// raw source-id width.
+fn normalize_identity_hex(value: &str, identity_bytes: usize, label: &str) -> Result<String> {
+    let text = value.trim().to_ascii_lowercase();
+    let expected_hex_len = identity_bytes.saturating_mul(2);
+    if text.len() != expected_hex_len || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(SspryError::from(format!(
+            "{label} must be exactly {expected_hex_len} hexadecimal characters.",
+        )));
+    }
+    Ok(text)
+}
+
 /// Estimates the heap retained by one in-memory candidate document record.
 fn candidate_doc_memory_bytes(doc: &CandidateDoc) -> u64 {
     (std::mem::size_of::<CandidateDoc>() as u64).saturating_add(doc.identity.capacity() as u64)
@@ -450,6 +470,9 @@ fn elapsed_us(started: Instant) -> u64 {
 const DOC_META_ROW_BYTES: usize = 56;
 const TIER2_DOC_META_ROW_BYTES: usize = 24;
 const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+const TREE_SOURCE_REF_MANIFEST_VERSION: u32 = 1;
+const FOREST_SOURCE_DEDUP_MANIFEST_VERSION: u32 = 1;
+const TREE_SOURCE_REF_RUN_MAX_ENTRIES: usize = 16_384;
 const DOC_FLAG_DELETED: u8 = 0x02;
 const DOC_FLAG_SPECIAL_POPULATION: u8 = 0x04;
 
@@ -989,7 +1012,7 @@ pub(crate) struct CandidateCompactionSnapshot {
 
 #[derive(Clone, Debug)]
 struct CompactionDocRef {
-    identity: [u8; 32],
+    identity: Vec<u8>,
     file_size: u64,
     filter_bytes: usize,
     bloom_hashes: usize,
@@ -1003,6 +1026,118 @@ struct CompactionDocRef {
 pub(crate) struct CandidateCompactionResult {
     pub reclaimed_docs: usize,
     pub reclaimed_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TreeSourceRefManifest {
+    version: u32,
+    id_source: String,
+    identity_bytes: usize,
+    candidate_shards: usize,
+    entry_count: u64,
+    total_inserted_docs: u64,
+    last_built_unix_ms: Option<u64>,
+}
+
+impl Default for TreeSourceRefManifest {
+    /// Returns the empty manifest state before the first successful tree-level
+    /// source-id reference build.
+    fn default() -> Self {
+        Self {
+            version: TREE_SOURCE_REF_MANIFEST_VERSION,
+            id_source: String::new(),
+            identity_bytes: 0,
+            candidate_shards: 0,
+            entry_count: 0,
+            total_inserted_docs: 0,
+            last_built_unix_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ForestSourceDedupManifest {
+    pub(crate) version: u32,
+    pub(crate) id_source: String,
+    pub(crate) identity_bytes: usize,
+    pub(crate) tree_count: usize,
+    pub(crate) total_inserted_docs: u64,
+    pub(crate) last_built_unix_ms: Option<u64>,
+    pub(crate) last_duplicate_groups: u64,
+    pub(crate) last_deleted_docs: u64,
+    pub(crate) last_affected_trees: usize,
+}
+
+impl Default for ForestSourceDedupManifest {
+    /// Returns the empty manifest state before the first successful
+    /// forest-wide source-id deduplication pass.
+    fn default() -> Self {
+        Self {
+            version: FOREST_SOURCE_DEDUP_MANIFEST_VERSION,
+            id_source: String::new(),
+            identity_bytes: 0,
+            tree_count: 0,
+            total_inserted_docs: 0,
+            last_built_unix_ms: None,
+            last_duplicate_groups: 0,
+            last_deleted_docs: 0,
+            last_affected_trees: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TreeSourceRefBuildResult {
+    pub entry_count: u64,
+    pub total_inserted_docs: u64,
+    pub candidate_shards: usize,
+    pub identity_bytes: usize,
+    pub id_source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TreeSourceRefEntry {
+    pub identity: Vec<u8>,
+    pub shard_idx: u32,
+    pub doc_id: u64,
+}
+
+impl Ord for TreeSourceRefEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity
+            .cmp(&other.identity)
+            .then_with(|| self.shard_idx.cmp(&other.shard_idx))
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+impl PartialOrd for TreeSourceRefEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ForestSourceDedupResult {
+    pub duplicate_groups: u64,
+    pub deleted_docs: u64,
+    pub affected_trees: usize,
+    pub total_inserted_docs: u64,
+    pub tree_count: usize,
+    pub identity_bytes: usize,
+    pub id_source: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ForestSourceDedupSummaryState {
+    pub min_new_docs: u64,
+    pub last_completed_unix_ms: Option<u64>,
+    pub last_duplicate_groups: u64,
+    pub last_deleted_docs: u64,
+    pub last_affected_trees: usize,
+    pub last_total_inserted_docs: u64,
 }
 
 #[derive(Debug)]
@@ -1279,6 +1414,618 @@ fn load_store_local_meta(root: &Path) -> Result<StoreLocalMeta> {
     Ok(StoreLocalMeta::from(&legacy))
 }
 
+/// Returns the current insert watermark for one tree by summing the next-doc-id
+/// counters across all of its shards.
+fn tree_total_inserted_docs(root: &Path, shard_count: usize) -> Result<u64> {
+    let mut total = 0u64;
+    for shard_idx in 0..shard_count.max(1) {
+        let shard_root = candidate_shard_root(root, shard_count, shard_idx);
+        let local_meta = load_store_local_meta(&shard_root)?;
+        total = total.saturating_add(local_meta.next_doc_id.saturating_sub(1));
+    }
+    Ok(total)
+}
+
+/// Returns the current wall-clock timestamp as a saturated Unix-millisecond
+/// counter for manifest bookkeeping.
+fn current_unix_ms_saturated() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Debug)]
+struct TreeSourceRefPlan {
+    manifest: Option<TreeSourceRefManifest>,
+    id_source: String,
+    identity_bytes: usize,
+    candidate_shards: usize,
+    total_inserted_docs: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ForestSourceDedupPlan {
+    manifest: Option<ForestSourceDedupManifest>,
+    id_source: String,
+    identity_bytes: usize,
+    tree_count: usize,
+    total_inserted_docs: u64,
+}
+
+/// Loads the current tree-level source-id reference inputs and any previously
+/// persisted manifest so maintenance can decide whether a rebuild is due.
+fn tree_source_ref_plan(root: &Path) -> Result<TreeSourceRefPlan> {
+    let meta = load_forest_meta(root)?;
+    let candidate_shards = read_candidate_shard_count(root)?.unwrap_or(1).max(1);
+    let identity_bytes = identity_bytes_for_source(&meta.id_source)?;
+    Ok(TreeSourceRefPlan {
+        manifest: read_tree_source_ref_manifest(root)?,
+        id_source: meta.id_source,
+        identity_bytes,
+        candidate_shards,
+        total_inserted_docs: tree_total_inserted_docs(root, candidate_shards)?,
+    })
+}
+
+/// Reports whether a tree-level source-id reference file is present and in sync
+/// with the current published tree contents.
+pub(crate) fn tree_source_ref_is_current(root: &Path) -> Result<bool> {
+    let plan = tree_source_ref_plan(root)?;
+    if plan.total_inserted_docs == 0 {
+        return Ok(true);
+    }
+
+    let Some(manifest) = plan.manifest.as_ref() else {
+        return Ok(false);
+    };
+    Ok(tree_source_ref_path(root).is_file()
+        && manifest.version == TREE_SOURCE_REF_MANIFEST_VERSION
+        && manifest.id_source == plan.id_source
+        && manifest.identity_bytes == plan.identity_bytes
+        && manifest.candidate_shards == plan.candidate_shards
+        && manifest.total_inserted_docs == plan.total_inserted_docs)
+}
+
+/// Loads the current forest-wide source-id dedup inputs and any previously
+/// persisted manifest so maintenance can decide whether another pass is due.
+fn forest_source_dedup_plan(root: &Path, tree_roots: &[PathBuf]) -> Result<ForestSourceDedupPlan> {
+    let meta = load_forest_meta(root)?;
+    let identity_bytes = identity_bytes_for_source(&meta.id_source)?;
+    let mut total_inserted_docs = 0u64;
+    for tree_root in tree_roots {
+        let candidate_shards = read_candidate_shard_count(tree_root)?.unwrap_or(1).max(1);
+        total_inserted_docs = total_inserted_docs
+            .saturating_add(tree_total_inserted_docs(tree_root, candidate_shards)?);
+    }
+    Ok(ForestSourceDedupPlan {
+        manifest: read_forest_source_dedup_manifest(root)?,
+        id_source: meta.id_source,
+        identity_bytes,
+        tree_count: tree_roots.len(),
+        total_inserted_docs,
+    })
+}
+
+/// Loads the persisted forest-wide source-id deduplication policy and most
+/// recent maintenance checkpoint for diagnostics.
+pub(crate) fn forest_source_dedup_summary_state(
+    root: &Path,
+) -> Result<ForestSourceDedupSummaryState> {
+    let meta = load_forest_meta(root)?;
+    let manifest = read_forest_source_dedup_manifest(root)?;
+    Ok(ForestSourceDedupSummaryState {
+        min_new_docs: meta.source_dedup_min_new_docs.max(1),
+        last_completed_unix_ms: manifest.as_ref().and_then(|value| value.last_built_unix_ms),
+        last_duplicate_groups: manifest
+            .as_ref()
+            .map(|value| value.last_duplicate_groups)
+            .unwrap_or(0),
+        last_deleted_docs: manifest
+            .as_ref()
+            .map(|value| value.last_deleted_docs)
+            .unwrap_or(0),
+        last_affected_trees: manifest
+            .as_ref()
+            .map(|value| value.last_affected_trees)
+            .unwrap_or(0),
+        last_total_inserted_docs: manifest
+            .as_ref()
+            .map(|value| value.total_inserted_docs)
+            .unwrap_or(0),
+    })
+}
+
+/// Returns whether the forest-wide source-id deduplication pass should run for
+/// the current published forest. All non-empty trees must already have current
+/// tree-level reference files before the merge can start.
+pub(crate) fn forest_source_dedup_due(
+    root: &Path,
+    tree_roots: &[PathBuf],
+    min_new_docs: u64,
+) -> Result<bool> {
+    if tree_roots.len() < 2 {
+        return Ok(false);
+    }
+
+    for tree_root in tree_roots {
+        if !tree_source_ref_is_current(tree_root)? {
+            return Ok(false);
+        }
+    }
+
+    let plan = forest_source_dedup_plan(root, tree_roots)?;
+    if plan.total_inserted_docs == 0 {
+        return Ok(false);
+    }
+
+    let manifest_matches = plan.manifest.as_ref().is_some_and(|manifest| {
+        manifest.version == FOREST_SOURCE_DEDUP_MANIFEST_VERSION
+            && manifest.id_source == plan.id_source
+            && manifest.identity_bytes == plan.identity_bytes
+            && manifest.tree_count == plan.tree_count
+    });
+    if !manifest_matches {
+        return Ok(plan.total_inserted_docs >= min_new_docs);
+    }
+
+    let manifest = plan.manifest.as_ref().expect("checked manifest above");
+    let new_docs = plan
+        .total_inserted_docs
+        .saturating_sub(manifest.total_inserted_docs);
+    Ok(new_docs > 0 && new_docs >= min_new_docs)
+}
+
+/// Returns whether a tree-level source-id reference rebuild should run for the
+/// current published tree root.
+pub(crate) fn tree_source_ref_build_due(root: &Path, min_new_docs: u64) -> Result<bool> {
+    let plan = tree_source_ref_plan(root)?;
+    if plan.total_inserted_docs == 0 {
+        return Ok(false);
+    }
+
+    let file_exists = tree_source_ref_path(root).is_file();
+    let manifest_matches = plan.manifest.as_ref().is_some_and(|manifest| {
+        manifest.version == TREE_SOURCE_REF_MANIFEST_VERSION
+            && manifest.id_source == plan.id_source
+            && manifest.identity_bytes == plan.identity_bytes
+            && manifest.candidate_shards == plan.candidate_shards
+    });
+    if !file_exists || !manifest_matches {
+        return Ok(plan.total_inserted_docs >= min_new_docs);
+    }
+
+    let built_total = plan
+        .manifest
+        .as_ref()
+        .map(|manifest| manifest.total_inserted_docs)
+        .unwrap_or(0);
+    let new_docs = plan.total_inserted_docs.saturating_sub(built_total);
+    Ok(new_docs > 0 && new_docs >= min_new_docs)
+}
+
+/// Reads the next tree-level source-id reference entry from one sorted run.
+pub(crate) fn read_next_tree_source_ref_entry(
+    reader: &mut BufReader<fs::File>,
+    identity_bytes: usize,
+) -> Result<Option<TreeSourceRefEntry>> {
+    let mut first = [0u8; 1];
+    match reader.read(&mut first) {
+        Ok(0) => return Ok(None),
+        Ok(1) => {}
+        Ok(_) => unreachable!("single-byte read returned more than one byte"),
+        Err(err) => return Err(err.into()),
+    }
+
+    let mut identity = vec![0u8; identity_bytes];
+    identity[0] = first[0];
+    if identity_bytes > 1 {
+        reader.read_exact(&mut identity[1..])?;
+    }
+
+    let mut shard_idx = [0u8; 4];
+    reader.read_exact(&mut shard_idx)?;
+    let mut doc_id = [0u8; 8];
+    reader.read_exact(&mut doc_id)?;
+    Ok(Some(TreeSourceRefEntry {
+        identity,
+        shard_idx: u32::from_le_bytes(shard_idx),
+        doc_id: u64::from_le_bytes(doc_id),
+    }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForestSourceRefHeapEntry {
+    tree_idx: usize,
+    entry: TreeSourceRefEntry,
+}
+
+impl Ord for ForestSourceRefHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.entry
+            .identity
+            .cmp(&other.entry.identity)
+            .then_with(|| self.tree_idx.cmp(&other.tree_idx))
+            .then_with(|| self.entry.shard_idx.cmp(&other.entry.shard_idx))
+            .then_with(|| self.entry.doc_id.cmp(&other.entry.doc_id))
+    }
+}
+
+impl PartialOrd for ForestSourceRefHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn flush_forest_source_ref_duplicate_group<F>(
+    group: &mut Vec<(usize, TreeSourceRefEntry)>,
+    duplicate_groups: &mut u64,
+    deleted_docs: &mut u64,
+    on_victim: &mut F,
+) -> Result<()>
+where
+    F: FnMut(usize, &TreeSourceRefEntry) -> Result<()>,
+{
+    if group.len() <= 1 {
+        group.clear();
+        return Ok(());
+    }
+
+    group.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.shard_idx.cmp(&right.1.shard_idx))
+            .then_with(|| left.1.doc_id.cmp(&right.1.doc_id))
+    });
+
+    *duplicate_groups = duplicate_groups.saturating_add(1);
+    for (tree_idx, entry) in group.iter().skip(1).rev() {
+        on_victim(*tree_idx, entry)?;
+        *deleted_docs = deleted_docs.saturating_add(1);
+    }
+    group.clear();
+    Ok(())
+}
+
+/// Streams duplicate victims from the current forest-wide tree source-ref files
+/// in source-id order without materializing the full forest in memory. The
+/// oldest tree, identified by the lowest sorted tree index, is kept.
+pub(crate) fn for_each_forest_source_ref_duplicate_victim<F>(
+    tree_roots: &[PathBuf],
+    mut on_victim: F,
+) -> Result<(u64, u64)>
+where
+    F: FnMut(usize, &TreeSourceRefEntry) -> Result<()>,
+{
+    if tree_roots.len() < 2 {
+        return Ok((0, 0));
+    }
+
+    let mut readers = Vec::<Option<BufReader<fs::File>>>::with_capacity(tree_roots.len());
+    let mut identity_bytes = None::<usize>;
+    let mut heap = BinaryHeap::<Reverse<ForestSourceRefHeapEntry>>::new();
+    for (tree_idx, tree_root) in tree_roots.iter().enumerate() {
+        let manifest = read_tree_source_ref_manifest(tree_root)?.ok_or_else(|| {
+            SspryError::from(format!(
+                "tree source ref manifest missing at {}",
+                tree_root.display()
+            ))
+        })?;
+        let current_identity_bytes = manifest.identity_bytes;
+        match identity_bytes {
+            Some(expected) if expected != current_identity_bytes => {
+                return Err(SspryError::from(format!(
+                    "forest source ref identity width mismatch at {}",
+                    tree_root.display()
+                )));
+            }
+            None => identity_bytes = Some(current_identity_bytes),
+            _ => {}
+        }
+        let path = tree_source_ref_path(tree_root);
+        let mut reader = BufReader::new(fs::File::open(&path)?);
+        if let Some(entry) = read_next_tree_source_ref_entry(&mut reader, current_identity_bytes)? {
+            heap.push(Reverse(ForestSourceRefHeapEntry { tree_idx, entry }));
+        }
+        readers.push(Some(reader));
+    }
+
+    let Some(identity_bytes) = identity_bytes else {
+        return Ok((0, 0));
+    };
+
+    let mut duplicate_groups = 0u64;
+    let mut deleted_docs = 0u64;
+    let mut current_group = Vec::<(usize, TreeSourceRefEntry)>::new();
+    let mut current_identity = None::<Vec<u8>>;
+    while let Some(Reverse(item)) = heap.pop() {
+        if current_identity
+            .as_ref()
+            .is_some_and(|identity| identity != &item.entry.identity)
+        {
+            flush_forest_source_ref_duplicate_group(
+                &mut current_group,
+                &mut duplicate_groups,
+                &mut deleted_docs,
+                &mut on_victim,
+            )?;
+            current_identity = None;
+        }
+        if current_identity.is_none() {
+            current_identity = Some(item.entry.identity.clone());
+        }
+        current_group.push((item.tree_idx, item.entry));
+
+        if let Some(reader) = readers[item.tree_idx].as_mut() {
+            if let Some(next_entry) = read_next_tree_source_ref_entry(reader, identity_bytes)? {
+                heap.push(Reverse(ForestSourceRefHeapEntry {
+                    tree_idx: item.tree_idx,
+                    entry: next_entry,
+                }));
+            }
+        }
+    }
+    flush_forest_source_ref_duplicate_group(
+        &mut current_group,
+        &mut duplicate_groups,
+        &mut deleted_docs,
+        &mut on_victim,
+    )?;
+    Ok((duplicate_groups, deleted_docs))
+}
+
+/// Writes one sorted run of tree-level source-id reference entries.
+fn write_tree_source_ref_run(
+    entries: &mut Vec<TreeSourceRefEntry>,
+    run_path: &Path,
+    identity_bytes: usize,
+) -> Result<()> {
+    entries.sort_unstable();
+    let mut writer = BufWriter::new(fs::File::create(run_path)?);
+    for entry in entries.iter() {
+        if entry.identity.len() != identity_bytes {
+            return Err(SspryError::from(format!(
+                "tree source ref entry identity width mismatch at {}",
+                run_path.display()
+            )));
+        }
+        writer.write_all(&entry.identity)?;
+        writer.write_all(&entry.shard_idx.to_le_bytes())?;
+        writer.write_all(&entry.doc_id.to_le_bytes())?;
+    }
+    writer.flush()?;
+    entries.clear();
+    Ok(())
+}
+
+/// Flushes the current in-memory source-id reference chunk into one sorted run
+/// on disk.
+fn flush_tree_source_ref_run(
+    entries: &mut Vec<TreeSourceRefEntry>,
+    run_dir: &Path,
+    run_paths: &mut Vec<PathBuf>,
+    next_run_idx: &mut usize,
+    identity_bytes: usize,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let run_path = run_dir.join(format!("run_{:06}.bin", *next_run_idx));
+    *next_run_idx = next_run_idx.saturating_add(1);
+    write_tree_source_ref_run(entries, &run_path, identity_bytes)?;
+    run_paths.push(run_path);
+    Ok(())
+}
+
+/// Streams one shard's live documents into the current sorted-run builder while
+/// validating the on-disk sidecar layout.
+fn append_tree_source_ref_entries_from_shard(
+    shard_root: &Path,
+    shard_idx: u32,
+    identity_bytes: usize,
+    chunk_entries: &mut Vec<TreeSourceRefEntry>,
+    run_dir: &Path,
+    run_paths: &mut Vec<PathBuf>,
+    next_run_idx: &mut usize,
+    entry_count: &mut u64,
+) -> Result<()> {
+    if !sha_by_docid_path(shard_root).exists() || !doc_meta_path(shard_root).exists() {
+        return Ok(());
+    }
+
+    let mut identity_file = fs::File::open(sha_by_docid_path(shard_root))?;
+    let mut row_file = fs::File::open(doc_meta_path(shard_root))?;
+    let identity_len = identity_file.metadata()?.len() as usize;
+    let row_len = row_file.metadata()?.len() as usize;
+    if identity_len % identity_bytes != 0 || row_len % DOC_META_ROW_BYTES != 0 {
+        return Err(SspryError::from(format!(
+            "Invalid candidate binary document state at {}",
+            shard_root.display()
+        )));
+    }
+    let doc_count = identity_len / identity_bytes;
+    if doc_count != row_len / DOC_META_ROW_BYTES {
+        return Err(SspryError::from(format!(
+            "Mismatched candidate binary document state at {}",
+            shard_root.display()
+        )));
+    }
+
+    let mut row_bytes = [0u8; DOC_META_ROW_BYTES];
+    for index in 0..doc_count {
+        let mut identity = vec![0u8; identity_bytes];
+        identity_file.read_exact(&mut identity)?;
+        row_file.read_exact(&mut row_bytes)?;
+        let row = DocMetaRow::decode(&row_bytes)?;
+        if (row.flags & DOC_FLAG_DELETED) != 0 {
+            continue;
+        }
+        chunk_entries.push(TreeSourceRefEntry {
+            identity,
+            shard_idx,
+            doc_id: (index + 1) as u64,
+        });
+        *entry_count = entry_count.saturating_add(1);
+        if chunk_entries.len() >= TREE_SOURCE_REF_RUN_MAX_ENTRIES {
+            flush_tree_source_ref_run(
+                chunk_entries,
+                run_dir,
+                run_paths,
+                next_run_idx,
+                identity_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Merges all sorted source-id reference runs into the final tree-level
+/// reference file.
+fn merge_tree_source_ref_runs(
+    run_paths: &[PathBuf],
+    identity_bytes: usize,
+    output_path: &Path,
+) -> Result<()> {
+    let mut writer = BufWriter::new(fs::File::create(output_path)?);
+    if run_paths.is_empty() {
+        writer.flush()?;
+        return Ok(());
+    }
+
+    let mut readers = Vec::with_capacity(run_paths.len());
+    let mut heap = BinaryHeap::<Reverse<(TreeSourceRefEntry, usize)>>::new();
+    for (run_idx, path) in run_paths.iter().enumerate() {
+        let mut reader = BufReader::new(fs::File::open(path)?);
+        if let Some(entry) = read_next_tree_source_ref_entry(&mut reader, identity_bytes)? {
+            heap.push(Reverse((entry, run_idx)));
+        }
+        readers.push(reader);
+    }
+
+    while let Some(Reverse((entry, run_idx))) = heap.pop() {
+        writer.write_all(&entry.identity)?;
+        writer.write_all(&entry.shard_idx.to_le_bytes())?;
+        writer.write_all(&entry.doc_id.to_le_bytes())?;
+        if let Some(next_entry) =
+            read_next_tree_source_ref_entry(&mut readers[run_idx], identity_bytes)?
+        {
+            heap.push(Reverse((next_entry, run_idx)));
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Builds the sorted tree-level source-id reference file used by future
+/// forest-wide deduplication passes.
+pub(crate) fn build_tree_source_ref(root: &Path) -> Result<TreeSourceRefBuildResult> {
+    let plan = tree_source_ref_plan(root)?;
+    let temp_root = root.join(".source_id_refs.tmp");
+    let result = (|| {
+        if temp_root.exists() {
+            fs::remove_dir_all(&temp_root)?;
+        }
+        let run_dir = temp_root.join("runs");
+        fs::create_dir_all(&run_dir)?;
+
+        let mut chunk_entries = Vec::<TreeSourceRefEntry>::with_capacity(TREE_SOURCE_REF_RUN_MAX_ENTRIES);
+        let mut run_paths = Vec::<PathBuf>::new();
+        let mut next_run_idx = 0usize;
+        let mut entry_count = 0u64;
+        for shard_idx in 0..plan.candidate_shards {
+            append_tree_source_ref_entries_from_shard(
+                &candidate_shard_root(root, plan.candidate_shards, shard_idx),
+                shard_idx as u32,
+                plan.identity_bytes,
+                &mut chunk_entries,
+                &run_dir,
+                &mut run_paths,
+                &mut next_run_idx,
+                &mut entry_count,
+            )?;
+        }
+        flush_tree_source_ref_run(
+            &mut chunk_entries,
+            &run_dir,
+            &mut run_paths,
+            &mut next_run_idx,
+            plan.identity_bytes,
+        )?;
+
+        let temp_output_path = temp_root.join("source_id_refs.sorted.bin");
+        merge_tree_source_ref_runs(&run_paths, plan.identity_bytes, &temp_output_path)?;
+        fs::rename(&temp_output_path, tree_source_ref_path(root))?;
+
+        let manifest = TreeSourceRefManifest {
+            version: TREE_SOURCE_REF_MANIFEST_VERSION,
+            id_source: plan.id_source.clone(),
+            identity_bytes: plan.identity_bytes,
+            candidate_shards: plan.candidate_shards,
+            entry_count,
+            total_inserted_docs: plan.total_inserted_docs,
+            last_built_unix_ms: Some(current_unix_ms_saturated()),
+        };
+        write_tree_source_ref_manifest(root, &manifest)?;
+
+        Ok(TreeSourceRefBuildResult {
+            entry_count,
+            total_inserted_docs: plan.total_inserted_docs,
+            candidate_shards: plan.candidate_shards,
+            identity_bytes: plan.identity_bytes,
+            id_source: plan.id_source,
+        })
+    })();
+    let _ = fs::remove_dir_all(&temp_root);
+    result
+}
+
+/// Persists the completion checkpoint for one forest-wide source-id
+/// deduplication pass and returns the summarized result.
+pub(crate) fn record_forest_source_dedup_pass(
+    root: &Path,
+    tree_roots: &[PathBuf],
+    duplicate_groups: u64,
+    deleted_docs: u64,
+    affected_trees: usize,
+) -> Result<ForestSourceDedupResult> {
+    let plan = forest_source_dedup_plan(root, tree_roots)?;
+    let manifest = ForestSourceDedupManifest {
+        version: FOREST_SOURCE_DEDUP_MANIFEST_VERSION,
+        id_source: plan.id_source.clone(),
+        identity_bytes: plan.identity_bytes,
+        tree_count: plan.tree_count,
+        total_inserted_docs: plan.total_inserted_docs,
+        last_built_unix_ms: Some(current_unix_ms_saturated()),
+        last_duplicate_groups: duplicate_groups,
+        last_deleted_docs: deleted_docs,
+        last_affected_trees: affected_trees,
+    };
+    write_forest_source_dedup_manifest(root, &manifest)?;
+    Ok(ForestSourceDedupResult {
+        duplicate_groups,
+        deleted_docs,
+        affected_trees,
+        total_inserted_docs: plan.total_inserted_docs,
+        tree_count: plan.tree_count,
+        identity_bytes: plan.identity_bytes,
+        id_source: plan.id_source,
+    })
+}
+
+#[cfg(test)]
+/// Reads the tree-level source-id reference file back into decoded entries for
+/// integration tests.
+pub(crate) fn read_tree_source_ref_entries(root: &Path) -> Result<Vec<TreeSourceRefEntry>> {
+    let manifest = read_tree_source_ref_manifest(root)?
+        .ok_or_else(|| SspryError::from("tree source ref manifest missing"))?;
+    let mut reader = BufReader::new(fs::File::open(tree_source_ref_path(root))?);
+    let mut entries = Vec::with_capacity(manifest.entry_count as usize);
+    while let Some(entry) = read_next_tree_source_ref_entry(&mut reader, manifest.identity_bytes)? {
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 impl CandidateStore {
     /// Creates an empty candidate store on disk and writes the initial metadata
     /// and append-only sidecar files.
@@ -1351,6 +2098,7 @@ impl CandidateStore {
                 tier1_filter_target_fp: config.resolved_tier1_filter_target_fp(),
                 tier2_filter_target_fp: config.resolved_tier2_filter_target_fp(),
                 compaction_idle_cooldown_s: config.compaction_idle_cooldown_s.max(0.0),
+                source_dedup_min_new_docs: config.source_dedup_min_new_docs.max(1),
             },
             local_meta: StoreLocalMeta::default(),
             docs: Vec::new(),
@@ -1404,7 +2152,7 @@ impl CandidateStore {
             .try_into()
             .unwrap_or(u64::MAX);
         let load_state_started = Instant::now();
-        let (docs, doc_rows, tier2_doc_rows) = load_candidate_store_state(&root)?;
+        let (docs, doc_rows, tier2_doc_rows) = load_candidate_store_state(&root, &meta.id_source)?;
         let load_state_ms = load_state_started
             .elapsed()
             .as_millis()
@@ -1489,6 +2237,7 @@ impl CandidateStore {
             tier2_filter_target_fp,
             filter_target_fp: None,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
+            source_dedup_min_new_docs: self.meta.source_dedup_min_new_docs,
         }
     }
 
@@ -1590,10 +2339,8 @@ impl CandidateStore {
             if doc.deleted {
                 continue;
             }
-            let mut sha256 = [0u8; 32];
-            hex::decode_to_slice(&doc.identity, &mut sha256)?;
             live_docs.push(CompactionDocRef {
-                identity: sha256,
+                identity: hex::decode(&doc.identity)?,
                 file_size: doc.file_size,
                 filter_bytes: doc.filter_bytes,
                 bloom_hashes: doc.bloom_hashes,
@@ -1798,9 +2545,9 @@ impl CandidateStore {
 
     /// Inserts or restores one document when the caller already prepared the
     /// tier-1 and tier-2 bloom payloads.
-    pub fn insert_document(
+    pub fn insert_document<I>(
         &mut self,
-        identity: [u8; 32],
+        identity: I,
         file_size: u64,
         bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
@@ -1811,7 +2558,10 @@ impl CandidateStore {
         tier2_filter_bytes: usize,
         tier2_bloom_filter: &[u8],
         external_id: Option<String>,
-    ) -> Result<CandidateInsertResult> {
+    ) -> Result<CandidateInsertResult>
+    where
+        I: Into<Vec<u8>>,
+    {
         self.insert_document_with_metadata(
             identity,
             file_size,
@@ -1831,9 +2581,9 @@ impl CandidateStore {
 
     /// Inserts or restores one document, validating bloom sizing rules and
     /// persisting optional metadata and external identifiers alongside it.
-    pub fn insert_document_with_metadata(
+    pub fn insert_document_with_metadata<I>(
         &mut self,
-        identity: [u8; 32],
+        identity: I,
         file_size: u64,
         bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
@@ -1846,9 +2596,13 @@ impl CandidateStore {
         metadata: &[u8],
         special_population: bool,
         external_id: Option<String>,
-    ) -> Result<CandidateInsertResult> {
+    ) -> Result<CandidateInsertResult>
+    where
+        I: Into<Vec<u8>>,
+    {
         let mut total_scope = scope("candidate.insert_document");
         total_scope.add_bytes(file_size);
+        let identity = identity.into();
         if filter_bytes == 0 {
             return Err(SspryError::from("filter_bytes must be > 0"));
         }
@@ -1888,7 +2642,7 @@ impl CandidateStore {
                 )));
             }
         }
-        let identity_hex = hex::encode(identity);
+        let identity_hex = hex::encode(&identity);
 
         // Bloom-only ingest only needs the per-document bloom payloads here.
         let status;
@@ -2008,7 +2762,7 @@ impl CandidateStore {
     pub fn insert_documents_batch(
         &mut self,
         documents: &[(
-            [u8; 32],
+            Vec<u8>,
             u64,
             Option<usize>,
             Option<usize>,
@@ -2024,7 +2778,7 @@ impl CandidateStore {
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
         struct PendingNewInsert<'a> {
-            identity: [u8; 32],
+            identity: &'a [u8],
             identity_hex: String,
             doc: CandidateDoc,
             metadata: &'a [u8],
@@ -2045,7 +2799,7 @@ impl CandidateStore {
 
         for document in documents {
             let (
-                sha256,
+                identity,
                 file_size,
                 bloom_item_estimate,
                 bloom_hashes,
@@ -2105,7 +2859,7 @@ impl CandidateStore {
             }
 
             let resolve_doc_state_started = Instant::now();
-            let identity_hex = hex::encode(sha256);
+            let identity_hex = hex::encode(identity);
             let _ = bloom_item_estimate;
 
             if let Some(existing_pos) = self.identity_to_pos.get(&identity_hex).copied() {
@@ -2216,7 +2970,7 @@ impl CandidateStore {
                 identity: identity_hex,
             });
             pending_new_inserts.push(PendingNewInsert {
-                identity: *sha256,
+                identity: identity.as_slice(),
                 identity_hex: doc.identity.clone(),
                 doc,
                 metadata,
@@ -2240,7 +2994,8 @@ impl CandidateStore {
                 .sum::<usize>();
             let mut blooms_payload = Vec::<u8>::with_capacity(bloom_total_bytes);
             let mut tier2_blooms_payload = Vec::<u8>::with_capacity(tier2_bloom_total_bytes);
-            let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_new_inserts.len() * 32);
+            let mut sha_by_docid_payload =
+                Vec::<u8>::with_capacity(pending_new_inserts.len() * self.identity_bytes_len());
             let mut doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_new_inserts.len() * DOC_META_ROW_BYTES);
             let mut tier2_doc_meta_payload =
@@ -2326,7 +3081,7 @@ impl CandidateStore {
                 insert_profile.append_external_id_payload_bytes = insert_profile
                     .append_external_id_payload_bytes
                     .saturating_add(row_profile.external_id_bytes);
-                sha_by_docid_payload.extend_from_slice(&pending.identity);
+                sha_by_docid_payload.extend_from_slice(pending.identity);
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared_rows.push((pending, row, tier2_row));
@@ -2405,38 +3160,94 @@ impl CandidateStore {
     /// fixed-width metadata row.
     pub fn delete_document(&mut self, identity_hex: &str) -> Result<CandidateDeleteResult> {
         let _scope = scope("candidate.delete_document");
-        let normalized = normalize_sha256_hex(identity_hex)?;
+        let normalized =
+            normalize_identity_hex(identity_hex, self.identity_bytes_len(), &self.meta.id_source)?;
         if let Some(pos) = self.identity_to_pos.get(&normalized).copied() {
-            if self.docs[pos].deleted {
-                return Ok(CandidateDeleteResult {
-                    status: "missing".to_owned(),
-                    identity: normalized,
-                    doc_id: None,
-                });
-            }
-            let snapshot = {
-                let doc = &mut self.docs[pos];
-                doc.deleted = true;
-                doc.clone()
-            };
-            let result = CandidateDeleteResult {
-                status: "deleted".to_owned(),
-                identity: snapshot.identity.clone(),
-                doc_id: Some(snapshot.doc_id),
-            };
-            let mut row = self.doc_rows[pos];
-            row.flags |= DOC_FLAG_DELETED;
-            self.doc_rows[pos] = row;
-            self.write_doc_row(snapshot.doc_id, row)?;
-            self.mark_write_activity();
-            record_counter("candidate.delete_document_deleted_total", 1);
-            return Ok(result);
+            return self.delete_document_at_position(pos, normalized);
         }
         Ok(CandidateDeleteResult {
             status: "missing".to_owned(),
             identity: normalized,
             doc_id: None,
         })
+    }
+
+    /// Marks one specific document pointer as deleted, validating that the
+    /// pointed row still matches the expected identity before mutating it.
+    pub(crate) fn delete_document_by_pointer(
+        &mut self,
+        doc_id: u64,
+        expected_identity_hex: &str,
+    ) -> Result<CandidateDeleteResult> {
+        let _scope = scope("candidate.delete_document_by_pointer");
+        let normalized = normalize_identity_hex(
+            expected_identity_hex,
+            self.identity_bytes_len(),
+            &self.meta.id_source,
+        )?;
+        let Some(pos) = self.document_position_for_doc_id(doc_id) else {
+            return Ok(CandidateDeleteResult {
+                status: "missing".to_owned(),
+                identity: normalized,
+                doc_id: None,
+            });
+        };
+        if self.docs[pos].identity != normalized {
+            return Ok(CandidateDeleteResult {
+                status: "missing".to_owned(),
+                identity: normalized,
+                doc_id: None,
+            });
+        }
+        self.delete_document_at_position(pos, normalized)
+    }
+
+    /// Resolves one document id back to its in-memory slot. The fast path uses
+    /// the append-order invariant, with a linear fallback for any future layout
+    /// that breaks that assumption.
+    fn document_position_for_doc_id(&self, doc_id: u64) -> Option<usize> {
+        let fast_pos = doc_id
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok());
+        if let Some(pos) = fast_pos {
+            if self.docs.get(pos).is_some_and(|doc| doc.doc_id == doc_id) {
+                return Some(pos);
+            }
+        }
+        self.docs.iter().position(|doc| doc.doc_id == doc_id)
+    }
+
+    /// Applies the persistent deleted flag to one already-resolved document
+    /// slot.
+    fn delete_document_at_position(
+        &mut self,
+        pos: usize,
+        normalized_identity: String,
+    ) -> Result<CandidateDeleteResult> {
+        if self.docs[pos].deleted {
+            return Ok(CandidateDeleteResult {
+                status: "missing".to_owned(),
+                identity: normalized_identity,
+                doc_id: None,
+            });
+        }
+        let snapshot = {
+            let doc = &mut self.docs[pos];
+            doc.deleted = true;
+            doc.clone()
+        };
+        let result = CandidateDeleteResult {
+            status: "deleted".to_owned(),
+            identity: snapshot.identity.clone(),
+            doc_id: Some(snapshot.doc_id),
+        };
+        let mut row = self.doc_rows[pos];
+        row.flags |= DOC_FLAG_DELETED;
+        self.doc_rows[pos] = row;
+        self.write_doc_row(snapshot.doc_id, row)?;
+        self.mark_write_activity();
+        record_counter("candidate.delete_document_deleted_total", 1);
+        Ok(result)
     }
 
     /// Materializes every live document into an importable batch representation
@@ -2449,10 +3260,8 @@ impl CandidateStore {
             if doc.deleted {
                 continue;
             }
-            let mut sha256 = [0u8; 32];
-            hex::decode_to_slice(&doc.identity, &mut sha256)?;
             out.push(ImportedCandidateDocument {
-                identity: sha256,
+                identity: hex::decode(&doc.identity)?,
                 identity_hex: doc.identity.clone(),
                 file_size: doc.file_size,
                 filter_bytes: doc.filter_bytes,
@@ -2643,7 +3452,8 @@ impl CandidateStore {
             let mut external_ids_payload = Vec::<u8>::with_capacity(external_ids_total_bytes);
             let mut metadata_payload = Vec::<u8>::with_capacity(metadata_total_bytes);
             let mut tier2_blooms_payload = Vec::<u8>::with_capacity(tier2_bloom_total_bytes);
-            let mut sha_by_docid_payload = Vec::<u8>::with_capacity(pending_inserts.len() * 32);
+            let mut sha_by_docid_payload =
+                Vec::<u8>::with_capacity(pending_inserts.len() * self.identity_bytes_len());
             let mut doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_inserts.len() * DOC_META_ROW_BYTES);
             let mut tier2_doc_meta_payload =
@@ -2837,6 +3647,17 @@ impl CandidateStore {
         Ok(results)
     }
 
+    /// Returns the raw identity width for documents stored in this forest.
+    fn identity_bytes_len(&self) -> usize {
+        match self.meta.id_source.as_str() {
+            "md5" => 16,
+            "sha1" => 20,
+            "sha256" => 32,
+            "sha512" => 64,
+            _ => 32,
+        }
+    }
+
     /// Returns profiling data captured during the most recent batch insert
     /// operation.
     pub fn last_insert_batch_profile(&self) -> CandidateInsertBatchProfile {
@@ -2851,7 +3672,7 @@ impl CandidateStore {
 
     /// Reports whether the given canonical identity is present as a non-deleted document
     /// in the store.
-    pub fn contains_live_document_identity(&self, identity: &[u8; 32]) -> bool {
+    pub fn contains_live_document_identity(&self, identity: &[u8]) -> bool {
         let identity_hex = hex::encode(identity);
         self.identity_to_pos
             .get(&identity_hex)
@@ -3500,6 +4321,7 @@ impl CandidateStore {
             tier2_gram_size: self.meta.tier2_gram_size,
             tier1_gram_size: self.meta.tier1_gram_size,
             compaction_idle_cooldown_s: self.meta.compaction_idle_cooldown_s,
+            source_dedup_min_new_docs: self.meta.source_dedup_min_new_docs,
             compaction_cooldown_remaining_s: cooldown_remaining,
             compaction_waiting_for_cooldown: cooldown_remaining > 0.0,
             compaction_generation: self.compaction_generation,
@@ -3824,7 +4646,7 @@ impl CandidateStore {
     /// document id.
     fn append_new_doc(
         &mut self,
-        identity: &[u8; 32],
+        identity: &[u8],
         row: DocMetaRow,
         tier2_row: Tier2DocMetaRow,
     ) -> Result<()> {

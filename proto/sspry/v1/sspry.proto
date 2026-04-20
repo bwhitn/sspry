@@ -110,6 +110,16 @@ message StoreSummary {
   double compaction_idle_cooldown_s = 20;
   double compaction_cooldown_remaining_s = 21;
   bool compaction_waiting_for_cooldown = 22;
+  uint64 source_dedup_min_new_docs = 23;
+}
+
+message ForestSourceDedupSummary {
+  uint64 min_new_docs = 1;
+  uint64 last_completed_unix_ms = 2;
+  uint64 last_duplicate_groups = 3;
+  uint64 last_deleted_docs = 4;
+  uint64 last_affected_trees = 5;
+  uint64 last_total_inserted_docs = 6;
 }
 
 message AdaptivePublishSummary {
@@ -230,6 +240,7 @@ message StatsResponse {
   uint64 search_workers = 4;
   uint64 current_rss_kb = 5;
   uint64 peak_rss_kb = 6;
+  ForestSourceDedupSummary forest_source_dedup = 7;
 }
 
 message StatusResponse {
@@ -257,6 +268,7 @@ message StatusResponse {
   StoreSummary published = 22;
   PublishSummary publish = 23;
   PublishedTier2SnapshotSealSummary published_tier2_snapshot_seal = 24;
+  ForestSourceDedupSummary forest_source_dedup = 25;
 }
 
 message SearchRequest {

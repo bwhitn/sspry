@@ -462,33 +462,49 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     ))
 }
 
-/// Decodes a normalized SHA-256 string into its 32-byte binary form.
+/// Returns the raw identity width implied by one configured id_source label.
+fn identity_bytes_for_source(id_source: &str) -> Result<usize> {
+    match id_source {
+        "md5" => Ok(16),
+        "sha1" => Ok(20),
+        "sha256" => Ok(32),
+        "sha512" => Ok(64),
+        other => Err(SspryError::from(format!(
+            "invalid candidate id_source `{other}`; expected one of sha256, md5, sha1, sha512"
+        ))),
+    }
+}
+
+/// Decodes a normalized identity string into its raw binary form.
 ///
 /// Inputs:
-/// - `value`: User-provided hexadecimal SHA-256 string.
+/// - `value`: User-provided hexadecimal digest string.
+/// - `id_source`: Configured forest identity source.
 ///
 /// Returns:
-/// - The decoded 32-byte digest.
-fn decode_sha256(value: &str) -> Result<[u8; 32]> {
-    let normalized = normalize_sha256_hex(value)?;
-    let mut out = [0u8; 32];
+/// - The decoded digest bytes.
+fn decode_identity(value: &str, id_source: &str) -> Result<Vec<u8>> {
+    let normalized = normalize_identity_hex(value, id_source)?;
+    let mut out = vec![0u8; identity_bytes_for_source(id_source)?];
     hex::decode_to_slice(normalized, &mut out)?;
     Ok(out)
 }
 
-/// Validates and normalizes a user-provided SHA-256 string.
+/// Validates and normalizes a user-provided identity string.
 ///
 /// Inputs:
 /// - `value`: Candidate hexadecimal digest text.
+/// - `id_source`: Configured forest identity source.
 ///
 /// Returns:
-/// - The lowercase 64-character digest string.
-fn normalize_sha256_hex(value: &str) -> Result<String> {
+/// - The lowercase hexadecimal digest string.
+fn normalize_identity_hex(value: &str, id_source: &str) -> Result<String> {
     let text = value.trim().to_ascii_lowercase();
-    if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(SspryError::from(
-            "sha256 must be exactly 64 hexadecimal characters.",
-        ));
+    let expected_hex_len = identity_bytes_for_source(id_source)?.saturating_mul(2);
+    if text.len() != expected_hex_len || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(SspryError::from(format!(
+            "{id_source} must be exactly {expected_hex_len} hexadecimal characters.",
+        )));
     }
     Ok(text)
 }

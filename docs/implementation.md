@@ -77,7 +77,8 @@ Per shard, the implementation persists sidecars such as:
 - `store_meta.json`
 - `doc_meta.bin`
 - `tier2_doc_meta.bin`
-- `sha256_by_docid.dat`
+- `sha256_by_docid.dat` storing one raw source-id digest per doc id
+  - legacy filename; row width follows the forest `id_source` (`md5` 16, `sha1` 20, `sha256` 32, `sha512` 64 bytes)
 - `doc_metadata.bin`
 - `blooms.bin`
 - `tier2_blooms.bin`

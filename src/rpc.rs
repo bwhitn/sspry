@@ -12,39 +12,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio_stream::StreamExt;
 use tonic::{Request as GrpcRequest, Response as GrpcResponse, Status as GrpcStatus};
 
 #[cfg(test)]
 use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
+#[cfg(test)]
+use crate::candidate::store::read_forest_source_dedup_manifest;
 use crate::candidate::store::{
-    CandidateCompactionResult, CandidateCompactionSnapshot, CandidateImportBatchProfile,
-    CandidateInsertBatchProfile, CandidateStoreOpenProfile, RuntimeQueryArtifacts,
-    build_runtime_query_artifacts, cleanup_abandoned_compaction_roots, compaction_work_root,
-    runtime_query_artifacts_memory_bytes, write_compacted_snapshot,
+    build_runtime_query_artifacts, build_tree_source_ref, cleanup_abandoned_compaction_roots,
+    compaction_work_root, for_each_forest_source_ref_duplicate_victim, forest_source_dedup_due,
+    record_forest_source_dedup_pass, runtime_query_artifacts_memory_bytes,
+    tree_source_ref_build_due, write_compacted_snapshot, CandidateCompactionResult,
+    CandidateCompactionSnapshot, CandidateImportBatchProfile, CandidateInsertBatchProfile,
+    CandidateStoreOpenProfile, ForestSourceDedupResult, RuntimeQueryArtifacts,
 };
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
-    GramSizes, candidate_shard_index, candidate_shard_root,
+    candidate_shard_index, candidate_shard_root,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     read_candidate_shard_count, resolve_max_candidates, search_target_rule_names,
-    write_candidate_shard_count,
+    write_candidate_shard_count, BoundedCache, CandidateConfig, CandidateQueryProfile,
+    CandidateStore, CompiledQueryPlan, GramSizes,
 };
 #[cfg(test)]
 use crate::candidate::{PatternPlan, QueryNode};
 use crate::grpc::v1::{
+    sspry_server::{Sspry as GrpcSspry, SspryServer},
     AdaptivePublishSummary, DeleteRequest as GrpcDeleteRequest,
-    DeleteResponse as GrpcDeleteResponse, IndexClientBeginRequest, IndexClientBeginResponse,
-    IndexClientHeartbeatRequest, IndexSessionBeginRequest, IndexSessionEndRequest,
-    IndexSessionProgressRequest, IndexSessionResponse, IndexSessionSummary,
+    DeleteResponse as GrpcDeleteResponse, ForestSourceDedupSummary, IndexClientBeginRequest,
+    IndexClientBeginResponse, IndexClientHeartbeatRequest, IndexSessionBeginRequest,
+    IndexSessionEndRequest, IndexSessionProgressRequest, IndexSessionResponse, IndexSessionSummary,
     InsertBatchProfileSummary, InsertFrame, InsertResult, InsertSummary, OptionalString,
     PingRequest, PingResponse, PublishRequest, PublishResponse as GrpcPublishResponse,
     PublishSummary, PublishedTier2SnapshotSealSummary, QueryProfileSummary, SearchFrame,
     SearchRequest, ShutdownRequest, ShutdownResponse as GrpcShutdownResponse, StartupStoreSummary,
     StartupSummary, StatsRequest, StatsResponse, StatusRequest, StatusResponse, StoreSummary,
-    sspry_server::{Sspry as GrpcSspry, SspryServer},
 };
 use crate::perf::{record_counter, scope};
 use crate::{Result, SspryError};
@@ -288,7 +292,7 @@ struct CandidateIndexSessionProgressRequest {
 }
 
 type ParsedCandidateInsertDocument = (
-    [u8; 32],
+    Vec<u8>,
     u64,
     Option<usize>,
     Vec<u8>,
@@ -570,6 +574,7 @@ impl Drop for ActiveSearchRequestGuard<'_> {
             }
             self.state.search_admission_cv.notify_all();
         }
+        self.state.notify_maintenance_workers();
     }
 }
 
@@ -1438,8 +1443,13 @@ impl GrpcSspry for GrpcServerService {
 
             let row_len = current_row.len();
             let started_parse = Instant::now();
-            let parsed = parse_candidate_insert_binary_row(&current_row, "grpc.insert_stream.row")
-                .map_err(|err| GrpcStatus::invalid_argument(err.to_string()))?;
+            let identity_bytes = self.state.candidate_identity_bytes_len();
+            let parsed = parse_candidate_insert_binary_row(
+                &current_row,
+                identity_bytes,
+                "grpc.insert_stream.row",
+            )
+            .map_err(|err| GrpcStatus::invalid_argument(err.to_string()))?;
             batch_parse_elapsed += started_parse.elapsed();
             batch_input_bytes = batch_input_bytes.saturating_add(parsed.1);
             batch_row_bytes = batch_row_bytes.saturating_add(row_len);

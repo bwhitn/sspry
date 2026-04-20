@@ -23,7 +23,7 @@ const SPECIAL_POPULATION_MIN_ENTROPY_BITS_PER_BYTE: f64 = 7.75;
 #[derive(Clone, Debug)]
 pub struct DocumentFeatures {
     pub sha256: [u8; 32],
-    pub alternate_identity: Option<[u8; 32]>,
+    pub alternate_identity: Option<Vec<u8>>,
     pub entropy_bits_per_byte: f32,
     pub file_size: u64,
     pub bloom_filter: Vec<u8>,
@@ -64,28 +64,14 @@ impl AdditionalDigestState {
         }
     }
 
-    /// Finalizes the alternate digest and folds it into the normalized
-    /// 32-byte identity namespace used by the index.
-    fn finalize_normalized(self) -> [u8; 32] {
+    /// Finalizes the alternate digest into its raw source-id bytes.
+    fn finalize_raw(self) -> Vec<u8> {
         match self {
-            Self::Md5(digest) => normalize_identity_digest("md5", &digest.finalize()),
-            Self::Sha1(digest) => normalize_identity_digest("sha1", &digest.finalize()),
-            Self::Sha512(digest) => normalize_identity_digest("sha512", &digest.finalize()),
+            Self::Md5(digest) => digest.finalize().to_vec(),
+            Self::Sha1(digest) => digest.finalize().to_vec(),
+            Self::Sha512(digest) => digest.finalize().to_vec(),
         }
     }
-}
-
-/// Namespaces an arbitrary digest into the project's canonical 32-byte
-/// identity representation.
-fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"sspry-identity\0");
-    digest.update(kind.as_bytes());
-    digest.update(b"\0");
-    digest.update(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest.finalize());
-    out
 }
 
 /// Computes sampled Shannon entropy from the sparse byte histogram collected
@@ -497,7 +483,7 @@ pub fn scan_file_features_bloom_only_with_gram_sizes(
 
     Ok(DocumentFeatures {
         sha256,
-        alternate_identity: alternate_identity.map(AdditionalDigestState::finalize_normalized),
+        alternate_identity: alternate_identity.map(AdditionalDigestState::finalize_raw),
         entropy_bits_per_byte: exact_entropy,
         file_size,
         bloom_filter: bloom.map(BloomFilter::into_bytes).unwrap_or_default(),
@@ -754,10 +740,7 @@ mod tests {
 
         assert_eq!(
             features.alternate_identity,
-            Some(crate::app::normalize_identity_digest(
-                "md5",
-                &md5::Md5::digest(b"identity-check-bytes"),
-            ))
+            Some(md5::Md5::digest(b"identity-check-bytes").to_vec())
         );
     }
 }

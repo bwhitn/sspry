@@ -704,6 +704,7 @@ fn init_help_surfaces_db_policy_flags() {
     assert!(out.contains("--id-source"));
     assert!(out.contains("--store-path"));
     assert!(out.contains("--gram-sizes"));
+    assert!(out.contains("--dedup-min-docs"));
 }
 
 #[test]
@@ -723,6 +724,7 @@ fn serve_and_local_index_help_hide_init_only_flags() {
     assert!(!local_index.contains("--tier2-set-fp"));
     assert!(!local_index.contains("--gram-sizes"));
     assert!(!local_index.contains("--compaction-idle-cooldown-s"));
+    assert!(!local_index.contains("--dedup-min-docs"));
     assert!(local_index.contains("--batch-docs"));
     assert!(!local_index.contains("--batch-size"));
 
@@ -752,12 +754,10 @@ fn info_light_exposes_adaptive_publish_status() {
     assert!(adaptive_publish.contains_key("mode"));
     assert!(adaptive_publish.contains_key("reason"));
     assert!(adaptive_publish.contains_key("storage_class"));
-    assert!(
-        parsed
-            .get("published_tier2_snapshot_seal")
-            .and_then(Value::as_object)
-            .is_some()
-    );
+    assert!(parsed
+        .get("published_tier2_snapshot_seal")
+        .and_then(Value::as_object)
+        .is_some());
 
     let _ = child.kill();
     let _ = child.wait();
@@ -793,6 +793,12 @@ fn info_exposes_compaction_cooldown_fields() {
             .get("compaction_waiting_for_cooldown")
             .and_then(Value::as_bool),
         Some(false)
+    );
+    assert_eq!(
+        parsed
+            .get("source_dedup_min_new_docs")
+            .and_then(Value::as_u64),
+        Some(1_000)
     );
 
     let _ = child.kill();

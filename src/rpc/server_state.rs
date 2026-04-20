@@ -437,8 +437,8 @@ impl ServerState {
         }
     }
 
-    #[cfg(test)]
-    /// Test-only helper that reports the current forest root and tree count.
+    /// Reports the current forest root and tree count when the server is
+    /// serving a forest layout.
     fn forest_mode_info(&self) -> Result<Option<(PathBuf, usize)>> {
         let mode = self
             .store_mode
@@ -1732,6 +1732,11 @@ impl ServerState {
     fn grpc_stats_response(&self) -> Result<StatsResponse> {
         let stats = self.grpc_store_summary_for_query_store_sets("grpc stats")?;
         let (current_rss_kb, peak_rss_kb) = current_process_memory_kb();
+        let forest_source_dedup = if self.forest_mode_info()?.is_some() {
+            grpc_forest_source_dedup_summary_from_root(&self.config.candidate_config.root)
+        } else {
+            None
+        };
         Ok(StatsResponse {
             stats: Some(stats),
             memory_budget_bytes: self.config.memory_budget_bytes,
@@ -1739,6 +1744,7 @@ impl ServerState {
             search_workers: self.config.search_workers as u64,
             current_rss_kb: current_rss_kb as u64,
             peak_rss_kb: peak_rss_kb as u64,
+            forest_source_dedup,
         })
     }
 
@@ -1750,6 +1756,11 @@ impl ServerState {
         let readiness = self.publish_readiness(now_unix_ms);
         let published =
             self.grpc_store_summary_for_query_store_sets("grpc status published stats")?;
+        let forest_source_dedup = if self.forest_mode_info()?.is_some() {
+            grpc_forest_source_dedup_summary_from_root(&self.config.candidate_config.root)
+        } else {
+            None
+        };
         let workspace_roots = self.workspace_roots()?;
         let workspace_mode = workspace_roots.is_some();
         let (published_root, work_root, has_work, work) =
@@ -1807,6 +1818,7 @@ impl ServerState {
             published_tier2_snapshot_seal: Some(
                 grpc_published_tier2_snapshot_seal_summary_from_state(self),
             ),
+            forest_source_dedup,
         })
     }
 
@@ -2019,10 +2031,9 @@ impl ServerState {
         );
         index_session.insert(
             "last_update_unix_ms".to_owned(),
-            json!(
-                self.index_session_last_update_unix_ms
-                    .load(Ordering::Acquire)
-            ),
+            json!(self
+                .index_session_last_update_unix_ms
+                .load(Ordering::Acquire)),
         );
         index_session.insert(
             "server_insert_batch_profile".to_owned(),
@@ -2256,10 +2267,9 @@ impl ServerState {
             );
             publish.insert(
                 "index_backpressure_sleep_ms_total".to_owned(),
-                json!(
-                    self.index_backpressure_sleep_ms_total
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .index_backpressure_sleep_ms_total
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "adaptive_recent_publish_p95_ms".to_owned(),
@@ -2359,94 +2369,81 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_promote_work_export_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_export_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_export_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_resolve_doc_state_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_resolve_doc_state_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_resolve_doc_state_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_build_payloads_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_build_payloads_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_build_payloads_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_append_sidecars_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_append_sidecars_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_append_sidecars_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_install_docs_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_install_docs_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_install_docs_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_tier2_update_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_tier2_update_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_tier2_update_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_persist_meta_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_persist_meta_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_persist_meta_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_rebalance_tier2_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_rebalance_tier2_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_rebalance_tier2_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_remove_work_root_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_remove_work_root_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_remove_work_root_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_other_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_other_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_other_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_imported_docs".to_owned(),
-                json!(
-                    self.last_publish_promote_work_imported_docs
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_imported_docs
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_imported_shards".to_owned(),
-                json!(
-                    self.last_publish_promote_work_imported_shards
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_imported_shards
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_init_work_ms".to_owned(),
@@ -2454,17 +2451,15 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
-                json!(
-                    self.last_publish_tier2_snapshot_persist_failures
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_tier2_snapshot_persist_failures
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_persisted_snapshot_shards".to_owned(),
-                json!(
-                    self.last_publish_persisted_snapshot_shards
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_persisted_snapshot_shards
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_reused_work_stores".to_owned(),
@@ -2781,10 +2776,9 @@ impl ServerState {
             );
             publish.insert(
                 "index_backpressure_sleep_ms_total".to_owned(),
-                json!(
-                    self.index_backpressure_sleep_ms_total
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .index_backpressure_sleep_ms_total
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "retired_published_root_count".to_owned(),
@@ -2824,94 +2818,81 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_promote_work_export_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_export_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_export_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_resolve_doc_state_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_resolve_doc_state_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_resolve_doc_state_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_build_payloads_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_build_payloads_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_build_payloads_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_append_sidecars_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_append_sidecars_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_append_sidecars_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_install_docs_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_install_docs_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_install_docs_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_tier2_update_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_tier2_update_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_tier2_update_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_persist_meta_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_persist_meta_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_persist_meta_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_import_rebalance_tier2_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_import_rebalance_tier2_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_import_rebalance_tier2_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_remove_work_root_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_remove_work_root_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_remove_work_root_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_other_ms".to_owned(),
-                json!(
-                    self.last_publish_promote_work_other_ms
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_other_ms
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_imported_docs".to_owned(),
-                json!(
-                    self.last_publish_promote_work_imported_docs
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_imported_docs
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_promote_work_imported_shards".to_owned(),
-                json!(
-                    self.last_publish_promote_work_imported_shards
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_promote_work_imported_shards
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_init_work_ms".to_owned(),
@@ -2919,17 +2900,15 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
-                json!(
-                    self.last_publish_tier2_snapshot_persist_failures
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_tier2_snapshot_persist_failures
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_persisted_snapshot_shards".to_owned(),
-                json!(
-                    self.last_publish_persisted_snapshot_shards
-                        .load(Ordering::Acquire)
-                ),
+                json!(self
+                    .last_publish_persisted_snapshot_shards
+                    .load(Ordering::Acquire)),
             );
             publish.insert(
                 "last_publish_reused_work_stores".to_owned(),
@@ -2966,8 +2945,19 @@ impl ServerState {
         self.config.candidate_shards.max(1)
     }
 
+    /// Returns the raw identity width implied by the configured candidate source.
+    pub(crate) fn candidate_identity_bytes_len(&self) -> usize {
+        match self.config.candidate_config.id_source.as_str() {
+            "md5" => 16,
+            "sha1" => 20,
+            "sha256" => 32,
+            "sha512" => 64,
+            _ => 32,
+        }
+    }
+
     /// Maps a document hash to its candidate shard index.
-    fn candidate_store_index_for_identity(&self, identity: &[u8; 32]) -> usize {
+    fn candidate_store_index_for_identity(&self, identity: &[u8]) -> usize {
         candidate_shard_index(identity, self.candidate_shard_count())
     }
 
@@ -3179,6 +3169,192 @@ impl ServerState {
     fn run_compaction_cycle_for_tests(&self) -> Result<()> {
         let _ = self.run_compaction_cycle_once()?;
         Ok(())
+    }
+
+    /// Returns the currently published tree roots when the server is running in
+    /// forest mode.
+    fn published_forest_tree_roots(&self) -> Result<Option<Vec<PathBuf>>> {
+        let mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+        match &*mode {
+            StoreMode::Forest { trees, .. } => trees
+                .iter()
+                .map(|stores| stores.root())
+                .collect::<Result<Vec<_>>>()
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Returns the currently published tree roots and store sets when the
+    /// server is running in forest mode.
+    fn published_forest_tree_sets(&self) -> Result<Option<Vec<(PathBuf, Arc<StoreSet>)>>> {
+        let mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+        match &*mode {
+            StoreMode::Forest { trees, .. } => trees
+                .iter()
+                .map(|stores| Ok((stores.root()?, stores.clone())))
+                .collect::<Result<Vec<_>>>()
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Runs one tree-level source-id reference maintenance pass when forest
+    /// mode is active and enough new inserts have accumulated since the last
+    /// successful build.
+    fn run_tree_source_ref_cycle_once(&self, min_new_docs: u64) -> Result<CompactionCycleOutcome> {
+        let Some(tree_roots) = self.published_forest_tree_roots()? else {
+            return Ok(CompactionCycleOutcome::Idle);
+        };
+        if self.publish_requested.load(Ordering::Acquire)
+            || self.active_index_sessions.load(Ordering::Acquire) > 0
+            || self.active_index_clients.load(Ordering::Acquire) > 0
+        {
+            return Ok(CompactionCycleOutcome::RetryLater);
+        }
+
+        let _op = match self.operation_gate.try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(CompactionCycleOutcome::RetryLater),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(SspryError::from("Server operation gate lock poisoned."));
+            }
+        };
+
+        for tree_root in tree_roots {
+            if !tree_source_ref_build_due(&tree_root, min_new_docs)? {
+                continue;
+            }
+            let _ = build_tree_source_ref(&tree_root)?;
+            return Ok(CompactionCycleOutcome::Progress);
+        }
+        Ok(CompactionCycleOutcome::Idle)
+    }
+
+    #[cfg(test)]
+    /// Executes one tree-level source-id reference maintenance pass
+    /// synchronously so tests can assert on the published artifact.
+    fn run_tree_source_ref_cycle_for_tests(&self, min_new_docs: u64) -> Result<()> {
+        let _ = self.run_tree_source_ref_cycle_once(min_new_docs)?;
+        Ok(())
+    }
+
+    /// Runs one forest-wide source-id deduplication pass when forest mode is
+    /// active, tree-level source refs are current, and enough new inserts have
+    /// accumulated since the last successful merge checkpoint.
+    fn run_forest_source_dedup_cycle_once(
+        &self,
+        min_new_docs: u64,
+    ) -> Result<CompactionCycleOutcome> {
+        let Some(tree_sets) = self.published_forest_tree_sets()? else {
+            return Ok(CompactionCycleOutcome::Idle);
+        };
+        if tree_sets.len() < 2 {
+            return Ok(CompactionCycleOutcome::Idle);
+        }
+        if self.publish_requested.load(Ordering::Acquire)
+            || self.active_index_sessions.load(Ordering::Acquire) > 0
+            || self.active_index_clients.load(Ordering::Acquire) > 0
+        {
+            return Ok(CompactionCycleOutcome::RetryLater);
+        }
+
+        let tree_roots = tree_sets
+            .iter()
+            .map(|(root, _)| root.clone())
+            .collect::<Vec<_>>();
+        let _op = match self.operation_gate.try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(CompactionCycleOutcome::RetryLater),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(SspryError::from("Server operation gate lock poisoned."));
+            }
+        };
+        if !forest_source_dedup_due(
+            &self.config.candidate_config.root,
+            &tree_roots,
+            min_new_docs,
+        )? {
+            return Ok(CompactionCycleOutcome::Idle);
+        }
+
+        let mut affected_tree_indexes = HashSet::<usize>::new();
+        let (duplicate_groups, deleted_docs) =
+            for_each_forest_source_ref_duplicate_victim(&tree_roots, |tree_idx, entry| {
+                let (_, stores) = &tree_sets[tree_idx];
+                let shard_idx = usize::try_from(entry.shard_idx).map_err(|_| {
+                    SspryError::from(format!(
+                        "forest dedup shard index overflow for tree {}",
+                        tree_roots[tree_idx].display()
+                    ))
+                })?;
+                let mut store = lock_candidate_store_with_timeout(
+                    &stores.stores[shard_idx],
+                    shard_idx,
+                    "forest dedup delete",
+                )?;
+                let result = store
+                    .delete_document_by_pointer(entry.doc_id, &hex::encode(&entry.identity))?;
+                if result.status != "deleted" {
+                    return Err(SspryError::from(format!(
+                        "forest dedup stale duplicate pointer at {} shard {} doc_id {}",
+                        tree_roots[tree_idx].display(),
+                        shard_idx,
+                        entry.doc_id
+                    )));
+                }
+                affected_tree_indexes.insert(tree_idx);
+                Ok(())
+            })?;
+
+        for tree_idx in &affected_tree_indexes {
+            let tree_root = &tree_roots[*tree_idx];
+            let _ = build_tree_source_ref(tree_root)?;
+            let (_, stores) = &tree_sets[*tree_idx];
+            stores.invalidate_stats_cache()?;
+        }
+
+        let summary: ForestSourceDedupResult = record_forest_source_dedup_pass(
+            &self.config.candidate_config.root,
+            &tree_roots,
+            duplicate_groups,
+            deleted_docs,
+            affected_tree_indexes.len(),
+        )?;
+        if summary.deleted_docs > 0 {
+            self.invalidate_search_caches();
+        }
+        Ok(CompactionCycleOutcome::Progress)
+    }
+
+    #[cfg(test)]
+    /// Executes one forest-wide source-id deduplication pass synchronously so
+    /// tests can assert on the resulting deleted documents and rebuilt refs.
+    fn run_forest_source_dedup_cycle_for_tests(
+        &self,
+        min_new_docs: u64,
+    ) -> Result<ForestSourceDedupResult> {
+        let tree_roots = self
+            .published_forest_tree_roots()?
+            .ok_or_else(|| SspryError::from("forest mode is unavailable"))?;
+        let _ = self.run_forest_source_dedup_cycle_once(min_new_docs)?;
+        let manifest = read_forest_source_dedup_manifest(&self.config.candidate_config.root)?
+            .ok_or_else(|| SspryError::from("forest source dedup manifest missing"))?;
+        Ok(ForestSourceDedupResult {
+            duplicate_groups: manifest.last_duplicate_groups,
+            deleted_docs: manifest.last_deleted_docs,
+            affected_trees: manifest.last_affected_trees,
+            total_inserted_docs: manifest.total_inserted_docs,
+            tree_count: tree_roots.len(),
+            identity_bytes: manifest.identity_bytes,
+            id_source: manifest.id_source,
+        })
     }
 
     /// Serializes a compiled query plan into the cache key used by artifact and
@@ -3484,7 +3660,8 @@ impl ServerState {
         document: &CandidateDocumentWire,
         field_prefix: &str,
     ) -> Result<ParsedCandidateInsertDocument> {
-        let sha256 = decode_sha256(&document.identity)?;
+        let identity =
+            decode_identity(&document.identity, &self.config.candidate_config.id_source)?;
         let bloom_filter = base64::engine::general_purpose::STANDARD
             .decode(document.bloom_filter_b64.as_bytes())
             .map_err(|_| {
@@ -3537,7 +3714,7 @@ impl ServerState {
             })
             .transpose()?;
         Ok((
-            sha256,
+            identity,
             document.file_size,
             bloom_item_estimate,
             bloom_filter,
@@ -3657,7 +3834,7 @@ impl ServerState {
                 .iter()
                 .map(|row| {
                     (
-                        row.0,
+                        row.0.clone(),
                         row.1,
                         row.2,
                         None,
@@ -3761,7 +3938,7 @@ impl ServerState {
                     .iter()
                     .map(|(_, row)| {
                         (
-                            row.0,
+                            row.0.clone(),
                             row.1,
                             row.2,
                             None,
@@ -3909,7 +4086,7 @@ impl ServerState {
             .operation_gate
             .read()
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
-        let decoded = decode_sha256(identity)?;
+        let decoded = decode_identity(identity, &self.config.candidate_config.id_source)?;
         let shard_idx = self.candidate_store_index_for_identity(&decoded);
         let published = self.published_store_set()?;
         let mut published_store = lock_candidate_store_with_timeout(
@@ -3992,14 +4169,14 @@ impl ServerState {
             let mut values = vec![None; page.len()];
             let mut by_shard = HashMap::<usize, Vec<(usize, String)>>::new();
             let query_store_sets = self.published_query_store_sets()?;
-            for (idx, sha256_hex) in page.iter().enumerate() {
-                let mut decoded = [0u8; 32];
-                hex::decode_to_slice(sha256_hex, &mut decoded)?;
+            for (idx, identity_hex) in page.iter().enumerate() {
+                let decoded =
+                    decode_identity(identity_hex, &self.config.candidate_config.id_source)?;
                 let shard_idx = self.candidate_store_index_for_identity(&decoded);
                 by_shard
                     .entry(shard_idx)
                     .or_default()
-                    .push((idx, sha256_hex.clone()));
+                    .push((idx, identity_hex.clone()));
             }
             for stores in query_store_sets {
                 for (shard_idx, items) in &by_shard {
@@ -4106,12 +4283,13 @@ impl ServerState {
         } else {
             None
         };
-        let candidate_limit = searchable_doc_count.and_then(|doc_count| {
-            match resolve_max_candidates(doc_count, plan.max_candidates) {
-                usize::MAX => None,
-                value => Some(value),
-            }
-        });
+        let candidate_limit =
+            searchable_doc_count.and_then(|doc_count| {
+                match resolve_max_candidates(doc_count, plan.max_candidates) {
+                    usize::MAX => None,
+                    value => Some(value),
+                }
+            });
         if let Some(plan_key) = plan_key.as_deref() {
             search_trace_log(format!(
                 "stream.scope plan_key={} store_sets={} searchable_doc_count={:?} candidate_limit={:?}",
@@ -4285,8 +4463,10 @@ impl ServerState {
 
             match local.external_ids {
                 Some(values) => {
-                    for (hash_chunk, external_id_chunk) in
-                        local.hashes.chunks(chunk_size).zip(values.chunks(chunk_size))
+                    for (hash_chunk, external_id_chunk) in local
+                        .hashes
+                        .chunks(chunk_size)
+                        .zip(values.chunks(chunk_size))
                     {
                         on_frame(CandidateQueryStreamFrame {
                             identities: hash_chunk.to_vec(),

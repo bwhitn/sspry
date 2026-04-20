@@ -476,6 +476,13 @@ struct InitArgs {
         help = "Minimum idle time after writes before compaction is allowed to run."
     )]
     compaction_idle_cooldown_s: f64,
+    #[arg(
+        long = "dedup-min-docs",
+        alias = "source-dedup-min-new-docs",
+        default_value_t = 1_000_u64,
+        help = "Minimum new inserts before tree source-ref rebuilds and forest-wide source-id dedup maintenance can run."
+    )]
+    source_dedup_min_new_docs: u64,
 }
 
 #[cfg(test)]

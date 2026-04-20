@@ -54,9 +54,22 @@ fn store_local_meta_path(root: &Path) -> PathBuf {
     root.join("store_meta.json")
 }
 
-/// Returns the path of the SHA-by-doc-id blob file.
+/// Returns the path of the legacy identity-by-doc-id blob file.
 fn sha_by_docid_path(root: &Path) -> PathBuf {
     root.join("sha256_by_docid.dat")
+}
+
+/// Returns the raw identity width implied by the configured forest id source.
+fn identity_bytes_for_source(id_source: &str) -> Result<usize> {
+    match id_source {
+        "md5" => Ok(16),
+        "sha1" => Ok(20),
+        "sha256" => Ok(32),
+        "sha512" => Ok(64),
+        other => Err(SspryError::from(format!(
+            "invalid candidate id_source `{other}`; expected one of sha256, md5, sha1, sha512"
+        ))),
+    }
 }
 
 /// Returns the path of the primary document metadata row file.
@@ -104,6 +117,24 @@ fn shard_compaction_manifest_path(root: &Path) -> PathBuf {
     parent.join(format!(".{stem}.compaction.json"))
 }
 
+/// Returns the tree-level sorted source-id reference file used by forest-wide
+/// deduplication maintenance.
+pub(crate) fn tree_source_ref_path(root: &Path) -> PathBuf {
+    root.join("source_id_refs.sorted.bin")
+}
+
+/// Returns the manifest that records the last successful tree-level
+/// source-id reference build.
+fn tree_source_ref_manifest_path(root: &Path) -> PathBuf {
+    root.join(".source_id_refs.json")
+}
+
+/// Returns the manifest that records the last successful forest-wide
+/// source-id deduplication pass.
+fn forest_source_dedup_manifest_path(root: &Path) -> PathBuf {
+    root.join(".forest_source_dedup.json")
+}
+
 /// Loads the shard-compaction manifest if present, or returns an empty default
 /// manifest when none exists yet.
 fn read_shard_compaction_manifest(root: &Path) -> Result<ShardCompactionManifest> {
@@ -132,6 +163,54 @@ fn ensure_shard_compaction_manifest(root: &Path) -> Result<ShardCompactionManife
     Ok(manifest)
 }
 
+/// Loads the tree-level source-id reference manifest when present.
+pub(crate) fn read_tree_source_ref_manifest(root: &Path) -> Result<Option<TreeSourceRefManifest>> {
+    let path = tree_source_ref_manifest_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let manifest = serde_json::from_slice(&fs::read(&path)?).map_err(|_| {
+        SspryError::from(format!(
+            "Invalid tree source reference manifest at {}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(manifest))
+}
+
+/// Writes the tree-level source-id reference manifest atomically.
+pub(crate) fn write_tree_source_ref_manifest(
+    root: &Path,
+    manifest: &TreeSourceRefManifest,
+) -> Result<()> {
+    write_json(tree_source_ref_manifest_path(root), manifest)
+}
+
+/// Loads the forest-wide source-id deduplication manifest when present.
+pub(crate) fn read_forest_source_dedup_manifest(
+    root: &Path,
+) -> Result<Option<ForestSourceDedupManifest>> {
+    let path = forest_source_dedup_manifest_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let manifest = serde_json::from_slice(&fs::read(&path)?).map_err(|_| {
+        SspryError::from(format!(
+            "Invalid forest source dedup manifest at {}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(manifest))
+}
+
+/// Writes the forest-wide source-id deduplication manifest atomically.
+pub(crate) fn write_forest_source_dedup_manifest(
+    root: &Path,
+    manifest: &ForestSourceDedupManifest,
+) -> Result<()> {
+    write_json(forest_source_dedup_manifest_path(root), manifest)
+}
+
 /// Returns the hidden retired-generation directory used to stage replaced
 /// store roots.
 fn retired_generation_root(root: &Path, generation: u64) -> PathBuf {
@@ -152,12 +231,15 @@ pub fn candidate_shard_root(root: &Path, shard_count: usize, shard_idx: usize) -
     root.join(format!("shard_{shard_idx:03}"))
 }
 
-/// Maps a SHA-256 document identity to its candidate shard index.
-pub fn candidate_shard_index(sha256: &[u8; 32], shard_count: usize) -> usize {
+/// Maps a document identity to its candidate shard index.
+pub fn candidate_shard_index(identity: &[u8], shard_count: usize) -> usize {
     if shard_count <= 1 {
         return 0;
     }
-    let head = u32::from_le_bytes([sha256[0], sha256[1], sha256[2], sha256[3]]) as usize;
+    let mut head_bytes = [0u8; 4];
+    let prefix_len = identity.len().min(head_bytes.len());
+    head_bytes[..prefix_len].copy_from_slice(&identity[..prefix_len]);
+    let head = u32::from_le_bytes(head_bytes) as usize;
     head % shard_count
 }
 
@@ -330,9 +412,10 @@ fn dir_size(path: &Path) -> u64 {
 /// layout, or returns empty state when the store is uninitialized.
 fn load_candidate_store_state(
     root: &Path,
+    id_source: &str,
 ) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
     if binary_store_exists(root) {
-        return load_candidate_binary_store(root);
+        return load_candidate_binary_store(root, identity_bytes_for_source(id_source)?);
     }
     Ok((Vec::new(), Vec::new(), Vec::new()))
 }
@@ -349,17 +432,29 @@ fn binary_store_exists(root: &Path) -> bool {
 /// Reconstructs in-memory document rows from the binary candidate-store files.
 fn load_candidate_binary_store(
     root: &Path,
+    identity_bytes: usize,
 ) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
     let sha_bytes = fs::read(sha_by_docid_path(root))?;
     let row_bytes = fs::read(doc_meta_path(root))?;
     let tier2_row_bytes = fs::read(tier2_doc_meta_path(root)).unwrap_or_default();
-    if sha_bytes.len() % 32 != 0 || row_bytes.len() % DOC_META_ROW_BYTES != 0 {
+    let row_count = row_bytes.len() / DOC_META_ROW_BYTES;
+    if identity_bytes != 32
+        && row_bytes.len() % DOC_META_ROW_BYTES == 0
+        && sha_bytes.len() % 32 == 0
+        && sha_bytes.len() / 32 == row_count
+    {
+        return Err(SspryError::from(format!(
+            "Store at {} uses a legacy fixed-width identity layout for id_source; reindex or migrate the store before reopening it with variable-width source ids.",
+            root.display()
+        )));
+    }
+    if sha_bytes.len() % identity_bytes != 0 || row_bytes.len() % DOC_META_ROW_BYTES != 0 {
         return Err(SspryError::from(format!(
             "Invalid candidate binary document state at {}",
             root.display()
         )));
     }
-    let doc_count = sha_bytes.len() / 32;
+    let doc_count = sha_bytes.len() / identity_bytes;
     if doc_count != row_bytes.len() / DOC_META_ROW_BYTES {
         return Err(SspryError::from(format!(
             "Mismatched candidate binary document state at {}",
@@ -371,7 +466,8 @@ fn load_candidate_binary_store(
     let mut tier2_rows = Vec::with_capacity(doc_count);
     for index in 0..doc_count {
         let doc_id = (index + 1) as u64;
-        let sha256 = hex::encode(&sha_bytes[index * 32..(index + 1) * 32]);
+        let identity_hex =
+            hex::encode(&sha_bytes[index * identity_bytes..(index + 1) * identity_bytes]);
         let row = DocMetaRow::decode(
             &row_bytes[index * DOC_META_ROW_BYTES..(index + 1) * DOC_META_ROW_BYTES],
         )?;
@@ -385,7 +481,7 @@ fn load_candidate_binary_store(
         };
         docs.push(CandidateDoc {
             doc_id,
-            identity: sha256,
+            identity: identity_hex,
             file_size: row.file_size,
             filter_bytes: row.filter_bytes as usize,
             bloom_hashes: usize::from(row.bloom_hashes.max(1)),
@@ -462,8 +558,15 @@ fn validate_config(config: &CandidateConfig) -> Result<()> {
         ("tier2_filter_target_fp", config.tier2_filter_target_fp),
     ] {
         if let Some(value) = value {
-            if !(0.0 < value && value < 1.0) {
-                return Err(SspryError::from(format!("{field} must be in range (0, 1)")));
+            if !(crate::candidate::filter_policy::MIN_FILTER_TARGET_FP
+                ..=crate::candidate::filter_policy::MAX_FILTER_TARGET_FP)
+                .contains(&value)
+            {
+                return Err(SspryError::from(format!(
+                    "{field} must be in range [{}, {}]",
+                    crate::candidate::filter_policy::MIN_FILTER_TARGET_FP,
+                    crate::candidate::filter_policy::MAX_FILTER_TARGET_FP
+                )));
             }
         }
     }

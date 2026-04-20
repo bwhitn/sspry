@@ -24,6 +24,7 @@ fn default_internal_init_args(root: &Path, shards: usize, force: bool) -> InitAr
         store_path: false,
         gram_sizes: "3,4".to_owned(),
         compaction_idle_cooldown_s: 5.0,
+        source_dedup_min_new_docs: 1_000,
     }
 }
 
@@ -134,6 +135,7 @@ fn init_candidate_shard_count_uses_mode_defaults() {
         store_path: false,
         gram_sizes: "3,4".to_owned(),
         compaction_idle_cooldown_s: 5.0,
+        source_dedup_min_new_docs: 1_000,
     };
     assert_eq!(
         init_candidate_shard_count(&workspace),
@@ -247,6 +249,23 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
             LocalCommands::Search(args) => assert_eq!(args.search_workers, 2),
             other => panic!("unexpected local command: {other:?}"),
         },
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn init_accepts_shorter_dedup_flag_and_legacy_alias() {
+    let cli = Cli::try_parse_from(["sspry", "init", "--dedup-min-docs", "2500"])
+        .expect("parse new init dedup flag");
+    match cli.command {
+        Commands::Init(args) => assert_eq!(args.source_dedup_min_new_docs, 2_500),
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["sspry", "init", "--source-dedup-min-new-docs", "2500"])
+        .expect("parse legacy init dedup alias");
+    match cli.command {
+        Commands::Init(args) => assert_eq!(args.source_dedup_min_new_docs, 2_500),
         other => panic!("unexpected command: {other:?}"),
     }
 }
@@ -653,12 +672,10 @@ fn file_path_collection_and_hash_helpers_work() {
         file_digest,
         path_identity_sha256(&sample).expect("path digest")
     );
-    assert!(
-        sha256_file(&sample, 0)
-            .expect_err("zero chunk size")
-            .to_string()
-            .contains("positive integer")
-    );
+    assert!(sha256_file(&sample, 0)
+        .expect_err("zero chunk size")
+        .to_string()
+        .contains("positive integer"));
 
     let mut files = Vec::new();
     collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -673,7 +690,7 @@ fn file_path_collection_and_hash_helpers_work() {
     assert!(missing.is_empty());
     assert!(resolved_file_path(&tmp.path().join("missing.bin")).is_err());
     assert!(path_identity_sha256(&tmp.path().join("missing.bin")).is_err());
-    assert!(decode_sha256_hex("abcd").is_err());
+    assert!(decode_exact_hex::<32>("abcd", "sha256").is_err());
 }
 
 #[test]
@@ -692,19 +709,20 @@ fn json_config_and_binary_row_helpers_work() {
         PathBuf::from("root"),
         CandidateIdSource::Sha256,
         true,
-        0.001,
-        0.002,
+        0.01,
+        0.02,
         3,
         4,
         33.5,
+        1_000,
     );
     assert_eq!(fixed.root, PathBuf::from("root"));
     assert_eq!(fixed.id_source, "sha256");
     assert!(fixed.store_path);
     assert_eq!(fixed.tier2_gram_size, 3);
     assert_eq!(fixed.tier1_gram_size, 4);
-    assert_eq!(fixed.tier1_filter_target_fp, Some(0.001));
-    assert_eq!(fixed.tier2_filter_target_fp, Some(0.002));
+    assert_eq!(fixed.tier1_filter_target_fp, Some(0.01));
+    assert_eq!(fixed.tier2_filter_target_fp, Some(0.02));
     assert_eq!(fixed.filter_target_fp, None);
     assert_eq!(fixed.compaction_idle_cooldown_s, 33.5);
 
@@ -717,6 +735,7 @@ fn json_config_and_binary_row_helpers_work() {
         5,
         4,
         9.25,
+        1_000,
     );
     assert_eq!(variable.root, PathBuf::from("root"));
     assert_eq!(variable.id_source, "sha256");
@@ -729,7 +748,7 @@ fn json_config_and_binary_row_helpers_work() {
     assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
     let row = IndexBatchRow {
-        identity: [0xAA; 32],
+        identity: vec![0xAA; 32],
         file_size: 123,
         filter_bytes: 2048,
         bloom_item_estimate: Some(77),
@@ -742,8 +761,9 @@ fn json_config_and_binary_row_helpers_work() {
         external_id: Some("x".to_owned()),
     };
     let wire = serialize_candidate_document_binary_row(&row).expect("binary row");
-    let parsed = crate::rpc::parse_candidate_insert_binary_row_for_test(&wire).expect("parse row");
-    assert_eq!(parsed.0, [0xAA; 32]);
+    let parsed =
+        crate::rpc::parse_candidate_insert_binary_row_for_test(&wire, 32).expect("parse row");
+    assert_eq!(parsed.0, vec![0xAA; 32]);
     assert_eq!(parsed.1, 123);
     assert_eq!(parsed.2, Some(77));
     assert_eq!(parsed.3, vec![1, 2, 3, 4]);
@@ -1663,24 +1683,18 @@ fn digest_helpers_and_delete_resolution_cover_remaining_branches() {
     let sample = tmp.path().join("sample.bin");
     fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-    assert!(
-        md5_file(&sample, 0)
-            .expect_err("md5 zero chunk")
-            .to_string()
-            .contains("positive integer")
-    );
-    assert!(
-        sha1_file(&sample, 0)
-            .expect_err("sha1 zero chunk")
-            .to_string()
-            .contains("positive integer")
-    );
-    assert!(
-        sha512_file(&sample, 0)
-            .expect_err("sha512 zero chunk")
-            .to_string()
-            .contains("positive integer")
-    );
+    assert!(md5_file(&sample, 0)
+        .expect_err("md5 zero chunk")
+        .to_string()
+        .contains("positive integer"));
+    assert!(sha1_file(&sample, 0)
+        .expect_err("sha1 zero chunk")
+        .to_string()
+        .contains("positive integer"));
+    assert!(sha512_file(&sample, 0)
+        .expect_err("sha512 zero chunk")
+        .to_string()
+        .contains("positive integer"));
 
     assert_eq!(
         detect_digest_identity_source(&"aa".repeat(16)),
@@ -1861,46 +1875,38 @@ fn grpc_batch_helper_functions_cover_limits_and_oversize_rows() {
         payload_size: empty_payload_size + 3,
     };
 
-    assert!(
-        !prepare_serialized_remote_batch_row(
-            &pending_empty,
-            16,
-            empty_payload_size,
-            empty_payload_size + 32,
-            false,
-        )
-        .expect("fits empty batch")
-    );
-    assert!(
-        prepare_serialized_remote_batch_row(
-            &pending_non_empty,
-            4,
-            empty_payload_size,
-            empty_payload_size + 7,
-            false,
-        )
-        .expect("flush before oversize append")
-    );
-    assert!(
-        prepare_serialized_remote_batch_row(
-            &pending_non_empty,
-            64,
-            empty_payload_size,
-            empty_payload_size + 32,
-            true,
-        )
-        .expect("flush before oversize single row")
-    );
-    assert!(
-        prepare_serialized_remote_batch_row(
-            &pending_empty,
-            64,
-            empty_payload_size,
-            empty_payload_size + 32,
-            false,
-        )
-        .is_err()
-    );
+    assert!(!prepare_serialized_remote_batch_row(
+        &pending_empty,
+        16,
+        empty_payload_size,
+        empty_payload_size + 32,
+        false,
+    )
+    .expect("fits empty batch"));
+    assert!(prepare_serialized_remote_batch_row(
+        &pending_non_empty,
+        4,
+        empty_payload_size,
+        empty_payload_size + 7,
+        false,
+    )
+    .expect("flush before oversize append"));
+    assert!(prepare_serialized_remote_batch_row(
+        &pending_non_empty,
+        64,
+        empty_payload_size,
+        empty_payload_size + 32,
+        true,
+    )
+    .expect("flush before oversize single row"));
+    assert!(prepare_serialized_remote_batch_row(
+        &pending_empty,
+        64,
+        empty_payload_size,
+        empty_payload_size + 32,
+        false,
+    )
+    .is_err());
 }
 
 #[test]

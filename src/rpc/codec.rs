@@ -123,7 +123,7 @@ fn read_exact_bytes<'a>(
 /// - Stores optional sections behind bit flags.
 ///
 /// Inputs:
-/// - `sha256`, `file_size`: Stable identity and size for the document.
+/// - `identity`, `file_size`: Stable identity bytes and size for the document.
 /// - `bloom_item_estimate`, `bloom_filter`: Tier1 bloom metadata and payload.
 /// - `tier2_bloom_item_estimate`, `tier2_bloom_filter`: Tier2 bloom metadata and payload.
 /// - `special_population`: Whether the row belongs to a special precomputed population.
@@ -133,7 +133,7 @@ fn read_exact_bytes<'a>(
 /// Returns:
 /// - The encoded binary row ready to concatenate into a request payload.
 pub fn serialize_candidate_insert_binary_row_parts(
-    sha256: &[u8; 32],
+    identity: &[u8],
     file_size: u64,
     bloom_item_estimate: Option<usize>,
     bloom_filter: &[u8],
@@ -180,7 +180,7 @@ pub fn serialize_candidate_insert_binary_row_parts(
     }
 
     let mut row = Vec::with_capacity(
-        32 + 8
+        identity.len() + 8
             + 1
             + 8
             + 8
@@ -190,7 +190,7 @@ pub fn serialize_candidate_insert_binary_row_parts(
             + metadata.len()
             + external_id_bytes.len(),
     );
-    row.extend_from_slice(sha256);
+    row.extend_from_slice(identity);
     push_u64_le(&mut row, file_size);
     row.push(flags);
     push_u64_le(&mut row, bloom_item_estimate_u64.unwrap_or(0));
@@ -216,12 +216,17 @@ pub fn serialize_candidate_insert_binary_row_parts(
 /// - The parsed candidate document tuple used by the server-side insert path.
 fn parse_candidate_insert_binary_row(
     payload: &[u8],
+    identity_bytes: usize,
     field_prefix: &str,
 ) -> Result<ParsedCandidateInsertDocument> {
     let mut offset = 0usize;
-    let sha_bytes = read_exact_bytes(payload, &mut offset, 32, &format!("{field_prefix}.sha256"))?;
-    let mut sha256 = [0u8; 32];
-    sha256.copy_from_slice(sha_bytes);
+    let identity = read_exact_bytes(
+        payload,
+        &mut offset,
+        identity_bytes,
+        &format!("{field_prefix}.identity"),
+    )?
+    .to_vec();
     let file_size = read_u64_le(payload, &mut offset, &format!("{field_prefix}.file_size"))?;
     let flags = read_u8(payload, &mut offset, &format!("{field_prefix}.flags"))?;
     let bloom_item_estimate = read_u64_le(
@@ -300,7 +305,7 @@ fn parse_candidate_insert_binary_row(
         )));
     }
     Ok((
-        sha256,
+        identity,
         file_size,
         if flags & (1 << 0) != 0 {
             Some(usize::try_from(bloom_item_estimate).map_err(|_| {
@@ -339,8 +344,9 @@ fn parse_candidate_insert_binary_row(
 #[cfg(test)]
 pub(crate) fn parse_candidate_insert_binary_row_for_test(
     payload: &[u8],
+    identity_bytes: usize,
 ) -> Result<ParsedCandidateInsertDocument> {
-    parse_candidate_insert_binary_row(payload, "test.row")
+    parse_candidate_insert_binary_row(payload, identity_bytes, "test.row")
 }
 
 /// Concatenates already-encoded row payloads into the binary batch format used

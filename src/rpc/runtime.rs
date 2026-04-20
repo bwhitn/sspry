@@ -77,9 +77,10 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.compaction_idle_cooldown_s)
         .fold(0.0_f64, f64::max);
-    let compaction_cooldown_remaining_s = if stats_rows.iter().any(|item| {
-        item.deleted_doc_count > 0 && item.compaction_cooldown_remaining_s <= 0.0
-    }) {
+    let compaction_cooldown_remaining_s = if stats_rows
+        .iter()
+        .any(|item| item.deleted_doc_count > 0 && item.compaction_cooldown_remaining_s <= 0.0)
+    {
         0.0
     } else {
         stats_rows
@@ -148,6 +149,10 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         json!(compaction_idle_cooldown_s),
     );
     out.insert(
+        "source_dedup_min_new_docs".to_owned(),
+        json!(stats.source_dedup_min_new_docs),
+    );
+    out.insert(
         "compaction_cooldown_remaining_s".to_owned(),
         json!(compaction_cooldown_remaining_s),
     );
@@ -205,7 +210,12 @@ fn candidate_stats_json_from_parts(
     root: &Path,
     stats_rows: &[crate::candidate::CandidateStats],
 ) -> Map<String, Value> {
-    candidate_stats_json_from_parts_with_disk_usage(stats_rows, disk_usage_under(root))
+    let mut out =
+        candidate_stats_json_from_parts_with_disk_usage(stats_rows, disk_usage_under(root));
+    if let Some(summary) = forest_source_dedup_summary_json_map(root) {
+        out.insert("forest_source_dedup".to_owned(), Value::Object(summary));
+    }
+    out
 }
 
 /// Constructs an empty stats payload for tests that need the CLI JSON shape
@@ -234,6 +244,7 @@ fn empty_candidate_stats_json_for_config(
         tier2_gram_size: config.candidate_config.tier2_gram_size,
         tier1_gram_size: config.candidate_config.tier1_gram_size,
         compaction_idle_cooldown_s: config.candidate_config.compaction_idle_cooldown_s,
+        source_dedup_min_new_docs: config.candidate_config.source_dedup_min_new_docs,
         compaction_cooldown_remaining_s: 0.0,
         compaction_waiting_for_cooldown: false,
         compaction_generation: 1,
@@ -303,6 +314,36 @@ pub fn candidate_stats_json_for_stores(
     candidate_stats_json_from_parts(root, &stats_rows)
 }
 
+/// Loads the persisted forest-wide source-id deduplication summary and formats
+/// it for JSON status output. Returns `None` when the root does not carry valid
+/// forest policy metadata.
+fn forest_source_dedup_summary_json_map(root: &Path) -> Option<Map<String, Value>> {
+    let summary = crate::candidate::store::forest_source_dedup_summary_state(root).ok()?;
+    let mut map = Map::new();
+    map.insert("min_new_docs".to_owned(), json!(summary.min_new_docs));
+    map.insert(
+        "last_completed_unix_ms".to_owned(),
+        json!(summary.last_completed_unix_ms.unwrap_or(0)),
+    );
+    map.insert(
+        "last_duplicate_groups".to_owned(),
+        json!(summary.last_duplicate_groups),
+    );
+    map.insert(
+        "last_deleted_docs".to_owned(),
+        json!(summary.last_deleted_docs),
+    );
+    map.insert(
+        "last_affected_trees".to_owned(),
+        json!(summary.last_affected_trees),
+    );
+    map.insert(
+        "last_total_inserted_docs".to_owned(),
+        json!(summary.last_total_inserted_docs),
+    );
+    Some(map)
+}
+
 /// Starts the background worker that drains compaction work whenever the server
 /// signals a maintenance epoch change.
 ///
@@ -326,7 +367,32 @@ fn start_compaction_worker(state: Arc<ServerState>) -> thread::JoinHandle<()> {
             loop {
                 match state.run_compaction_cycle_once() {
                     Ok(CompactionCycleOutcome::Progress) => continue,
-                    Ok(CompactionCycleOutcome::Idle | CompactionCycleOutcome::RetryLater) => break,
+                    Ok(CompactionCycleOutcome::Idle) => {
+                        let source_dedup_min_new_docs = state
+                            .config
+                            .candidate_config
+                            .source_dedup_min_new_docs
+                            .max(1);
+                        match state.run_tree_source_ref_cycle_once(source_dedup_min_new_docs) {
+                            Ok(CompactionCycleOutcome::Progress) => continue,
+                            Ok(
+                                CompactionCycleOutcome::Idle | CompactionCycleOutcome::RetryLater,
+                            ) => {
+                                match state
+                                    .run_forest_source_dedup_cycle_once(source_dedup_min_new_docs)
+                                {
+                                    Ok(CompactionCycleOutcome::Progress) => continue,
+                                    Ok(
+                                        CompactionCycleOutcome::Idle
+                                        | CompactionCycleOutcome::RetryLater,
+                                    ) => break,
+                                    Err(_) => break,
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Ok(CompactionCycleOutcome::RetryLater) => break,
                     Err(_) => break,
                 }
             }
@@ -545,6 +611,20 @@ fn grpc_optional_string(value: Option<String>) -> OptionalString {
     }
 }
 
+/// Loads the persisted forest-wide source-id deduplication summary and adapts
+/// it into the protobuf payload returned by gRPC status endpoints.
+fn grpc_forest_source_dedup_summary_from_root(root: &Path) -> Option<ForestSourceDedupSummary> {
+    let summary = crate::candidate::store::forest_source_dedup_summary_state(root).ok()?;
+    Some(ForestSourceDedupSummary {
+        min_new_docs: summary.min_new_docs,
+        last_completed_unix_ms: summary.last_completed_unix_ms.unwrap_or(0),
+        last_duplicate_groups: summary.last_duplicate_groups,
+        last_deleted_docs: summary.last_deleted_docs,
+        last_affected_trees: summary.last_affected_trees as u64,
+        last_total_inserted_docs: summary.last_total_inserted_docs,
+    })
+}
+
 /// Aggregates per-shard candidate stats into the protobuf store summary used by
 /// the gRPC status API.
 ///
@@ -584,9 +664,10 @@ fn grpc_store_summary_from_candidate_stats(
         .iter()
         .map(|item| item.compaction_idle_cooldown_s)
         .fold(0.0_f64, f64::max);
-    let compaction_cooldown_remaining_s = if stats_rows.iter().any(|item| {
-        item.deleted_doc_count > 0 && item.compaction_cooldown_remaining_s <= 0.0
-    }) {
+    let compaction_cooldown_remaining_s = if stats_rows
+        .iter()
+        .any(|item| item.deleted_doc_count > 0 && item.compaction_cooldown_remaining_s <= 0.0)
+    {
         0.0
     } else {
         stats_rows
@@ -602,6 +683,7 @@ fn grpc_store_summary_from_candidate_stats(
         candidate_shards: candidate_shards.max(1) as u64,
         id_source: stats.id_source,
         store_path: stats.store_path,
+        source_dedup_min_new_docs: stats.source_dedup_min_new_docs,
         deleted_doc_count: deleted_doc_count as u64,
         disk_usage_bytes,
         doc_count: active_doc_count.saturating_add(deleted_doc_count) as u64,
@@ -648,6 +730,7 @@ fn grpc_empty_store_summary_for_config(
         tier2_gram_size: config.candidate_config.tier2_gram_size,
         tier1_gram_size: config.candidate_config.tier1_gram_size,
         compaction_idle_cooldown_s: config.candidate_config.compaction_idle_cooldown_s,
+        source_dedup_min_new_docs: config.candidate_config.source_dedup_min_new_docs,
         compaction_cooldown_remaining_s: 0.0,
         compaction_waiting_for_cooldown: false,
         compaction_generation: 1,

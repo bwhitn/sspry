@@ -1,20 +1,3 @@
-/// Validates and normalizes a SHA-256 string used by local search helpers.
-///
-/// Inputs:
-/// - `value`: Candidate hexadecimal digest string.
-///
-/// Returns:
-/// - The lowercase 64-character digest string.
-fn normalize_sha256_hex(value: &str) -> Result<String> {
-    let text = value.trim().to_ascii_lowercase();
-    if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(SspryError::from(
-            "sha256 must be exactly 64 hexadecimal characters.",
-        ));
-    }
-    Ok(text)
-}
-
 type RuntimeGramMaskCache = HashMap<(u64, usize, usize, usize, usize), Vec<(usize, u64)>>;
 
 const MAX_LANE_POSITION_VARIANTS: usize = 64;

@@ -21,6 +21,10 @@ fn grpc_store_summary_json_map(
     map.insert("id_source".to_owned(), serde_json::json!(store.id_source));
     map.insert("store_path".to_owned(), serde_json::json!(store.store_path));
     map.insert(
+        "source_dedup_min_new_docs".to_owned(),
+        serde_json::json!(store.source_dedup_min_new_docs),
+    );
+    map.insert(
         "deleted_doc_count".to_owned(),
         serde_json::json!(store.deleted_doc_count),
     );
@@ -85,6 +89,45 @@ fn grpc_store_summary_json_map(
     map.insert(
         "deleted_storage_bytes".to_owned(),
         serde_json::json!(store.deleted_storage_bytes),
+    );
+    map
+}
+
+/// Converts forest-wide source-id deduplication maintenance state into the
+/// JSON object exposed by status and info commands.
+///
+/// Inputs:
+/// - `summary`: Forest deduplication checkpoint state returned by the server.
+///
+/// Returns:
+/// - A JSON map containing threshold and last-pass outcome counters.
+fn grpc_forest_source_dedup_json_map(
+    summary: &grpc::v1::ForestSourceDedupSummary,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "min_new_docs".to_owned(),
+        serde_json::json!(summary.min_new_docs),
+    );
+    map.insert(
+        "last_completed_unix_ms".to_owned(),
+        serde_json::json!(summary.last_completed_unix_ms),
+    );
+    map.insert(
+        "last_duplicate_groups".to_owned(),
+        serde_json::json!(summary.last_duplicate_groups),
+    );
+    map.insert(
+        "last_deleted_docs".to_owned(),
+        serde_json::json!(summary.last_deleted_docs),
+    );
+    map.insert(
+        "last_affected_trees".to_owned(),
+        serde_json::json!(summary.last_affected_trees),
+    );
+    map.insert(
+        "last_total_inserted_docs".to_owned(),
+        serde_json::json!(summary.last_total_inserted_docs),
     );
     map
 }
@@ -617,6 +660,12 @@ fn grpc_status_output_json(
         map.insert(
             "published_tier2_snapshot_seal".to_owned(),
             serde_json::Value::Object(grpc_published_tier2_snapshot_seal_json_map(seal)),
+        );
+    }
+    if let Some(summary) = &status.forest_source_dedup {
+        map.insert(
+            "forest_source_dedup".to_owned(),
+            serde_json::Value::Object(grpc_forest_source_dedup_json_map(summary)),
         );
     }
     if include_store_details {

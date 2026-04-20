@@ -21,21 +21,20 @@ use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanne
 use crate::candidate::features::AdditionalDigestKind;
 use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
-    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
+    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
-    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes,
-    HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
-    choose_filter_bytes_for_file_size,
+    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
     estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
     extract_compact_document_metadata_with_entropy, load_rule_file_with_includes,
     read_candidate_shard_count, resolve_max_candidates,
     rule_check_all_from_file_with_gram_sizes_and_identity_source,
-    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names,
+    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names, BoundedCache,
+    CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan, GramSizes,
+    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, HLL_DEFAULT_PRECISION,
 };
 use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
@@ -522,19 +521,6 @@ fn path_identity_sha256(path: &Path) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Folds an alternate digest into the canonical 32-byte candidate identity
-/// namespace.
-pub(crate) fn normalize_identity_digest(kind: &str, bytes: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"sspry-identity\0");
-    digest.update(kind.as_bytes());
-    digest.update(b"\0");
-    digest.update(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest.finalize());
-    out
-}
-
 /// Streams a file through SHA-256 and returns the raw digest bytes.
 fn sha256_file(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
     if chunk_size == 0 {
@@ -619,21 +605,8 @@ fn sha512_file(path: &Path, chunk_size: usize) -> Result<[u8; 64]> {
     Ok(out)
 }
 
-/// Decodes a canonical 64-character SHA-256 hex string.
-fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
-    let text = value.trim().to_ascii_lowercase();
-    if text.len() != 64 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(SspryError::from(
-            "sha256 must be exactly 64 hexadecimal characters.",
-        ));
-    }
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(text, &mut out)?;
-    Ok(out)
-}
-
 /// Decodes a fixed-width hexadecimal digest and validates its exact size.
-fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<Vec<u8>> {
     let text = value.trim().to_ascii_lowercase();
     if text.len() != N * 2 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(SspryError::from(format!(
@@ -641,58 +614,40 @@ fn decode_exact_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N]>
             N * 2
         )));
     }
-    let mut out = [0u8; N];
+    let mut out = vec![0u8; N];
     hex::decode_to_slice(text, &mut out)?;
     Ok(out)
 }
 
-/// Computes the normalized candidate identity for a file using the configured
+/// Computes the candidate identity bytes for a file using the configured
 /// identity source.
 fn identity_from_file(
     path: &Path,
     chunk_size: usize,
     id_source: CandidateIdSource,
-) -> Result<[u8; 32]> {
+) -> Result<Vec<u8>> {
     match id_source {
-        CandidateIdSource::Sha256 => sha256_file(path, chunk_size),
-        CandidateIdSource::Md5 => Ok(normalize_identity_digest(
-            "md5",
-            &md5_file(path, chunk_size)?,
-        )),
-        CandidateIdSource::Sha1 => Ok(normalize_identity_digest(
-            "sha1",
-            &sha1_file(path, chunk_size)?,
-        )),
-        CandidateIdSource::Sha512 => Ok(normalize_identity_digest(
-            "sha512",
-            &sha512_file(path, chunk_size)?,
-        )),
+        CandidateIdSource::Sha256 => Ok(sha256_file(path, chunk_size)?.to_vec()),
+        CandidateIdSource::Md5 => Ok(md5_file(path, chunk_size)?.to_vec()),
+        CandidateIdSource::Sha1 => Ok(sha1_file(path, chunk_size)?.to_vec()),
+        CandidateIdSource::Sha512 => Ok(sha512_file(path, chunk_size)?.to_vec()),
     }
 }
 
-/// Decodes a textual digest into the normalized candidate identity for the
+/// Decodes a textual digest into the candidate identity bytes for the
 /// configured identity source.
-fn identity_from_hex(value: &str, id_source: CandidateIdSource) -> Result<[u8; 32]> {
+fn identity_from_hex(value: &str, id_source: CandidateIdSource) -> Result<Vec<u8>> {
     match id_source {
         CandidateIdSource::Sha256 => decode_exact_hex::<32>(value, "sha256"),
-        CandidateIdSource::Md5 => Ok(normalize_identity_digest(
-            "md5",
-            &decode_exact_hex::<16>(value, "md5")?,
-        )),
-        CandidateIdSource::Sha1 => Ok(normalize_identity_digest(
-            "sha1",
-            &decode_exact_hex::<20>(value, "sha1")?,
-        )),
-        CandidateIdSource::Sha512 => Ok(normalize_identity_digest(
-            "sha512",
-            &decode_exact_hex::<64>(value, "sha512")?,
-        )),
+        CandidateIdSource::Md5 => decode_exact_hex::<16>(value, "md5"),
+        CandidateIdSource::Sha1 => decode_exact_hex::<20>(value, "sha1"),
+        CandidateIdSource::Sha512 => decode_exact_hex::<64>(value, "sha512"),
     }
 }
 
 #[cfg(test)]
 /// Resolves exactly one delete target from explicit digests or a file path into
-/// the canonical SHA-256 hex identity stored by the index.
+/// the configured source-id hex value stored by the index.
 fn resolve_delete_identity(
     sha256: Option<&str>,
     md5: Option<&str>,
@@ -702,7 +657,7 @@ fn resolve_delete_identity(
     id_source: CandidateIdSource,
     chunk_size: usize,
 ) -> Result<String> {
-    let mut chosen = None::<[u8; 32]>;
+    let mut chosen = None::<Vec<u8>>;
     let mut count = 0usize;
     for (value, source) in [
         (sha256, CandidateIdSource::Sha256),
@@ -1548,6 +1503,7 @@ fn store_config_from_parts(
     tier2_gram_size: usize,
     tier1_gram_size: usize,
     compaction_idle_cooldown_s: f64,
+    source_dedup_min_new_docs: u64,
 ) -> CandidateConfig {
     CandidateConfig {
         root,
@@ -1564,6 +1520,7 @@ fn store_config_from_parts(
             None
         },
         compaction_idle_cooldown_s: compaction_idle_cooldown_s.max(0.0),
+        source_dedup_min_new_docs: source_dedup_min_new_docs.max(1),
     }
 }
 
@@ -1595,6 +1552,7 @@ fn store_config_from_init_args(args: &InitArgs, root: PathBuf) -> CandidateConfi
         gram_sizes.tier2,
         gram_sizes.tier1,
         args.compaction_idle_cooldown_s,
+        args.source_dedup_min_new_docs,
     )
 }
 
@@ -1994,7 +1952,11 @@ fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
         .map(|entry| {
             let path = entry.path();
             let current = path.join("current");
-            if current.is_dir() { current } else { path }
+            if current.is_dir() {
+                current
+            } else {
+                path
+            }
         })
         .filter(|path| {
             path.is_dir()
@@ -2314,7 +2276,7 @@ fn verify_search_candidates(
 
 #[derive(Debug)]
 struct IndexBatchRow {
-    identity: [u8; 32],
+    identity: Vec<u8>,
     file_size: u64,
     filter_bytes: usize,
     bloom_item_estimate: Option<usize>,
@@ -2491,7 +2453,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         extract_compact_document_metadata_with_entropy(scan_path, features.entropy_bits_per_byte)?
     };
     let identity = if policy.id_source == CandidateIdSource::Sha256 {
-        features.sha256
+        features.sha256.to_vec()
     } else {
         features
             .alternate_identity
@@ -2905,6 +2867,7 @@ fn resolve_serve_runtime_settings(args: &ServeCommonArgs) -> Result<ResolvedServ
             stats.tier2_gram_size,
             stats.tier1_gram_size,
             stats.compaction_idle_cooldown_s,
+            stats.source_dedup_min_new_docs,
         );
         return Ok(ResolvedServeRuntimeSettings {
             candidate_config,
@@ -2956,6 +2919,10 @@ fn cmd_init(args: &InitArgs) -> i32 {
         println!(
             "compaction_idle_cooldown_s: {}",
             stats.compaction_idle_cooldown_s
+        );
+        println!(
+            "source_dedup_min_new_docs: {}",
+            stats.source_dedup_min_new_docs
         );
         Ok(0)
     })() {
@@ -3073,19 +3040,19 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
                 .id_source;
             let id_source = CandidateIdSource::parse_config_value(&id_source)?;
             for value in &args.values {
-                let sha256_hex =
+                let identity_hex =
                     resolve_delete_value(value, id_source, DEFAULT_FILE_READ_CHUNK_SIZE)?;
-                let sha256 = decode_sha256_hex(&sha256_hex)?;
-                let shard_idx = candidate_shard_index(&sha256, stores.len());
-                results.push(stores[shard_idx].delete_document(&sha256_hex)?);
+                let identity = identity_from_hex(&identity_hex, id_source)?;
+                let shard_idx = candidate_shard_index(&identity, stores.len());
+                results.push(stores[shard_idx].delete_document(&identity_hex)?);
             }
         } else {
             let server_id_source = server_identity_source(&args.connection)?;
             let mut client = grpc_client(&args.connection)?;
             for value in &args.values {
-                let sha256_hex =
+                let identity_hex =
                     resolve_delete_value(value, server_id_source, DEFAULT_FILE_READ_CHUNK_SIZE)?;
-                let deleted = client.candidate_delete_identity(&sha256_hex)?;
+                let deleted = client.candidate_delete_identity(&identity_hex)?;
                 results.push(crate::candidate::CandidateDeleteResult {
                     status: deleted.status,
                     doc_id: deleted.doc_id,
@@ -3279,6 +3246,12 @@ fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
                 "peak_rss_kb".to_owned(),
                 serde_json::json!(stats.peak_rss_kb),
             );
+            if let Some(summary) = &stats.forest_source_dedup {
+                map.insert(
+                    "forest_source_dedup".to_owned(),
+                    serde_json::Value::Object(grpc_forest_source_dedup_json_map(summary)),
+                );
+            }
             serde_json::Value::Object(map)
         };
         println!("{}", serde_json::to_string_pretty(&stats)?);
@@ -4142,12 +4115,12 @@ fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
         let mut exit_code = 0;
         for value in &args.values {
             match (|| -> Result<()> {
-                let sha256_hex = resolve_delete_value(
+                let identity_hex = resolve_delete_value(
                     value,
                     server_policy.id_source,
                     DEFAULT_FILE_READ_CHUNK_SIZE,
                 )?;
-                let result = client.candidate_delete_identity(&sha256_hex)?;
+                let result = client.candidate_delete_identity(&identity_hex)?;
                 println!("value: {value}");
                 println!("status: {}", result.status);
                 println!("identity: {}", result.identity);

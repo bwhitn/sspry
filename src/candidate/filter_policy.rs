@@ -3,6 +3,30 @@ use crate::{Result, SspryError};
 const LN_2: f64 = std::f64::consts::LN_2;
 const LN_2_SQ: f64 = LN_2 * LN_2;
 const BLOOM_WORD_BYTES: usize = 8;
+pub const MIN_FILTER_TARGET_FP: f64 = 0.01;
+pub const MAX_FILTER_TARGET_FP: f64 = 0.5;
+
+/// Returns the integer hash-count target implied by a bloom false-positive
+/// rate using the standard `k ~= log2(1 / p)` approximation.
+fn optimal_hash_count_for_target_fp(value: f64) -> usize {
+    ((1.0 / value).log2().round() as usize).max(1)
+}
+
+/// Returns the largest hash count supported by the current target-fp policy.
+pub fn max_supported_bloom_hashes() -> usize {
+    optimal_hash_count_for_target_fp(MIN_FILTER_TARGET_FP)
+}
+
+/// Validates that a configured bloom target false-positive rate stays within
+/// the supported operating range for the current sizing policy.
+fn validate_target_fp(value: f64, field: &str) -> Result<()> {
+    if (MIN_FILTER_TARGET_FP..=MAX_FILTER_TARGET_FP).contains(&value) {
+        return Ok(());
+    }
+    Err(SspryError::from(format!(
+        "{field} must be in range [{MIN_FILTER_TARGET_FP}, {MAX_FILTER_TARGET_FP}]",
+    )))
+}
 
 /// Rounds a bloom payload size up to the nearest whole machine word so mask
 /// operations can stay word-aligned.
@@ -51,11 +75,7 @@ fn normalize_filter_policy(
         maximum = minimum;
     }
     if let Some(value) = filter_target_fp {
-        if !(0.0 < value && value < 1.0) {
-            return Err(SspryError::from(
-                "filter_target_fp must be in range (0, 1) when set",
-            ));
-        }
+        validate_target_fp(value, "filter_target_fp")?;
     }
     Ok((minimum, maximum, filter_target_fp))
 }
@@ -63,15 +83,14 @@ fn normalize_filter_policy(
 /// Derives an overall bloom hash count from a target false-positive rate, or
 /// falls back to the configured default when no target is set.
 pub fn derive_bloom_hash_count(target_fp: Option<f64>, fallback_hashes: usize) -> Result<usize> {
-    let fallback = fallback_hashes.max(1);
+    let maximum = max_supported_bloom_hashes();
+    let fallback = fallback_hashes.max(1).min(maximum);
     let Some(fp) = target_fp else {
         return Ok(fallback);
     };
-    if !(0.0 < fp && fp < 1.0) {
-        return Err(SspryError::from("target_fp must be in range (0, 1)"));
-    }
-    let estimate = (1.0 / fp).log2().round() as usize;
-    Ok(estimate.clamp(1, 16))
+    validate_target_fp(fp, "target_fp")?;
+    let estimate = optimal_hash_count_for_target_fp(fp);
+    Ok(estimate.clamp(1, maximum))
 }
 
 /// Estimates a per-document bloom hash count from the filter density implied
@@ -81,14 +100,15 @@ pub fn derive_document_bloom_hash_count(
     bloom_item_estimate: Option<usize>,
     fallback_hashes: usize,
 ) -> usize {
-    let fallback = fallback_hashes.max(1);
+    let maximum = max_supported_bloom_hashes();
+    let fallback = fallback_hashes.max(1).min(maximum);
     let Some(bloom_item_estimate) = bloom_item_estimate else {
         return fallback;
     };
     let gram_count = bloom_item_estimate.max(1) as f64;
     let bits = (filter_bytes.max(1) * 8) as f64;
     let estimate = ((bits / gram_count) * LN_2).round() as usize;
-    estimate.clamp(1, 16)
+    estimate.clamp(1, maximum)
 }
 
 /// Chooses the filter size for one document by combining file-size heuristics,
@@ -129,8 +149,9 @@ pub fn choose_filter_bytes_for_file_size(
 #[cfg(test)]
 mod tests {
     use super::{
-        align_filter_bytes, choose_filter_bytes_for_file_size, derive_bloom_hash_count,
-        derive_document_bloom_hash_count, normalize_filter_policy,
+        MAX_FILTER_TARGET_FP, MIN_FILTER_TARGET_FP, align_filter_bytes,
+        choose_filter_bytes_for_file_size, derive_bloom_hash_count,
+        derive_document_bloom_hash_count, max_supported_bloom_hashes, normalize_filter_policy,
     };
 
     #[test]
@@ -173,11 +194,11 @@ mod tests {
             2048,
             Some(2048),
             Some(0),
-            Some(0.0001),
+            Some(0.01),
             Some(22_000_000),
         )
         .expect("theoretical size");
-        assert_eq!(selected, 52_717_568);
+        assert_eq!(selected, 26_358_784);
     }
 
     #[test]
@@ -187,6 +208,8 @@ mod tests {
             1
         );
         assert_eq!(derive_document_bloom_hash_count(2048, None, 7), 7);
+        assert_eq!(derive_document_bloom_hash_count(2048, None, 13), 7);
+        assert_eq!(derive_document_bloom_hash_count(2048, Some(1), 7), 7);
     }
 
     #[test]
@@ -197,10 +220,22 @@ mod tests {
         assert_eq!(maximum, 4096);
         assert_eq!(fp, None);
 
-        assert!(normalize_filter_policy(2048, None, None, Some(1.0)).is_err());
+        normalize_filter_policy(2048, None, None, Some(MIN_FILTER_TARGET_FP))
+            .expect("minimum target fp");
+        normalize_filter_policy(2048, None, None, Some(MAX_FILTER_TARGET_FP))
+            .expect("maximum target fp");
+        assert_eq!(max_supported_bloom_hashes(), 7);
+        assert!(normalize_filter_policy(2048, None, None, Some(0.009)).is_err());
+        assert!(normalize_filter_policy(2048, None, None, Some(0.51)).is_err());
         assert_eq!(derive_bloom_hash_count(None, 0).expect("fallback"), 1);
+        assert_eq!(derive_bloom_hash_count(None, 13).expect("capped fallback"), 7);
         assert_eq!(derive_bloom_hash_count(Some(0.25), 13).expect("derived"), 2);
-        assert!(derive_bloom_hash_count(Some(0.0), 13).is_err());
+        assert_eq!(
+            derive_bloom_hash_count(Some(MIN_FILTER_TARGET_FP), 13).expect("minimum fp cap"),
+            7
+        );
+        assert!(derive_bloom_hash_count(Some(0.009), 13).is_err());
+        assert!(derive_bloom_hash_count(Some(0.51), 13).is_err());
 
         let selected =
             choose_filter_bytes_for_file_size(1, 1, Some(1), Some(0), Some(0.5), Some(1))

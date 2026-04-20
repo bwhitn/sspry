@@ -1127,9 +1127,154 @@ fn target_fp_derives_effective_bloom_hash_count() {
     )
     .expect("init");
     let bloom_hashes = store.resolve_bloom_hashes_for_document(512 * 1024, Some(100_000), Some(7));
-    assert_eq!(bloom_hashes, 16);
+    assert_eq!(bloom_hashes, 7);
     assert_eq!(store.stats().tier1_filter_target_fp, Some(0.25));
     assert_eq!(store.stats().tier2_filter_target_fp, Some(0.25));
+}
+
+#[test]
+fn build_tree_source_ref_sorts_live_entries_across_shards() {
+    let tmp = tempdir().expect("tmp");
+    let tree_root = tmp.path().join("tree_00").join("current");
+    fs::create_dir_all(&tree_root).expect("tree root");
+    write_candidate_shard_count(&tree_root, 2).expect("shard manifest");
+
+    let mut shard0 = CandidateStore::init(
+        CandidateConfig {
+            root: candidate_shard_root(&tree_root, 2, 0),
+            ..CandidateConfig::default()
+        },
+        true,
+    )
+    .expect("init shard0");
+    let mut shard1 = CandidateStore::init(
+        CandidateConfig {
+            root: candidate_shard_root(&tree_root, 2, 1),
+            ..CandidateConfig::default()
+        },
+        true,
+    )
+    .expect("init shard1");
+
+    let filter_bytes = shard0
+        .resolve_filter_bytes_for_file_size(1, None)
+        .expect("filter bytes");
+    let bloom = vec![0u8; filter_bytes];
+    let mut identity_a = vec![0u8; 32];
+    identity_a[0] = 1;
+    let mut identity_b = vec![0u8; 32];
+    identity_b[0] = 2;
+    let mut identity_c = vec![0u8; 32];
+    identity_c[0] = 3;
+    let mut identity_deleted = vec![0u8; 32];
+    identity_deleted[0] = 4;
+
+    shard1
+        .insert_document(
+            identity_a.clone(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            filter_bytes,
+            &bloom,
+            0,
+            &[],
+            None,
+        )
+        .expect("insert a");
+    shard0
+        .insert_document(
+            identity_b.clone(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            filter_bytes,
+            &bloom,
+            0,
+            &[],
+            None,
+        )
+        .expect("insert b");
+    shard1
+        .insert_document(
+            identity_c.clone(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            filter_bytes,
+            &bloom,
+            0,
+            &[],
+            None,
+        )
+        .expect("insert c");
+    shard0
+        .insert_document(
+            identity_deleted.clone(),
+            1,
+            None,
+            None,
+            None,
+            None,
+            filter_bytes,
+            &bloom,
+            0,
+            &[],
+            None,
+        )
+        .expect("insert deleted");
+    shard0
+        .delete_document(&hex::encode(&identity_deleted))
+        .expect("delete doc");
+
+    shard0.persist_meta_if_dirty().expect("persist shard0");
+    shard1.persist_meta_if_dirty().expect("persist shard1");
+
+    assert!(tree_source_ref_build_due(&tree_root, 1).expect("due before build"));
+    let result = build_tree_source_ref(&tree_root).expect("build tree source ref");
+    assert_eq!(result.entry_count, 3);
+    assert_eq!(result.total_inserted_docs, 4);
+    assert_eq!(result.candidate_shards, 2);
+    assert_eq!(result.identity_bytes, 32);
+    assert_eq!(result.id_source, "sha256");
+
+    let manifest = read_tree_source_ref_manifest(&tree_root)
+        .expect("manifest read")
+        .expect("manifest present");
+    assert_eq!(manifest.entry_count, 3);
+    assert_eq!(manifest.total_inserted_docs, 4);
+    assert_eq!(manifest.candidate_shards, 2);
+    assert_eq!(manifest.identity_bytes, 32);
+    assert_eq!(manifest.id_source, "sha256");
+
+    let entries = read_tree_source_ref_entries(&tree_root).expect("read entries");
+    assert_eq!(
+        entries,
+        vec![
+            TreeSourceRefEntry {
+                identity: identity_a,
+                shard_idx: 1,
+                doc_id: 1,
+            },
+            TreeSourceRefEntry {
+                identity: identity_b,
+                shard_idx: 0,
+                doc_id: 1,
+            },
+            TreeSourceRefEntry {
+                identity: identity_c,
+                shard_idx: 1,
+                doc_id: 2,
+            },
+        ]
+    );
+    assert!(!tree_source_ref_build_due(&tree_root, 1).expect("not due after build"));
 }
 
 #[test]
@@ -1267,11 +1412,12 @@ fn validation_and_open_error_paths_work() {
         .contains("filter_target_fp")
     );
     assert_eq!(
-        normalize_sha256_hex(&format!("  {}  ", "AB".repeat(32))).expect("normalize"),
+        normalize_identity_hex(&format!("  {}  ", "AB".repeat(32)), 32, "sha256")
+            .expect("normalize"),
         "ab".repeat(32)
     );
     assert!(
-        normalize_sha256_hex("not-a-sha")
+        normalize_identity_hex("not-a-sha", 32, "sha256")
             .expect_err("invalid sha")
             .to_string()
             .contains("64 hexadecimal")
@@ -1367,7 +1513,7 @@ fn binary_sidecars_roundtrip_and_reopen() {
         .expect("delete two");
 
     let (loaded_docs, loaded_rows, loaded_tier2_rows) =
-        load_candidate_binary_store(&root).expect("load binary");
+        load_candidate_binary_store(&root, 32).expect("load binary");
     assert_eq!(loaded_docs.len(), 2);
     assert_eq!(loaded_rows.len(), 2);
     assert_eq!(loaded_tier2_rows.len(), 2);
@@ -1418,7 +1564,7 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
     .expect("insert invalid len root");
     fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
     assert!(
-        load_candidate_binary_store(&invalid_len_root)
+        load_candidate_binary_store(&invalid_len_root, 32)
             .expect_err("invalid binary len")
             .to_string()
             .contains("Invalid candidate binary document state")
@@ -1453,7 +1599,7 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
     .expect("insert mismatch root");
     fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
     assert!(
-        load_candidate_binary_store(&mismatch_root)
+        load_candidate_binary_store(&mismatch_root, 32)
             .expect_err("mismatch state")
             .to_string()
             .contains("Mismatched candidate binary document state")
