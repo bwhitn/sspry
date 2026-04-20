@@ -111,7 +111,7 @@ fn non_exact_patterns_use_any_lane_masks() {
 
     let doc = CandidateDoc {
         doc_id: 0,
-        sha256: String::new(),
+        identity: String::new(),
         file_size: 0,
         filter_bytes,
         bloom_hashes,
@@ -195,7 +195,7 @@ fn tier2_only_patterns_do_not_match_without_tier2_bloom_hit() {
     let runtime = build_runtime_query_artifacts(&plan).expect("runtime query artifacts");
     let doc = CandidateDoc {
         doc_id: 0,
-        sha256: String::new(),
+        identity: String::new(),
         file_size: 0,
         filter_bytes: 64,
         bloom_hashes: 3,
@@ -393,7 +393,7 @@ fn evaluate_rule_against_file_blooms(
     let runtime = build_runtime_query_artifacts(&plan)?;
     let doc = CandidateDoc {
         doc_id: 0,
-        sha256: hex::encode(features.sha256),
+        identity: hex::encode(features.sha256),
         file_size: features.file_size,
         filter_bytes,
         bloom_hashes,
@@ -628,7 +628,7 @@ rule q {
     )
     .expect("plan");
     let query = store.query_candidates(&plan, 0, 128).expect("query");
-    assert_eq!(query.sha256, vec![hex::encode([0x11; 32])]);
+    assert_eq!(query.identities, vec![hex::encode([0x11; 32])]);
 
     let deleted = store
         .delete_document(&hex::encode([0x11; 32]))
@@ -636,7 +636,7 @@ rule q {
     assert_eq!(deleted.status, "deleted");
 
     let query_after = store.query_candidates(&plan, 0, 128).expect("query");
-    assert!(query_after.sha256.is_empty());
+    assert!(query_after.identities.is_empty());
 
     let reopened = CandidateStore::open(root).expect("open");
     assert_eq!(reopened.stats().deleted_doc_count, 1);
@@ -700,7 +700,7 @@ rule q {
     )
     .expect("plan");
     let query = store.query_candidates(&plan, 0, 128).expect("query");
-    assert_eq!(query.sha256, vec![hex::encode([0x11; 32])]);
+    assert_eq!(query.identities, vec![hex::encode([0x11; 32])]);
     assert_eq!(query.query_profile.docs_scanned, 1);
     assert_eq!(query.query_profile.tier1_bloom_loads, 0);
     assert_eq!(query.query_profile.tier2_bloom_loads, 0);
@@ -1196,7 +1196,7 @@ fn external_ids_follow_active_docs() {
         .delete_document(&hex::encode(sha3))
         .expect("delete third");
 
-    let external_ids = store.external_ids_for_sha256(&[
+    let external_ids = store.external_ids_for_identities(&[
         hex::encode(sha1),
         hex::encode(sha2),
         hex::encode(sha3),
@@ -1211,7 +1211,7 @@ fn external_ids_follow_active_docs() {
             None,
         ]
     );
-    let doc_ids = store.doc_ids_for_sha256(&[
+    let doc_ids = store.doc_ids_for_identities(&[
         hex::encode(sha1),
         hex::encode(sha2),
         hex::encode(sha3),
@@ -1376,7 +1376,7 @@ fn binary_sidecars_roundtrip_and_reopen() {
 
     let reopened = CandidateStore::open(&root).expect("reopen");
     assert_eq!(
-        reopened.external_ids_for_sha256(&[hex::encode([0x11; 32])]),
+        reopened.external_ids_for_identities(&[hex::encode([0x11; 32])]),
         vec![Some("doc-one".to_owned())]
     );
 }
@@ -1857,7 +1857,7 @@ fn insert_restore_delete_and_stats_edge_paths_work() {
     assert_eq!(stats.doc_count, 1);
     assert_eq!(stats.deleted_doc_count, 0);
     assert_eq!(
-        store.external_ids_for_sha256(&[hex::encode([0x10; 32])]),
+        store.external_ids_for_identities(&[hex::encode([0x10; 32])]),
         vec![Some("restored".to_owned())]
     );
 }
@@ -1973,7 +1973,7 @@ fn query_and_ast_edge_paths_work() {
     let bloom_bytes = lane_bloom_bytes(64, 2, &[1, 2]);
     let doc = CandidateDoc {
         doc_id: 99,
-        sha256: hex::encode([0x44; 32]),
+        identity: hex::encode([0x44; 32]),
         file_size: 42,
         filter_bytes: 64,
         bloom_hashes: 2,
@@ -2416,7 +2416,7 @@ fn query_candidates_truncates_when_match_count_exceeds_max_candidates() {
     assert_eq!(result.truncated_limit, Some(2));
     assert_eq!(result.total_candidates, 2);
     assert_eq!(result.returned_count, 2);
-    assert_eq!(result.sha256.len(), 2);
+    assert_eq!(result.identities.len(), 2);
 }
 
 #[test]
@@ -2448,7 +2448,7 @@ fn evaluate_node_supports_metadata_and_time_conditions() {
 
     let doc = CandidateDoc {
         doc_id: 1,
-        sha256: hex::encode([0x11; 32]),
+        identity: hex::encode([0x11; 32]),
         file_size: pe.len() as u64,
         filter_bytes: 8,
         bloom_hashes: 2,
@@ -3241,7 +3241,7 @@ fn query_candidates_scans_special_population_when_no_regular_docs_exist() {
     let result = store.query_candidates(&plan, 0, 8).expect("query");
     assert_eq!(result.total_candidates, 1);
     assert_eq!(result.returned_count, 1);
-    assert_eq!(result.sha256, vec![hex::encode(sha256)]);
+    assert_eq!(result.identities, vec![hex::encode(sha256)]);
     assert_eq!(result.query_profile.docs_scanned, 1);
     assert_eq!(result.query_profile.tier1_bloom_loads, 1);
 }

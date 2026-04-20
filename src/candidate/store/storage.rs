@@ -385,7 +385,7 @@ fn load_candidate_binary_store(
         };
         docs.push(CandidateDoc {
             doc_id,
-            sha256,
+            identity: sha256,
             file_size: row.file_size,
             filter_bytes: row.filter_bytes as usize,
             bloom_hashes: usize::from(row.bloom_hashes.max(1)),

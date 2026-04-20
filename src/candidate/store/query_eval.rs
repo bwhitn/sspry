@@ -1066,7 +1066,7 @@ where
                 .as_ref()
                 .ok_or_else(|| SspryError::from("identity_eq node requires pattern_id"))?;
             Ok(MatchOutcome {
-                matched: doc_inputs.doc.sha256 == *expected,
+                matched: doc_inputs.doc.identity == *expected,
                 tiers: TierFlags::default(),
             })
         }

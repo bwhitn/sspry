@@ -304,7 +304,7 @@ include "second.yar"
 #[test]
 fn grpc_search_frame_to_internal_preserves_bundled_rule_metadata() {
     let frame = GrpcSearchFrame {
-        sha256: vec!["aa".to_owned()],
+        identities: vec!["aa".to_owned()],
         external_ids: vec![Some("doc-a".to_owned())],
         candidate_limit: Some(10),
         stream_complete: false,
@@ -371,7 +371,7 @@ rule rule_two {
         None,
         &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: vec!["hash-a".to_owned()],
+                identities: vec!["hash-a".to_owned()],
                 external_ids: Some(vec![None]),
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -382,7 +382,7 @@ rule rule_two {
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -396,7 +396,7 @@ rule rule_two {
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: vec!["hash-b".to_owned()],
+                identities: vec!["hash-b".to_owned()],
                 external_ids: Some(vec![None]),
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -407,7 +407,7 @@ rule rule_two {
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -421,7 +421,7 @@ rule rule_two {
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: None,
                 stream_complete: true,
@@ -501,7 +501,7 @@ rule rule_two {
         None,
         &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: vec!["hash-a".to_owned()],
+                identities: vec!["hash-a".to_owned()],
                 external_ids: Some(vec![None]),
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -512,7 +512,7 @@ rule rule_two {
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -532,7 +532,7 @@ rule rule_two {
             assert!(!saw_stream_complete.get());
 
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: vec!["hash-b".to_owned()],
+                identities: vec!["hash-b".to_owned()],
                 external_ids: Some(vec![None]),
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -543,7 +543,7 @@ rule rule_two {
                 query_eval_nanos: 0,
             })?;
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: Some(100),
                 stream_complete: false,
@@ -564,7 +564,7 @@ rule rule_two {
 
             saw_stream_complete.set(true);
             on_frame(rpc::CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: None,
                 stream_complete: true,
@@ -729,7 +729,7 @@ fn json_config_and_binary_row_helpers_work() {
     assert_eq!(variable.compaction_idle_cooldown_s, 9.25);
 
     let row = IndexBatchRow {
-        sha256: [0xAA; 32],
+        identity: [0xAA; 32],
         file_size: 123,
         filter_bytes: 2048,
         bloom_item_estimate: Some(77),
@@ -884,7 +884,7 @@ fn scan_candidate_batch_helpers_work() {
     assert_eq!(row.filter_bytes % 8, 0);
     assert_eq!(row.tier2_filter_bytes % 8, 0);
     assert_eq!(
-        md5_row.sha256,
+        md5_row.identity,
         identity_from_file(&sample, 4, CandidateIdSource::Md5).expect("md5 id")
     );
     assert!(md5_row.external_id.is_none());

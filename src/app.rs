@@ -1098,7 +1098,7 @@ fn resolve_delete_value(
 /// RPC path.
 fn serialize_candidate_document_binary_row(row: &IndexBatchRow) -> Result<Vec<u8>> {
     rpc::serialize_candidate_insert_binary_row_parts(
-        &row.sha256,
+        &row.identity,
         row.file_size,
         row.bloom_item_estimate,
         &row.bloom_filter,
@@ -1468,9 +1468,9 @@ fn flush_local_pending_rows(
 ) -> Result<()> {
     for row in pending.drain(..) {
         let started_submit = Instant::now();
-        let shard_idx = candidate_shard_index(&row.sha256, stores.len());
+        let shard_idx = candidate_shard_index(&row.identity, stores.len());
         let _ = stores[shard_idx].insert_document_with_metadata(
-            row.sha256,
+            row.identity,
             row.file_size,
             row.bloom_item_estimate,
             None,
@@ -1858,16 +1858,16 @@ impl SearchExecutionAccumulator {
         }
 
         let mut frame_external_ids = frame.external_ids.unwrap_or_default();
-        if args.verify_yara_files && frame_external_ids.len() < frame.sha256.len() {
-            frame_external_ids.resize(frame.sha256.len(), None);
+        if args.verify_yara_files && frame_external_ids.len() < frame.identities.len() {
+            frame_external_ids.resize(frame.identities.len(), None);
         }
-        for (idx, sha256) in frame.sha256.into_iter().enumerate() {
+        for (idx, identity) in frame.identities.into_iter().enumerate() {
             let external_id = if args.verify_yara_files {
                 frame_external_ids.get(idx).cloned().flatten()
             } else {
                 None
             };
-            if let Some(existing_idx) = self.accepted_positions.get(&sha256).copied() {
+            if let Some(existing_idx) = self.accepted_positions.get(&identity).copied() {
                 if args.verify_yara_files
                     && self
                         .external_ids
@@ -1887,9 +1887,9 @@ impl SearchExecutionAccumulator {
                 continue;
             }
             self.accepted_positions
-                .insert(sha256.clone(), self.rows.len());
+                .insert(identity.clone(), self.rows.len());
             self.total_candidates = self.total_candidates.saturating_add(1);
-            self.rows.push(sha256);
+            self.rows.push(identity);
             if args.verify_yara_files {
                 self.external_ids.push(external_id);
             }
@@ -2084,14 +2084,15 @@ fn query_store_group_all_candidates(
             out.tier_used.push(local.tier_used.clone());
             out.query_profile.merge_from(&local.query_profile);
             if include_external_ids {
-                let external_ids = store.external_ids_for_sha256(&local.sha256);
-                for (sha256, external_id) in local.sha256.into_iter().zip(external_ids.into_iter())
+                let external_ids = store.external_ids_for_identities(&local.identities);
+                for (identity, external_id) in
+                    local.identities.into_iter().zip(external_ids.into_iter())
                 {
-                    out.hashes.insert(sha256.clone());
-                    out.external_ids.entry(sha256).or_insert(external_id);
+                    out.hashes.insert(identity.clone());
+                    out.external_ids.entry(identity).or_insert(external_id);
                 }
             } else {
-                out.hashes.extend(local.sha256);
+                out.hashes.extend(local.identities);
             }
             if let Some(next) = local.next_cursor {
                 cursor = next;
@@ -2313,7 +2314,7 @@ fn verify_search_candidates(
 
 #[derive(Debug)]
 struct IndexBatchRow {
-    sha256: [u8; 32],
+    identity: [u8; 32],
     file_size: u64,
     filter_bytes: usize,
     bloom_item_estimate: Option<usize>,
@@ -2489,7 +2490,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         metadata_scope.add_items(1);
         extract_compact_document_metadata_with_entropy(scan_path, features.entropy_bits_per_byte)?
     };
-    let sha256 = if policy.id_source == CandidateIdSource::Sha256 {
+    let identity = if policy.id_source == CandidateIdSource::Sha256 {
         features.sha256
     } else {
         features
@@ -2500,7 +2501,7 @@ fn scan_index_batch_row(file_path: &Path, policy: ScanPolicy) -> Result<IndexBat
         let mut row_build_scope = perf::scope("candidate.scan_index_batch_row.row_build");
         row_build_scope.add_items(1);
         IndexBatchRow {
-            sha256,
+            identity,
             file_size: features.file_size,
             filter_bytes,
             bloom_item_estimate,
@@ -2991,9 +2992,9 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
                 },
             )?;
             row.external_id = args.external_id.clone().or(row.external_id);
-            let shard_idx = candidate_shard_index(&row.sha256, stores.len());
+            let shard_idx = candidate_shard_index(&row.identity, stores.len());
             let result = stores[shard_idx].insert_document_with_metadata(
-                row.sha256,
+                row.identity,
                 row.file_size,
                 row.bloom_item_estimate,
                 None,
@@ -3010,7 +3011,7 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
             rpc::CandidateInsertResponse {
                 status: result.status,
                 doc_id: result.doc_id,
-                sha256: result.sha256,
+                identity: result.identity,
             }
         } else {
             let server_policy = server_scan_policy(&args.connection)?;
@@ -3038,13 +3039,13 @@ fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
             rpc::CandidateInsertResponse {
                 status: result.status,
                 doc_id: result.doc_id,
-                sha256: result.sha256,
+                identity: result.identity,
             }
         };
 
         println!("status: {}", result.status);
         println!("doc_id: {}", result.doc_id);
-        println!("sha256: {}", result.sha256);
+        println!("identity: {}", result.identity);
         Ok(0)
     })() {
         Ok(code) => code,
@@ -3084,11 +3085,11 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
             for value in &args.values {
                 let sha256_hex =
                     resolve_delete_value(value, server_id_source, DEFAULT_FILE_READ_CHUNK_SIZE)?;
-                let deleted = client.candidate_delete_sha256(&sha256_hex)?;
+                let deleted = client.candidate_delete_identity(&sha256_hex)?;
                 results.push(crate::candidate::CandidateDeleteResult {
                     status: deleted.status,
                     doc_id: deleted.doc_id,
-                    sha256: deleted.sha256,
+                    identity: deleted.identity,
                 });
             }
         }
@@ -3101,7 +3102,7 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_owned())
             );
-            println!("sha256: {}", result.sha256);
+            println!("identity: {}", result.identity);
             if result.status != "deleted" {
                 any_failed = true;
             }
@@ -3154,7 +3155,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             let result =
                 stores[0].query_candidates(&resolved_plan, args.cursor, args.chunk_size)?;
             rpc::CandidateQueryResponse {
-                sha256: result.sha256,
+                identities: result.identities,
                 total_candidates: result.total_candidates,
                 returned_count: result.returned_count,
                 cursor: result.cursor,
@@ -3180,7 +3181,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     let local = store.query_candidates(&scan_plan, cursor, collect_chunk)?;
                     tier_used.push(local.tier_used.clone());
                     query_profile.merge_from(&local.query_profile);
-                    hashes.extend(local.sha256);
+                    hashes.extend(local.identities);
                     if let Some(next) = local.next_cursor {
                         cursor = next;
                     } else {
@@ -3198,7 +3199,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             let end = (start + args.chunk_size.max(1)).min(total_candidates);
             rpc::CandidateQueryResponse {
                 returned_count: end.saturating_sub(start),
-                sha256: hashes[start..end].to_vec(),
+                identities: hashes[start..end].to_vec(),
                 total_candidates,
                 cursor: start,
                 next_cursor: (end < total_candidates).then_some(end),
@@ -3226,8 +3227,8 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
         if let Some(limit) = result.truncated_limit {
             println!("truncated_limit: {limit}");
         }
-        for sha256 in result.sha256 {
-            println!("sha256: {sha256}");
+        for identity in result.identities {
+            println!("identity: {identity}");
         }
         Ok(0)
     })() {
@@ -4146,10 +4147,10 @@ fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
                     server_policy.id_source,
                     DEFAULT_FILE_READ_CHUNK_SIZE,
                 )?;
-                let result = client.candidate_delete_sha256(&sha256_hex)?;
+                let result = client.candidate_delete_identity(&sha256_hex)?;
                 println!("value: {value}");
                 println!("status: {}", result.status);
-                println!("sha256: {}", result.sha256);
+                println!("identity: {}", result.identity);
                 println!(
                     "doc_id: {}",
                     result
@@ -4378,7 +4379,7 @@ where
 /// shared search-collection path.
 fn grpc_search_frame_to_internal(frame: grpc::GrpcSearchFrame) -> rpc::CandidateQueryStreamFrame {
     rpc::CandidateQueryStreamFrame {
-        sha256: frame.sha256,
+        identities: frame.identities,
         external_ids: Some(frame.external_ids),
         candidate_limit: frame.candidate_limit,
         stream_complete: frame.stream_complete,

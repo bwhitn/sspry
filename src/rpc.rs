@@ -163,7 +163,7 @@ pub struct ServerConfig {
 pub struct CandidateInsertResponse {
     pub status: String,
     pub doc_id: u64,
-    pub sha256: String,
+    pub identity: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,13 +175,13 @@ pub struct CandidateInsertBatchResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateDeleteResponse {
     pub status: String,
-    pub sha256: String,
+    pub identity: String,
     pub doc_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateQueryResponse {
-    pub sha256: Vec<String>,
+    pub identities: Vec<String>,
     pub total_candidates: usize,
     pub returned_count: usize,
     pub cursor: usize,
@@ -200,7 +200,7 @@ pub struct CandidateQueryResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CandidateQueryStreamFrame {
     #[serde(default)]
-    pub sha256: Vec<String>,
+    pub identities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ids: Option<Vec<Option<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,7 +222,7 @@ pub(crate) struct CandidateQueryStreamFrame {
 #[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateDocumentWire {
-    pub sha256: String,
+    pub identity: String,
     pub file_size: u64,
     pub bloom_filter_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -631,7 +631,7 @@ struct StoreRootStartupProfile {
     store_open_load_state_ms: u64,
     store_open_sidecars_ms: u64,
     store_open_rebuild_indexes_ms: u64,
-    store_open_rebuild_sha_index_ms: u64,
+    store_open_rebuild_identity_index_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1229,20 +1229,20 @@ impl GrpcSspry for GrpcServerService {
         request: GrpcRequest<GrpcDeleteRequest>,
     ) -> std::result::Result<GrpcResponse<GrpcDeleteResponse>, GrpcStatus> {
         let request = request.into_inner();
-        if request.sha256.trim().is_empty() {
+        if request.identity.trim().is_empty() {
             return Err(GrpcStatus::invalid_argument(
-                "Delete request is missing sha256.",
+                "Delete request is missing identity.",
             ));
         }
         let state = self.state.clone();
         let response =
-            tokio::task::spawn_blocking(move || state.handle_candidate_delete(&request.sha256))
+            tokio::task::spawn_blocking(move || state.handle_candidate_delete(&request.identity))
                 .await
                 .map_err(grpc_join_error_status)?
                 .map_err(grpc_internal_status)?;
         Ok(GrpcResponse::new(GrpcDeleteResponse {
             status: response.status,
-            sha256: response.sha256,
+            identity: response.identity,
             doc_id: response.doc_id.unwrap_or(0),
             has_doc_id: response.doc_id.is_some(),
         }))
@@ -1310,7 +1310,7 @@ impl GrpcSspry for GrpcServerService {
                     plan.root
                 ));
                 state.stream_candidate_query_frames(internal_request, plan, |frame| {
-                    let frame_candidates = frame.sha256.len();
+                    let frame_candidates = frame.identities.len();
                     frame_count += 1;
                     candidate_count += frame_candidates;
                     search_trace_log(format!(
@@ -1333,7 +1333,7 @@ impl GrpcSspry for GrpcServerService {
                     grpc_started.elapsed().as_millis()
                 ));
                 state.stream_candidate_query_frames_batch(internal_request, &named_plans, |frame| {
-                    let frame_candidates = frame.sha256.len();
+                    let frame_candidates = frame.identities.len();
                     frame_count += 1;
                     candidate_count += frame_candidates;
                     search_trace_log(format!(
@@ -1487,7 +1487,7 @@ impl GrpcSspry for GrpcServerService {
                 .map(|item| InsertResult {
                     status: item.status,
                     doc_id: item.doc_id,
-                    sha256: item.sha256,
+                    identity: item.identity,
                 })
                 .collect(),
         }))

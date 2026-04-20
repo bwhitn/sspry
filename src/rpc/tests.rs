@@ -193,7 +193,7 @@ fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDoc
     fs::write(path, bytes).expect("write sample");
     let features = scan_features_default_grams(path).expect("features");
     CandidateDocumentWire {
-        sha256: hex::encode(features.sha256),
+        identity: hex::encode(features.sha256),
         file_size: features.file_size,
         bloom_filter_b64: base64::engine::general_purpose::STANDARD.encode(features.bloom_filter),
         bloom_item_estimate: None,
@@ -498,7 +498,7 @@ fn direct_server_query_caches_results_and_external_ids() {
     let features = scan_features_default_grams(&sample).expect("features");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features.sha256),
+            identity: hex::encode(features.sha256),
             file_size: features.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features.bloom_filter),
@@ -604,7 +604,7 @@ fn published_query_waits_for_locked_shard() {
 
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: "11".repeat(32),
+            identity: "11".repeat(32),
             file_size: 16,
             bloom_filter_b64,
             bloom_item_estimate: None,
@@ -690,7 +690,7 @@ rule overflow_rule {
     assert_eq!(result.truncated_limit, Some(1));
     assert_eq!(result.total_candidates, 1);
     assert_eq!(result.returned_count, 1);
-    assert_eq!(result.sha256.len(), 1);
+    assert_eq!(result.identities.len(), 1);
 }
 
 #[test]
@@ -782,7 +782,7 @@ fn insert_is_rejected_while_publish_pauses_mutations() {
     state.mutations_paused.store(true, Ordering::SeqCst);
     let err = state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: "11".repeat(32),
+            identity: "11".repeat(32),
             file_size: 1,
             bloom_filter_b64: String::new(),
             bloom_item_estimate: None,
@@ -1023,7 +1023,7 @@ fn insert_batch_advances_active_index_session_progress() {
     let features_b = scan_features_default_grams(&sample_b).expect("features b");
     let docs = vec![
         CandidateDocumentWire {
-            sha256: hex::encode(features_a.sha256),
+            identity: hex::encode(features_a.sha256),
             file_size: features_a.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_a.bloom_filter),
@@ -1035,7 +1035,7 @@ fn insert_batch_advances_active_index_session_progress() {
             external_id: None,
         },
         CandidateDocumentWire {
-            sha256: hex::encode(features_b.sha256),
+            identity: hex::encode(features_b.sha256),
             file_size: features_b.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_b.bloom_filter),
@@ -1207,7 +1207,7 @@ fn workspace_delete_only_targets_current_store() {
     let tmp = tempdir().expect("tmp");
     let state = sample_workspace_server_state(tmp.path(), 1);
     let doc = candidate_document_wire_from_bytes(&tmp.path().join("queued.bin"), b"queued-current");
-    let sha256 = doc.sha256.clone();
+    let sha256 = doc.identity.clone();
 
     state
         .handle_candidate_insert(&doc)
@@ -1274,7 +1274,7 @@ fn workspace_compaction_reclaims_deleted_docs_from_current_store() {
         ("compact-second.bin", b"second-current".as_slice()),
     ] {
         let doc = candidate_document_wire_from_bytes(&tmp.path().join(name), bytes);
-        sha256s.push(doc.sha256.clone());
+        sha256s.push(doc.identity.clone());
         state.handle_candidate_insert(&doc).expect("insert doc");
     }
 
@@ -1591,7 +1591,7 @@ fn workspace_work_roots_are_lazy_and_removed_when_idle() {
     let features = scan_features_default_grams(&sample).expect("features");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features.sha256),
+            identity: hex::encode(features.sha256),
             file_size: features.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features.bloom_filter),
@@ -1624,7 +1624,7 @@ fn workspace_mode_keeps_queries_on_published_root_until_publish() {
     let features = scan_features_default_grams(&sample).expect("features");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features.sha256),
+            identity: hex::encode(features.sha256),
             file_size: features.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features.bloom_filter),
@@ -1742,7 +1742,7 @@ fn auto_publish_promotes_work_after_index_session_finishes() {
         .expect("begin index session");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features.sha256),
+            identity: hex::encode(features.sha256),
             file_size: features.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features.bloom_filter),
@@ -1826,7 +1826,7 @@ fn auto_publish_does_not_rotate_work_while_index_session_is_active_under_pressur
     let features = scan_features_default_grams(&sample).expect("features");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features.sha256),
+            identity: hex::encode(features.sha256),
             file_size: features.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features.bloom_filter),
@@ -1948,7 +1948,7 @@ fn workspace_publish_merges_incremental_work_into_published_root() {
     let features_a = scan_features_default_grams(&sample_a).expect("features a");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features_a.sha256),
+            identity: hex::encode(features_a.sha256),
             file_size: features_a.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_a.bloom_filter),
@@ -1967,7 +1967,7 @@ fn workspace_publish_merges_incremental_work_into_published_root() {
     let features_b = scan_features_default_grams(&sample_b).expect("features b");
     state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: hex::encode(features_b.sha256),
+            identity: hex::encode(features_b.sha256),
             file_size: features_b.file_size,
             bloom_filter_b64: base64::engine::general_purpose::STANDARD
                 .encode(features_b.bloom_filter),
@@ -2213,7 +2213,7 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
     };
     let docs = vec![
         CandidateDocumentWire {
-            sha256: "00".repeat(32),
+            identity: "00".repeat(32),
             file_size: 16,
             bloom_filter_b64: bloom_filter_b64.clone(),
             bloom_item_estimate: None,
@@ -2224,7 +2224,7 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
             external_id: Some("shard-a".to_owned()),
         },
         CandidateDocumentWire {
-            sha256: "01".repeat(32),
+            identity: "01".repeat(32),
             file_size: 16,
             bloom_filter_b64: bloom_filter_b64.clone(),
             bloom_item_estimate: None,
@@ -2270,7 +2270,7 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
     assert_eq!(page_two.next_cursor, None);
     assert!(page_two.external_ids.is_none());
     let deleted = state
-        .handle_candidate_delete(&docs[0].sha256)
+        .handle_candidate_delete(&docs[0].identity)
         .expect("delete first multishard doc");
     assert_eq!(deleted.status, "deleted");
     let query_after_delete = state
@@ -2288,7 +2288,7 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
     assert!(
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: "ab".repeat(32),
+                identity: "ab".repeat(32),
                 file_size: 1,
                 bloom_filter_b64: "**".to_owned(),
                 bloom_item_estimate: None,
@@ -2305,7 +2305,7 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
     assert!(
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: "ab".repeat(32),
+                identity: "ab".repeat(32),
                 file_size: 1,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -2320,7 +2320,7 @@ fn multishard_state_and_insert_parsing_cover_remaining_rpc_branches() {
     assert!(
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: "not hex".to_owned(),
+                identity: "not hex".to_owned(),
                 file_size: 1,
                 bloom_filter_b64,
                 bloom_item_estimate: None,
@@ -2447,7 +2447,7 @@ fn single_shard_query_with_external_ids_and_sha_normalization_work() {
         base64::engine::general_purpose::STANDARD.encode(lane_bloom_bytes(1024, 7, &[gram]));
     let inserted = state
         .handle_candidate_insert(&CandidateDocumentWire {
-            sha256: "AA".repeat(32),
+            identity: "AA".repeat(32),
             file_size: 16,
             bloom_filter_b64,
             bloom_item_estimate: None,
@@ -2535,8 +2535,8 @@ fn multishard_query_uses_parallel_collection_and_cached_results() {
     for byte in 1_u8..=64 {
         let sha = [byte; 32];
         if docs.iter().all(|existing: &[u8; 32]| {
-            state.candidate_store_index_for_sha256(existing)
-                != state.candidate_store_index_for_sha256(&sha)
+            state.candidate_store_index_for_identity(existing)
+                != state.candidate_store_index_for_identity(&sha)
         }) {
             docs.push(sha);
         }
@@ -2548,7 +2548,7 @@ fn multishard_query_uses_parallel_collection_and_cached_results() {
     for (index, sha) in docs.into_iter().enumerate() {
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode(sha),
+                identity: hex::encode(sha),
                 file_size: 16,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -2599,7 +2599,7 @@ fn multishard_query_uses_parallel_collection_and_cached_results() {
     let second = state
         .handle_candidate_query(request, &plan)
         .expect("second query");
-    assert_eq!(second.sha256, first.sha256);
+    assert_eq!(second.identities, first.identities);
     assert_eq!(second.external_ids, first.external_ids);
     assert_eq!(second.tier_used, first.tier_used);
 }
@@ -2633,8 +2633,8 @@ fn direct_multishard_stream_candidate_query_frames_returns_hits_from_all_shards(
     for byte in 1_u8..=64 {
         let sha = [byte; 32];
         if docs.iter().all(|existing: &[u8; 32]| {
-            state.candidate_store_index_for_sha256(existing)
-                != state.candidate_store_index_for_sha256(&sha)
+            state.candidate_store_index_for_identity(existing)
+                != state.candidate_store_index_for_identity(&sha)
         }) {
             docs.push(sha);
         }
@@ -2646,7 +2646,7 @@ fn direct_multishard_stream_candidate_query_frames_returns_hits_from_all_shards(
     for (index, sha) in docs.into_iter().enumerate() {
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode(sha),
+                identity: hex::encode(sha),
                 file_size: 16,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -2688,7 +2688,7 @@ fn direct_multishard_stream_candidate_query_frames_returns_hits_from_all_shards(
         if frame.stream_complete || frame.rule_complete {
             continue;
         }
-        hashes.extend(frame.sha256.iter().cloned());
+        hashes.extend(frame.identities.iter().cloned());
         external_ids.extend(frame.external_ids.clone().unwrap_or_default());
     }
     hashes.sort();
@@ -2716,8 +2716,8 @@ fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_r
     for byte in 65_u8..=128 {
         let sha = [byte; 32];
         if docs.iter().all(|existing: &[u8; 32]| {
-            state.candidate_store_index_for_sha256(existing)
-                != state.candidate_store_index_for_sha256(&sha)
+            state.candidate_store_index_for_identity(existing)
+                != state.candidate_store_index_for_identity(&sha)
         }) {
             docs.push(sha);
         }
@@ -2729,7 +2729,7 @@ fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_r
     for (index, sha) in docs.into_iter().enumerate() {
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode(sha),
+                identity: hex::encode(sha),
                 file_size: 16,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -2785,7 +2785,7 @@ fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_r
         hits_by_rule
             .entry(frame.target_rule_name.clone())
             .or_default()
-            .extend(frame.sha256.iter().cloned());
+            .extend(frame.identities.iter().cloned());
         external_ids_by_rule
             .entry(frame.target_rule_name.clone())
             .or_default()
@@ -2848,7 +2848,7 @@ fn forest_stream_candidate_query_frames_returns_hits_from_all_trees() {
         if frame.stream_complete || frame.rule_complete {
             continue;
         }
-        hashes.extend(frame.sha256.iter().cloned());
+        hashes.extend(frame.identities.iter().cloned());
         external_ids.extend(frame.external_ids.clone().unwrap_or_default());
     }
     hashes.sort();
@@ -2912,7 +2912,7 @@ fn forest_stream_candidate_query_frames_batch_returns_hits_for_each_rule() {
         hits_by_rule
             .entry(frame.target_rule_name.clone())
             .or_default()
-            .extend(frame.sha256.iter().cloned());
+            .extend(frame.identities.iter().cloned());
         external_ids_by_rule
             .entry(frame.target_rule_name.clone())
             .or_default()
@@ -3000,10 +3000,10 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
             .all(|frame| !frame.stream_complete && !frame.rule_complete)
     );
     assert_eq!(frames[0].target_rule_name, "rule_one");
-    assert_eq!(frames[0].sha256, vec!["hash-a".to_owned()]);
+    assert_eq!(frames[0].identities, vec!["hash-a".to_owned()]);
     assert_eq!(frames[1].target_rule_name, "rule_two");
-    assert_eq!(frames[1].sha256, vec!["hash-b".to_owned()]);
-    assert_eq!(frames[2].sha256, vec!["hash-c".to_owned()]);
+    assert_eq!(frames[1].identities, vec!["hash-b".to_owned()]);
+    assert_eq!(frames[2].identities, vec!["hash-c".to_owned()]);
     assert_eq!(accumulators[0].tier_used, vec!["tier1".to_owned()]);
     assert_eq!(accumulators[0].query_profile.docs_scanned, 3);
     assert_eq!(accumulators[0].eval_nanos, 11);
@@ -3050,7 +3050,7 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
 
     assert_eq!(frames.len(), prior_frame_count + 1);
     assert_eq!(
-        frames.last().expect("second partial frame").sha256,
+        frames.last().expect("second partial frame").identities,
         vec!["hash-d"]
     );
     assert_eq!(
@@ -3126,7 +3126,7 @@ fn compaction_cycle_reclaims_deleted_docs_and_updates_stats() {
     for byte in [0x11u8, 0x22u8] {
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode([byte; 32]),
+                identity: hex::encode([byte; 32]),
                 file_size: 32,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -3229,10 +3229,10 @@ fn compaction_cycle_scans_all_shards_for_pending_work() {
     let mut deleted_sha = None;
     for byte in 1u8..=32 {
         let sha = [byte; 32];
-        let shard_idx = state.candidate_store_index_for_sha256(&sha);
+        let shard_idx = state.candidate_store_index_for_identity(&sha);
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode(sha),
+                identity: hex::encode(sha),
                 file_size: 32,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -3300,7 +3300,7 @@ fn next_compaction_wait_timeout_tracks_pending_delete_cooldown() {
     for byte in [0x11u8, 0x22u8] {
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode([byte; 32]),
+                identity: hex::encode([byte; 32]),
                 file_size: 32,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,
@@ -3387,7 +3387,7 @@ fn compaction_cycle_garbage_collects_retired_generation_before_next_snapshot_sca
     for byte in [0x11u8, 0x22u8] {
         state
             .handle_candidate_insert(&CandidateDocumentWire {
-                sha256: hex::encode([byte; 32]),
+                identity: hex::encode([byte; 32]),
                 file_size: 32,
                 bloom_filter_b64: bloom_filter_b64.clone(),
                 bloom_item_estimate: None,

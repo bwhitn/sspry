@@ -101,7 +101,7 @@ pub struct BlockingGrpcClient {
 
 #[derive(Clone, Debug)]
 pub struct GrpcSearchFrame {
-    pub sha256: Vec<String>,
+    pub identities: Vec<String>,
     pub external_ids: Vec<Option<String>>,
     pub candidate_limit: Option<usize>,
     pub stream_complete: bool,
@@ -292,15 +292,15 @@ impl BlockingGrpcClient {
         Ok(response.into_inner().message)
     }
 
-    /// Deletes one candidate document by SHA-256 and maps the protobuf reply
+    /// Deletes one candidate document by canonical identity and maps the protobuf reply
     /// into the local response type.
-    pub fn candidate_delete_sha256(&mut self, sha256: &str) -> Result<CandidateDeleteResponse> {
+    pub fn candidate_delete_identity(&mut self, identity: &str) -> Result<CandidateDeleteResponse> {
         let response = self
             .runtime
             .block_on(async {
                 self.inner
                     .delete(v1::DeleteRequest {
-                        sha256: sha256.to_owned(),
+                        identity: identity.to_owned(),
                     })
                     .await
             })
@@ -308,7 +308,7 @@ impl BlockingGrpcClient {
         let response = response.into_inner();
         Ok(CandidateDeleteResponse {
             status: response.status,
-            sha256: response.sha256,
+            identity: response.identity,
             doc_id: response.has_doc_id.then_some(response.doc_id),
         })
     }
@@ -329,7 +329,7 @@ impl BlockingGrpcClient {
                 let frame = frame.map_err(tonic_error)?;
                 let query_profile = query_profile_from_proto(frame.query_profile.as_ref());
                 let mapped = GrpcSearchFrame {
-                    sha256: frame.sha256,
+                    identities: frame.identities,
                     external_ids: frame
                         .external_ids
                         .into_iter()

@@ -28,9 +28,9 @@ fn apply_store_open_profile(
     aggregate.store_open_rebuild_indexes_ms = aggregate
         .store_open_rebuild_indexes_ms
         .saturating_add(profile.rebuild_indexes_ms);
-    aggregate.store_open_rebuild_sha_index_ms = aggregate
-        .store_open_rebuild_sha_index_ms
-        .saturating_add(profile.rebuild_sha_index_ms);
+    aggregate.store_open_rebuild_identity_index_ms = aggregate
+        .store_open_rebuild_identity_index_ms
+        .saturating_add(profile.rebuild_identity_index_ms);
 }
 
 /// Opens an existing candidate store or initializes a new one while capturing
@@ -239,9 +239,9 @@ fn merge_store_root_startup_profile(
     dst.store_open_rebuild_indexes_ms = dst
         .store_open_rebuild_indexes_ms
         .saturating_add(src.store_open_rebuild_indexes_ms);
-    dst.store_open_rebuild_sha_index_ms = dst
-        .store_open_rebuild_sha_index_ms
-        .saturating_add(src.store_open_rebuild_sha_index_ms);
+    dst.store_open_rebuild_identity_index_ms = dst
+        .store_open_rebuild_identity_index_ms
+        .saturating_add(src.store_open_rebuild_identity_index_ms);
 }
 
 /// Produces a unique path for the next retired published root.

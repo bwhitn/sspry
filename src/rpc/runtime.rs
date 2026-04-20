@@ -57,9 +57,9 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         .iter()
         .map(|item| item.tier2_doc_rows_bytes)
         .sum::<u64>();
-    let sha_index_bytes = stats_rows
+    let identity_index_bytes = stats_rows
         .iter()
-        .map(|item| item.sha_index_bytes)
+        .map(|item| item.identity_index_bytes)
         .sum::<u64>();
     let special_doc_positions_bytes = stats_rows
         .iter()
@@ -118,7 +118,10 @@ fn candidate_stats_json_from_parts_with_disk_usage(
         "tier2_doc_rows_bytes".to_owned(),
         json!(tier2_doc_rows_bytes),
     );
-    out.insert("sha_index_bytes".to_owned(), json!(sha_index_bytes));
+    out.insert(
+        "identity_index_bytes".to_owned(),
+        json!(identity_index_bytes),
+    );
     out.insert(
         "special_doc_positions_bytes".to_owned(),
         json!(special_doc_positions_bytes),
@@ -242,7 +245,7 @@ fn empty_candidate_stats_json_for_config(
         docs_vector_bytes: 0,
         doc_rows_bytes: 0,
         tier2_doc_rows_bytes: 0,
-        sha_index_bytes: 0,
+        identity_index_bytes: 0,
         special_doc_positions_bytes: 0,
         query_artifact_cache_entries: 0,
         query_artifact_cache_bytes: 0,
@@ -656,7 +659,7 @@ fn grpc_empty_store_summary_for_config(
         docs_vector_bytes: 0,
         doc_rows_bytes: 0,
         tier2_doc_rows_bytes: 0,
-        sha_index_bytes: 0,
+        identity_index_bytes: 0,
         special_doc_positions_bytes: 0,
         query_artifact_cache_entries: 0,
         query_artifact_cache_bytes: 0,
@@ -974,7 +977,7 @@ fn grpc_query_profile_summary_from_internal(
 /// - The protobuf frame with optional profiles only on the terminal frame.
 fn grpc_search_frame_from_internal(frame: CandidateQueryStreamFrame) -> Result<SearchFrame> {
     Ok(SearchFrame {
-        sha256: frame.sha256,
+        identities: frame.identities,
         external_ids: frame
             .external_ids
             .unwrap_or_default()

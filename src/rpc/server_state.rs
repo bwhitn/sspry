@@ -2085,7 +2085,7 @@ impl ServerState {
                 "store_open_load_state_ms": profile.store_open_load_state_ms,
                 "store_open_sidecars_ms": profile.store_open_sidecars_ms,
                 "store_open_rebuild_indexes_ms": profile.store_open_rebuild_indexes_ms,
-                "store_open_rebuild_sha_index_ms": profile.store_open_rebuild_sha_index_ms,
+                "store_open_rebuild_identity_index_ms": profile.store_open_rebuild_identity_index_ms,
             })
         };
         stats.insert(
@@ -2967,8 +2967,8 @@ impl ServerState {
     }
 
     /// Maps a document hash to its candidate shard index.
-    fn candidate_store_index_for_sha256(&self, sha256: &[u8; 32]) -> usize {
-        candidate_shard_index(sha256, self.candidate_shard_count())
+    fn candidate_store_index_for_identity(&self, identity: &[u8; 32]) -> usize {
+        candidate_shard_index(identity, self.candidate_shard_count())
     }
 
     /// Merges per-shard tier labels into one user-facing summary label.
@@ -3284,7 +3284,7 @@ impl ServerState {
             ));
         }
         let external_ids = if include_external_ids {
-            Some(store.external_ids_for_sha256(&local_hits))
+            Some(store.external_ids_for_identities(&local_hits))
         } else {
             None
         };
@@ -3322,7 +3322,8 @@ impl ServerState {
             let Some(partial) = partials.get_mut(index) else {
                 continue;
             };
-            partial.external_ids = include_external_ids.then(|| store.external_ids_for_sha256(&hits));
+            partial.external_ids =
+                include_external_ids.then(|| store.external_ids_for_identities(&hits));
             partial.hashes = hits;
             partial.tier_used = tier_used;
             partial.query_profile = query_profile;
@@ -3483,7 +3484,7 @@ impl ServerState {
         document: &CandidateDocumentWire,
         field_prefix: &str,
     ) -> Result<ParsedCandidateInsertDocument> {
-        let sha256 = decode_sha256(&document.sha256)?;
+        let sha256 = decode_sha256(&document.identity)?;
         let bloom_filter = base64::engine::general_purpose::STANDARD
             .decode(document.bloom_filter_b64.as_bytes())
             .map_err(|_| {
@@ -3555,7 +3556,7 @@ impl ServerState {
         CandidateInsertResponse {
             status: result.status,
             doc_id: result.doc_id,
-            sha256: result.sha256,
+            identity: result.identity,
         }
     }
 
@@ -3577,7 +3578,7 @@ impl ServerState {
         } else {
             None
         };
-        let shard_idx = self.candidate_store_index_for_sha256(&parsed.0);
+        let shard_idx = self.candidate_store_index_for_identity(&parsed.0);
         let work = self.work_store_set()?;
         let mut store =
             lock_candidate_store_with_timeout(&work.stores[shard_idx], shard_idx, "insert")?;
@@ -3744,7 +3745,7 @@ impl ServerState {
             let started_group = Instant::now();
             let mut grouped = HashMap::<usize, Vec<(usize, ParsedCandidateInsertDocument)>>::new();
             for (idx, row) in parsed_documents.into_iter().enumerate() {
-                let shard_idx = self.candidate_store_index_for_sha256(&row.0);
+                let shard_idx = self.candidate_store_index_for_identity(&row.0);
                 grouped.entry(shard_idx).or_default().push((idx, row));
             }
             group_elapsed = started_group.elapsed();
@@ -3901,22 +3902,22 @@ impl ServerState {
 
     /// Deletes one document from the published shard set and invalidates
     /// related search/stat caches.
-    fn handle_candidate_delete(&self, sha256: &str) -> Result<CandidateDeleteResponse> {
+    fn handle_candidate_delete(&self, identity: &str) -> Result<CandidateDeleteResponse> {
         let _scope = scope("rpc.handle_candidate_delete");
         let _mutation = self.begin_mutation("delete")?;
         let _op = self
             .operation_gate
             .read()
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
-        let decoded = decode_sha256(sha256)?;
-        let shard_idx = self.candidate_store_index_for_sha256(&decoded);
+        let decoded = decode_sha256(identity)?;
+        let shard_idx = self.candidate_store_index_for_identity(&decoded);
         let published = self.published_store_set()?;
         let mut published_store = lock_candidate_store_with_timeout(
             &published.stores[shard_idx],
             shard_idx,
             "delete published",
         )?;
-        let published_result = published_store.delete_document(sha256)?;
+        let published_result = published_store.delete_document(identity)?;
         drop(published_store);
         if published_result.status == "deleted" {
             let _ = self.enqueue_published_tier2_snapshot_shards([shard_idx]);
@@ -3929,7 +3930,7 @@ impl ServerState {
         self.invalidate_search_caches();
         Ok(CandidateDeleteResponse {
             status: published_result.status,
-            sha256: published_result.sha256,
+            identity: published_result.identity,
             doc_id: published_result.doc_id,
         })
     }
@@ -3994,7 +3995,7 @@ impl ServerState {
             for (idx, sha256_hex) in page.iter().enumerate() {
                 let mut decoded = [0u8; 32];
                 hex::decode_to_slice(sha256_hex, &mut decoded)?;
-                let shard_idx = self.candidate_store_index_for_sha256(&decoded);
+                let shard_idx = self.candidate_store_index_for_identity(&decoded);
                 by_shard
                     .entry(shard_idx)
                     .or_default()
@@ -4017,7 +4018,7 @@ impl ServerState {
                     for ((idx, _), external_id) in items
                         .iter()
                         .cloned()
-                        .zip(store.external_ids_for_sha256(&hashes))
+                        .zip(store.external_ids_for_identities(&hashes))
                     {
                         if values[idx].is_none() && external_id.is_some() {
                             values[idx] = external_id;
@@ -4032,7 +4033,7 @@ impl ServerState {
         let _ = self.invalidate_published_stats_cache();
         Ok(CandidateQueryResponse {
             returned_count: page.len(),
-            sha256: page,
+            identities: page,
             total_candidates,
             cursor: start,
             next_cursor,
@@ -4207,7 +4208,7 @@ impl ServerState {
                         hits.chunks(chunk_size).zip(values.chunks(chunk_size))
                     {
                         on_frame(CandidateQueryStreamFrame {
-                            sha256: hash_chunk.to_vec(),
+                            identities: hash_chunk.to_vec(),
                             external_ids: Some(external_id_chunk.to_vec()),
                             candidate_limit,
                             stream_complete: false,
@@ -4222,7 +4223,7 @@ impl ServerState {
                 None => {
                     for hash_chunk in hits.chunks(chunk_size) {
                         on_frame(CandidateQueryStreamFrame {
-                            sha256: hash_chunk.to_vec(),
+                            identities: hash_chunk.to_vec(),
                             external_ids: None,
                             candidate_limit,
                             stream_complete: false,
@@ -4238,7 +4239,7 @@ impl ServerState {
         }
 
         on_frame(CandidateQueryStreamFrame {
-            sha256: Vec::new(),
+            identities: Vec::new(),
             external_ids: None,
             candidate_limit,
             stream_complete: true,
@@ -4288,7 +4289,7 @@ impl ServerState {
                         local.hashes.chunks(chunk_size).zip(values.chunks(chunk_size))
                     {
                         on_frame(CandidateQueryStreamFrame {
-                            sha256: hash_chunk.to_vec(),
+                            identities: hash_chunk.to_vec(),
                             external_ids: Some(external_id_chunk.to_vec()),
                             candidate_limit: candidate_limits[index],
                             stream_complete: false,
@@ -4303,7 +4304,7 @@ impl ServerState {
                 None => {
                     for hash_chunk in local.hashes.chunks(chunk_size) {
                         on_frame(CandidateQueryStreamFrame {
-                            sha256: hash_chunk.to_vec(),
+                            identities: hash_chunk.to_vec(),
                             external_ids: None,
                             candidate_limit: candidate_limits[index],
                             stream_complete: false,
@@ -4489,7 +4490,7 @@ impl ServerState {
                 continue;
             };
             on_frame(CandidateQueryStreamFrame {
-                sha256: Vec::new(),
+                identities: Vec::new(),
                 external_ids: None,
                 candidate_limit: candidate_limits[index],
                 stream_complete: false,
@@ -4502,7 +4503,7 @@ impl ServerState {
         }
 
         on_frame(CandidateQueryStreamFrame {
-            sha256: Vec::new(),
+            identities: Vec::new(),
             external_ids: None,
             candidate_limit: None,
             stream_complete: true,
@@ -4751,7 +4752,7 @@ impl ServerState {
                             .lock()
                             .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
                         let all_known_new = imported.iter().all(|document| {
-                            !published_store.contains_live_document_sha256(&document.sha256)
+                            !published_store.contains_live_document_identity(&document.identity)
                         });
                         if all_known_new {
                             published_store.import_documents_batch_known_new_quiet(&imported)?

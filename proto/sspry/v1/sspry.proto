@@ -69,12 +69,12 @@ message PublishRequest {}
 message ShutdownRequest {}
 
 message DeleteRequest {
-  string sha256 = 1;
+  string identity = 1;
 }
 
 message DeleteResponse {
   string status = 1;
-  string sha256 = 2;
+  string identity = 2;
   uint64 doc_id = 3;
   bool has_doc_id = 4;
 }
@@ -271,7 +271,7 @@ message SearchRequest {
 }
 
 message SearchFrame {
-  repeated string sha256 = 1;
+  repeated string identities = 1;
   repeated OptionalString external_ids = 2;
   uint64 candidate_limit = 3;
   bool has_candidate_limit = 4;
@@ -307,5 +307,5 @@ message InsertSummary {
 message InsertResult {
   string status = 1;
   uint64 doc_id = 2;
-  string sha256 = 3;
+  string identity = 3;
 }

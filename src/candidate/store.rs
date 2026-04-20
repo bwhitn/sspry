@@ -92,7 +92,7 @@ impl CandidateConfig {
 pub struct CandidateInsertResult {
     pub status: String,
     pub doc_id: u64,
-    pub sha256: String,
+    pub identity: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,7 +146,7 @@ struct CandidateDocRowPayloadProfile {
 #[derive(Clone, Debug)]
 pub struct CandidateDeleteResult {
     pub status: String,
-    pub sha256: String,
+    pub identity: String,
     pub doc_id: Option<u64>,
 }
 
@@ -158,20 +158,20 @@ pub struct CandidateStoreOpenProfile {
     pub load_state_ms: u64,
     pub sidecars_ms: u64,
     pub rebuild_indexes_ms: u64,
-    pub rebuild_sha_index_ms: u64,
+    pub rebuild_identity_index_ms: u64,
     pub total_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CandidateStoreRebuildProfile {
-    sha_index_ms: u64,
+    identity_index_ms: u64,
     total_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportedCandidateDocument {
-    pub sha256: [u8; 32],
-    pub sha256_hex: String,
+    pub identity: [u8; 32],
+    pub identity_hex: String,
     pub file_size: u64,
     pub filter_bytes: usize,
     pub bloom_hashes: usize,
@@ -186,7 +186,7 @@ pub struct ImportedCandidateDocument {
 
 #[derive(Clone, Debug)]
 pub struct CandidateQueryResult {
-    pub sha256: Vec<String>,
+    pub identities: Vec<String>,
     pub total_candidates: usize,
     pub returned_count: usize,
     pub cursor: usize,
@@ -272,7 +272,7 @@ pub struct CandidateStats {
     pub docs_vector_bytes: u64,
     pub doc_rows_bytes: u64,
     pub tier2_doc_rows_bytes: u64,
-    pub sha_index_bytes: u64,
+    pub identity_index_bytes: u64,
     pub special_doc_positions_bytes: u64,
     pub query_artifact_cache_entries: usize,
     pub query_artifact_cache_bytes: u64,
@@ -426,7 +426,7 @@ impl From<&LegacyStoreMeta> for StoreLocalMeta {
 #[derive(Clone, Debug)]
 struct CandidateDoc {
     doc_id: u64,
-    sha256: String,
+    identity: String,
     file_size: u64,
     filter_bytes: usize,
     bloom_hashes: usize,
@@ -438,7 +438,7 @@ struct CandidateDoc {
 
 /// Estimates the heap retained by one in-memory candidate document record.
 fn candidate_doc_memory_bytes(doc: &CandidateDoc) -> u64 {
-    (std::mem::size_of::<CandidateDoc>() as u64).saturating_add(doc.sha256.capacity() as u64)
+    (std::mem::size_of::<CandidateDoc>() as u64).saturating_add(doc.identity.capacity() as u64)
 }
 
 /// Converts an `Instant` into a saturated microsecond count for profiling
@@ -989,7 +989,7 @@ pub(crate) struct CandidateCompactionSnapshot {
 
 #[derive(Clone, Debug)]
 struct CompactionDocRef {
-    sha256: [u8; 32],
+    identity: [u8; 32],
     file_size: u64,
     filter_bytes: usize,
     bloom_hashes: usize,
@@ -1034,7 +1034,7 @@ pub struct CandidateStore {
     tier2_doc_rows: Vec<Tier2DocMetaRow>,
     sidecars: StoreSidecars,
     append_writers: StoreAppendWriters,
-    sha_to_pos: HashMap<String, usize>,
+    identity_to_pos: HashMap<String, usize>,
     special_doc_positions: Vec<usize>,
     mutation_counter: u64,
     compaction_generation: u64,
@@ -1358,7 +1358,7 @@ impl CandidateStore {
             tier2_doc_rows: Vec::new(),
             sidecars: StoreSidecars::new(&config.root),
             append_writers: StoreAppendWriters::new(&config.root)?,
-            sha_to_pos: HashMap::new(),
+            identity_to_pos: HashMap::new(),
             special_doc_positions: Vec::new(),
             mutation_counter: 0,
             compaction_generation: 1,
@@ -1420,7 +1420,7 @@ impl CandidateStore {
             tier2_doc_rows,
             sidecars: StoreSidecars::map_existing(root.as_path())?,
             append_writers: StoreAppendWriters::new(root.as_path())?,
-            sha_to_pos: HashMap::new(),
+            identity_to_pos: HashMap::new(),
             special_doc_positions: Vec::new(),
             mutation_counter: 0,
             compaction_generation: compaction_manifest.current_generation,
@@ -1452,7 +1452,7 @@ impl CandidateStore {
             load_state_ms,
             sidecars_ms,
             rebuild_indexes_ms: rebuild_profile.total_ms,
-            rebuild_sha_index_ms: rebuild_profile.sha_index_ms,
+            rebuild_identity_index_ms: rebuild_profile.identity_index_ms,
             total_ms: started_total
                 .elapsed()
                 .as_millis()
@@ -1591,9 +1591,9 @@ impl CandidateStore {
                 continue;
             }
             let mut sha256 = [0u8; 32];
-            hex::decode_to_slice(&doc.sha256, &mut sha256)?;
+            hex::decode_to_slice(&doc.identity, &mut sha256)?;
             live_docs.push(CompactionDocRef {
-                sha256,
+                identity: sha256,
                 file_size: doc.file_size,
                 filter_bytes: doc.filter_bytes,
                 bloom_hashes: doc.bloom_hashes,
@@ -1800,7 +1800,7 @@ impl CandidateStore {
     /// tier-1 and tier-2 bloom payloads.
     pub fn insert_document(
         &mut self,
-        sha256: [u8; 32],
+        identity: [u8; 32],
         file_size: u64,
         bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
@@ -1813,7 +1813,7 @@ impl CandidateStore {
         external_id: Option<String>,
     ) -> Result<CandidateInsertResult> {
         self.insert_document_with_metadata(
-            sha256,
+            identity,
             file_size,
             bloom_item_estimate,
             bloom_hashes,
@@ -1833,7 +1833,7 @@ impl CandidateStore {
     /// persisting optional metadata and external identifiers alongside it.
     pub fn insert_document_with_metadata(
         &mut self,
-        sha256: [u8; 32],
+        identity: [u8; 32],
         file_size: u64,
         bloom_item_estimate: Option<usize>,
         bloom_hashes: Option<usize>,
@@ -1888,18 +1888,18 @@ impl CandidateStore {
                 )));
             }
         }
-        let sha256_hex = hex::encode(sha256);
+        let identity_hex = hex::encode(identity);
 
         // Bloom-only ingest only needs the per-document bloom payloads here.
         let status;
         let doc_id;
-        if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
+        if let Some(existing_pos) = self.identity_to_pos.get(&identity_hex).copied() {
             if !self.docs[existing_pos].deleted {
                 let existing = &self.docs[existing_pos];
                 return Ok(CandidateInsertResult {
                     status: "already_exists".to_owned(),
                     doc_id: existing.doc_id,
-                    sha256: existing.sha256.clone(),
+                    identity: existing.identity.clone(),
                 });
             }
             let snapshot = {
@@ -1949,7 +1949,7 @@ impl CandidateStore {
             self.local_meta.next_doc_id += 1;
             let doc = CandidateDoc {
                 doc_id,
-                sha256: sha256_hex.clone(),
+                identity: identity_hex.clone(),
                 file_size,
                 filter_bytes,
                 bloom_hashes: expected_bloom_hashes,
@@ -1980,13 +1980,13 @@ impl CandidateStore {
                     tier2_bloom_filter,
                 )?;
                 self.mark_meta_dirty();
-                self.append_new_doc(&sha256, row, tier2_row)?;
+                self.append_new_doc(&identity, row, tier2_row)?;
                 self.doc_rows.push(row);
                 self.tier2_doc_rows.push(tier2_row);
             }
             self.docs.push(doc.clone());
             let new_pos = self.docs.len() - 1;
-            self.sha_to_pos.insert(sha256_hex.clone(), new_pos);
+            self.identity_to_pos.insert(identity_hex.clone(), new_pos);
             if doc.special_population {
                 self.remember_special_doc_position(new_pos);
             }
@@ -1999,7 +1999,7 @@ impl CandidateStore {
         Ok(CandidateInsertResult {
             status,
             doc_id,
-            sha256: sha256_hex,
+            identity: identity_hex,
         })
     }
 
@@ -2024,8 +2024,8 @@ impl CandidateStore {
         )],
     ) -> Result<Vec<CandidateInsertResult>> {
         struct PendingNewInsert<'a> {
-            sha256: [u8; 32],
-            sha256_hex: String,
+            identity: [u8; 32],
+            identity_hex: String,
             doc: CandidateDoc,
             metadata: &'a [u8],
             external_id: Option<&'a str>,
@@ -2105,16 +2105,16 @@ impl CandidateStore {
             }
 
             let resolve_doc_state_started = Instant::now();
-            let sha256_hex = hex::encode(sha256);
+            let identity_hex = hex::encode(sha256);
             let _ = bloom_item_estimate;
 
-            if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
+            if let Some(existing_pos) = self.identity_to_pos.get(&identity_hex).copied() {
                 if !self.docs[existing_pos].deleted {
                     let existing = &self.docs[existing_pos];
                     results.push(CandidateInsertResult {
                         status: "already_exists".to_owned(),
                         doc_id: existing.doc_id,
-                        sha256: existing.sha256.clone(),
+                        identity: existing.identity.clone(),
                     });
                     insert_profile.resolve_doc_state_us = insert_profile
                         .resolve_doc_state_us
@@ -2183,7 +2183,7 @@ impl CandidateStore {
                 results.push(CandidateInsertResult {
                     status: "restored".to_owned(),
                     doc_id: snapshot.doc_id,
-                    sha256: sha256_hex,
+                    identity: identity_hex,
                 });
                 continue;
             }
@@ -2195,7 +2195,7 @@ impl CandidateStore {
             self.local_meta.next_doc_id += 1;
             let doc = CandidateDoc {
                 doc_id,
-                sha256: sha256_hex.clone(),
+                identity: identity_hex.clone(),
                 file_size: *file_size,
                 filter_bytes: *filter_bytes,
                 bloom_hashes: expected_bloom_hashes,
@@ -2213,11 +2213,11 @@ impl CandidateStore {
             results.push(CandidateInsertResult {
                 status: "inserted".to_owned(),
                 doc_id,
-                sha256: sha256_hex,
+                identity: identity_hex,
             });
             pending_new_inserts.push(PendingNewInsert {
-                sha256: *sha256,
-                sha256_hex: doc.sha256.clone(),
+                identity: *sha256,
+                identity_hex: doc.identity.clone(),
                 doc,
                 metadata,
                 external_id: external_id.as_deref(),
@@ -2326,7 +2326,7 @@ impl CandidateStore {
                 insert_profile.append_external_id_payload_bytes = insert_profile
                     .append_external_id_payload_bytes
                     .saturating_add(row_profile.external_id_bytes);
-                sha_by_docid_payload.extend_from_slice(&pending.sha256);
+                sha_by_docid_payload.extend_from_slice(&pending.identity);
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared_rows.push((pending, row, tier2_row));
@@ -2350,7 +2350,7 @@ impl CandidateStore {
                 self.doc_rows.push(row);
                 self.tier2_doc_rows.push(tier2_row);
                 self.docs.push(pending.doc.clone());
-                self.sha_to_pos.insert(pending.sha256_hex, pos);
+                self.identity_to_pos.insert(pending.identity_hex, pos);
                 if pending.doc.special_population {
                     self.remember_special_doc_position(pos);
                 }
@@ -2403,14 +2403,14 @@ impl CandidateStore {
 
     /// Marks one document as deleted and persists the deleted flag in the
     /// fixed-width metadata row.
-    pub fn delete_document(&mut self, sha256_hex: &str) -> Result<CandidateDeleteResult> {
+    pub fn delete_document(&mut self, identity_hex: &str) -> Result<CandidateDeleteResult> {
         let _scope = scope("candidate.delete_document");
-        let normalized = normalize_sha256_hex(sha256_hex)?;
-        if let Some(pos) = self.sha_to_pos.get(&normalized).copied() {
+        let normalized = normalize_sha256_hex(identity_hex)?;
+        if let Some(pos) = self.identity_to_pos.get(&normalized).copied() {
             if self.docs[pos].deleted {
                 return Ok(CandidateDeleteResult {
                     status: "missing".to_owned(),
-                    sha256: normalized,
+                    identity: normalized,
                     doc_id: None,
                 });
             }
@@ -2421,7 +2421,7 @@ impl CandidateStore {
             };
             let result = CandidateDeleteResult {
                 status: "deleted".to_owned(),
-                sha256: snapshot.sha256.clone(),
+                identity: snapshot.identity.clone(),
                 doc_id: Some(snapshot.doc_id),
             };
             let mut row = self.doc_rows[pos];
@@ -2434,7 +2434,7 @@ impl CandidateStore {
         }
         Ok(CandidateDeleteResult {
             status: "missing".to_owned(),
-            sha256: normalized,
+            identity: normalized,
             doc_id: None,
         })
     }
@@ -2450,10 +2450,10 @@ impl CandidateStore {
                 continue;
             }
             let mut sha256 = [0u8; 32];
-            hex::decode_to_slice(&doc.sha256, &mut sha256)?;
+            hex::decode_to_slice(&doc.identity, &mut sha256)?;
             out.push(ImportedCandidateDocument {
-                sha256,
-                sha256_hex: doc.sha256.clone(),
+                identity: sha256,
+                identity_hex: doc.identity.clone(),
                 file_size: doc.file_size,
                 filter_bytes: doc.filter_bytes,
                 bloom_hashes: doc.bloom_hashes,
@@ -2516,7 +2516,7 @@ impl CandidateStore {
     ) -> Result<Vec<CandidateInsertResult>> {
         struct PendingImportedInsert<'a> {
             doc_id: u64,
-            sha256_hex: String,
+            identity_hex: String,
             document: &'a ImportedCandidateDocument,
         }
 
@@ -2534,17 +2534,17 @@ impl CandidateStore {
         let resolve_doc_state_started = Instant::now();
         for document in documents {
             total_scope.add_bytes(document.file_size);
-            let sha256_hex = document.sha256_hex.clone();
+            let identity_hex = document.identity_hex.clone();
 
             if !assume_new {
-                if let Some(existing_pos) = self.sha_to_pos.get(&sha256_hex).copied() {
+                if let Some(existing_pos) = self.identity_to_pos.get(&identity_hex).copied() {
                     if !self.docs[existing_pos].deleted {
                         let existing = &self.docs[existing_pos];
                         if collect_results {
                             results.push(CandidateInsertResult {
                                 status: "already_exists".to_owned(),
                                 doc_id: existing.doc_id,
-                                sha256: existing.sha256.clone(),
+                                identity: existing.identity.clone(),
                             });
                         }
                         continue;
@@ -2588,7 +2588,7 @@ impl CandidateStore {
                         results.push(CandidateInsertResult {
                             status: "restored".to_owned(),
                             doc_id: snapshot.doc_id,
-                            sha256: sha256_hex,
+                            identity: identity_hex,
                         });
                     }
                     continue;
@@ -2599,7 +2599,7 @@ impl CandidateStore {
             self.local_meta.next_doc_id += 1;
             pending_inserts.push(PendingImportedInsert {
                 doc_id,
-                sha256_hex,
+                identity_hex,
                 document,
             });
             modified = true;
@@ -2712,7 +2712,7 @@ impl CandidateStore {
 
                 let doc = CandidateDoc {
                     doc_id: pending.doc_id,
-                    sha256: pending.sha256_hex.clone(),
+                    identity: pending.identity_hex.clone(),
                     file_size: document.file_size,
                     filter_bytes: document.filter_bytes,
                     bloom_hashes: document.bloom_hashes,
@@ -2722,14 +2722,14 @@ impl CandidateStore {
                     deleted: false,
                 };
 
-                sha_by_docid_payload.extend_from_slice(&document.sha256);
+                sha_by_docid_payload.extend_from_slice(&document.identity);
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared.push((
                     doc,
                     row,
                     tier2_row,
-                    pending.sha256_hex,
+                    pending.identity_hex,
                     document.filter_bytes,
                     document.bloom_hashes,
                     document.bloom_filter.as_slice(),
@@ -2775,7 +2775,7 @@ impl CandidateStore {
                 doc,
                 row,
                 tier2_row,
-                sha256_hex,
+                identity_hex,
                 filter_bytes,
                 bloom_hashes,
                 bloom_filter,
@@ -2788,7 +2788,7 @@ impl CandidateStore {
                 self.tier2_doc_rows.push(tier2_row);
                 let pos = self.docs.len();
                 self.docs.push(doc.clone());
-                self.sha_to_pos.insert(sha256_hex.clone(), pos);
+                self.identity_to_pos.insert(identity_hex.clone(), pos);
                 if doc.special_population {
                     self.remember_special_doc_position(pos);
                 }
@@ -2807,7 +2807,7 @@ impl CandidateStore {
                     results.push(CandidateInsertResult {
                         status: "inserted".to_owned(),
                         doc_id: doc.doc_id,
-                        sha256: sha256_hex,
+                        identity: identity_hex,
                     });
                 }
             }
@@ -2849,12 +2849,12 @@ impl CandidateStore {
         self.last_import_batch_profile
     }
 
-    /// Reports whether the given SHA-256 is present as a non-deleted document
+    /// Reports whether the given canonical identity is present as a non-deleted document
     /// in the store.
-    pub fn contains_live_document_sha256(&self, sha256: &[u8; 32]) -> bool {
-        let sha256_hex = hex::encode(sha256);
-        self.sha_to_pos
-            .get(&sha256_hex)
+    pub fn contains_live_document_identity(&self, identity: &[u8; 32]) -> bool {
+        let identity_hex = hex::encode(identity);
+        self.identity_to_pos
+            .get(&identity_hex)
             .copied()
             .map(|pos| !self.docs[pos].deleted)
             .unwrap_or(false)
@@ -2910,7 +2910,7 @@ impl CandidateStore {
         let mut used_tiers = TierFlags::default();
         let mut query_profile = CandidateQueryProfile::default();
         for sha256 in seed_hashes {
-            let Some(pos) = self.sha_to_pos.get(&sha256).copied() else {
+            let Some(pos) = self.identity_to_pos.get(&sha256).copied() else {
                 continue;
             };
             let doc = &self.docs[pos];
@@ -2936,7 +2936,7 @@ impl CandidateStore {
                 gram_cache,
             )?;
             if outcome.matched {
-                matched_hits.push(doc.sha256.clone());
+                matched_hits.push(doc.identity.clone());
                 used_tiers.merge(outcome.tiers);
             }
             query_profile.merge_from(&doc_inputs.into_profile());
@@ -2945,7 +2945,7 @@ impl CandidateStore {
     }
 
     /// Executes a query plan against the store and returns one paginated page
-    /// of candidate SHA-256 values.
+    /// of candidate identities.
     pub fn query_candidates(
         &mut self,
         plan: &CompiledQueryPlan,
@@ -3164,7 +3164,7 @@ impl CandidateStore {
             paginate_query_hits(&matched_hits, cursor, chunk_size);
 
         Ok(CandidateQueryResult {
-            sha256: page,
+            identities: page,
             total_candidates: total,
             returned_count: end.saturating_sub(start),
             cursor: start,
@@ -3266,7 +3266,7 @@ impl CandidateStore {
             let profile_delta = doc_inputs.profile.delta_since(&profile_before);
             result.profile.merge_from(&profile_delta);
             if outcome.matched {
-                result.hits.push(doc.sha256.clone());
+                result.hits.push(doc.identity.clone());
                 result.tiers.merge(outcome.tiers);
             }
         }
@@ -3372,7 +3372,7 @@ impl CandidateStore {
                 gram_cache,
             )?;
             if outcome.matched {
-                matched_hits.push(doc.sha256.clone());
+                matched_hits.push(doc.identity.clone());
                 used_tiers.merge(outcome.tiers);
             }
             query_profile.merge_from(&doc_inputs.into_profile());
@@ -3415,7 +3415,7 @@ impl CandidateStore {
                 gram_cache,
             )?;
             if outcome.matched {
-                matched_hits.push(doc.sha256.clone());
+                matched_hits.push(doc.identity.clone());
                 used_tiers.merge(outcome.tiers);
             }
             query_profile.merge_from(&doc_inputs.into_profile());
@@ -3440,13 +3440,13 @@ impl CandidateStore {
             )
     }
 
-    /// Estimates memory used by the SHA-256 to document-position hash index.
-    fn sha_index_memory_bytes(&self) -> u64 {
-        let bucket_bytes = (self.sha_to_pos.capacity() as u64).saturating_mul(
+    /// Estimates memory used by the identity-to-document-position hash index.
+    fn identity_index_memory_bytes(&self) -> u64 {
+        let bucket_bytes = (self.identity_to_pos.capacity() as u64).saturating_mul(
             (std::mem::size_of::<(String, usize)>() + std::mem::size_of::<u64>()) as u64,
         );
         let key_bytes = self
-            .sha_to_pos
+            .identity_to_pos
             .keys()
             .map(|sha| sha.capacity() as u64)
             .sum::<u64>();
@@ -3513,7 +3513,7 @@ impl CandidateStore {
                 .saturating_mul(std::mem::size_of::<DocMetaRow>() as u64),
             tier2_doc_rows_bytes: (self.tier2_doc_rows.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<Tier2DocMetaRow>() as u64),
-            sha_index_bytes: self.sha_index_memory_bytes(),
+            identity_index_bytes: self.identity_index_memory_bytes(),
             special_doc_positions_bytes: (self.special_doc_positions.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<usize>() as u64),
             query_artifact_cache_entries: self.query_artifact_cache.len(),
@@ -3525,24 +3525,24 @@ impl CandidateStore {
         }
     }
 
-    /// Returns external identifiers for the provided SHA-256 list, preserving
+    /// Returns external identifiers for the provided identity list, preserving
     /// input order and using `None` for missing/deleted documents.
-    pub fn external_ids_for_sha256(&self, hashes: &[String]) -> Vec<Option<String>> {
+    pub fn external_ids_for_identities(&self, hashes: &[String]) -> Vec<Option<String>> {
         hashes
             .iter()
-            .map(|sha256| match self.sha_to_pos.get(sha256).copied() {
+            .map(|sha256| match self.identity_to_pos.get(sha256).copied() {
                 Some(pos) if !self.docs[pos].deleted => self.doc_external_id(pos).ok().flatten(),
                 _ => None,
             })
             .collect()
     }
 
-    /// Returns document ids for the provided SHA-256 list, preserving input
+    /// Returns document ids for the provided identity list, preserving input
     /// order and using `None` for missing/deleted documents.
-    pub fn doc_ids_for_sha256(&self, hashes: &[String]) -> Vec<Option<u64>> {
+    pub fn doc_ids_for_identities(&self, hashes: &[String]) -> Vec<Option<u64>> {
         hashes
             .iter()
-            .map(|sha256| match self.sha_to_pos.get(sha256).copied() {
+            .map(|sha256| match self.identity_to_pos.get(sha256).copied() {
                 Some(pos) if !self.docs[pos].deleted => Some(self.docs[pos].doc_id),
                 _ => None,
             })
@@ -3824,11 +3824,11 @@ impl CandidateStore {
     /// document id.
     fn append_new_doc(
         &mut self,
-        sha256: &[u8; 32],
+        identity: &[u8; 32],
         row: DocMetaRow,
         tier2_row: Tier2DocMetaRow,
     ) -> Result<()> {
-        self.append_writers.sha_by_docid.append(sha256)?;
+        self.append_writers.sha_by_docid.append(identity)?;
         self.append_writers.doc_meta.append(&row.encode())?;
         self.append_writers
             .tier2_doc_meta
@@ -3880,7 +3880,7 @@ impl CandidateStore {
     /// normalizes legacy row defaults encountered on disk.
     fn rebuild_indexes_profiled(&mut self) -> Result<CandidateStoreRebuildProfile> {
         let started_total = Instant::now();
-        self.sha_to_pos.clear();
+        self.identity_to_pos.clear();
         self.special_doc_positions.clear();
         let sha_started = Instant::now();
         for (index, doc) in self.docs.iter_mut().enumerate() {
@@ -3890,18 +3890,18 @@ impl CandidateStore {
                     row.bloom_hashes = DEFAULT_BLOOM_HASHES.min(u8::MAX as usize) as u8;
                 }
             }
-            self.sha_to_pos.insert(doc.sha256.clone(), index);
+            self.identity_to_pos.insert(doc.identity.clone(), index);
             if doc.special_population {
                 self.special_doc_positions.push(index);
             }
         }
-        let sha_index_ms = sha_started
+        let identity_index_ms = sha_started
             .elapsed()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
         Ok(CandidateStoreRebuildProfile {
-            sha_index_ms,
+            identity_index_ms,
             total_ms: started_total
                 .elapsed()
                 .as_millis()
@@ -4033,7 +4033,7 @@ pub(crate) fn write_compacted_snapshot(
                 bloom_len: tier2_bloom_bytes.len() as u32,
             }
         };
-        append_blob(sha_by_docid_path(compacted_root), &doc.sha256)?;
+        append_blob(sha_by_docid_path(compacted_root), &doc.identity)?;
         append_blob(doc_meta_path(compacted_root), &row.encode())?;
         append_blob(tier2_doc_meta_path(compacted_root), &tier2_row.encode())?;
     }
