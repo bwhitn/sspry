@@ -672,10 +672,12 @@ fn file_path_collection_and_hash_helpers_work() {
         file_digest,
         path_identity_sha256(&sample).expect("path digest")
     );
-    assert!(sha256_file(&sample, 0)
-        .expect_err("zero chunk size")
-        .to_string()
-        .contains("positive integer"));
+    assert!(
+        sha256_file(&sample, 0)
+            .expect_err("zero chunk size")
+            .to_string()
+            .contains("positive integer")
+    );
 
     let mut files = Vec::new();
     collect_files_recursive(tmp.path(), &mut files).expect("collect files");
@@ -1683,18 +1685,24 @@ fn digest_helpers_and_delete_resolution_cover_remaining_branches() {
     let sample = tmp.path().join("sample.bin");
     fs::write(&sample, b"identity-check-bytes").expect("sample");
 
-    assert!(md5_file(&sample, 0)
-        .expect_err("md5 zero chunk")
-        .to_string()
-        .contains("positive integer"));
-    assert!(sha1_file(&sample, 0)
-        .expect_err("sha1 zero chunk")
-        .to_string()
-        .contains("positive integer"));
-    assert!(sha512_file(&sample, 0)
-        .expect_err("sha512 zero chunk")
-        .to_string()
-        .contains("positive integer"));
+    assert!(
+        md5_file(&sample, 0)
+            .expect_err("md5 zero chunk")
+            .to_string()
+            .contains("positive integer")
+    );
+    assert!(
+        sha1_file(&sample, 0)
+            .expect_err("sha1 zero chunk")
+            .to_string()
+            .contains("positive integer")
+    );
+    assert!(
+        sha512_file(&sample, 0)
+            .expect_err("sha512 zero chunk")
+            .to_string()
+            .contains("positive integer")
+    );
 
     assert_eq!(
         detect_digest_identity_source(&"aa".repeat(16)),
@@ -1875,38 +1883,46 @@ fn grpc_batch_helper_functions_cover_limits_and_oversize_rows() {
         payload_size: empty_payload_size + 3,
     };
 
-    assert!(!prepare_serialized_remote_batch_row(
-        &pending_empty,
-        16,
-        empty_payload_size,
-        empty_payload_size + 32,
-        false,
-    )
-    .expect("fits empty batch"));
-    assert!(prepare_serialized_remote_batch_row(
-        &pending_non_empty,
-        4,
-        empty_payload_size,
-        empty_payload_size + 7,
-        false,
-    )
-    .expect("flush before oversize append"));
-    assert!(prepare_serialized_remote_batch_row(
-        &pending_non_empty,
-        64,
-        empty_payload_size,
-        empty_payload_size + 32,
-        true,
-    )
-    .expect("flush before oversize single row"));
-    assert!(prepare_serialized_remote_batch_row(
-        &pending_empty,
-        64,
-        empty_payload_size,
-        empty_payload_size + 32,
-        false,
-    )
-    .is_err());
+    assert!(
+        !prepare_serialized_remote_batch_row(
+            &pending_empty,
+            16,
+            empty_payload_size,
+            empty_payload_size + 32,
+            false,
+        )
+        .expect("fits empty batch")
+    );
+    assert!(
+        prepare_serialized_remote_batch_row(
+            &pending_non_empty,
+            4,
+            empty_payload_size,
+            empty_payload_size + 7,
+            false,
+        )
+        .expect("flush before oversize append")
+    );
+    assert!(
+        prepare_serialized_remote_batch_row(
+            &pending_non_empty,
+            64,
+            empty_payload_size,
+            empty_payload_size + 32,
+            true,
+        )
+        .expect("flush before oversize single row")
+    );
+    assert!(
+        prepare_serialized_remote_batch_row(
+            &pending_empty,
+            64,
+            empty_payload_size,
+            empty_payload_size + 32,
+            false,
+        )
+        .is_err()
+    );
 }
 
 #[test]

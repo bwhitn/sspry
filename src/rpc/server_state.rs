@@ -3002,32 +3002,44 @@ impl ServerState {
         self.next_compaction_shard.fetch_add(1, Ordering::Relaxed) % shard_count
     }
 
-    /// Prunes retired generations for one published shard and refreshes stats
-    /// caches when anything was removed.
-    fn garbage_collect_retired_generations(&self, shard_idx: usize) -> Result<usize> {
-        let stores = self.published_store_set()?;
+    /// Prunes retired generations for one shard in a concrete store set and
+    /// refreshes that store set's cached stats when anything was removed.
+    fn garbage_collect_retired_generations(
+        &self,
+        stores: &StoreSet,
+        shard_idx: usize,
+    ) -> Result<usize> {
         let mut store = stores.stores[shard_idx]
             .lock()
             .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
         let removed = store.garbage_collect_retired_generations()?;
         if removed > 0 {
-            let _ = self.invalidate_published_stats_cache();
+            let _ = stores.invalidate_stats_cache();
         }
         Ok(removed)
     }
 
-    /// Finds the next published shard whose deleted-document snapshot is worth
-    /// compacting.
-    fn find_compaction_candidate(&self) -> Result<Option<(usize, CandidateCompactionSnapshot)>> {
+    /// Finds the next published-query shard whose deleted-document snapshot is
+    /// worth compacting. In forest mode this scans each tree's shard at the
+    /// current shard index before moving to the next shard index.
+    fn find_compaction_candidate(
+        &self,
+        store_sets: &[Arc<StoreSet>],
+    ) -> Result<Option<(Arc<StoreSet>, usize, CandidateCompactionSnapshot)>> {
         let shard_count = self.candidate_shard_count().max(1);
         let start = self.next_compaction_candidate_shard();
         for offset in 0..shard_count {
             let shard_idx = (start + offset) % shard_count;
-            let _ = self.garbage_collect_retired_generations(shard_idx);
-            if let Some(snapshot) = self.prepare_compaction_snapshot(shard_idx)? {
-                self.next_compaction_shard
-                    .store((shard_idx + 1) % shard_count, Ordering::Relaxed);
-                return Ok(Some((shard_idx, snapshot)));
+            for stores in store_sets {
+                let _ = self.garbage_collect_retired_generations(stores, shard_idx);
+                let store = stores.stores[shard_idx]
+                    .lock()
+                    .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
+                if let Some(snapshot) = store.prepare_compaction_snapshot(false)? {
+                    self.next_compaction_shard
+                        .store((shard_idx + 1) % shard_count, Ordering::Relaxed);
+                    return Ok(Some((stores.clone(), shard_idx, snapshot)));
+                }
             }
         }
         Ok(None)
@@ -3041,57 +3053,33 @@ impl ServerState {
         }
     }
 
-    /// Asks one published shard to prepare a compaction snapshot.
-    fn prepare_compaction_snapshot(
-        &self,
-        shard_idx: usize,
-    ) -> Result<Option<CandidateCompactionSnapshot>> {
-        let stores = self.published_store_set()?;
-        let store = stores.stores[shard_idx]
-            .lock()
-            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
-        store.prepare_compaction_snapshot(false)
-    }
-
-    /// Applies a completed compaction snapshot back into one published shard.
-    fn apply_compaction_snapshot(
-        &self,
-        shard_idx: usize,
-        snapshot: &CandidateCompactionSnapshot,
-        compacted_root: &Path,
-    ) -> Result<Option<CandidateCompactionResult>> {
-        let stores = self.published_store_set()?;
-        let mut store = stores.stores[shard_idx]
-            .lock()
-            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
-        store.apply_compaction_snapshot(snapshot, compacted_root)
-    }
-
     /// Chooses how long the background compaction worker should sleep before
     /// re-checking published shards for newly eligible delete reclamation.
     fn next_compaction_wait_timeout(&self) -> Duration {
         const DEFAULT_WAIT: Duration = Duration::from_secs(30);
         const READY_RETRY_WAIT: Duration = Duration::from_millis(100);
 
-        let Ok(stores) = self.published_store_set() else {
+        let Ok(store_sets) = self.published_query_store_sets() else {
             return DEFAULT_WAIT;
         };
 
         let mut min_wait = None::<Duration>;
-        for store in &stores.stores {
-            let Ok(store) = store.lock() else {
-                return DEFAULT_WAIT;
-            };
-            let Some(wait) = store.pending_compaction_wait() else {
-                continue;
-            };
-            if wait.is_zero() {
-                return READY_RETRY_WAIT;
+        for stores in store_sets {
+            for store in &stores.stores {
+                let Ok(store) = store.lock() else {
+                    return DEFAULT_WAIT;
+                };
+                let Some(wait) = store.pending_compaction_wait() else {
+                    continue;
+                };
+                if wait.is_zero() {
+                    return READY_RETRY_WAIT;
+                }
+                min_wait = Some(match min_wait {
+                    Some(current) => current.min(wait),
+                    None => wait,
+                });
             }
-            min_wait = Some(match min_wait {
-                Some(current) => current.min(wait),
-                None => wait,
-            });
         }
 
         min_wait
@@ -3102,11 +3090,14 @@ impl ServerState {
     /// Runs one background compaction cycle, covering snapshot selection,
     /// snapshot writing, and install/retry bookkeeping.
     fn run_compaction_cycle_once(&self) -> Result<CompactionCycleOutcome> {
+        let forest_mode = self.forest_mode_info()?.is_some();
         let _op = self
             .operation_gate
             .read()
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
-        let Some((shard_idx, snapshot)) = self.find_compaction_candidate()? else {
+        let store_sets = self.published_query_store_sets()?;
+        let Some((stores, shard_idx, snapshot)) = self.find_compaction_candidate(&store_sets)?
+        else {
             return Ok(CompactionCycleOutcome::Idle);
         };
 
@@ -3119,20 +3110,31 @@ impl ServerState {
             runtime.last_error = None;
         }
 
-        let stores = self.published_store_set()?;
         let compacted_root = compaction_work_root(
             &candidate_shard_root(&stores.root()?, self.candidate_shard_count(), shard_idx),
             "compact",
         );
         let build_result = write_compacted_snapshot(&snapshot, &compacted_root);
         let apply_result = match build_result {
-            Ok(()) => self.apply_compaction_snapshot(shard_idx, &snapshot, &compacted_root),
+            Ok(()) => {
+                let mut store = stores.stores[shard_idx]
+                    .lock()
+                    .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
+                store.apply_compaction_snapshot(&snapshot, &compacted_root)
+            }
             Err(err) => Err(err),
         };
 
         match apply_result {
             Ok(Some(result)) => {
-                let _ = self.invalidate_published_stats_cache();
+                let _ = stores.invalidate_stats_cache();
+                let source_ref_result = if forest_mode {
+                    stores
+                        .root()
+                        .and_then(|root| build_tree_source_ref(&root).map(|_| ()))
+                } else {
+                    Ok(())
+                };
                 let mut runtime = self
                     .compaction_runtime
                     .lock()
@@ -3142,7 +3144,12 @@ impl ServerState {
                 runtime.last_reclaimed_docs = result.reclaimed_docs;
                 runtime.last_reclaimed_bytes = result.reclaimed_bytes;
                 runtime.last_completed_unix_ms = Some(current_unix_ms());
-                runtime.last_error = None;
+                runtime.last_error = source_ref_result
+                    .as_ref()
+                    .err()
+                    .map(|err| err.to_string());
+                drop(runtime);
+                source_ref_result?;
                 Ok(CompactionCycleOutcome::Progress)
             }
             Ok(None) => {

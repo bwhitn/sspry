@@ -228,7 +228,10 @@ mod tests {
         assert!(normalize_filter_policy(2048, None, None, Some(0.009)).is_err());
         assert!(normalize_filter_policy(2048, None, None, Some(0.51)).is_err());
         assert_eq!(derive_bloom_hash_count(None, 0).expect("fallback"), 1);
-        assert_eq!(derive_bloom_hash_count(None, 13).expect("capped fallback"), 7);
+        assert_eq!(
+            derive_bloom_hash_count(None, 13).expect("capped fallback"),
+            7
+        );
         assert_eq!(derive_bloom_hash_count(Some(0.25), 13).expect("derived"), 2);
         assert_eq!(
             derive_bloom_hash_count(Some(MIN_FILTER_TARGET_FP), 13).expect("minimum fp cap"),

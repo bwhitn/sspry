@@ -21,20 +21,21 @@ use yara_x::{Compiler as YaraCompiler, Rules as YaraRules, Scanner as YaraScanne
 use crate::candidate::features::AdditionalDigestKind;
 use crate::candidate::filter_policy::align_filter_bytes;
 use crate::candidate::query_plan::{
-    evaluate_fixed_literal_match, fixed_literal_match_plan, FixedLiteralMatchPlan,
+    FixedLiteralMatchPlan, evaluate_fixed_literal_match, fixed_literal_match_plan,
 };
 use crate::candidate::write_candidate_shard_count;
 use crate::candidate::{
-    candidate_shard_index, candidate_shard_root, choose_filter_bytes_for_file_size,
+    BoundedCache, CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan,
+    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, GramSizes,
+    HLL_DEFAULT_PRECISION, candidate_shard_index, candidate_shard_root,
+    choose_filter_bytes_for_file_size,
     compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source,
     compile_query_plan_from_file_with_gram_sizes, derive_document_bloom_hash_count,
     estimate_unique_grams_for_size_hll, estimate_unique_grams_pair_hll,
     extract_compact_document_metadata_with_entropy, load_rule_file_with_includes,
     read_candidate_shard_count, resolve_max_candidates,
     rule_check_all_from_file_with_gram_sizes_and_identity_source,
-    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names, BoundedCache,
-    CandidateConfig, CandidateQueryProfile, CandidateStore, CompiledQueryPlan, GramSizes,
-    DEFAULT_TIER1_FILTER_TARGET_FP, DEFAULT_TIER2_FILTER_TARGET_FP, HLL_DEFAULT_PRECISION,
+    scan_file_features_bloom_only_with_gram_sizes, search_target_rule_names,
 };
 use crate::grpc::{self, BlockingGrpcClient};
 use crate::perf;
@@ -1952,11 +1953,7 @@ fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
         .map(|entry| {
             let path = entry.path();
             let current = path.join("current");
-            if current.is_dir() {
-                current
-            } else {
-                path
-            }
+            if current.is_dir() { current } else { path }
         })
         .filter(|path| {
             path.is_dir()

@@ -754,10 +754,12 @@ fn info_light_exposes_adaptive_publish_status() {
     assert!(adaptive_publish.contains_key("mode"));
     assert!(adaptive_publish.contains_key("reason"));
     assert!(adaptive_publish.contains_key("storage_class"));
-    assert!(parsed
-        .get("published_tier2_snapshot_seal")
-        .and_then(Value::as_object)
-        .is_some());
+    assert!(
+        parsed
+            .get("published_tier2_snapshot_seal")
+            .and_then(Value::as_object)
+            .is_some()
+    );
 
     let _ = child.kill();
     let _ = child.wait();

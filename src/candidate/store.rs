@@ -1928,7 +1928,8 @@ pub(crate) fn build_tree_source_ref(root: &Path) -> Result<TreeSourceRefBuildRes
         let run_dir = temp_root.join("runs");
         fs::create_dir_all(&run_dir)?;
 
-        let mut chunk_entries = Vec::<TreeSourceRefEntry>::with_capacity(TREE_SOURCE_REF_RUN_MAX_ENTRIES);
+        let mut chunk_entries =
+            Vec::<TreeSourceRefEntry>::with_capacity(TREE_SOURCE_REF_RUN_MAX_ENTRIES);
         let mut run_paths = Vec::<PathBuf>::new();
         let mut next_run_idx = 0usize;
         let mut entry_count = 0u64;
@@ -3160,8 +3161,11 @@ impl CandidateStore {
     /// fixed-width metadata row.
     pub fn delete_document(&mut self, identity_hex: &str) -> Result<CandidateDeleteResult> {
         let _scope = scope("candidate.delete_document");
-        let normalized =
-            normalize_identity_hex(identity_hex, self.identity_bytes_len(), &self.meta.id_source)?;
+        let normalized = normalize_identity_hex(
+            identity_hex,
+            self.identity_bytes_len(),
+            &self.meta.id_source,
+        )?;
         if let Some(pos) = self.identity_to_pos.get(&normalized).copied() {
             return self.delete_document_at_position(pos, normalized);
         }
