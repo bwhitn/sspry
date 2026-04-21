@@ -1775,51 +1775,6 @@ fn workspace_startup_prunes_old_retired_roots() {
 }
 
 #[test]
-fn workspace_startup_rejects_retired_single_work_root() {
-    let tmp = tempdir().expect("tmp");
-    let workspace_root = tmp.path().join("candidate_workspace_1");
-    let legacy_work_root = workspace_root.join("work");
-    let (legacy_stores, _, _) = ensure_candidate_stores_at_root(
-        &ServerConfig {
-            candidate_config: CandidateConfig {
-                root: workspace_root.clone(),
-                ..CandidateConfig::default()
-            },
-            candidate_shards: 1,
-            search_workers: 1,
-            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            auto_publish_initial_idle_ms: 500,
-            auto_publish_storage_class: "unknown".to_owned(),
-            workspace_mode: true,
-        },
-        &legacy_work_root,
-    )
-    .expect("init legacy work root");
-    assert_eq!(legacy_stores.len(), 1);
-    assert!(legacy_work_root.exists());
-    assert!(!workspace_work_root_a(&workspace_root).exists());
-    assert!(!workspace_work_root_b(&workspace_root).exists());
-
-    let err = ServerState::new(
-        ServerConfig {
-            candidate_config: CandidateConfig {
-                root: workspace_root.clone(),
-                ..CandidateConfig::default()
-            },
-            candidate_shards: 1,
-            search_workers: 1,
-            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-            auto_publish_initial_idle_ms: 500,
-            auto_publish_storage_class: "unknown".to_owned(),
-            workspace_mode: true,
-        },
-        Arc::new(AtomicBool::new(false)),
-    )
-    .expect_err("workspace startup must fail");
-    assert!(err.to_string().contains("retired workspace work/ root"));
-}
-
-#[test]
 fn workspace_work_roots_are_lazy_and_removed_when_idle() {
     let tmp = tempdir().expect("tmp");
     let state = sample_workspace_server_state(tmp.path(), 1);
@@ -2625,26 +2580,22 @@ fn query_plan_wire_and_store_setup_cover_manifest_errors() {
         true,
     )
     .expect("init orphaned shard");
-    let (stores, _, _) = ensure_candidate_stores(&ServerConfig {
-        candidate_config: CandidateConfig {
-            root: sharded_root.clone(),
-            ..CandidateConfig::default()
-        },
-        candidate_shards: 1,
-        search_workers: 1,
-        memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
-        auto_publish_initial_idle_ms: 500,
-        auto_publish_storage_class: "unknown".to_owned(),
-        workspace_mode: false,
-    })
-    .expect("direct root should normalize to single-store layout");
-    assert_eq!(
-        match stores {
-            StoreMode::Direct { stores } => stores.stores.len(),
-            StoreMode::Forest { .. } => 0,
-            StoreMode::Workspace { .. } => 0,
-        },
-        1
+    assert!(
+        ensure_candidate_stores(&ServerConfig {
+            candidate_config: CandidateConfig {
+                root: sharded_root.clone(),
+                ..CandidateConfig::default()
+            },
+            candidate_shards: 1,
+            search_workers: 1,
+            memory_budget_bytes: crate::app::DEFAULT_MEMORY_BUDGET_BYTES,
+            auto_publish_initial_idle_ms: 500,
+            auto_publish_storage_class: "unknown".to_owned(),
+            workspace_mode: false,
+        })
+        .expect_err("sharded layout should not open as direct single-store root")
+        .to_string()
+        .contains("sharded store")
     );
 
     let manifest_root = tmp.path().join("manifest");
@@ -2932,20 +2883,20 @@ fn direct_multishard_stream_candidate_query_frames_returns_hits_from_all_shards(
     assert_eq!(stream_complete[0].tier_used, "tier1");
     assert!(stream_complete[0].query_profile.docs_scanned >= 2);
 
-    let mut hashes = Vec::new();
+    let mut identities = Vec::new();
     let mut external_ids = Vec::new();
     for frame in &frames {
         if frame.stream_complete || frame.rule_complete {
             continue;
         }
-        hashes.extend(frame.identities.iter().cloned());
+        identities.extend(frame.identities.iter().cloned());
         external_ids.extend(frame.external_ids.clone().unwrap_or_default());
     }
-    hashes.sort();
-    hashes.dedup();
+    identities.sort();
+    identities.dedup();
     external_ids.sort();
     external_ids.dedup();
-    assert_eq!(hashes.len(), 2);
+    assert_eq!(identities.len(), 2);
     assert_eq!(
         external_ids,
         vec![
@@ -3043,12 +2994,12 @@ fn direct_multishard_stream_candidate_query_frames_batch_returns_hits_for_each_r
     }
 
     for rule_name in ["rule_one", "rule_two"] {
-        let Some(hashes) = hits_by_rule.get_mut(rule_name) else {
+        let Some(identities) = hits_by_rule.get_mut(rule_name) else {
             panic!("missing hits for {rule_name}");
         };
-        hashes.sort();
-        hashes.dedup();
-        assert_eq!(hashes.len(), 2);
+        identities.sort();
+        identities.dedup();
+        assert_eq!(identities.len(), 2);
 
         let Some(external_ids) = external_ids_by_rule.get_mut(rule_name) else {
             panic!("missing external ids for {rule_name}");
@@ -3092,20 +3043,20 @@ fn forest_stream_candidate_query_frames_returns_hits_from_all_trees() {
     assert_eq!(stream_complete[0].tier_used, "tier1");
     assert!(stream_complete[0].query_profile.docs_scanned >= 2);
 
-    let mut hashes = Vec::new();
+    let mut identities = Vec::new();
     let mut external_ids = Vec::new();
     for frame in &frames {
         if frame.stream_complete || frame.rule_complete {
             continue;
         }
-        hashes.extend(frame.identities.iter().cloned());
+        identities.extend(frame.identities.iter().cloned());
         external_ids.extend(frame.external_ids.clone().unwrap_or_default());
     }
-    hashes.sort();
-    hashes.dedup();
+    identities.sort();
+    identities.dedup();
     external_ids.sort();
     external_ids.dedup();
-    assert_eq!(hashes.len(), 2);
+    assert_eq!(identities.len(), 2);
     assert_eq!(
         external_ids,
         vec![
@@ -3170,12 +3121,12 @@ fn forest_stream_candidate_query_frames_batch_returns_hits_for_each_rule() {
     }
 
     for rule_name in ["rule_one", "rule_two"] {
-        let Some(hashes) = hits_by_rule.get_mut(rule_name) else {
+        let Some(identities) = hits_by_rule.get_mut(rule_name) else {
             panic!("missing hits for {rule_name}");
         };
-        hashes.sort();
-        hashes.dedup();
-        assert_eq!(hashes.len(), 2);
+        identities.sort();
+        identities.dedup();
+        assert_eq!(identities.len(), 2);
 
         let Some(external_ids) = external_ids_by_rule.get_mut(rule_name) else {
             panic!("missing external ids for {rule_name}");
@@ -3217,14 +3168,14 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
             },
             vec![
                 BundledQueryPartial {
-                    hashes: vec!["hash-a".to_owned()],
+                    identities: vec!["hash-a".to_owned()],
                     external_ids: Some(vec![Some("ext-a".to_owned())]),
                     tier_used: "tier1".to_owned(),
                     query_profile: profile_one.clone(),
                     eval_nanos: 11,
                 },
                 BundledQueryPartial {
-                    hashes: vec!["hash-b".to_owned(), "hash-c".to_owned()],
+                    identities: vec!["hash-b".to_owned(), "hash-c".to_owned()],
                     external_ids: Some(vec![Some("ext-b".to_owned()), None]),
                     tier_used: "tier2".to_owned(),
                     query_profile: profile_two.clone(),
@@ -3272,14 +3223,14 @@ fn emit_stream_candidate_query_frames_batch_partial_streams_hits_immediately() {
             },
             vec![
                 BundledQueryPartial {
-                    hashes: vec!["hash-d".to_owned()],
+                    identities: vec!["hash-d".to_owned()],
                     external_ids: None,
                     tier_used: "tier1".to_owned(),
                     query_profile: profile_three,
                     eval_nanos: 33,
                 },
                 BundledQueryPartial {
-                    hashes: Vec::new(),
+                    identities: Vec::new(),
                     external_ids: None,
                     tier_used: String::new(),
                     query_profile: CandidateQueryProfile::default(),

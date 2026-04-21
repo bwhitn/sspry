@@ -447,35 +447,6 @@ fn insert_primary(
 }
 
 #[test]
-fn legacy_store_meta_conversion_preserves_filter_targets() {
-    let legacy = LegacyStoreMeta {
-        version: 7,
-        next_doc_id: 11,
-        id_source: "md5".to_owned(),
-        store_path: true,
-        tier2_gram_size: 5,
-        tier1_gram_size: 4,
-        tier1_filter_target_fp: None,
-        tier2_filter_target_fp: Some(0.18),
-        filter_target_fp: Some(0.39),
-        compaction_idle_cooldown_s: 12.5,
-    };
-
-    let forest = ForestMeta::from(&legacy);
-    assert_eq!(forest.version, 7);
-    assert_eq!(forest.id_source, "md5");
-    assert!(forest.store_path);
-    assert_eq!(forest.tier1_gram_size, 4);
-    assert_eq!(forest.tier2_gram_size, 5);
-    assert_eq!(forest.tier1_filter_target_fp, Some(0.39));
-    assert_eq!(forest.tier2_filter_target_fp, Some(0.18));
-
-    let local = StoreLocalMeta::from(&legacy);
-    assert_eq!(local.version, 7);
-    assert_eq!(local.next_doc_id, 11);
-}
-
-#[test]
 #[ignore = "diagnostic on local corpus only"]
 fn diagnostic_scanstrings_string_matches_bloom_path() {
     let rule = r#"
@@ -1425,7 +1396,7 @@ fn validation_and_open_error_paths_work() {
 
     let open_root = tmp.path().join("open_checks");
     fs::create_dir_all(&open_root).expect("open root");
-    fs::write(meta_path(&open_root), b"{").expect("bad meta");
+    fs::write(forest_meta_path(&open_root), b"{").expect("bad meta");
     assert!(
         CandidateStore::open(&open_root)
             .expect_err("invalid meta")
@@ -1433,12 +1404,12 @@ fn validation_and_open_error_paths_work() {
             .contains("Invalid candidate metadata")
     );
 
-    let bad_version = LegacyStoreMeta {
+    let bad_version = ForestMeta {
         version: STORE_VERSION + 1,
-        ..LegacyStoreMeta::default()
+        ..ForestMeta::default()
     };
     fs::write(
-        meta_path(&open_root),
+        forest_meta_path(&open_root),
         serde_json::to_vec_pretty(&bad_version).expect("version json"),
     )
     .expect("write version");
@@ -1450,10 +1421,15 @@ fn validation_and_open_error_paths_work() {
     );
 
     fs::write(
-        meta_path(&open_root),
-        serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("meta json"),
+        forest_meta_path(&open_root),
+        serde_json::to_vec_pretty(&ForestMeta::default()).expect("meta json"),
     )
     .expect("write good meta");
+    fs::write(
+        store_local_meta_path(&open_root),
+        serde_json::to_vec_pretty(&StoreLocalMeta::default()).expect("local meta json"),
+    )
+    .expect("write local meta");
     let opened = CandidateStore::open(&open_root).expect("open without docs");
     assert_eq!(opened.stats().doc_count, 0);
 }
@@ -1562,7 +1538,7 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
         Some("ok".to_owned()),
     )
     .expect("insert invalid len root");
-    fs::write(sha_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate sha");
+    fs::write(source_id_by_docid_path(&invalid_len_root), [0u8; 31]).expect("truncate source id");
     assert!(
         load_candidate_binary_store(&invalid_len_root, 32)
             .expect_err("invalid binary len")
@@ -1597,7 +1573,8 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
         Some("ok".to_owned()),
     )
     .expect("insert mismatch root");
-    fs::write(sha_by_docid_path(&mismatch_root), vec![0u8; 64]).expect("mismatch sha bytes");
+    fs::write(source_id_by_docid_path(&mismatch_root), vec![0u8; 64])
+        .expect("mismatch source-id bytes");
     assert!(
         load_candidate_binary_store(&mismatch_root, 32)
             .expect_err("mismatch state")
@@ -1636,11 +1613,6 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
         .expect("decode row");
     row.bloom_offset = 1_000_000;
     fs::write(doc_meta_path(&invalid_bloom_root), row.encode()).expect("write bad row");
-    fs::write(
-        meta_path(&invalid_bloom_root),
-        serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad bloom meta"),
-    )
-    .expect("write bad bloom meta");
     let mut reopened_invalid_bloom =
         CandidateStore::open(&invalid_bloom_root).expect("open invalid bloom root");
     let invalid_bloom_plan = CompiledQueryPlan {
@@ -1701,11 +1673,6 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
     )
     .expect("insert invalid utf8 root");
     fs::write(external_ids_path(&invalid_utf8_root), [0xFF, 0xFE]).expect("write bad utf8");
-    fs::write(
-        meta_path(&invalid_utf8_root),
-        serde_json::to_vec_pretty(&LegacyStoreMeta::default()).expect("bad utf8 meta"),
-    )
-    .expect("write bad utf8 meta");
     assert!(
         CandidateStore::open(&invalid_utf8_root)
             .expect("open utf8 root")

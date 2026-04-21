@@ -221,7 +221,6 @@ Usage: sspry local search [OPTIONS] --root <ROOT> --rule <RULE>
 - `--root <ROOT>`
 - `--rule <RULE>`
 - `--search-workers <N>` where `0` means auto up to tree count
-  - `--tree-search-workers` remains accepted as a compatibility alias
 - `--max-anchors-per-pattern <N>`
 - `--max-candidates <PERCENT>` default `10`
 - `--verify`

@@ -7,7 +7,7 @@ BIN=${BIN:-"$ROOT_DIR/target/debug/sspry"}
 ADDR=
 ROOT=
 OUT=
-RULE_MANIFEST=
+RULE_LIST=
 BUNDLE_RULE=
 MODE_LABEL=default
 SEARCH_WORKERS=0
@@ -30,7 +30,7 @@ Required:
   --out <dir>               Output directory for logs, metrics, and summaries.
 
 Search selection:
-  --rule-manifest <path>    Newline-delimited rule list for sequential individual runs.
+  --rule-list <path>    Newline-delimited rule list for sequential individual runs.
   --bundle-rule <path>      Bundle file for the bundled search run.
   --skip-individual         Skip the sequential per-rule phase.
   --skip-bundle             Skip the bundled phase.
@@ -291,8 +291,8 @@ while [[ $# -gt 0 ]]; do
       OUT="$2"
       shift 2
       ;;
-    --rule-manifest)
-      RULE_MANIFEST="$2"
+    --rule-list)
+      RULE_LIST="$2"
       shift 2
       ;;
     --bundle-rule)
@@ -352,8 +352,8 @@ done
 (( SKIP_INDIVIDUAL == 0 || SKIP_BUNDLE == 0 )) || die "cannot skip both phases"
 
 if (( SKIP_INDIVIDUAL == 0 )); then
-  [[ -n "$RULE_MANIFEST" ]] || die "--rule-manifest is required unless --skip-individual is set"
-  require_file "$RULE_MANIFEST"
+  [[ -n "$RULE_LIST" ]] || die "--rule-list is required unless --skip-individual is set"
+  require_file "$RULE_LIST"
 fi
 if (( SKIP_BUNDLE == 0 )); then
   [[ -n "$BUNDLE_RULE" ]] || die "--bundle-rule is required unless --skip-bundle is set"
@@ -429,7 +429,7 @@ if (( SKIP_INDIVIDUAL == 0 )); then
       "$(metric_value "$OUT/${LABEL}.time" max_rss_kb)" \
       >> "$OUT/individual_summary.tsv"
     echo "[$(date -u +%FT%TZ)] individual rule done rule=$RULE_NAME" >> "$OUT/run.log"
-  done < "$RULE_MANIFEST"
+  done < "$RULE_LIST"
   read -r INDIVIDUAL_END_TS INDIVIDUAL_END_UTIME INDIVIDUAL_END_STIME \
     < <(capture_server_snapshot "$SERVER_PID")
   eval "$(sum_metric_key "${INDIVIDUAL_FILES[@]}")"

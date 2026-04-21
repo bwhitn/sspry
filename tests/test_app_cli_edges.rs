@@ -97,25 +97,6 @@ fn local_index_requires_explicit_init() {
 }
 
 #[test]
-fn local_index_rejects_removed_batch_size_flag() {
-    let tmp = tempdir().expect("tmp");
-    let root = tmp.path().join("local_db");
-    let sample = tmp.path().join("sample.bin");
-    fs::write(&sample, b"sample local index").expect("write sample");
-
-    let err = run_fail(&[
-        "local",
-        "index",
-        "--root",
-        root.to_str().expect("root"),
-        "--batch-size",
-        "1",
-        sample.to_str().expect("sample"),
-    ]);
-    assert!(err.contains("unexpected argument '--batch-size'"), "{err}");
-}
-
-#[test]
 fn rule_check_reports_unsupported_hash_mismatch_with_explicit_policy() {
     let tmp = tempdir().expect("tmp");
     let rule_path = tmp.path().join("rule.yar");

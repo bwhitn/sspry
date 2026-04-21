@@ -20,7 +20,7 @@
     <text x="404" y="168" font-size="15" fill="#14532d">store_meta.json</text>
     <text x="404" y="196" font-size="15" fill="#14532d">doc_meta.bin</text>
     <text x="404" y="224" font-size="15" fill="#14532d">tier2_doc_meta.bin</text>
-    <text x="404" y="252" font-size="15" fill="#14532d">sha256_by_docid.dat</text>
+    <text x="404" y="252" font-size="15" fill="#14532d">source_id_by_docid.dat</text>
     <text x="404" y="280" font-size="15" fill="#14532d">compaction.json</text>
     <text x="550" y="354" text-anchor="middle" font-size="14" fill="#14532d">doc state, generation info,</text>
     <text x="550" y="376" text-anchor="middle" font-size="14" fill="#14532d">identity mapping,</text>

@@ -1208,12 +1208,12 @@ struct RemoteEncodeStats {
 #[cfg(test)]
 /// Derives the test-only remote index session document cap from the effective
 /// client memory budget and requested batch size.
-fn remote_index_session_document_limit(effective_budget_bytes: u64, batch_size: usize) -> usize {
+fn remote_index_session_document_limit(effective_budget_bytes: u64, batch_docs: usize) -> usize {
     if effective_budget_bytes == 0 {
-        return REMOTE_INDEX_SESSION_MAX_DOCUMENTS.max(batch_size);
+        return REMOTE_INDEX_SESSION_MAX_DOCUMENTS.max(batch_docs);
     }
     let derived = usize::try_from(effective_budget_bytes / (640 * 1024) / 4).unwrap_or(usize::MAX);
-    derived.clamp(batch_size.max(1), REMOTE_INDEX_SESSION_MAX_DOCUMENTS)
+    derived.clamp(batch_docs.max(1), REMOTE_INDEX_SESSION_MAX_DOCUMENTS)
 }
 
 #[cfg(test)]
@@ -1319,7 +1319,7 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
     client: &mut C,
     pending: &mut RemotePendingBatch,
     row_bytes: Vec<u8>,
-    batch_size: usize,
+    batch_docs: usize,
     processed: &mut usize,
     submit_time: &mut Duration,
     show_progress: bool,
@@ -1358,7 +1358,7 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
     let flush_after = push_serialized_remote_batch_row(
         pending,
         row_bytes,
-        batch_size,
+        batch_docs,
         remote_batch_soft_limit_bytes,
         allow_oversize_single_row,
     )?;
@@ -1385,7 +1385,7 @@ fn push_serialized_remote_upload_row<C: RemoteBinaryInsertClient>(
 fn push_serialized_remote_batch_row(
     pending: &mut RemotePendingBatch,
     row_bytes: Vec<u8>,
-    batch_size: usize,
+    batch_docs: usize,
     remote_batch_soft_limit_bytes: usize,
     allow_oversize_single_row: bool,
 ) -> Result<bool> {
@@ -1407,7 +1407,7 @@ fn push_serialized_remote_batch_row(
     }
     pending.rows.push(row_bytes);
     pending.payload_size = payload_size;
-    Ok(pending.rows.len() >= batch_size)
+    Ok(pending.rows.len() >= batch_docs)
 }
 
 /// Flushes a local pending batch into the correct shard stores and updates
@@ -1562,11 +1562,14 @@ fn store_config_from_init_args(args: &InitArgs, root: PathBuf) -> CandidateConfi
 fn store_root_has_markers(root: &Path) -> bool {
     root.join("store_meta.json").exists()
         || root.join("meta.json").exists()
-        || root.join("sha256_by_docid.dat").exists()
+        || root.join("source_id_by_docid.dat").exists()
         || root.join("doc_meta.bin").exists()
         || root.join("shard_000").join("store_meta.json").exists()
         || root.join("shard_000").join("meta.json").exists()
-        || root.join("shard_000").join("sha256_by_docid.dat").exists()
+        || root
+            .join("shard_000")
+            .join("source_id_by_docid.dat")
+            .exists()
         || root.join("shard_000").join("doc_meta.bin").exists()
 }
 
@@ -1584,8 +1587,8 @@ fn placeholder_connection() -> ClientConnectionArgs {
 /// metadata requires it.
 fn ensure_store(config: CandidateConfig, force: bool) -> Result<CandidateStore> {
     let local_meta_path = config.root.join("store_meta.json");
-    let legacy_meta_path = config.root.join("meta.json");
-    if force || (!local_meta_path.exists() && !legacy_meta_path.exists()) {
+    let root_meta_path = config.root.join("meta.json");
+    if force || (!local_meta_path.exists() && !root_meta_path.exists()) {
         return CandidateStore::init(config, force);
     }
     CandidateStore::open(config.root)
@@ -1613,7 +1616,6 @@ fn open_stores(root: &Path) -> Result<Vec<CandidateStore>> {
         .collect()
 }
 
-#[allow(dead_code)]
 struct LocalInitOutcome {
     mode: InitMode,
     logical_root: PathBuf,
@@ -1654,17 +1656,27 @@ fn ensure_store_root_initialized(
         }
 
         let local_meta_path = root.join("store_meta.json");
-        let legacy_meta_path = root.join("meta.json");
         let first_local_meta = root.join("shard_000").join("store_meta.json");
-        let first_legacy_meta = root.join("shard_000").join("meta.json");
-        if shard_count == 1 && (local_meta_path.exists() || legacy_meta_path.exists()) {
+        if shard_count == 1 && first_local_meta.exists() {
+            return Err(SspryError::from(format!(
+                "{} already contains a sharded store; re-run init with matching --shards.",
+                root.display()
+            )));
+        }
+        if shard_count == 1 && local_meta_path.exists() {
             return Ok(open_stores(root)?
                 .into_iter()
                 .next()
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .stats());
         }
-        if shard_count > 1 && (first_local_meta.exists() || first_legacy_meta.exists()) {
+        if shard_count > 1 && local_meta_path.exists() {
+            return Err(SspryError::from(format!(
+                "{} already contains a single-shard store; re-run init with --shards 1 or re-init.",
+                root.display()
+            )));
+        }
+        if shard_count > 1 && first_local_meta.exists() {
             return Ok(open_stores(root)?
                 .into_iter()
                 .next()
@@ -1700,12 +1712,6 @@ fn ensure_initialized_root(args: &InitArgs) -> Result<LocalInitOutcome> {
         {
             return Err(SspryError::from(format!(
                 "{} contains a direct store; initialize a fresh workspace root or use --mode local.",
-                logical_root.display()
-            )));
-        }
-        if logical_root.join("work").exists() {
-            return Err(SspryError::from(format!(
-                "{} contains the retired workspace work/ root; move or remove it before initializing.",
                 logical_root.display()
             )));
         }
@@ -1749,7 +1755,7 @@ struct TreeStoreGroup {
 
 #[derive(Debug, Default)]
 struct LocalTreeQueryAggregate {
-    hashes: HashSet<String>,
+    identities: HashSet<String>,
     external_ids: HashMap<String, Option<String>>,
     tier_used: Vec<String>,
     query_profile: crate::candidate::CandidateQueryProfile,
@@ -1757,7 +1763,7 @@ struct LocalTreeQueryAggregate {
 
 #[derive(Debug)]
 struct LocalForestQueryAggregate {
-    hashes: Vec<String>,
+    identities: Vec<String>,
     total_candidates: usize,
     truncated: bool,
     truncated_limit: Option<usize>,
@@ -2026,7 +2032,7 @@ fn validate_forest_search_policy(
 include!("app/rule_check.rs");
 
 /// Executes a full candidate scan across one tree group's stores and merges the
-/// resulting hashes, external IDs, and query profile counters.
+/// resulting identities, external IDs, and query profile counters.
 fn query_store_group_all_candidates(
     stores: &mut [CandidateStore],
     plan: &crate::candidate::CompiledQueryPlan,
@@ -2047,11 +2053,11 @@ fn query_store_group_all_candidates(
                 for (identity, external_id) in
                     local.identities.into_iter().zip(external_ids.into_iter())
                 {
-                    out.hashes.insert(identity.clone());
+                    out.identities.insert(identity.clone());
                     out.external_ids.entry(identity).or_insert(external_id);
                 }
             } else {
-                out.hashes.extend(local.identities);
+                out.identities.extend(local.identities);
             }
             if let Some(next) = local.next_cursor {
                 cursor = next;
@@ -2100,11 +2106,11 @@ fn query_local_forest_all_candidates(
                             plan,
                             include_external_ids,
                         )?;
-                        merged.hashes.extend(partial.hashes);
+                        merged.identities.extend(partial.identities);
                         merged.tier_used.extend(partial.tier_used);
                         merged.query_profile.merge_from(&partial.query_profile);
-                        for (sha256, external_id) in partial.external_ids {
-                            merged.external_ids.entry(sha256).or_insert(external_id);
+                        for (identity, external_id) in partial.external_ids {
+                            merged.external_ids.entry(identity).or_insert(external_id);
                         }
                     }
                     Ok(merged)
@@ -2123,41 +2129,41 @@ fn query_local_forest_all_candidates(
         partials = scoped;
     }
 
-    let mut hashes = HashSet::<String>::new();
+    let mut identities = HashSet::<String>::new();
     let mut external_id_map = HashMap::<String, Option<String>>::new();
     let mut tier_used = Vec::<String>::new();
     let mut query_profile = crate::candidate::CandidateQueryProfile::default();
     for partial in partials {
-        hashes.extend(partial.hashes);
+        identities.extend(partial.identities);
         tier_used.extend(partial.tier_used);
         query_profile.merge_from(&partial.query_profile);
-        for (sha256, external_id) in partial.external_ids {
-            external_id_map.entry(sha256).or_insert(external_id);
+        for (identity, external_id) in partial.external_ids {
+            external_id_map.entry(identity).or_insert(external_id);
         }
     }
-    let mut hashes = hashes.into_iter().collect::<Vec<_>>();
-    let truncated = resolved_limit != usize::MAX && hashes.len() > resolved_limit;
+    let mut identities = identities.into_iter().collect::<Vec<_>>();
+    let truncated = resolved_limit != usize::MAX && identities.len() > resolved_limit;
     if truncated {
-        hashes.truncate(resolved_limit);
+        identities.truncate(resolved_limit);
     }
     let external_ids = if include_external_ids {
         Some(
-            hashes
+            identities
                 .iter()
-                .map(|sha256| external_id_map.get(sha256).cloned().flatten())
+                .map(|identity| external_id_map.get(identity).cloned().flatten())
                 .collect::<Vec<_>>(),
         )
     } else {
         None
     };
     Ok(LocalForestQueryAggregate {
-        total_candidates: hashes.len(),
+        total_candidates: identities.len(),
         truncated,
         truncated_limit: truncated.then_some(resolved_limit),
         tier_used: merge_tier_used(tier_used),
         query_profile,
         external_ids,
-        hashes,
+        identities,
     })
 }
 
@@ -2201,7 +2207,7 @@ fn verify_search_candidates(
     let mut page_results = vec![None::<bool>; rows.len()];
     let mut skipped_results = vec![false; rows.len()];
     let mut verify_jobs = Vec::<(usize, String, PathBuf)>::new();
-    for (index, (sha256, external_id)) in rows
+    for (index, (identity, external_id)) in rows
         .iter()
         .cloned()
         .zip(external_ids.into_iter())
@@ -2218,9 +2224,9 @@ fn verify_search_candidates(
             skipped_results[index] = true;
             continue;
         }
-        verify_jobs.push((index, sha256, candidate_path));
+        verify_jobs.push((index, identity, candidate_path));
     }
-    for (index, _sha256, candidate_path) in verify_jobs {
+    for (index, _identity, candidate_path) in verify_jobs {
         verified_checked += 1;
         let matched = if let Some(plan) = &literal_plan {
             match verify_fixed_literal_plan_on_file(&candidate_path, plan) {
@@ -2248,16 +2254,16 @@ fn verify_search_candidates(
         };
         page_results[index] = Some(matched);
     }
-    for (index, sha256) in rows.iter().cloned().enumerate() {
+    for (index, identity) in rows.iter().cloned().enumerate() {
         match page_results.get(index).copied().flatten() {
             Some(true) => {
                 verified_matched += 1;
-                verified_rows.push(sha256);
+                verified_rows.push(identity);
             }
             Some(false) => {}
             None => {
                 if skipped_results[index] {
-                    unverified_rows.push(sha256);
+                    unverified_rows.push(identity);
                 }
             }
         }
@@ -3131,7 +3137,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 external_ids: None,
             }
         } else {
-            let mut hashes = std::collections::HashSet::<String>::new();
+            let mut identities = std::collections::HashSet::<String>::new();
             let mut tier_used = Vec::<String>::new();
             let mut query_profile = crate::candidate::CandidateQueryProfile::default();
             let mut scan_plan = plan.clone();
@@ -3145,7 +3151,7 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     let local = store.query_candidates(&scan_plan, cursor, collect_chunk)?;
                     tier_used.push(local.tier_used.clone());
                     query_profile.merge_from(&local.query_profile);
-                    hashes.extend(local.identities);
+                    identities.extend(local.identities);
                     if let Some(next) = local.next_cursor {
                         cursor = next;
                     } else {
@@ -3153,17 +3159,17 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                     }
                 }
             }
-            let mut hashes = hashes.into_iter().collect::<Vec<_>>();
-            let truncated = resolved_limit != usize::MAX && hashes.len() > resolved_limit;
+            let mut identities = identities.into_iter().collect::<Vec<_>>();
+            let truncated = resolved_limit != usize::MAX && identities.len() > resolved_limit;
             if truncated {
-                hashes.truncate(resolved_limit);
+                identities.truncate(resolved_limit);
             }
-            let total_candidates = hashes.len();
+            let total_candidates = identities.len();
             let start = args.cursor.min(total_candidates);
             let end = (start + args.chunk_size.max(1)).min(total_candidates);
             rpc::CandidateQueryResponse {
                 returned_count: end.saturating_sub(start),
-                identities: hashes[start..end].to_vec(),
+                identities: identities[start..end].to_vec(),
                 total_candidates,
                 cursor: start,
                 next_cursor: (end < total_candidates).then_some(end),
@@ -3289,7 +3295,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         let mut last_progress_reported = 0usize;
         let mut last_progress_at = Instant::now();
         let mut processed = 0usize;
-        let batch_size = args.batch_size.max(1);
+        let batch_docs = args.batch_docs.max(1);
         let resolved_workers = resolve_ingest_workers(
             args.workers,
             total_files,
@@ -3331,7 +3337,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     &mut last_progress_at,
                     false,
                 );
-                if pending.len() >= batch_size {
+                if pending.len() >= batch_docs {
                     flush_local_pending_rows(
                         &mut stores,
                         &mut pending,
@@ -3406,7 +3412,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                         &mut last_progress_at,
                         false,
                     );
-                    if pending.len() >= batch_size {
+                    if pending.len() >= batch_docs {
                         flush_local_pending_rows(
                             &mut stores,
                             &mut pending,
@@ -3463,7 +3469,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             eprintln!("verbose.index.worker_scan_cpu_ms: {scan_ms:.3}");
             eprintln!("verbose.index.result_wait_ms: {result_wait_ms:.3}");
             eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
-            eprintln!("verbose.index.batch_size: {}", batch_size);
+            eprintln!("verbose.index.batch_docs: {}", batch_docs);
             eprintln!("verbose.index.workers: {workers}");
             eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
             eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
@@ -4087,7 +4093,7 @@ fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
             paths: args.paths.clone(),
             path_list: args.path_list,
             root: Some(args.root.clone()),
-            batch_size: args.batch_size,
+            batch_docs: args.batch_docs,
             workers: args.workers.unwrap_or(0),
             chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
             verbose: args.verbose,
@@ -4548,7 +4554,7 @@ fn execute_local_search_rule(
         tier_used: local.tier_used,
         truncated: local.truncated,
         truncated_limit: local.truncated_limit,
-        rows: local.hashes,
+        rows: local.identities,
         query_profile: local.query_profile,
         external_ids: local.external_ids.unwrap_or_default(),
         tree_count: Some(context.tree_count),

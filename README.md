@@ -68,6 +68,7 @@ cargo build --release
 ## Test
 
 ```bash
+./scripts/naming_audit.sh
 cargo test --workspace --all-targets
 ```
 
@@ -90,7 +91,7 @@ For server-side search benchmarks with CPU and anon-memory sampling:
   --out ./results/bench_runtime_workers6 \
   --mode-label runtime \
   --search-workers 6 \
-  --rule-manifest /path/to/rules.manifest \
+  --rule-list /path/to/rules.list \
   --bundle-rule /path/to/bundle_10rules.yar
 ```
 

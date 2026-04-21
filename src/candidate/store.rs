@@ -309,21 +309,6 @@ struct StoreLocalMeta {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-struct LegacyStoreMeta {
-    version: u32,
-    next_doc_id: u64,
-    id_source: String,
-    store_path: bool,
-    tier2_gram_size: usize,
-    tier1_gram_size: usize,
-    tier1_filter_target_fp: Option<f64>,
-    tier2_filter_target_fp: Option<f64>,
-    filter_target_fp: Option<f64>,
-    compaction_idle_cooldown_s: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
 struct ShardCompactionManifest {
     current_generation: u64,
     retired_roots: Vec<String>,
@@ -369,25 +354,6 @@ impl Default for StoreLocalMeta {
     }
 }
 
-impl Default for LegacyStoreMeta {
-    /// Returns the legacy single-file metadata defaults used during
-    /// compatibility upgrades.
-    fn default() -> Self {
-        Self {
-            version: STORE_VERSION,
-            next_doc_id: 1,
-            id_source: "sha256".to_owned(),
-            store_path: false,
-            tier2_gram_size: DEFAULT_TIER2_GRAM_SIZE,
-            tier1_gram_size: DEFAULT_TIER1_GRAM_SIZE,
-            tier1_filter_target_fp: Some(DEFAULT_TIER1_FILTER_TARGET_FP),
-            tier2_filter_target_fp: Some(DEFAULT_TIER2_FILTER_TARGET_FP),
-            filter_target_fp: None,
-            compaction_idle_cooldown_s: DEFAULT_COMPACTION_IDLE_COOLDOWN_S,
-        }
-    }
-}
-
 impl ForestMeta {
     /// Returns the effective tier-1 false-positive target stored in forest
     /// metadata.
@@ -399,34 +365,6 @@ impl ForestMeta {
     /// metadata.
     fn resolved_tier2_filter_target_fp(&self) -> Option<f64> {
         self.tier2_filter_target_fp
-    }
-}
-
-impl From<&LegacyStoreMeta> for ForestMeta {
-    /// Upgrades legacy store metadata into the split forest-wide metadata
-    /// format.
-    fn from(value: &LegacyStoreMeta) -> Self {
-        Self {
-            version: value.version,
-            id_source: value.id_source.clone(),
-            store_path: value.store_path,
-            tier2_gram_size: value.tier2_gram_size,
-            tier1_gram_size: value.tier1_gram_size,
-            tier1_filter_target_fp: value.tier1_filter_target_fp.or(value.filter_target_fp),
-            tier2_filter_target_fp: value.tier2_filter_target_fp.or(value.filter_target_fp),
-            compaction_idle_cooldown_s: value.compaction_idle_cooldown_s,
-            source_dedup_min_new_docs: 1_000,
-        }
-    }
-}
-
-impl From<&LegacyStoreMeta> for StoreLocalMeta {
-    /// Upgrades legacy store metadata into the split local metadata format.
-    fn from(value: &LegacyStoreMeta) -> Self {
-        Self {
-            version: value.version,
-            next_doc_id: value.next_doc_id,
-        }
     }
 }
 
@@ -962,7 +900,7 @@ struct StoreAppendWriters {
     tier2_blooms: AppendFile,
     metadata: AppendFile,
     external_ids: AppendFile,
-    sha_by_docid: AppendFile,
+    source_id_by_docid: AppendFile,
     doc_meta: AppendFile,
     tier2_doc_meta: AppendFile,
 }
@@ -981,7 +919,7 @@ impl StoreAppendWriters {
             )?,
             metadata: AppendFile::new(doc_metadata_path(root))?,
             external_ids: AppendFile::new(external_ids_path(root))?,
-            sha_by_docid: AppendFile::new(sha_by_docid_path(root))?,
+            source_id_by_docid: AppendFile::new(source_id_by_docid_path(root))?,
             doc_meta: AppendFile::new(doc_meta_path(root))?,
             tier2_doc_meta: AppendFile::new(tier2_doc_meta_path(root))?,
         })
@@ -993,7 +931,8 @@ impl StoreAppendWriters {
         self.tier2_blooms.retarget(tier2_blooms_path(root));
         self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
-        self.sha_by_docid.retarget(sha_by_docid_path(root));
+        self.source_id_by_docid
+            .retarget(source_id_by_docid_path(root));
         self.doc_meta.retarget(doc_meta_path(root));
         self.tier2_doc_meta.retarget(tier2_doc_meta_path(root));
     }
@@ -1338,80 +1277,41 @@ fn paginate_query_hits(
     (page, total, start, end, next_cursor)
 }
 
-/// Loads the forest-wide metadata file, upgrading from legacy metadata when
-/// needed.
+/// Loads the forest-wide metadata file for a direct store or shard forest.
 fn load_forest_meta(root: &Path) -> Result<ForestMeta> {
     let policy_root = forest_policy_root(root);
     let policy_path = forest_meta_path(&policy_root);
-    if policy_path.exists() {
-        let meta: ForestMeta = serde_json::from_slice(&fs::read(&policy_path)?).map_err(|_| {
-            SspryError::from(format!(
-                "Invalid candidate metadata at {}",
-                policy_path.display()
-            ))
-        })?;
-        if meta.version != STORE_VERSION {
-            return Err(SspryError::from(format!(
-                "Unsupported candidate store version: {}",
-                meta.version
-            )));
-        }
-        return Ok(meta);
-    }
-
-    let legacy_path = forest_meta_path(root);
-    let legacy: LegacyStoreMeta =
-        serde_json::from_slice(&fs::read(&legacy_path)?).map_err(|_| {
-            SspryError::from(format!(
-                "Invalid candidate metadata at {}",
-                legacy_path.display()
-            ))
-        })?;
-    if legacy.version != STORE_VERSION {
+    let meta: ForestMeta = serde_json::from_slice(&fs::read(&policy_path)?).map_err(|_| {
+        SspryError::from(format!(
+            "Invalid candidate metadata at {}",
+            policy_path.display()
+        ))
+    })?;
+    if meta.version != STORE_VERSION {
         return Err(SspryError::from(format!(
             "Unsupported candidate store version: {}",
-            legacy.version
+            meta.version
         )));
     }
-    Ok(ForestMeta::from(&legacy))
+    Ok(meta)
 }
 
-/// Loads the per-root local metadata file, upgrading from legacy metadata when
-/// needed.
+/// Loads the per-root local metadata file that owns the next document id.
 fn load_store_local_meta(root: &Path) -> Result<StoreLocalMeta> {
     let local_path = store_local_meta_path(root);
-    if local_path.exists() {
-        let meta: StoreLocalMeta =
-            serde_json::from_slice(&fs::read(&local_path)?).map_err(|_| {
-                SspryError::from(format!(
-                    "Invalid candidate local metadata at {}",
-                    local_path.display()
-                ))
-            })?;
-        if meta.version != STORE_VERSION {
-            return Err(SspryError::from(format!(
-                "Unsupported candidate store version: {}",
-                meta.version
-            )));
-        }
-        return Ok(meta);
-    }
-
-    let legacy_path = forest_meta_path(root);
-    let legacy: LegacyStoreMeta =
-        serde_json::from_slice(&fs::read(&legacy_path)?).map_err(|_| {
-            SspryError::from(format!(
-                "Invalid candidate metadata at {}",
-                legacy_path.display()
-            ))
-        })?;
-    if legacy.version != STORE_VERSION {
+    let meta: StoreLocalMeta = serde_json::from_slice(&fs::read(&local_path)?).map_err(|_| {
+        SspryError::from(format!(
+            "Invalid candidate local metadata at {}",
+            local_path.display()
+        ))
+    })?;
+    if meta.version != STORE_VERSION {
         return Err(SspryError::from(format!(
             "Unsupported candidate store version: {}",
-            legacy.version
+            meta.version
         )));
     }
-    Ok(StoreLocalMeta::from(&legacy))
+    Ok(meta)
 }
 
 /// Returns the current insert watermark for one tree by summing the next-doc-id
@@ -1829,11 +1729,11 @@ fn append_tree_source_ref_entries_from_shard(
     next_run_idx: &mut usize,
     entry_count: &mut u64,
 ) -> Result<()> {
-    if !sha_by_docid_path(shard_root).exists() || !doc_meta_path(shard_root).exists() {
+    if !source_id_by_docid_path(shard_root).exists() || !doc_meta_path(shard_root).exists() {
         return Ok(());
     }
 
-    let mut identity_file = fs::File::open(sha_by_docid_path(shard_root))?;
+    let mut identity_file = fs::File::open(source_id_by_docid_path(shard_root))?;
     let mut row_file = fs::File::open(doc_meta_path(shard_root))?;
     let identity_len = identity_file.metadata()?.len() as usize;
     let row_len = row_file.metadata()?.len() as usize;
@@ -2038,18 +1938,18 @@ impl CandidateStore {
         fs::create_dir_all(&policy_root)?;
         let meta_path = forest_meta_path(&policy_root);
         let local_meta_path = store_local_meta_path(&config.root);
-        let legacy_meta_path = forest_meta_path(&config.root);
-        let sha_path = sha_by_docid_path(&config.root);
+        let source_id_path = source_id_by_docid_path(&config.root);
         let doc_meta_path = doc_meta_path(&config.root);
         let tier2_doc_meta_path = tier2_doc_meta_path(&config.root);
         let doc_metadata_path = doc_metadata_path(&config.root);
         let blooms_path = blooms_path(&config.root);
         let tier2_blooms_path = tier2_blooms_path(&config.root);
         let external_ids_path = external_ids_path(&config.root);
+        let direct_meta_exists = policy_root == config.root && meta_path.exists();
         if !force
-            && (local_meta_path.exists()
-                || legacy_meta_path.exists()
-                || sha_path.exists()
+            && (direct_meta_exists
+                || local_meta_path.exists()
+                || source_id_path.exists()
                 || doc_meta_path.exists()
                 || tier2_doc_meta_path.exists()
                 || doc_metadata_path.exists()
@@ -2076,10 +1976,7 @@ impl CandidateStore {
             let _ = fs::remove_file(&compaction_manifest_path);
             let _ = fs::remove_file(&meta_path);
             let _ = fs::remove_file(&local_meta_path);
-            if legacy_meta_path != meta_path {
-                let _ = fs::remove_file(&legacy_meta_path);
-            }
-            let _ = fs::remove_file(&sha_path);
+            let _ = fs::remove_file(&source_id_path);
             let _ = fs::remove_file(&doc_meta_path);
             let _ = fs::remove_file(&tier2_doc_meta_path);
             let _ = fs::remove_file(&doc_metadata_path);
@@ -2995,7 +2892,7 @@ impl CandidateStore {
                 .sum::<usize>();
             let mut blooms_payload = Vec::<u8>::with_capacity(bloom_total_bytes);
             let mut tier2_blooms_payload = Vec::<u8>::with_capacity(tier2_bloom_total_bytes);
-            let mut sha_by_docid_payload =
+            let mut source_id_by_docid_payload =
                 Vec::<u8>::with_capacity(pending_new_inserts.len() * self.identity_bytes_len());
             let mut doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_new_inserts.len() * DOC_META_ROW_BYTES);
@@ -3082,7 +2979,7 @@ impl CandidateStore {
                 insert_profile.append_external_id_payload_bytes = insert_profile
                     .append_external_id_payload_bytes
                     .saturating_add(row_profile.external_id_bytes);
-                sha_by_docid_payload.extend_from_slice(pending.identity);
+                source_id_by_docid_payload.extend_from_slice(pending.identity);
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared_rows.push((pending, row, tier2_row));
@@ -3090,8 +2987,8 @@ impl CandidateStore {
 
             let append_doc_records_started = Instant::now();
             self.append_writers
-                .sha_by_docid
-                .append(&sha_by_docid_payload)?;
+                .source_id_by_docid
+                .append(&source_id_by_docid_payload)?;
             self.append_writers.doc_meta.append(&doc_meta_payload)?;
             self.append_writers
                 .tier2_doc_meta
@@ -3456,7 +3353,7 @@ impl CandidateStore {
             let mut external_ids_payload = Vec::<u8>::with_capacity(external_ids_total_bytes);
             let mut metadata_payload = Vec::<u8>::with_capacity(metadata_total_bytes);
             let mut tier2_blooms_payload = Vec::<u8>::with_capacity(tier2_bloom_total_bytes);
-            let mut sha_by_docid_payload =
+            let mut source_id_by_docid_payload =
                 Vec::<u8>::with_capacity(pending_inserts.len() * self.identity_bytes_len());
             let mut doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_inserts.len() * DOC_META_ROW_BYTES);
@@ -3536,7 +3433,7 @@ impl CandidateStore {
                     deleted: false,
                 };
 
-                sha_by_docid_payload.extend_from_slice(&document.identity);
+                source_id_by_docid_payload.extend_from_slice(&document.identity);
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared.push((
@@ -3568,8 +3465,8 @@ impl CandidateStore {
                 .tier2_blooms
                 .append(&tier2_blooms_payload)?;
             self.append_writers
-                .sha_by_docid
-                .append(&sha_by_docid_payload)?;
+                .source_id_by_docid
+                .append(&source_id_by_docid_payload)?;
             self.append_writers.doc_meta.append(&doc_meta_payload)?;
             self.append_writers
                 .tier2_doc_meta
@@ -3685,19 +3582,19 @@ impl CandidateStore {
             .unwrap_or(false)
     }
 
-    /// Extracts identity hash constraints that can seed an exact lookup before
+    /// Extracts identity equality constraints that can seed an exact lookup before
     /// the general scan path runs.
-    fn identity_seed_hashes(node: &QueryNode) -> Option<HashSet<String>> {
+    fn identity_seed_values(node: &QueryNode) -> Option<HashSet<String>> {
         match node.kind.as_str() {
             "identity_eq" => node
                 .pattern_id
                 .as_ref()
                 .map(|pattern_id| HashSet::from([pattern_id.clone()])),
             "and" => {
-                let mut seed_sets = node.children.iter().filter_map(Self::identity_seed_hashes);
+                let mut seed_sets = node.children.iter().filter_map(Self::identity_seed_values);
                 let mut seeds = seed_sets.next()?;
                 for child_seeds in seed_sets {
-                    seeds.retain(|hash| child_seeds.contains(hash));
+                    seeds.retain(|identity| child_seeds.contains(identity));
                     if seeds.is_empty() {
                         break;
                     }
@@ -3707,7 +3604,7 @@ impl CandidateStore {
             "or" => {
                 let mut seeds = HashSet::new();
                 for child in &node.children {
-                    let child_seeds = Self::identity_seed_hashes(child)?;
+                    let child_seeds = Self::identity_seed_values(child)?;
                     seeds.extend(child_seeds);
                 }
                 Some(seeds)
@@ -3724,7 +3621,7 @@ impl CandidateStore {
         runtime: &RuntimeQueryArtifacts,
         gram_cache: &mut RuntimeGramMaskCache,
     ) -> Result<Option<(Vec<String>, TierFlags, CandidateQueryProfile)>> {
-        let Some(seed_hashes) = Self::identity_seed_hashes(&plan.root) else {
+        let Some(seed_identities) = Self::identity_seed_values(&plan.root) else {
             return Ok(None);
         };
         let query_now_unix = SystemTime::now()
@@ -3734,8 +3631,8 @@ impl CandidateStore {
         let mut matched_hits = Vec::<String>::new();
         let mut used_tiers = TierFlags::default();
         let mut query_profile = CandidateQueryProfile::default();
-        for sha256 in seed_hashes {
-            let Some(pos) = self.identity_to_pos.get(&sha256).copied() else {
+        for identity in seed_identities {
+            let Some(pos) = self.identity_to_pos.get(&identity).copied() else {
                 continue;
             };
             let doc = &self.docs[pos];
@@ -4353,25 +4250,31 @@ impl CandidateStore {
 
     /// Returns external identifiers for the provided identity list, preserving
     /// input order and using `None` for missing/deleted documents.
-    pub fn external_ids_for_identities(&self, hashes: &[String]) -> Vec<Option<String>> {
-        hashes
+    pub fn external_ids_for_identities(&self, identities: &[String]) -> Vec<Option<String>> {
+        identities
             .iter()
-            .map(|sha256| match self.identity_to_pos.get(sha256).copied() {
-                Some(pos) if !self.docs[pos].deleted => self.doc_external_id(pos).ok().flatten(),
-                _ => None,
-            })
+            .map(
+                |identity| match self.identity_to_pos.get(identity).copied() {
+                    Some(pos) if !self.docs[pos].deleted => {
+                        self.doc_external_id(pos).ok().flatten()
+                    }
+                    _ => None,
+                },
+            )
             .collect()
     }
 
     /// Returns document ids for the provided identity list, preserving input
     /// order and using `None` for missing/deleted documents.
-    pub fn doc_ids_for_identities(&self, hashes: &[String]) -> Vec<Option<u64>> {
-        hashes
+    pub fn doc_ids_for_identities(&self, identities: &[String]) -> Vec<Option<u64>> {
+        identities
             .iter()
-            .map(|sha256| match self.identity_to_pos.get(sha256).copied() {
-                Some(pos) if !self.docs[pos].deleted => Some(self.docs[pos].doc_id),
-                _ => None,
-            })
+            .map(
+                |identity| match self.identity_to_pos.get(identity).copied() {
+                    Some(pos) if !self.docs[pos].deleted => Some(self.docs[pos].doc_id),
+                    _ => None,
+                },
+            )
             .collect()
     }
 
@@ -4654,7 +4557,7 @@ impl CandidateStore {
         row: DocMetaRow,
         tier2_row: Tier2DocMetaRow,
     ) -> Result<()> {
-        self.append_writers.sha_by_docid.append(identity)?;
+        self.append_writers.source_id_by_docid.append(identity)?;
         self.append_writers.doc_meta.append(&row.encode())?;
         self.append_writers
             .tier2_doc_meta
@@ -4702,20 +4605,13 @@ impl CandidateStore {
             .saturating_add(tier2_docs_matched);
     }
 
-    /// Rebuilds transient in-memory indexes from the loaded document list and
-    /// normalizes legacy row defaults encountered on disk.
+    /// Rebuilds transient in-memory indexes from the loaded document list.
     fn rebuild_indexes_profiled(&mut self) -> Result<CandidateStoreRebuildProfile> {
         let started_total = Instant::now();
         self.identity_to_pos.clear();
         self.special_doc_positions.clear();
         let sha_started = Instant::now();
-        for (index, doc) in self.docs.iter_mut().enumerate() {
-            if doc.bloom_hashes == 0 {
-                doc.bloom_hashes = DEFAULT_BLOOM_HASHES;
-                if let Some(row) = self.doc_rows.get_mut(index) {
-                    row.bloom_hashes = DEFAULT_BLOOM_HASHES.min(u8::MAX as usize) as u8;
-                }
-            }
+        for (index, doc) in self.docs.iter().enumerate() {
             self.identity_to_pos.insert(doc.identity.clone(), index);
             if doc.special_population {
                 self.special_doc_positions.push(index);
@@ -4769,7 +4665,7 @@ pub(crate) fn write_compacted_snapshot(
     fs::create_dir_all(compacted_root)?;
 
     let paths = [
-        sha_by_docid_path(compacted_root),
+        source_id_by_docid_path(compacted_root),
         doc_meta_path(compacted_root),
         tier2_doc_meta_path(compacted_root),
         doc_metadata_path(compacted_root),
@@ -4859,7 +4755,7 @@ pub(crate) fn write_compacted_snapshot(
                 bloom_len: tier2_bloom_bytes.len() as u32,
             }
         };
-        append_blob(sha_by_docid_path(compacted_root), &doc.identity)?;
+        append_blob(source_id_by_docid_path(compacted_root), &doc.identity)?;
         append_blob(doc_meta_path(compacted_root), &row.encode())?;
         append_blob(tier2_doc_meta_path(compacted_root), &tier2_row.encode())?;
     }

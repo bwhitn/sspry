@@ -159,7 +159,7 @@ struct LocalIndexArgs {
         default_value_t = 64,
         help = "Documents per local insert batch."
     )]
-    batch_size: usize,
+    batch_docs: usize,
     #[arg(
         long = "workers",
         help = "Process workers for recursive file scan/feature extraction before local batched inserts. Default is auto: CPU-based on solid-state input, capped conservatively on rotational storage."
@@ -284,7 +284,6 @@ struct LocalSearchArgs {
     rule: String,
     #[arg(
         long = "search-workers",
-        alias = "tree-search-workers",
         default_value_t = 0,
         help = "Local search workers. 0 means auto up to the tree count."
     )]
@@ -478,7 +477,6 @@ struct InitArgs {
     compaction_idle_cooldown_s: f64,
     #[arg(
         long = "dedup-min-docs",
-        alias = "source-dedup-min-new-docs",
         default_value_t = 1_000_u64,
         help = "Minimum new inserts before tree source-ref rebuilds and forest-wide source-id dedup maintenance can run."
     )]
@@ -510,11 +508,11 @@ struct InternalIndexBatchArgs {
     #[arg(long = "root", help = "Candidate store root directory.")]
     root: Option<String>,
     #[arg(
-        long = "batch-size",
+        long = "batch-docs",
         default_value_t = 64,
         help = "Documents per batch request."
     )]
-    batch_size: usize,
+    batch_docs: usize,
     #[arg(
         long = "workers",
         default_value_t = default_ingest_workers(),

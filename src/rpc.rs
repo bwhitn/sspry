@@ -581,7 +581,7 @@ impl Drop for ActiveSearchRequestGuard<'_> {
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct CachedCandidateQuery {
-    ordered_hashes: Vec<String>,
+    ordered_identities: Vec<String>,
     truncated: bool,
     truncated_limit: Option<usize>,
     tier_used: String,
@@ -594,12 +594,12 @@ fn cached_candidate_query_memory_bytes(query: &CachedCandidateQuery) -> u64 {
     (std::mem::size_of::<CachedCandidateQuery>() as u64)
         .saturating_add(query.tier_used.capacity() as u64)
         .saturating_add(
-            (query.ordered_hashes.capacity() as u64)
+            (query.ordered_identities.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<String>() as u64),
         )
         .saturating_add(
             query
-                .ordered_hashes
+                .ordered_identities
                 .iter()
                 .map(|hash| hash.capacity() as u64)
                 .sum::<u64>(),

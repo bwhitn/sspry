@@ -231,39 +231,12 @@ fn search_related_commands_default_max_candidates_to_ten_percent() {
         },
         other => panic!("unexpected command: {other:?}"),
     }
-
-    let cli = Cli::try_parse_from([
-        "sspry",
-        "local",
-        "search",
-        "--root",
-        "db",
-        "--rule",
-        "rule.yar",
-        "--tree-search-workers",
-        "2",
-    ])
-    .expect("parse local search with tree-search-workers alias");
-    match cli.command {
-        Commands::Local(args) => match args.command {
-            LocalCommands::Search(args) => assert_eq!(args.search_workers, 2),
-            other => panic!("unexpected local command: {other:?}"),
-        },
-        other => panic!("unexpected command: {other:?}"),
-    }
 }
 
 #[test]
-fn init_accepts_shorter_dedup_flag_and_legacy_alias() {
+fn init_accepts_dedup_min_docs_flag() {
     let cli = Cli::try_parse_from(["sspry", "init", "--dedup-min-docs", "2500"])
-        .expect("parse new init dedup flag");
-    match cli.command {
-        Commands::Init(args) => assert_eq!(args.source_dedup_min_new_docs, 2_500),
-        other => panic!("unexpected command: {other:?}"),
-    }
-
-    let cli = Cli::try_parse_from(["sspry", "init", "--source-dedup-min-new-docs", "2500"])
-        .expect("parse legacy init dedup alias");
+        .expect("parse init dedup flag");
     match cli.command {
         Commands::Init(args) => assert_eq!(args.source_dedup_min_new_docs, 2_500),
         other => panic!("unexpected command: {other:?}"),
@@ -1143,7 +1116,7 @@ rule q {
         paths: vec![sample_dir.display().to_string()],
         path_list: false,
         root: Some(candidate_root.display().to_string()),
-        batch_size: 1,
+        batch_docs: 1,
         workers: 2,
         chunk_size: 1024,
         verbose: false,
@@ -1295,7 +1268,7 @@ rule q {
                 base.join("missing").display().to_string(),
             ],
             path_list: false,
-            batch_size: 1,
+            batch_docs: 1,
             workers: Some(1),
             verbose: false,
         }),
@@ -1306,7 +1279,7 @@ rule q {
             paths: vec![base.join("missing_only").display().to_string()],
             path_list: false,
             root: Some(candidate_root.display().to_string()),
-            batch_size: 1,
+            batch_docs: 1,
             workers: 1,
             chunk_size: 1024,
             verbose: false,
@@ -1573,7 +1546,7 @@ fn local_command_error_paths_report_failures() {
             root: missing_root.display().to_string(),
             paths: vec![sample.display().to_string()],
             path_list: false,
-            batch_size: 1,
+            batch_docs: 1,
             workers: Some(1),
             verbose: false,
         }),
@@ -1932,7 +1905,7 @@ fn internal_local_only_commands_reject_removed_remote_paths() {
             paths: Vec::new(),
             path_list: false,
             root: None,
-            batch_size: 1,
+            batch_docs: 1,
             workers: 1,
             chunk_size: 1024,
             verbose: false,

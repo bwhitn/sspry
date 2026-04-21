@@ -21,10 +21,6 @@ enum BoolField {
     LnkIsLnk = 8,
     ElfIsElf = 9,
     MachoIsMacho = 10,
-    #[allow(dead_code)]
-    ReservedLegacyZipBit = 11,
-    #[allow(dead_code)]
-    ReservedLegacyMzBit = 12,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

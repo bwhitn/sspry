@@ -299,7 +299,6 @@ Options:
 - `--search-workers <n>`
   - local search concurrency
   - `0` means auto up to the tree count
-  - `--tree-search-workers` remains accepted as a compatibility alias
 - `--max-anchors-per-pattern <n>`
 - `--max-candidates <p>` default `10`; `0` means unlimited
   - percentage of searchable documents
@@ -361,7 +360,7 @@ Numeric read equality is also accepted for literal `==` comparisons over the bui
 
 Common options:
 
-- `--rule-manifest <path>`
+- `--rule-list <path>`
   - newline-delimited per-rule search list
 - `--bundle-rule <path>`
   - top-level YARA file for the bundled search phase

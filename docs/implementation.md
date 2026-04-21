@@ -53,8 +53,8 @@ In local forest mode, the query path adds one layer above shard search:
 1. open all tree stores under the forest root
 2. validate that gram sizes, identity source, and shared search policy match across trees
 3. build one compiled plan against the shared forest policy
-4. fan out the query across trees with up to `tree_search_workers`
-5. merge candidate hashes, query profiles, and optional external ids
+4. fan out the query across trees with up to `search_workers`
+5. merge candidate identities, query profiles, and optional external ids
 
 When one top-level rule file expands to multiple searchable rules, `local search` still opens the forest once, validates shared policy once, and then reuses that opened forest while executing each named rule in source order.
 
@@ -77,8 +77,8 @@ Per shard, the implementation persists sidecars such as:
 - `store_meta.json`
 - `doc_meta.bin`
 - `tier2_doc_meta.bin`
-- `sha256_by_docid.dat` storing one raw source-id digest per doc id
-  - legacy filename; row width follows the forest `id_source` (`md5` 16, `sha1` 20, `sha256` 32, `sha512` 64 bytes)
+- `source_id_by_docid.dat` storing one raw source-id digest per doc id
+  - row width follows the forest `id_source` (`md5` 16, `sha1` 20, `sha256` 32, `sha512` 64 bytes)
 - `doc_metadata.bin`
 - `blooms.bin`
 - `tier2_blooms.bin`
@@ -144,7 +144,11 @@ The server decides identity at store creation time:
 - `sha1`
 - `sha512`
 
-The internal store key stays fixed-width. Non-`sha256` identities are normalized into the internal document id space.
+The persisted identity width follows the configured `id_source`: `md5` stores
+16 bytes, `sha1` stores 20 bytes, `sha256` stores 32 bytes, and `sha512`
+stores 64 bytes. The configured source-id value is the canonical document
+identity used for insert deduplication, delete, search identity matches, and
+forest-wide deduplication.
 
 Important consequence:
 

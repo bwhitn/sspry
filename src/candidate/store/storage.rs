@@ -43,20 +43,14 @@ fn forest_meta_path(root: &Path) -> PathBuf {
     root.join("meta.json")
 }
 
-#[cfg(test)]
-/// Test-only alias for the forest metadata path helper.
-fn meta_path(root: &Path) -> PathBuf {
-    forest_meta_path(root)
-}
-
 /// Returns the path of the store-local metadata sidecar.
 fn store_local_meta_path(root: &Path) -> PathBuf {
     root.join("store_meta.json")
 }
 
-/// Returns the path of the legacy identity-by-doc-id blob file.
-fn sha_by_docid_path(root: &Path) -> PathBuf {
-    root.join("sha256_by_docid.dat")
+/// Returns the path of the source-id-by-doc-id blob file.
+fn source_id_by_docid_path(root: &Path) -> PathBuf {
+    root.join("source_id_by_docid.dat")
 }
 
 /// Returns the raw identity width implied by the configured forest id source.
@@ -423,7 +417,7 @@ fn load_candidate_store_state(
 /// Returns whether any of the binary candidate-store sidecar files already
 /// exist for this root.
 fn binary_store_exists(root: &Path) -> bool {
-    sha_by_docid_path(root).exists()
+    source_id_by_docid_path(root).exists()
         || doc_meta_path(root).exists()
         || tier2_doc_meta_path(root).exists()
         || doc_metadata_path(root).exists()
@@ -434,27 +428,16 @@ fn load_candidate_binary_store(
     root: &Path,
     identity_bytes: usize,
 ) -> Result<(Vec<CandidateDoc>, Vec<DocMetaRow>, Vec<Tier2DocMetaRow>)> {
-    let sha_bytes = fs::read(sha_by_docid_path(root))?;
+    let source_id_bytes = fs::read(source_id_by_docid_path(root))?;
     let row_bytes = fs::read(doc_meta_path(root))?;
     let tier2_row_bytes = fs::read(tier2_doc_meta_path(root)).unwrap_or_default();
-    let row_count = row_bytes.len() / DOC_META_ROW_BYTES;
-    if identity_bytes != 32
-        && row_bytes.len() % DOC_META_ROW_BYTES == 0
-        && sha_bytes.len() % 32 == 0
-        && sha_bytes.len() / 32 == row_count
-    {
-        return Err(SspryError::from(format!(
-            "Store at {} uses a legacy fixed-width identity layout for id_source; reindex or migrate the store before reopening it with variable-width source ids.",
-            root.display()
-        )));
-    }
-    if sha_bytes.len() % identity_bytes != 0 || row_bytes.len() % DOC_META_ROW_BYTES != 0 {
+    if source_id_bytes.len() % identity_bytes != 0 || row_bytes.len() % DOC_META_ROW_BYTES != 0 {
         return Err(SspryError::from(format!(
             "Invalid candidate binary document state at {}",
             root.display()
         )));
     }
-    let doc_count = sha_bytes.len() / identity_bytes;
+    let doc_count = source_id_bytes.len() / identity_bytes;
     if doc_count != row_bytes.len() / DOC_META_ROW_BYTES {
         return Err(SspryError::from(format!(
             "Mismatched candidate binary document state at {}",
@@ -466,8 +449,9 @@ fn load_candidate_binary_store(
     let mut tier2_rows = Vec::with_capacity(doc_count);
     for index in 0..doc_count {
         let doc_id = (index + 1) as u64;
-        let identity_hex =
-            hex::encode(&sha_bytes[index * identity_bytes..(index + 1) * identity_bytes]);
+        let identity_hex = hex::encode(
+            &source_id_bytes[index * identity_bytes..(index + 1) * identity_bytes],
+        );
         let row = DocMetaRow::decode(
             &row_bytes[index * DOC_META_ROW_BYTES..(index + 1) * DOC_META_ROW_BYTES],
         )?;

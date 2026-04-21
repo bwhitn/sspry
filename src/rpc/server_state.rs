@@ -30,7 +30,7 @@ impl BundledQueryAccumulator {
 
 #[derive(Default)]
 struct BundledQueryPartial {
-    hashes: Vec<String>,
+    identities: Vec<String>,
     external_ids: Option<Vec<Option<String>>>,
     tier_used: String,
     query_profile: CandidateQueryProfile,
@@ -3404,7 +3404,7 @@ impl ServerState {
         Ok(entry)
     }
 
-    /// Collects candidate hashes from one store using prebuilt runtime-query artifacts
+    /// Collects candidate identities from one store using prebuilt runtime-query artifacts
     /// and an uncapped internal max-candidates setting.
     fn collect_query_matches_single_store(
         store: &mut CandidateStore,
@@ -3507,7 +3507,7 @@ impl ServerState {
             };
             partial.external_ids =
                 include_external_ids.then(|| store.external_ids_for_identities(&hits));
-            partial.hashes = hits;
+            partial.identities = hits;
             partial.tier_used = tier_used;
             partial.query_profile = query_profile;
             partial.eval_nanos = eval_nanos;
@@ -3540,13 +3540,13 @@ impl ServerState {
             let mut store = lock_candidate_store_blocking(&store_sets[0].stores[0])?;
             let (hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &runtime)?;
-            let mut ordered_hashes = hits;
-            let truncated = resolved_limit != usize::MAX && ordered_hashes.len() > resolved_limit;
+            let mut ordered_identities = hits;
+            let truncated = resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
             if truncated {
-                ordered_hashes.truncate(resolved_limit);
+                ordered_identities.truncate(resolved_limit);
             }
             return Ok(CachedCandidateQuery {
-                ordered_hashes,
+                ordered_identities,
                 truncated,
                 truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
@@ -3575,13 +3575,13 @@ impl ServerState {
                 tier_used.extend(local_tiers);
                 query_profile.merge_from(&local_profile);
             }
-            let mut ordered_hashes = hits.into_iter().collect::<Vec<_>>();
-            let truncated = resolved_limit != usize::MAX && ordered_hashes.len() > resolved_limit;
+            let mut ordered_identities = hits.into_iter().collect::<Vec<_>>();
+            let truncated = resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
             if truncated {
-                ordered_hashes.truncate(resolved_limit);
+                ordered_identities.truncate(resolved_limit);
             }
             return Ok(CachedCandidateQuery {
-                ordered_hashes,
+                ordered_identities,
                 truncated,
                 truncated_limit: truncated.then_some(resolved_limit),
                 tier_used: Self::merge_candidate_tier_used(&tier_used),
@@ -3645,13 +3645,13 @@ impl ServerState {
             tier_used.extend(local_tiers);
             query_profile.merge_from(&local_profile);
         }
-        let mut ordered_hashes = hits.into_iter().collect::<Vec<_>>();
-        let truncated = resolved_limit != usize::MAX && ordered_hashes.len() > resolved_limit;
+        let mut ordered_identities = hits.into_iter().collect::<Vec<_>>();
+        let truncated = resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
         if truncated {
-            ordered_hashes.truncate(resolved_limit);
+            ordered_identities.truncate(resolved_limit);
         }
         Ok(CachedCandidateQuery {
-            ordered_hashes,
+            ordered_identities,
             truncated,
             truncated_limit: truncated.then_some(resolved_limit),
             tier_used: Self::merge_candidate_tier_used(&tier_used),
@@ -4159,10 +4159,10 @@ impl ServerState {
             entry
         };
 
-        let total_candidates = cached.ordered_hashes.len();
+        let total_candidates = cached.ordered_identities.len();
         let start = request.cursor.min(total_candidates);
         let end = (start + chunk_size).min(total_candidates);
-        let page = cached.ordered_hashes[start..end].to_vec();
+        let page = cached.ordered_identities[start..end].to_vec();
         let next_cursor = if end < total_candidates {
             Some(end)
         } else {
@@ -4195,14 +4195,14 @@ impl ServerState {
                         *shard_idx,
                         "query external ids",
                     )?;
-                    let hashes = items
+                    let identities = items
                         .iter()
                         .map(|(_, value)| value.clone())
                         .collect::<Vec<_>>();
                     for ((idx, _), external_id) in items
                         .iter()
                         .cloned()
-                        .zip(store.external_ids_for_identities(&hashes))
+                        .zip(store.external_ids_for_identities(&identities))
                     {
                         if values[idx].is_none() && external_id.is_some() {
                             values[idx] = external_id;
@@ -4389,11 +4389,11 @@ impl ServerState {
 
             match external_ids {
                 Some(values) => {
-                    for (hash_chunk, external_id_chunk) in
+                    for (identity_chunk, external_id_chunk) in
                         hits.chunks(chunk_size).zip(values.chunks(chunk_size))
                     {
                         on_frame(CandidateQueryStreamFrame {
-                            identities: hash_chunk.to_vec(),
+                            identities: identity_chunk.to_vec(),
                             external_ids: Some(external_id_chunk.to_vec()),
                             candidate_limit,
                             stream_complete: false,
@@ -4406,9 +4406,9 @@ impl ServerState {
                     }
                 }
                 None => {
-                    for hash_chunk in hits.chunks(chunk_size) {
+                    for identity_chunk in hits.chunks(chunk_size) {
                         on_frame(CandidateQueryStreamFrame {
-                            identities: hash_chunk.to_vec(),
+                            identities: identity_chunk.to_vec(),
                             external_ids: None,
                             candidate_limit,
                             stream_complete: false,
@@ -4470,13 +4470,13 @@ impl ServerState {
 
             match local.external_ids {
                 Some(values) => {
-                    for (hash_chunk, external_id_chunk) in local
-                        .hashes
+                    for (identity_chunk, external_id_chunk) in local
+                        .identities
                         .chunks(chunk_size)
                         .zip(values.chunks(chunk_size))
                     {
                         on_frame(CandidateQueryStreamFrame {
-                            identities: hash_chunk.to_vec(),
+                            identities: identity_chunk.to_vec(),
                             external_ids: Some(external_id_chunk.to_vec()),
                             candidate_limit: candidate_limits[index],
                             stream_complete: false,
@@ -4489,9 +4489,9 @@ impl ServerState {
                     }
                 }
                 None => {
-                    for hash_chunk in local.hashes.chunks(chunk_size) {
+                    for identity_chunk in local.identities.chunks(chunk_size) {
                         on_frame(CandidateQueryStreamFrame {
-                            identities: hash_chunk.to_vec(),
+                            identities: identity_chunk.to_vec(),
                             external_ids: None,
                             candidate_limit: candidate_limits[index],
                             stream_complete: false,

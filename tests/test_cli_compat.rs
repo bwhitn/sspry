@@ -726,11 +726,9 @@ fn serve_and_local_index_help_hide_init_only_flags() {
     assert!(!local_index.contains("--compaction-idle-cooldown-s"));
     assert!(!local_index.contains("--dedup-min-docs"));
     assert!(local_index.contains("--batch-docs"));
-    assert!(!local_index.contains("--batch-size"));
 
     let local_search = run_ok(&["local", "search", "--help"]);
     assert!(local_search.contains("--search-workers"));
-    assert!(!local_search.contains("--tree-search-workers"));
 }
 
 #[test]

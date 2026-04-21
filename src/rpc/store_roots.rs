@@ -314,8 +314,8 @@ fn ensure_candidate_stores_at_root(
 ) -> Result<(Vec<CandidateStore>, usize, StoreRootStartupProfile)> {
     let started_total = Instant::now();
     let shard_count = config.candidate_shards.max(1);
-    let single_meta = root.join("meta.json");
-    let sharded_meta = root.join("shard_000").join("meta.json");
+    let single_local_meta = root.join("store_meta.json");
+    let sharded_local_meta = root.join("shard_000").join("store_meta.json");
     if let Some(existing) = read_candidate_shard_count(root)? {
         if existing != shard_count {
             return Err(SspryError::from(format!(
@@ -324,13 +324,13 @@ fn ensure_candidate_stores_at_root(
             )));
         }
     } else {
-        if shard_count > 1 && single_meta.exists() {
+        if shard_count > 1 && single_local_meta.exists() {
             return Err(SspryError::from(format!(
                 "{} contains a single-shard store; re-run init with --shards 1 or re-init.",
                 root.display()
             )));
         }
-        if shard_count == 1 && sharded_meta.exists() {
+        if shard_count == 1 && sharded_local_meta.exists() {
             return Err(SspryError::from(format!(
                 "{} contains a sharded store; re-run init with matching --shards.",
                 root.display()
@@ -437,12 +437,6 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     }
 
     let current_root = workspace_current_root(root);
-    if root.join("work").exists() {
-        return Err(SspryError::from(format!(
-            "{} contains the retired workspace work/ root; move or remove it before restarting.",
-            root.display()
-        )));
-    }
     let retired_root = workspace_retired_root(root);
     let removed_retired =
         prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
