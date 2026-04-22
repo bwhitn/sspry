@@ -60,6 +60,9 @@ Options:
   - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 - `--compaction-idle-cooldown-s <seconds>`
   - minimum idle time before compaction may run
+- `--dedup-min-docs <n>`
+  - minimum new inserts before tree source-reference rebuilds and forest-wide Source ID dedup maintenance may run
+  - default is `1000`
 
 Behavior:
 
@@ -156,7 +159,7 @@ Notes:
 - large documents are chunked across multiple frames; they are not treated as one capped request
 - only one active indexing session is allowed per server at a time
 - when the target server is running in workspace mode, `index` auto-publishes after ingest so newly indexed documents become searchable
-- with multiple addresses, `index` checks server info once before ingest, validates compatible DB policy, and routes documents by current per-server document count
+- with multiple addresses, `index` checks server info once before ingest, validates compatible DB policy, and routes each completed upload batch by current per-server document count
 - use `local index` for direct local ingest without a running server
 
 ## local index

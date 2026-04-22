@@ -155,6 +155,24 @@ Important consequence:
 - clients do not choose identity type
 - ingest and delete both follow the server's configured `--id-source`
 
+## Source ID Deduplication
+
+Insert-time duplicate detection is Tree-local and uses the configured Source ID.
+That prevents duplicate Source IDs within the same Tree, but a mutable Forest can
+temporarily contain duplicates across different Trees.
+
+Forest-wide deduplication is handled as idle maintenance:
+
+1. build or refresh sorted per-Tree Source ID reference files
+2. merge those sorted references across the Forest
+3. keep the oldest Tree entry for each Source ID
+4. mark duplicates in newer Trees as deleted
+
+The maintenance pass is gated by `init --dedup-min-docs`, which defaults to
+`1000`. It does not run during active indexing/search work. Search clients also
+deduplicate returned Source IDs, so temporary cross-Tree duplicates should not
+produce duplicate result identities.
+
 ## Gram Model
 
 `--gram-sizes <tier1,tier2>` is a DB-wide format choice.

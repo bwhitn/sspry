@@ -9,12 +9,13 @@ A mutable file search database with fast candidate retrieval and optional YARA v
 SSPRY is a scalable way to reduce the set of files that need to be scanned based on the YARA rule you intend to use. The public search path supports both single-rule lookups and small bundled rule sets loaded from one top-level YARA file with normal `include "..."` directives. It is intended to avoid false negatives and have limited false positives. Other projects have done similar things, but the goal of this one is to do so in a scalable way that trades upfront processing for reduced memory and search processing, while keeping the overall database (Forest) size smaller than the sum of the files; however, it has a fair amount of disk I/O during searches. In addition to those, the database needs to support the insertion and deletion of items.
 
 ## Terms
-Candidate - An individual document that is returned as a possible match.<br>
-Document - An individual file.<br>
-Document ID - The hash used to uniquely identify the file in the forest. (MD5, SHA1, SHA256, SHA512)<br>
-Forest - A collection of Trees.<br>
+Candidate - An individual document returned as a possible match, identified by its Source ID.<br>
+Document - An individual file with a Tier 1 bloom, Tier 2 bloom, and metadata sidecar.<br>
+Document ID - Numeric ID assigned on insert. The value is local to the Tree/shard that stores it.<br>
+Forest - A collection of Trees managed by one SSPRY instance or local forest root.<br>
 Metadata sidecar - The metadata contains the subset of YARA-relevant values that can be checked during search.<br>
 Shard - A partition inside a Tree used to stripe ingest/write work and bound shard-local files.<br>
+Source ID - The configured file identity hash used for insert deduplication, delete, search identity matches, and forest-wide deduplication. Supported modes are MD5, SHA1, SHA256, and SHA512.<br>
 Tier 1 bloom filter - A broader filter used first to gate some Tier 2 reads and help improve the accuracy.<br>
 Tier 2 bloom filter - A more precise filter used to further narrow candidate sets.<br>
 Tree - A single logical storage unit that contains a number of Shards.
@@ -22,9 +23,9 @@ Tree - A single logical storage unit that contains a number of Shards.
 ## General Methodology
 The general methodology involves a Forest that operates similarly to a Log-Structured Merge Tree (LSM Tree). The general idea is to append new items via a publish routine and perform deletions lazily via a compaction routine. The overall format isn’t really a Tree, but a physically split set of long data streams (a forest). Each file consists of a Tier 1 (T1) and a Tier 2 (T2) bloom filter, which, by default, are 3-gram and 4-gram bloom filters, respectively, along with an optional metadata sidecar containing YARA-specific information (pe.is_pe, file entropy for math.entropy(0, filesize), etc.). T1 is a lighter bloom filter that will gate some required T2 bloom filter reads and slightly reduce false positives. T2 is a more precise bloom filter with a much lower false-positive rate. The supported gram-size pairs are `3,4`, `4,5`, `5,6`, and `7,8`. The blooms are sized based on the false-positive (fp) value p and the approximate number of ngrams, computed by applying the HyperLogLog function to all grams, yielding results typically within 1% accuracy.
 
-These forests are broken into Trees of fixed-sized documents, and each Tree is further split into Shards. Each shard contains the data needed for the search to include T1 and T2 blooms, along with the metadata sidecar. These are broken down to prevent excessively large files. When a file is removed, it is annotated immediately, but won’t be physically removed until compaction is completed. Compaction rebuilds a shard, which is then swapped out for the previous one. Indexing, on the other hand, is done via publishing, which appends to the active shard set.
+These forests are broken into Trees, each with a fixed maximum number of documents, and each Tree is further split into Shards. Each shard contains the data needed for the search to include T1 and T2 blooms, along with the metadata sidecar. These are broken down to prevent excessively large files. When a file is removed, it is annotated immediately, but won’t be physically removed until compaction is completed. Compaction rebuilds a shard, which is then swapped out for the previous one. Indexing, on the other hand, is done via publishing, which appends to the active shard set.
 
-Duplicate detection is prevented on insert into the same shard. This does mean there could be duplicates inserted into the Forest in other Trees. In the future, maintenance runs will mark duplicates for deletion within the same forest, but this doesn’t currently happen. This won’t affect searches, as they are inserted into a hash set that automatically deduplicates them.
+Duplicate detection is prevented on insert within the same Tree based on the Source ID. Duplicates can still exist across different Trees in the Forest. During idle maintenance, the server builds sorted per-Tree Source ID reference files and runs a forest-wide dedup pass once enough new documents have been inserted. That pass keeps the oldest Tree entry and deletes duplicates from newer Trees. Clients also deduplicate matches during searches.
 
 Most bloom-backed searches read the T1 blooms across the Trees being searched. Possible T1 matches may then require T2 reads and metadata checks. If a rule has no searchable string anchors, it may fall back to metadata checks, direct identity lookups, or later verification depending on the rule structure. An example of this could be a condition like “filesize < 4kb and pe.is_pe and pe.timestamp > time.now”, which could find a PE file smaller than 4kb and with a timestamp greater than the time of the search start.
 
@@ -33,12 +34,12 @@ The program's architecture is primarily client-server. During ingest, the client
 
 Additionally, if you opt to store path information when creating the Forest, you can automatically verify search results using it.
 
-The client can also distribute files across multiple servers in a round-robin fashion. This can improve indexing throughput and spread search work across machines, but it also splits the corpus across those servers. As a result, built-in verification becomes more difficult unless the original files are still available to the system performing the verification.
+The client can also distribute work across multiple servers by passing comma-separated addresses to `--addr`. Multi-server indexing checks server info once at command start, validates compatible DB policy, and sends each completed upload batch to the server with the lowest current document count. Multi-server search fans out to all reachable servers and deduplicates returned Source IDs before applying the final cap. Multi-server delete fans out to all reachable servers because a document may exist on only one server. As a result, built-in verification becomes more difficult unless the original files are still available to the system performing the verification.
 
 ## General Operation Complexity
 * Search is generally linear in the amount of data the server has to examine.
-* Server-side indexing is append-oriented and mostly sequential, so for normal batch sizes it behaves close to constant in practice, even though it still grows with the amount of data written. Client-side indexing scales with file size, the number of unique n-grams, and the amount of metadata extraction work.
-*  Removals are usually cheap up front, while heavier cleanup work is deferred to compaction.
+* Server-side indexing is append-oriented and mostly sequential. Per-document server work is roughly bounded for typical batch sizes, but it still grows linearly with the amount of data written. Client-side indexing scales with file size, the number of unique n-grams, and the amount of metadata extraction work.
+* Removals are usually cheap up front, while heavier cleanup work is deferred to compaction.
 * All of this is with respect to the configured bloom sizing and the general occasional overhead from publishing and compaction.
 
 ## General Notes
@@ -48,9 +49,9 @@ The client can also distribute files across multiple servers in a round-robin fa
 * When using “time.now” in a YARA rule, there is a chance of a false negative because the search evaluates it at the time it starts, whereas verification happens later, and it will be evaluated again during that time.
 
 ## Current Issues
-* Deduplication across forest.
-* multi serve search
-* Clean up CLI
+* Multi-server mode is functional for index, delete, search, and info, but it is still an operationally simple client-side fanout model rather than a coordinated cluster.
+* Forest-wide deduplication runs during idle maintenance, so duplicate Source IDs can exist temporarily until the maintenance threshold is reached and the dedup pass completes.
+* The project is still in early development; database format changes may require rebuilding existing Forests.
 
 ## Quick Links
 

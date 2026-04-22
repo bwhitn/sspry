@@ -56,6 +56,8 @@ Key options:
 - `--gram-sizes <tier1,tier2>` default `3,4`
   - supported pairs: `3,4`, `4,5`, `5,6`, `7,8`
 - `--compaction-idle-cooldown-s <SECONDS>` default `5`
+- `--dedup-min-docs <N>` default `1000`
+  - minimum new inserts before tree source-reference rebuilds and forest-wide Source ID dedup maintenance can run
 
 Behavior:
 
@@ -112,7 +114,7 @@ Behavior:
 - large documents are chunked across frames
 - only one active indexing session is allowed per server at a time
 - when the target server is in workspace mode, `index` auto-publishes after ingest so new documents become searchable
-- multiple addresses route documents by current per-server document count after one initial info check
+- multiple addresses route completed upload batches by current per-server document count after one initial info check
 
 ## `delete`
 
