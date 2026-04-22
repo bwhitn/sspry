@@ -27,6 +27,7 @@ Default scan mode: sspry --rule <RULE> <FILE>
 ## Shared Notes
 
 - `SSPRY_ADDR` sets the default server address for remote client commands.
+- Remote address options accept `host`, `host:port`, `[ipv6]`, or `[ipv6]:port`; omitted ports default to `17653`.
 - `serve` is the only public server command.
 - `init` is the public DB/workspace initialization command.
 - `index`, `delete`, `search`, `info`, and `shutdown` are the public remote gRPC client commands.
@@ -95,9 +96,10 @@ Usage: sspry index [OPTIONS] <PATHS>...
 
 Remote ingest options:
 
-- `--addr <ADDR>`
+- `--addr <ADDR[,ADDR...]>`
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
+- `--ignore-offline`
 - `--path-list`
 - `--batch-bytes <BYTES>`
 - `--insert-chunk-bytes <BYTES>`
@@ -110,6 +112,7 @@ Behavior:
 - large documents are chunked across frames
 - only one active indexing session is allowed per server at a time
 - when the target server is in workspace mode, `index` auto-publishes after ingest so new documents become searchable
+- multiple addresses route documents by current per-server document count after one initial info check
 
 ## `delete`
 
@@ -117,9 +120,14 @@ Behavior:
 Usage: sspry delete [OPTIONS] <VALUES>...
 ```
 
-- `--addr <ADDR>`
+- `--addr <ADDR[,ADDR...]>`
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
+- `--ignore-offline`
+
+Multiple addresses fan out deletes to all reachable servers. A value succeeds
+when at least one reachable server deletes it; `missing` on other servers is
+expected when documents are distributed.
 
 ## `rule-check`
 
@@ -144,9 +152,10 @@ Usage: sspry search [OPTIONS] --rule <RULE>
 
 Remote search options:
 
-- `--addr <ADDR>`
+- `--addr <ADDR[,ADDR...]>`
 - `--timeout <SECONDS>`
 - `--max-message-bytes <BYTES>`
+- `--ignore-offline`
 - `--rule <RULE>`
 - `--max-anchors-per-pattern <N>`
 - `--max-candidates <PERCENT>` default `10`
@@ -158,6 +167,7 @@ Behavior:
 - expands one top-level rule file, including nested `include` directives
 - if the expanded source contains multiple searchable rules, `search` runs one execution per rule
 - `--max-candidates` is a percentage of searchable documents; `0` disables the cap
+- multiple addresses search all reachable servers, then deduplicate Source IDs before applying the global cap
 
 ## `info`
 
@@ -165,9 +175,12 @@ Behavior:
 Usage: sspry info [OPTIONS]
 ```
 
-- `--addr <ADDR>`
+- `--addr <ADDR[,ADDR...]>`
 - `--timeout <SECONDS>`
+- `--ignore-offline`
 - `--light`
+
+Multiple addresses return a JSON array of per-server info objects.
 
 ## `local`
 

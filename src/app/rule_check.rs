@@ -44,6 +44,7 @@ fn rule_check_policy(args: &RuleCheckArgs) -> Result<RuleCheckPolicy> {
             addr: addr.clone(),
             timeout: DEFAULT_RPC_TIMEOUT,
             max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            ignore_offline: false,
         })?;
         return Ok(RuleCheckPolicy {
             source: RuleCheckPolicySource::Server,

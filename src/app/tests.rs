@@ -9,6 +9,7 @@ fn default_connection() -> ClientConnectionArgs {
         addr: DEFAULT_RPC_ADDR.to_owned(),
         timeout: DEFAULT_RPC_TIMEOUT,
         max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        ignore_offline: false,
     }
 }
 
@@ -54,6 +55,7 @@ fn start_grpc_test_server_with_config(config: RpcServerConfig) -> ClientConnecti
         addr: format!("{DEFAULT_RPC_HOST}:{port}"),
         timeout: 0.5,
         max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        ignore_offline: false,
     };
     for _ in 0..100 {
         if grpc_client(&connection)
@@ -605,6 +607,14 @@ fn parse_host_port_accepts_common_forms() {
         ("127.0.0.1".to_owned(), 17653)
     );
     assert_eq!(
+        parse_host_port("127.0.0.1").expect("ipv4 default port"),
+        ("127.0.0.1".to_owned(), DEFAULT_RPC_PORT)
+    );
+    assert_eq!(
+        parse_host_port("example.com").expect("hostname default port"),
+        ("example.com".to_owned(), DEFAULT_RPC_PORT)
+    );
+    assert_eq!(
         parse_host_port("example.com:443").expect("hostname"),
         ("example.com".to_owned(), 443)
     );
@@ -612,15 +622,105 @@ fn parse_host_port_accepts_common_forms() {
         parse_host_port("[::1]:17653").expect("ipv6"),
         ("::1".to_owned(), 17653)
     );
+    assert_eq!(
+        parse_host_port("[::1]").expect("bracketed ipv6 default port"),
+        ("::1".to_owned(), DEFAULT_RPC_PORT)
+    );
+    assert_eq!(
+        parse_host_port("::1").expect("bare ipv6 default port"),
+        ("::1".to_owned(), DEFAULT_RPC_PORT)
+    );
 }
 
 #[test]
 fn parse_host_port_rejects_invalid_values() {
     assert!(parse_host_port("").is_err());
-    assert!(parse_host_port("127.0.0.1").is_err());
     assert!(parse_host_port(":17653").is_err());
     assert!(parse_host_port("127.0.0.1:notaport").is_err());
-    assert!(parse_host_port("[::1]").is_err());
+    assert!(parse_host_port("[::1").is_err());
+}
+
+#[test]
+fn split_server_addrs_accepts_comma_separated_values() {
+    assert_eq!(
+        split_server_addrs("127.0.0.1, example.com:2,[::1]").expect("addresses"),
+        vec![
+            format!("127.0.0.1:{DEFAULT_RPC_PORT}"),
+            "example.com:2".to_owned(),
+            format!("[::1]:{DEFAULT_RPC_PORT}")
+        ]
+    );
+}
+
+#[test]
+fn split_server_addrs_rejects_empty_or_invalid_values() {
+    assert!(split_server_addrs("").is_err());
+    assert!(split_server_addrs("127.0.0.1:1,notaport:bad").is_err());
+}
+
+#[test]
+fn merge_distributed_search_executions_deduplicates_and_applies_global_limit() {
+    let rule_text = r#"
+rule sample {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+"#;
+    let make_execution =
+        |rows: Vec<&str>, external_ids: Vec<Option<&str>>, tier_used: &str, docs_scanned: u64| {
+            let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                rule_text,
+                "sample",
+                GramSizes::new(3, 4).expect("gram sizes"),
+                None,
+                16,
+                false,
+                true,
+                0.0,
+            )
+            .expect("compile plan");
+            SearchExecution {
+                plan,
+                total_candidates: rows.len(),
+                tier_used: tier_used.to_owned(),
+                truncated: false,
+                truncated_limit: None,
+                rows: rows.into_iter().map(str::to_owned).collect(),
+                query_profile: CandidateQueryProfile {
+                    docs_scanned,
+                    ..CandidateQueryProfile::default()
+                },
+                external_ids: external_ids
+                    .into_iter()
+                    .map(|value| value.map(str::to_owned))
+                    .collect(),
+                tree_count: None,
+                search_workers: None,
+                server_rss_kb: None,
+                plan_time: Duration::from_millis(1),
+                query_time: Duration::from_millis(2),
+            }
+        };
+
+    let merged = merge_distributed_search_executions(
+        vec![
+            make_execution(vec!["a", "b"], vec![None, None], "tier1", 2),
+            make_execution(vec!["b", "c"], vec![Some("/b"), Some("/c")], "tier2", 3),
+        ],
+        20,
+        10.0,
+    )
+    .expect("merge distributed results");
+
+    assert_eq!(merged.rows, vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(merged.external_ids, vec![None, Some("/b".to_owned())]);
+    assert_eq!(merged.total_candidates, 2);
+    assert!(merged.truncated);
+    assert_eq!(merged.truncated_limit, Some(2));
+    assert_eq!(merged.tier_used, "tier1,tier2");
+    assert_eq!(merged.query_profile.docs_scanned, 5);
 }
 
 #[test]
@@ -1431,6 +1531,7 @@ rule remote_q {
             connection: InfoConnectionArgs {
                 addr: connection.addr.clone(),
                 timeout: connection.timeout,
+                ignore_offline: false,
             },
             light: false,
         }),

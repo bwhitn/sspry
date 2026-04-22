@@ -20,7 +20,7 @@ At a high level:
 
 Public interactive search now has two execution modes:
 
-- RPC mode: query one running `serve` process via `--addr`
+- RPC mode: query one or more running `serve` processes via `--addr`
 - local forest mode: query one forest root in-process via `local search --root`
 
 RPC mode itself now has two useful server shapes:

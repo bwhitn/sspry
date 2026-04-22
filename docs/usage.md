@@ -24,6 +24,9 @@
 - `--perf-report <path>`: write a JSON perf report
 - `--perf-stdout`: print the perf report to stdout on exit
 
+Remote address options accept `host`, `host:port`, `[ipv6]`, or `[ipv6]:port`.
+When the port is omitted, it defaults to `17653`.
+
 ## init
 
 ```bash
@@ -128,10 +131,12 @@ Example:
 
 Options:
 
-- `--addr <host:port>`
+- `--addr <host:port>[,<host:port>...]`
 - `--timeout <seconds>`
 - `--max-message-bytes <bytes>`
   - client-side remote message cap
+- `--ignore-offline`
+  - with multiple addresses, warn and skip servers that cannot be reached during initial command setup
 - `--path-list`
   - treat each input path as a newline-delimited manifest of file paths
 - `--batch-bytes <bytes>`
@@ -151,6 +156,7 @@ Notes:
 - large documents are chunked across multiple frames; they are not treated as one capped request
 - only one active indexing session is allowed per server at a time
 - when the target server is running in workspace mode, `index` auto-publishes after ingest so newly indexed documents become searchable
+- with multiple addresses, `index` checks server info once before ingest, validates compatible DB policy, and routes documents by current per-server document count
 - use `local index` for direct local ingest without a running server
 
 ## local index
@@ -182,9 +188,11 @@ Behavior:
 
 Options:
 
-- `--addr <host:port>`
+- `--addr <host:port>[,<host:port>...]`
 - `--timeout <seconds>`
 - `--max-message-bytes <bytes>`
+- `--ignore-offline`
+  - with multiple addresses, warn and skip servers that cannot be reached during initial command setup
 
 Values can be:
 
@@ -195,7 +203,9 @@ Behavior:
 
 - `delete` only targets the published `current/` store set
 - if the value exists only in `work_a/` or `work_b/`, the result is `missing`
-- `missing` is a normal outcome for multi-server delete fanout where only some servers actually contain the document
+- with multiple addresses, `delete` fans out to all reachable servers
+- `missing` is a normal per-server outcome for multi-server delete fanout where only some servers actually contain the document
+- a multi-server delete succeeds for a value when at least one reachable server deletes it
 - logical delete is immediate for search against `current/`
 - physical reclaim happens later through background compaction of `current/`
 
@@ -256,9 +266,11 @@ Behavior:
 
 Options:
 
-- `--addr <host:port>`
+- `--addr <host:port>[,<host:port>...]`
 - `--timeout <seconds>`
 - `--max-message-bytes <bytes>`
+- `--ignore-offline`
+  - with multiple addresses, warn and skip servers that cannot be reached during initial command setup
 - `--rule <path>`
   - path to one top-level YARA file
   - normal YARA `include "..."` directives are expanded before search
@@ -275,7 +287,7 @@ Behavior:
 - only one top-level search runs at a time per server; later searches queue
 - for a single searchable rule, the server executes the normal one-rule path
 - if the expanded source contains multiple searchable rules, the remote path sends one bundled request covering all named rules from the top-level file
-- the client deduplicates across the forest before applying the final cap
+- with multiple addresses, each reachable server executes the same search, and the client deduplicates across all returned Source IDs before applying the final cap
 - if the candidate cap is reached, output includes `truncated: true` and `truncated_limit: <n>`
 - `--verify` reopens candidate file paths and runs local `yara-x` verification
 - verified search requires stored file paths to still exist on disk
@@ -399,12 +411,14 @@ Use this helper when you want benchmark runs that preserve anon-memory and serve
 
 Options:
 
-- `--addr <host:port>`
+- `--addr <host:port>[,<host:port>...]`
 - `--timeout <seconds>`
+- `--ignore-offline`
+  - with multiple addresses, warn and skip servers that cannot be reached
 - `--light`
   - return lightweight server status without walking shard stats
 
-Returns JSON describing:
+Returns JSON describing one server. With multiple addresses, returns a JSON array of per-server objects.
 
 - identity mode
 - gram sizes

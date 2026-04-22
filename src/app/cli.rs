@@ -327,6 +327,12 @@ struct InfoConnectionArgs {
         help = "Connection/read timeout in seconds."
     )]
     timeout: f64,
+    #[arg(
+        long = "ignore-offline",
+        action = ArgAction::SetTrue,
+        help = "Skip unreachable servers when --addr contains multiple comma-separated addresses."
+    )]
+    ignore_offline: bool,
 }
 
 #[derive(Debug, clap::Args)]

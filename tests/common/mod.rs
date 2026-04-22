@@ -186,6 +186,37 @@ pub fn wait_for_published_doc_count_quick(addr: &str, expected_docs: u64, min_pu
     );
 }
 
+pub fn wait_for_search_candidates(addr: &str, rule: &Path, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_output = String::new();
+    while Instant::now() < deadline {
+        let output = Command::new(bin_path())
+            .args([
+                "search",
+                "--addr",
+                addr,
+                "--rule",
+                rule.to_str().expect("rule path"),
+                "--max-candidates",
+                "100",
+            ])
+            .output()
+            .expect("run search");
+        last_output = format!(
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains(&format!("candidates: {expected}"))
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("search did not reach {expected} candidates on {addr}; last_output={last_output}");
+}
+
 pub fn spawn_serve_tcp(port: u16, candidate_root: &Path, extra_args: &[&str]) -> Child {
     let addr = tcp_addr(port);
     let mut command = Command::new(bin_path());

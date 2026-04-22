@@ -360,6 +360,12 @@ struct ClientConnectionArgs {
         help = "Maximum remote message size in bytes."
     )]
     max_message_bytes: usize,
+    #[arg(
+        long = "ignore-offline",
+        action = ArgAction::SetTrue,
+        help = "Skip unreachable servers when --addr contains multiple comma-separated addresses."
+    )]
+    ignore_offline: bool,
 }
 
 /// Parses a `host:port` or `[ipv6]:port` address string into its components.
@@ -371,6 +377,12 @@ fn parse_host_port(value: &str) -> Result<(String, u16)> {
         ));
     }
     if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(host) = rest.strip_suffix(']') {
+            if host.is_empty() {
+                return Err(SspryError::from("addr host must not be empty."));
+            }
+            return Ok((host.to_owned(), DEFAULT_RPC_PORT));
+        }
         let (host, port_text) = rest
             .split_once("]:")
             .ok_or_else(|| SspryError::from("addr must use [ipv6]:port for IPv6 addresses."))?;
@@ -379,16 +391,91 @@ fn parse_host_port(value: &str) -> Result<(String, u16)> {
             .map_err(|_| SspryError::from("addr port must be a valid u16 value."))?;
         return Ok((host.to_owned(), port));
     }
+    if trimmed.matches(':').count() > 1 {
+        if trimmed.parse::<std::net::IpAddr>().is_ok() {
+            return Ok((trimmed.to_owned(), DEFAULT_RPC_PORT));
+        }
+        return Err(SspryError::from(
+            "addr must use [ipv6]:port for IPv6 addresses.",
+        ));
+    }
     let (host, port_text) = trimmed
         .rsplit_once(':')
-        .ok_or_else(|| SspryError::from("addr must be formatted as host:port."))?;
+        .map_or((trimmed, None), |(host, port_text)| (host, Some(port_text)));
     if host.is_empty() {
         return Err(SspryError::from("addr host must not be empty."));
     }
-    let port = port_text
-        .parse::<u16>()
-        .map_err(|_| SspryError::from("addr port must be a valid u16 value."))?;
+    let port = match port_text {
+        Some(port_text) => port_text
+            .parse::<u16>()
+            .map_err(|_| SspryError::from("addr port must be a valid u16 value."))?,
+        None => DEFAULT_RPC_PORT,
+    };
     Ok((host.to_owned(), port))
+}
+
+/// Formats a parsed host/port pair back into the address form accepted by
+/// tonic, adding brackets for bare IPv6 literals.
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Normalizes one remote address and fills in the default port when omitted.
+fn normalize_server_addr(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        let (host, port) = parse_host_port(rest)?;
+        return Ok(format!("http://{}", format_host_port(&host, port)));
+    }
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        let (host, port) = parse_host_port(rest)?;
+        return Ok(format!("https://{}", format_host_port(&host, port)));
+    }
+    let (host, port) = parse_host_port(trimmed)?;
+    Ok(format_host_port(&host, port))
+}
+
+/// Parses the remote address list used by multi-server client commands.
+fn split_server_addrs(value: &str) -> Result<Vec<String>> {
+    let addrs = value
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .map(normalize_server_addr)
+        .collect::<Result<Vec<_>>>()?;
+    if addrs.is_empty() {
+        return Err(SspryError::from(
+            "addr must contain at least one host:port value.",
+        ));
+    }
+    Ok(addrs)
+}
+
+/// Returns whether a connection string names more than one remote server.
+fn is_multi_server_addr(value: &str) -> Result<bool> {
+    Ok(split_server_addrs(value)?.len() > 1)
+}
+
+/// Clones one connection configuration while targeting a single server.
+fn connection_for_addr(
+    connection: &ClientConnectionArgs,
+    addr: impl Into<String>,
+) -> ClientConnectionArgs {
+    ClientConnectionArgs {
+        addr: addr.into(),
+        timeout: connection.timeout,
+        max_message_bytes: connection.max_message_bytes,
+        ignore_offline: connection.ignore_offline,
+    }
+}
+
+/// Emits the common warning used when --ignore-offline skips a remote server.
+fn warn_offline_server(operation: &str, addr: &str, err: &SspryError) {
+    eprintln!("warning.{operation}.offline_server: {addr}: {err}");
 }
 
 /// Canonicalizes a file path for stable downstream identity or display use.
@@ -862,8 +949,9 @@ fn grpc_client_with_timeout(
     connection: &ClientConnectionArgs,
     timeout_secs: f64,
 ) -> Result<BlockingGrpcClient> {
+    let addr = normalize_server_addr(&connection.addr)?;
     BlockingGrpcClient::connect_with_limits(
-        &connection.addr,
+        &addr,
         Duration::from_secs_f64(timeout_secs.max(0.0)),
         connection.max_message_bytes.max(1),
     )
@@ -917,6 +1005,82 @@ struct ServerScanPolicy {
     gram_sizes: GramSizes,
     memory_budget_bytes: u64,
     workspace_mode: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteServerEndpoint {
+    addr: String,
+    connection: ClientConnectionArgs,
+    policy: ServerScanPolicy,
+    active_doc_count: usize,
+}
+
+/// Returns true when two server policies are compatible for one distributed
+/// client command. Memory budgets may differ between servers.
+fn remote_server_policies_compatible(left: ServerScanPolicy, right: ServerScanPolicy) -> bool {
+    left.id_source == right.id_source
+        && left.store_path == right.store_path
+        && left.tier1_filter_target_fp == right.tier1_filter_target_fp
+        && left.tier2_filter_target_fp == right.tier2_filter_target_fp
+        && left.gram_sizes == right.gram_sizes
+        && left.workspace_mode == right.workspace_mode
+}
+
+/// Ensures every reachable server can participate in one distributed command.
+fn validate_remote_server_policies(endpoints: &[RemoteServerEndpoint]) -> Result<()> {
+    let Some(first) = endpoints.first() else {
+        return Err(SspryError::from("No reachable servers."));
+    };
+    for endpoint in &endpoints[1..] {
+        if !remote_server_policies_compatible(first.policy, endpoint.policy) {
+            return Err(SspryError::from(format!(
+                "server `{}` policy differs from `{}`; multi-server commands require matching id-source, gram sizes, bloom fp settings, store-path, and workspace mode",
+                endpoint.addr, first.addr
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Loads policy and count metadata for all configured remote servers.
+fn discover_remote_servers(
+    connection: &ClientConnectionArgs,
+    operation: &str,
+) -> Result<Vec<RemoteServerEndpoint>> {
+    let addrs = split_server_addrs(&connection.addr)?;
+    let mut endpoints = Vec::new();
+    for addr in addrs {
+        let server_connection = connection_for_addr(connection, addr.clone());
+        match (|| -> Result<RemoteServerEndpoint> {
+            let mut client = grpc_client(&server_connection)?;
+            let stats = client.stats()?;
+            let policy = server_scan_policy_from_grpc_stats(&stats)?;
+            let active_doc_count = stats
+                .stats
+                .as_ref()
+                .map(|store| usize::try_from(store.active_doc_count).unwrap_or(usize::MAX))
+                .unwrap_or(0);
+            Ok(RemoteServerEndpoint {
+                addr: addr.clone(),
+                connection: server_connection,
+                policy,
+                active_doc_count,
+            })
+        })() {
+            Ok(endpoint) => endpoints.push(endpoint),
+            Err(err) if connection.ignore_offline => {
+                warn_offline_server(operation, &addr, &err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(SspryError::from(
+            "No reachable servers after applying --ignore-offline.",
+        ));
+    }
+    validate_remote_server_policies(&endpoints)?;
+    Ok(endpoints)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1580,6 +1744,7 @@ fn placeholder_connection() -> ClientConnectionArgs {
         addr: DEFAULT_RPC_ADDR.to_owned(),
         timeout: DEFAULT_RPC_TIMEOUT,
         max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        ignore_offline: false,
     }
 }
 
@@ -3529,6 +3694,17 @@ fn cmd_index(args: &IndexArgs) -> i32 {
 /// Executes remote indexing by scanning files locally, batching encoded rows,
 /// and streaming them to the server.
 fn cmd_grpc_index(args: &IndexArgs) -> i32 {
+    match is_multi_server_addr(&args.connection.addr) {
+        Ok(true) => cmd_grpc_index_multi(args),
+        Ok(false) => cmd_grpc_index_single(args),
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+fn cmd_grpc_index_single(args: &IndexArgs) -> i32 {
     match (|| -> Result<i32> {
         let started_total = Instant::now();
         let mut scan_time = Duration::ZERO;
@@ -4085,6 +4261,597 @@ fn cmd_grpc_index(args: &IndexArgs) -> i32 {
     }
 }
 
+struct RemoteIndexHeartbeat {
+    stop: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn start_remote_index_heartbeat(
+    connection: &ClientConnectionArgs,
+    grpc_insert_chunk_bytes: usize,
+    index_client_id: u64,
+) -> Result<RemoteIndexHeartbeat> {
+    let mut heartbeat_client = grpc_client(connection)?;
+    heartbeat_client.set_insert_chunk_bytes(
+        grpc_insert_chunk_bytes
+            .max(1)
+            .min(connection.max_message_bytes.max(1)),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let error = Arc::new(Mutex::new(None::<String>));
+    let stop_flag = stop.clone();
+    let error_slot = error.clone();
+    let handle = thread::spawn(move || {
+        while !stop_flag.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(INDEX_CLIENT_HEARTBEAT_INTERVAL_MS));
+            if stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+            if let Err(err) = heartbeat_client.heartbeat_index_client(index_client_id) {
+                if let Ok(mut slot) = error_slot.lock() {
+                    if slot.is_none() {
+                        *slot = Some(err.to_string());
+                    }
+                }
+                break;
+            }
+        }
+    });
+    Ok(RemoteIndexHeartbeat {
+        stop,
+        error,
+        handle,
+    })
+}
+
+fn finish_remote_index_heartbeat(heartbeat: RemoteIndexHeartbeat) -> Result<()> {
+    heartbeat.stop.store(true, Ordering::SeqCst);
+    let _ = heartbeat.handle.join();
+    heartbeat
+        .error
+        .lock()
+        .map_err(|_| SspryError::from("Index heartbeat error slot poisoned."))?
+        .clone()
+        .map(SspryError::from)
+        .map_or(Ok(()), Err)
+}
+
+struct MultiServerIndexTarget {
+    endpoint: RemoteServerEndpoint,
+    client: BlockingGrpcClient,
+    index_client_id: u64,
+    heartbeat: Option<RemoteIndexHeartbeat>,
+    assigned_documents: usize,
+    processed_documents: usize,
+}
+
+impl MultiServerIndexTarget {
+    fn load(&self) -> usize {
+        self.endpoint
+            .active_doc_count
+            .saturating_add(self.assigned_documents)
+    }
+}
+
+fn remember_first_result_error(first_error: &mut Option<SspryError>, result: Result<()>) {
+    if first_error.is_none() {
+        if let Err(err) = result {
+            *first_error = Some(err);
+        }
+    }
+}
+
+fn finish_multi_server_index_targets(
+    targets: &mut [MultiServerIndexTarget],
+    publish: bool,
+) -> Result<()> {
+    let mut first_error = None;
+    for target in targets.iter_mut() {
+        if publish && target.endpoint.policy.workspace_mode {
+            remember_first_result_error(&mut first_error, target.client.publish().map(|_| ()));
+        }
+        remember_first_result_error(
+            &mut first_error,
+            target.client.end_index_session().map(|_| ()),
+        );
+        if let Some(heartbeat) = target.heartbeat.take() {
+            remember_first_result_error(&mut first_error, finish_remote_index_heartbeat(heartbeat));
+        }
+        remember_first_result_error(
+            &mut first_error,
+            target
+                .client
+                .end_index_client(target.index_client_id)
+                .map(|_| ()),
+        );
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn select_multi_server_index_target(targets: &[MultiServerIndexTarget]) -> Result<usize> {
+    targets
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, target)| target.load())
+        .map(|(index, _)| index)
+        .ok_or_else(|| SspryError::from("No reachable servers."))
+}
+
+fn flush_multi_server_pending_batch(
+    targets: &mut [MultiServerIndexTarget],
+    pending: &mut RemotePendingBatch,
+    processed: &mut usize,
+    submit_time: &mut Duration,
+    show_progress: bool,
+    total_files: usize,
+    last_progress_reported: &mut usize,
+    last_progress_at: &mut Instant,
+    empty_payload_size: usize,
+    verbose: bool,
+) -> Result<()> {
+    if pending.rows.is_empty() {
+        return Ok(());
+    }
+    let target_index = select_multi_server_index_target(targets)?;
+    let target = &mut targets[target_index];
+    let flush_rows = pending.rows.len();
+    let flush_payload_size = pending.payload_size;
+    let flush_payload = std::mem::take(&mut pending.rows);
+    let started_submit = Instant::now();
+    let started_flush = Instant::now();
+    let inserted_count = target.client.candidate_insert_binary_rows(flush_payload)?;
+    *submit_time += started_submit.elapsed();
+    if verbose {
+        eprintln!(
+            "verbose.index.remote_flush server={} rows={} payload_bytes={} inserted={} elapsed_ms={:.3}",
+            target.endpoint.addr,
+            flush_rows,
+            flush_payload_size,
+            inserted_count,
+            started_flush.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    pending.payload_size = empty_payload_size;
+    target.assigned_documents = target.assigned_documents.saturating_add(inserted_count);
+    target.processed_documents = target.processed_documents.saturating_add(inserted_count);
+    target.client.update_index_session_progress(
+        Some(target.processed_documents),
+        target.processed_documents,
+        target.processed_documents,
+    )?;
+    *processed = processed.saturating_add(inserted_count);
+    maybe_report_index_progress(
+        show_progress,
+        *processed,
+        total_files,
+        last_progress_reported,
+        last_progress_at,
+        false,
+    );
+    Ok(())
+}
+
+fn push_serialized_multi_server_upload_row(
+    targets: &mut [MultiServerIndexTarget],
+    pending: &mut RemotePendingBatch,
+    row_bytes: Vec<u8>,
+    batch_docs: usize,
+    processed: &mut usize,
+    submit_time: &mut Duration,
+    show_progress: bool,
+    total_files: usize,
+    last_progress_reported: &mut usize,
+    last_progress_at: &mut Instant,
+    empty_payload_size: usize,
+    remote_batch_soft_limit_bytes: usize,
+    allow_oversize_single_row: bool,
+    verbose: bool,
+) -> Result<Duration> {
+    let started_buffer = Instant::now();
+    let flush_before = prepare_serialized_remote_batch_row(
+        pending,
+        row_bytes.len(),
+        empty_payload_size,
+        remote_batch_soft_limit_bytes,
+        allow_oversize_single_row,
+    )?;
+    let mut buffer_time = started_buffer.elapsed();
+    if flush_before {
+        flush_multi_server_pending_batch(
+            targets,
+            pending,
+            processed,
+            submit_time,
+            show_progress,
+            total_files,
+            last_progress_reported,
+            last_progress_at,
+            empty_payload_size,
+            verbose,
+        )?;
+    }
+    let started_buffer = Instant::now();
+    let flush_after = push_serialized_remote_batch_row(
+        pending,
+        row_bytes,
+        batch_docs,
+        remote_batch_soft_limit_bytes,
+        allow_oversize_single_row,
+    )?;
+    buffer_time += started_buffer.elapsed();
+    if flush_after {
+        flush_multi_server_pending_batch(
+            targets,
+            pending,
+            processed,
+            submit_time,
+            show_progress,
+            total_files,
+            last_progress_reported,
+            last_progress_at,
+            empty_payload_size,
+            verbose,
+        )?;
+    }
+    Ok(buffer_time)
+}
+
+/// Distributes one remote index command across multiple servers. Input files
+/// are scanned once, then completed upload batches are sent to the server with
+/// the lowest current document count plus already-assigned rows.
+fn cmd_grpc_index_multi(args: &IndexArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let started_total = Instant::now();
+        let mut scan_time = Duration::ZERO;
+        let mut result_wait_time = Duration::ZERO;
+        let mut encode_time = Duration::ZERO;
+        let mut client_buffer_time = Duration::ZERO;
+        let mut submit_time = Duration::ZERO;
+        let endpoints = discover_remote_servers(&args.connection, "index")?;
+        let input_roots = expand_input_paths(&args.paths, args.path_list)?;
+        let total_files = if args.path_list || input_paths_are_file_only(&input_roots) {
+            input_roots.len()
+        } else {
+            count_input_files(&input_roots)?
+        };
+        if total_files == 0 {
+            return Err(SspryError::from("No input files found."));
+        }
+        let show_progress = args.verbose
+            && (args.path_list
+                || input_roots.iter().any(|path| path.is_dir())
+                || total_files > input_roots.len());
+        let mut last_progress_reported = 0usize;
+        let mut last_progress_at = Instant::now();
+        let mut processed = 0usize;
+        let batch_rows = GRPC_REMOTE_BATCH_MAX_ROWS;
+        let server_policy = endpoints
+            .first()
+            .map(|endpoint| endpoint.policy)
+            .ok_or_else(|| SspryError::from("No reachable servers."))?;
+        let resolved_workers =
+            resolve_ingest_workers(args.workers.unwrap_or(0), total_files, &input_roots, None);
+        let workers = resolved_workers.workers;
+        let policy = ScanPolicy {
+            fixed_filter_bytes: None,
+            tier1_filter_target_fp: server_policy.tier1_filter_target_fp,
+            tier2_filter_target_fp: server_policy.tier2_filter_target_fp,
+            gram_sizes: server_policy.gram_sizes,
+            chunk_size: DEFAULT_FILE_READ_CHUNK_SIZE,
+            store_path: server_policy.store_path,
+            id_source: server_policy.id_source,
+        };
+        let configured_budget_bytes = endpoints
+            .iter()
+            .map(|endpoint| endpoint.policy.memory_budget_bytes)
+            .min()
+            .unwrap_or(0);
+        let effective_budget_bytes = effective_memory_budget_bytes(configured_budget_bytes);
+        let queue_capacity = index_queue_capacity(effective_budget_bytes, workers);
+        let empty_payload_size = empty_remote_batch_payload_size()?;
+        let batch_bytes = grpc_remote_batch_bytes(args.batch_bytes, empty_payload_size);
+        let remote_upload_queue_limit_bytes =
+            remote_upload_queue_byte_limit(effective_budget_bytes, batch_bytes);
+        let mut pending = RemotePendingBatch {
+            rows: Vec::new(),
+            payload_size: empty_payload_size,
+        };
+        let mut targets = Vec::with_capacity(endpoints.len());
+        let setup_result = (|| -> Result<()> {
+            for endpoint in endpoints {
+                let mut client = grpc_client(&endpoint.connection)?;
+                client.set_insert_chunk_bytes(
+                    args.grpc_insert_chunk_bytes
+                        .max(1)
+                        .min(endpoint.connection.max_message_bytes.max(1)),
+                );
+                let (index_client_id, _) =
+                    client.begin_index_client(INDEX_CLIENT_HEARTBEAT_INTERVAL_MS)?;
+                let heartbeat = start_remote_index_heartbeat(
+                    &endpoint.connection,
+                    args.grpc_insert_chunk_bytes,
+                    index_client_id,
+                )?;
+                client.begin_index_session()?;
+                client.update_index_session_progress(None, 0, 0)?;
+                targets.push(MultiServerIndexTarget {
+                    endpoint,
+                    client,
+                    index_client_id,
+                    heartbeat: Some(heartbeat),
+                    assigned_documents: 0,
+                    processed_documents: 0,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(err) = setup_result {
+            let _ = finish_multi_server_index_targets(&mut targets, false);
+            return Err(err);
+        }
+        let target_count = targets.len();
+
+        let body_result = (|| -> Result<()> {
+            if workers <= 1 {
+                stream_selected_input_files(&input_roots, args.path_list, |file_path| {
+                    let started_scan = Instant::now();
+                    let scanned = scan_index_batch_row(&file_path, policy)?;
+                    scan_time += started_scan.elapsed();
+                    let started_encode = Instant::now();
+                    let row_bytes = serialize_candidate_document_binary_row(&scanned)?;
+                    encode_time += started_encode.elapsed();
+                    client_buffer_time += push_serialized_multi_server_upload_row(
+                        &mut targets,
+                        &mut pending,
+                        row_bytes,
+                        batch_rows,
+                        &mut processed,
+                        &mut submit_time,
+                        show_progress,
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        empty_payload_size,
+                        batch_bytes,
+                        true,
+                        args.verbose,
+                    )?;
+                    maybe_report_index_progress(
+                        show_progress,
+                        processed.saturating_add(pending.rows.len()),
+                        total_files,
+                        &mut last_progress_reported,
+                        &mut last_progress_at,
+                        false,
+                    );
+                    Ok(())
+                })?;
+            } else {
+                let (job_tx, job_rx) = bounded::<PathBuf>(queue_capacity);
+                let (result_tx, result_rx) =
+                    bounded::<Result<ScannedIndexBatchRow>>(queue_capacity);
+                let upload_queue =
+                    Arc::new(RemoteUploadQueue::new(remote_upload_queue_limit_bytes));
+                thread::scope(|scope| {
+                    for _worker_idx in 0..workers {
+                        let job_rx = job_rx.clone();
+                        let result_tx = result_tx.clone();
+                        scope.spawn(move || {
+                            for file_path in job_rx.iter() {
+                                let started_scan = Instant::now();
+                                let result = scan_index_batch_row(&file_path, policy).map(|row| {
+                                    ScannedIndexBatchRow {
+                                        row,
+                                        scan_elapsed: started_scan.elapsed(),
+                                    }
+                                });
+                                let _ = result_tx.send(result);
+                            }
+                        });
+                    }
+                    let producer_tx = job_tx.clone();
+                    let producer_result_tx = result_tx.clone();
+                    let producer_roots = input_roots.clone();
+                    let producer_path_list = args.path_list;
+                    scope.spawn(move || {
+                        let produce = stream_selected_input_files(
+                            &producer_roots,
+                            producer_path_list,
+                            |file_path| {
+                                producer_tx.send(file_path).map_err(|_| {
+                                    SspryError::from(
+                                        "candidate ingest file producer terminated unexpectedly",
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        );
+                        if let Err(err) = produce {
+                            let _ = producer_result_tx.send(Err(err));
+                        }
+                        drop(producer_tx);
+                    });
+
+                    drop(job_tx);
+                    drop(result_tx);
+
+                    let scope_result = (|| -> Result<()> {
+                        let upload_queue_consumer = upload_queue.clone();
+                        let encoder_handle = scope.spawn(move || -> Result<RemoteEncodeStats> {
+                            let mut received = 0usize;
+                            let mut local_scan_time = Duration::ZERO;
+                            let mut local_result_wait_time = Duration::ZERO;
+                            let mut local_encode_time = Duration::ZERO;
+                            let encoder_result = (|| -> Result<()> {
+                                loop {
+                                    let started_wait = Instant::now();
+                                    let Some(scanned) = result_rx.recv().ok() else {
+                                        break;
+                                    };
+                                    local_result_wait_time += started_wait.elapsed();
+                                    let scanned = scanned?;
+                                    received = received.saturating_add(1);
+                                    local_scan_time += scanned.scan_elapsed;
+                                    let started_encode = Instant::now();
+                                    let row_bytes =
+                                        serialize_candidate_document_binary_row(&scanned.row)?;
+                                    local_encode_time += started_encode.elapsed();
+                                    upload_queue_consumer.push(RemoteUploadRow { row_bytes })?;
+                                }
+                                if received != total_files {
+                                    return Err(SspryError::from(format!(
+                                        "candidate ingest worker result count mismatch: counted {total_files} input files but received {received} scan results"
+                                    )));
+                                }
+                                Ok(())
+                            })();
+                            let _ = upload_queue_consumer.close();
+                            encoder_result?;
+                            Ok(RemoteEncodeStats {
+                                scan_time: local_scan_time,
+                                result_wait_time: local_result_wait_time,
+                                encode_time: local_encode_time,
+                            })
+                        });
+
+                        let upload_result = (|| -> Result<()> {
+                            loop {
+                                let Some(upload_row) = upload_queue.pop()? else {
+                                    break;
+                                };
+                                client_buffer_time += push_serialized_multi_server_upload_row(
+                                    &mut targets,
+                                    &mut pending,
+                                    upload_row.row_bytes,
+                                    batch_rows,
+                                    &mut processed,
+                                    &mut submit_time,
+                                    show_progress,
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    empty_payload_size,
+                                    batch_bytes,
+                                    true,
+                                    args.verbose,
+                                )?;
+                                maybe_report_index_progress(
+                                    show_progress,
+                                    processed.saturating_add(pending.rows.len()),
+                                    total_files,
+                                    &mut last_progress_reported,
+                                    &mut last_progress_at,
+                                    false,
+                                );
+                            }
+                            Ok(())
+                        })();
+                        if let Err(upload_err) = upload_result {
+                            let _ = upload_queue.close();
+                            let _ = encoder_handle.join();
+                            return Err(upload_err);
+                        }
+                        let encoder_stats = encoder_handle.join().map_err(|_| {
+                            SspryError::from("candidate ingest encoder thread panicked")
+                        })??;
+                        scan_time += encoder_stats.scan_time;
+                        result_wait_time += encoder_stats.result_wait_time;
+                        encode_time += encoder_stats.encode_time;
+                        Ok(())
+                    })();
+                    let _ = upload_queue.close();
+                    scope_result?;
+                    Ok::<(), SspryError>(())
+                })?;
+            }
+
+            flush_multi_server_pending_batch(
+                &mut targets,
+                &mut pending,
+                &mut processed,
+                &mut submit_time,
+                show_progress,
+                total_files,
+                &mut last_progress_reported,
+                &mut last_progress_at,
+                empty_payload_size,
+                args.verbose,
+            )?;
+            for target in &mut targets {
+                target.client.update_index_session_progress(
+                    Some(target.processed_documents),
+                    target.processed_documents,
+                    target.processed_documents,
+                )?;
+            }
+            Ok(())
+        })();
+        let finish_result = finish_multi_server_index_targets(&mut targets, body_result.is_ok());
+        body_result?;
+        finish_result?;
+
+        maybe_report_index_progress(
+            show_progress,
+            processed,
+            total_files,
+            &mut last_progress_reported,
+            &mut last_progress_at,
+            true,
+        );
+
+        println!("multi_server_submitted_documents: {total_files}");
+        println!("multi_server_processed_documents: {processed}");
+        println!("multi_server_target_servers: {target_count}");
+        if args.verbose {
+            let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
+            let scan_ms = scan_time.as_secs_f64() * 1000.0;
+            let submit_ms = submit_time.as_secs_f64() * 1000.0;
+            let result_wait_ms = result_wait_time.as_secs_f64() * 1000.0;
+            let encode_ms = encode_time.as_secs_f64() * 1000.0;
+            let client_buffer_ms = client_buffer_time.as_secs_f64() * 1000.0;
+            eprintln!("verbose.index.total_ms: {total_ms:.3}");
+            eprintln!("verbose.index.scan_ms: {scan_ms:.3}");
+            eprintln!("verbose.index.worker_scan_cpu_ms: {scan_ms:.3}");
+            eprintln!("verbose.index.result_wait_ms: {result_wait_ms:.3}");
+            eprintln!("verbose.index.encode_ms: {encode_ms:.3}");
+            eprintln!("verbose.index.client_buffer_ms: {client_buffer_ms:.3}");
+            eprintln!("verbose.index.submit_ms: {submit_ms:.3}");
+            eprintln!("verbose.index.remote_batch_max_rows: {batch_rows}");
+            eprintln!("verbose.index.workers: {workers}");
+            eprintln!("verbose.index.memory_budget_bytes: {configured_budget_bytes}");
+            eprintln!("verbose.index.effective_memory_budget_bytes: {effective_budget_bytes}");
+            eprintln!("verbose.index.queue_capacity: {queue_capacity}");
+            eprintln!("verbose.index.batch_bytes: {batch_bytes}");
+            eprintln!(
+                "verbose.index.remote_upload_queue_limit_bytes: {}",
+                remote_upload_queue_limit_bytes
+            );
+            eprintln!("verbose.index.worker_auto: {}", resolved_workers.auto);
+            eprintln!(
+                "verbose.index.input_storage_class: {}",
+                resolved_workers.input_storage.as_str()
+            );
+            eprintln!(
+                "verbose.index.output_storage_class: {}",
+                resolved_workers.output_storage.as_str()
+            );
+            eprintln!("verbose.index.submitted_documents: {total_files}");
+            eprintln!("verbose.index.processed_documents: {processed}");
+            let (client_current_rss_kb, client_peak_rss_kb) = current_process_memory_kb();
+            eprintln!("verbose.index.client_current_rss_kb: {client_current_rss_kb}");
+            eprintln!("verbose.index.client_peak_rss_kb: {client_peak_rss_kb}");
+        }
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 /// Implements the high-level local indexing command by requiring an existing
 /// initialized direct local store and delegating to batch indexing.
 fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
@@ -4112,6 +4879,17 @@ fn cmd_delete(args: &DeleteArgs) -> i32 {
 
 /// Implements the remote delete command against the running server.
 fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
+    match is_multi_server_addr(&args.connection.addr) {
+        Ok(true) => cmd_grpc_delete_multi(args),
+        Ok(false) => cmd_grpc_delete_single(args),
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+fn cmd_grpc_delete_single(args: &DeleteArgs) -> i32 {
     match (|| -> Result<i32> {
         let server_policy = server_scan_policy(&args.connection)?;
         let mut client = grpc_client(&args.connection)?;
@@ -4138,6 +4916,83 @@ fn cmd_grpc_delete(args: &DeleteArgs) -> i32 {
                     return Err(SspryError::from(format!(
                         "delete failed for `{value}`: {}",
                         result.status
+                    )));
+                }
+                Ok(())
+            })() {
+                Ok(()) => {}
+                Err(err) => {
+                    println!("{err}");
+                    exit_code = 1;
+                }
+            }
+        }
+        Ok(exit_code)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+/// Sends one delete request to every reachable server. Source-id resolution is
+/// based on the shared server policy validated during discovery.
+fn cmd_grpc_delete_multi(args: &DeleteArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let endpoints = discover_remote_servers(&args.connection, "delete")?;
+        let id_source = endpoints[0].policy.id_source;
+        let mut clients = Vec::new();
+        for endpoint in &endpoints {
+            match grpc_client(&endpoint.connection) {
+                Ok(client) => clients.push((endpoint.addr.clone(), client)),
+                Err(err) if args.connection.ignore_offline => {
+                    warn_offline_server("delete", &endpoint.addr, &err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if clients.is_empty() {
+            return Err(SspryError::from(
+                "No reachable servers after applying --ignore-offline.",
+            ));
+        }
+
+        let mut exit_code = 0;
+        for value in &args.values {
+            match (|| -> Result<()> {
+                let identity_hex =
+                    resolve_delete_value(value, id_source, DEFAULT_FILE_READ_CHUNK_SIZE)?;
+                let mut deleted_count = 0usize;
+                let mut unexpected_status = false;
+                for (addr, client) in &mut clients {
+                    let result = client.candidate_delete_identity(&identity_hex)?;
+                    println!("server: {addr}");
+                    println!("value: {value}");
+                    println!("status: {}", result.status);
+                    println!("identity: {}", result.identity);
+                    println!(
+                        "doc_id: {}",
+                        result
+                            .doc_id
+                            .map(|doc_id| doc_id.to_string())
+                            .unwrap_or_else(|| "None".to_owned())
+                    );
+                    match result.status.as_str() {
+                        "deleted" => deleted_count = deleted_count.saturating_add(1),
+                        "missing" => {}
+                        _ => unexpected_status = true,
+                    }
+                }
+                if unexpected_status {
+                    return Err(SspryError::from(format!(
+                        "delete failed for `{value}`: unexpected status from at least one server"
+                    )));
+                }
+                if deleted_count == 0 {
+                    return Err(SspryError::from(format!(
+                        "delete failed for `{value}`: missing on all reachable servers"
                     )));
                 }
                 Ok(())
@@ -4519,6 +5374,166 @@ where
     )
 }
 
+/// Builds per-server search args while letting distributed search apply the
+/// global candidate cap after all server results are merged.
+fn search_args_for_endpoint(
+    args: &SearchCommandArgs,
+    endpoint: &RemoteServerEndpoint,
+    max_candidates: f64,
+) -> SearchCommandArgs {
+    SearchCommandArgs {
+        connection: endpoint.connection.clone(),
+        rule: args.rule.clone(),
+        max_anchors_per_pattern: args.max_anchors_per_pattern,
+        max_candidates,
+        verify_yara_files: args.verify_yara_files,
+        verbose: args.verbose,
+    }
+}
+
+/// Opens a search stream client for one endpoint without reloading policy,
+/// because multi-server discovery already validated it.
+fn remote_search_context_for_endpoint(
+    endpoint: &RemoteServerEndpoint,
+) -> Result<RemoteSearchContext> {
+    Ok(RemoteSearchContext {
+        client: search_grpc_client(&endpoint.connection)?,
+        server_policy: endpoint.policy,
+    })
+}
+
+/// Merges per-server executions for one rule, deduplicating by Source ID and
+/// applying the original candidate cap across the full distributed corpus.
+fn merge_distributed_search_executions(
+    executions: Vec<SearchExecution>,
+    searchable_doc_count: usize,
+    max_candidates: f64,
+) -> Result<SearchExecution> {
+    let mut executions = executions.into_iter();
+    let first = executions
+        .next()
+        .ok_or_else(|| SspryError::from("No reachable servers returned search results."))?;
+    let SearchExecution {
+        plan,
+        total_candidates: _,
+        tier_used,
+        truncated: _,
+        truncated_limit: _,
+        rows,
+        query_profile,
+        external_ids,
+        tree_count: _,
+        search_workers: _,
+        server_rss_kb,
+        plan_time,
+        query_time,
+    } = first;
+
+    let mut merged_rows = Vec::new();
+    let mut merged_external_ids = Vec::new();
+    let mut seen = HashMap::<String, usize>::new();
+    let mut merged_profile = CandidateQueryProfile::default();
+    let mut tier_parts = Vec::<String>::new();
+    let mut merged_server_rss = server_rss_kb;
+    let mut merged_plan_time = Duration::ZERO;
+    let mut merged_query_time = Duration::ZERO;
+
+    let mut merge_one = |tier_used: String,
+                         rows: Vec<String>,
+                         external_ids: Vec<Option<String>>,
+                         query_profile: CandidateQueryProfile,
+                         server_rss_kb: Option<(u64, u64)>,
+                         plan_time: Duration,
+                         query_time: Duration| {
+        if !tier_used.is_empty() && !tier_parts.iter().any(|value| value == &tier_used) {
+            tier_parts.push(tier_used);
+        }
+        merged_profile.merge_from(&query_profile);
+        merged_plan_time += plan_time;
+        merged_query_time += query_time;
+        if let Some((current, peak)) = server_rss_kb {
+            merged_server_rss = Some(match merged_server_rss {
+                Some((existing_current, existing_peak)) => {
+                    (existing_current.max(current), existing_peak.max(peak))
+                }
+                None => (current, peak),
+            });
+        }
+
+        let mut row_external_ids = external_ids;
+        if row_external_ids.len() < rows.len() {
+            row_external_ids.resize(rows.len(), None);
+        }
+        for (idx, identity) in rows.into_iter().enumerate() {
+            let external_id = row_external_ids.get(idx).cloned().flatten();
+            if let Some(existing_idx) = seen.get(&identity).copied() {
+                if merged_external_ids
+                    .get(existing_idx)
+                    .is_some_and(Option::is_none)
+                    && external_id.is_some()
+                {
+                    merged_external_ids[existing_idx] = external_id;
+                }
+                continue;
+            }
+            seen.insert(identity.clone(), merged_rows.len());
+            merged_rows.push(identity);
+            merged_external_ids.push(external_id);
+        }
+    };
+
+    merge_one(
+        tier_used,
+        rows,
+        external_ids,
+        query_profile,
+        server_rss_kb,
+        plan_time,
+        query_time,
+    );
+    for execution in executions {
+        merge_one(
+            execution.tier_used,
+            execution.rows,
+            execution.external_ids,
+            execution.query_profile,
+            execution.server_rss_kb,
+            execution.plan_time,
+            execution.query_time,
+        );
+    }
+
+    let resolved_limit = resolve_max_candidates(searchable_doc_count, max_candidates);
+    let mut truncated = false;
+    let mut truncated_limit = None;
+    if resolved_limit > 0 && merged_rows.len() > resolved_limit {
+        truncated = true;
+        truncated_limit = Some(resolved_limit);
+        merged_rows.truncate(resolved_limit);
+        merged_external_ids.truncate(resolved_limit);
+    }
+
+    Ok(SearchExecution {
+        plan,
+        total_candidates: merged_rows.len(),
+        tier_used: if tier_parts.is_empty() {
+            "none".to_owned()
+        } else {
+            tier_parts.join(",")
+        },
+        truncated,
+        truncated_limit,
+        rows: merged_rows,
+        query_profile: merged_profile,
+        external_ids: merged_external_ids,
+        tree_count: None,
+        search_workers: None,
+        server_rss_kb: merged_server_rss,
+        plan_time: merged_plan_time,
+        query_time: merged_query_time,
+    })
+}
+
 /// Executes one local forest search against a reusable opened forest and shared
 /// policy context.
 fn execute_local_search_rule(
@@ -4706,6 +5721,17 @@ fn cmd_search(args: &SearchCommandArgs) -> i32 {
 
 /// Runs the remote `search` command and prints any resulting candidates.
 fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
+    match is_multi_server_addr(&args.connection.addr) {
+        Ok(true) => cmd_grpc_search_multi(args),
+        Ok(false) => cmd_grpc_search_single(args),
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+fn cmd_grpc_search_single(args: &SearchCommandArgs) -> i32 {
     match (|| -> Result<i32> {
         let rule_path = Path::new(&args.rule);
         let (rule_text, rule_names) = load_search_rule_bundle(rule_path)?;
@@ -4776,6 +5802,132 @@ fn cmd_grpc_search(args: &SearchCommandArgs) -> i32 {
     }
 }
 
+/// Runs one remote search across every reachable server and merges the
+/// per-server Source ID streams before rendering the normal search output.
+fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let endpoints = discover_remote_servers(&args.connection, "search")?;
+        let mut search_targets = Vec::new();
+        for endpoint in endpoints {
+            match remote_search_context_for_endpoint(&endpoint) {
+                Ok(context) => search_targets.push((endpoint, context)),
+                Err(err) if args.connection.ignore_offline => {
+                    warn_offline_server("search", &endpoint.addr, &err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if search_targets.is_empty() {
+            return Err(SspryError::from(
+                "No reachable servers after applying --ignore-offline.",
+            ));
+        }
+        let searchable_doc_count = search_targets
+            .iter()
+            .map(|(endpoint, _)| endpoint.active_doc_count)
+            .sum::<usize>();
+        let rule_path = Path::new(&args.rule);
+        let (rule_text, rule_names) = load_search_rule_bundle(rule_path)?;
+        let multi_rule = rule_names.len() > 1;
+        let mut exit_code = 0;
+
+        if multi_rule {
+            let mut executions_by_rule = (0..rule_names.len())
+                .map(|_| Vec::<SearchExecution>::new())
+                .collect::<Vec<_>>();
+            for (endpoint, context) in &mut search_targets {
+                let server_args = search_args_for_endpoint(args, endpoint, 0.0);
+                execute_grpc_search_bundle_streaming(
+                    &server_args,
+                    &rule_text,
+                    &rule_names,
+                    context,
+                    |_, execution, index| {
+                        executions_by_rule[index].push(execution);
+                        Ok(())
+                    },
+                )?;
+            }
+
+            for (index, rule_name) in rule_names.iter().enumerate() {
+                let started_total = Instant::now();
+                let executions = std::mem::take(&mut executions_by_rule[index]);
+                let result = merge_distributed_search_executions(
+                    executions,
+                    searchable_doc_count,
+                    args.max_candidates,
+                )
+                .and_then(|execution| {
+                    finish_search_execution(
+                        rule_path,
+                        rule_name,
+                        args.verify_yara_files,
+                        args.verbose,
+                        args.max_candidates,
+                        args.max_anchors_per_pattern,
+                        started_total
+                            .checked_sub(execution.plan_time + execution.query_time)
+                            .unwrap_or_else(Instant::now),
+                        execution,
+                        true,
+                        index == 0,
+                    )
+                });
+                if let Err(err) = result {
+                    print_search_error(rule_path, rule_name, &err, true, index == 0);
+                    exit_code = 1;
+                }
+            }
+            return Ok(exit_code);
+        }
+
+        for (index, rule_name) in rule_names.iter().enumerate() {
+            let started_total = Instant::now();
+            let mut executions = Vec::new();
+            for (endpoint, context) in &mut search_targets {
+                let server_args = search_args_for_endpoint(args, endpoint, 0.0);
+                executions.push(execute_grpc_search_rule(
+                    &server_args,
+                    rule_path,
+                    &rule_text,
+                    rule_name,
+                    context,
+                )?);
+            }
+            let result = merge_distributed_search_executions(
+                executions,
+                searchable_doc_count,
+                args.max_candidates,
+            )
+            .and_then(|execution| {
+                finish_search_execution(
+                    rule_path,
+                    rule_name,
+                    args.verify_yara_files,
+                    args.verbose,
+                    args.max_candidates,
+                    args.max_anchors_per_pattern,
+                    started_total,
+                    execution,
+                    multi_rule,
+                    index == 0,
+                )
+            });
+            if let Err(err) = result {
+                print_search_error(rule_path, rule_name, &err, multi_rule, index == 0);
+                exit_code = 1;
+            }
+        }
+        Ok(exit_code)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
 /// Runs the local forest `search` command and prints any resulting candidates.
 fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
     match (|| -> Result<i32> {
@@ -4825,17 +5977,79 @@ fn cmd_info(args: &InfoCommandArgs) -> i32 {
 
 /// Queries a remote server for status and prints the response as JSON.
 fn cmd_grpc_info(args: &InfoCommandArgs) -> i32 {
+    match is_multi_server_addr(&args.connection.addr) {
+        Ok(true) => cmd_grpc_info_multi(args),
+        Ok(false) => cmd_grpc_info_single(args),
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+fn info_client_connection(
+    connection: &InfoConnectionArgs,
+    addr: impl Into<String>,
+) -> ClientConnectionArgs {
+    ClientConnectionArgs {
+        addr: addr.into(),
+        timeout: connection.timeout,
+        max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        ignore_offline: connection.ignore_offline,
+    }
+}
+
+fn cmd_grpc_info_single(args: &InfoCommandArgs) -> i32 {
     match (|| -> Result<i32> {
-        let mut client = grpc_client(&ClientConnectionArgs {
-            addr: args.connection.addr.clone(),
-            timeout: args.connection.timeout,
-            max_message_bytes: DEFAULT_MAX_REQUEST_BYTES,
-        })?;
+        let mut client = grpc_client(&info_client_connection(
+            &args.connection,
+            args.connection.addr.clone(),
+        ))?;
         let status = client.status()?;
         println!(
             "{}",
             serde_json::to_string_pretty(&grpc_status_output_json(&status, !args.light))?
         );
+        Ok(0)
+    })() {
+        Ok(code) => code,
+        Err(err) => {
+            println!("{err}");
+            1
+        }
+    }
+}
+
+/// Queries every configured server and prints a JSON array of per-server
+/// status objects.
+fn cmd_grpc_info_multi(args: &InfoCommandArgs) -> i32 {
+    match (|| -> Result<i32> {
+        let addrs = split_server_addrs(&args.connection.addr)?;
+        let mut outputs = Vec::new();
+        for addr in addrs {
+            let connection = info_client_connection(&args.connection, addr.clone());
+            match (|| -> Result<serde_json::Value> {
+                let mut client = grpc_client(&connection)?;
+                let status = client.status()?;
+                let mut output = grpc_status_output_json(&status, !args.light);
+                if let Some(map) = output.as_object_mut() {
+                    map.insert("addr".to_owned(), serde_json::json!(addr));
+                }
+                Ok(output)
+            })() {
+                Ok(output) => outputs.push(output),
+                Err(err) if args.connection.ignore_offline => {
+                    warn_offline_server("info", &connection.addr, &err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if outputs.is_empty() {
+            return Err(SspryError::from(
+                "No reachable servers after applying --ignore-offline.",
+            ));
+        }
+        println!("{}", serde_json::to_string_pretty(&outputs)?);
         Ok(0)
     })() {
         Ok(code) => code,

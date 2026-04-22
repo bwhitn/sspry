@@ -51,6 +51,114 @@ fn info_over_tcp_returns_json_after_explicit_init() {
 }
 
 #[test]
+fn multi_server_remote_commands_cover_info_index_search_and_delete() {
+    let tmp = tempdir().expect("tmp");
+    let root_a = tmp.path().join("candidate_a");
+    let root_b = tmp.path().join("candidate_b");
+    let port_a = reserve_tcp_port();
+    let port_b = reserve_tcp_port();
+    let addr_a = tcp_addr(port_a);
+    let addr_b = tcp_addr(port_b);
+    let addrs = format!("{addr_a},{addr_b}");
+
+    init_root(&root_a, "workspace", &[]);
+    init_root(&root_b, "workspace", &[]);
+    let mut child_a = spawn_serve_tcp(port_a, &root_a, &[]);
+    let mut child_b = spawn_serve_tcp(port_b, &root_b, &[]);
+    wait_for_info_quick(&addr_a);
+    wait_for_info_quick(&addr_b);
+
+    let multi_info = run_ok(&["info", "--addr", &addrs]);
+    let parsed: Value = serde_json::from_str(&multi_info).expect("multi info json");
+    let servers = parsed.as_array().expect("multi info array");
+    assert_eq!(servers.len(), 2);
+    assert!(servers.iter().any(|server| {
+        server
+            .get("addr")
+            .and_then(Value::as_str)
+            .is_some_and(|addr| addr == addr_a)
+    }));
+    assert!(servers.iter().any(|server| {
+        server
+            .get("addr")
+            .and_then(Value::as_str)
+            .is_some_and(|addr| addr == addr_b)
+    }));
+    let offline_addr = tcp_addr(reserve_tcp_port());
+    let ignore_addr = format!("{addr_a},{offline_addr}");
+    let (ignore_stdout, ignore_stderr) =
+        run_ok_capture(&["info", "--addr", &ignore_addr, "--ignore-offline"]);
+    let parsed: Value = serde_json::from_str(&ignore_stdout).expect("ignore-offline info json");
+    assert_eq!(
+        parsed.as_array().expect("ignore-offline info array").len(),
+        1
+    );
+    assert!(
+        ignore_stderr.contains("warning.info.offline_server"),
+        "{ignore_stderr}"
+    );
+
+    let mut sample_paths = Vec::new();
+    for index in 0..34 {
+        let path = tmp.path().join(format!("sample_{index:02}.bin"));
+        let body = if index == 0 {
+            "alpha distributed sample unique 00".to_string()
+        } else {
+            format!("distributed sample unique {index:02}")
+        };
+        fs::write(&path, body).expect("write sample");
+        sample_paths.push(path);
+    }
+    let alpha = sample_paths[0].clone();
+    let mut index_args = vec![
+        "index".to_owned(),
+        "--addr".to_owned(),
+        addrs.clone(),
+        "--workers".to_owned(),
+        "1".to_owned(),
+    ];
+    index_args.extend(
+        sample_paths
+            .iter()
+            .map(|path| path.to_str().expect("sample path").to_owned()),
+    );
+    let index_stdout = run_ok_owned(&index_args);
+    assert!(
+        index_stdout.contains("multi_server_submitted_documents: 34"),
+        "{index_stdout}"
+    );
+    assert!(
+        index_stdout.contains("multi_server_processed_documents: 34"),
+        "{index_stdout}"
+    );
+    wait_for_published_doc_count_quick(&addr_a, 18, 1);
+    wait_for_published_doc_count_quick(&addr_b, 16, 1);
+
+    let alpha_rule = tmp.path().join("alpha.yar");
+    fs::write(
+        &alpha_rule,
+        r#"
+rule alpha_hit {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+"#,
+    )
+    .expect("write alpha rule");
+    wait_for_search_candidates(&addrs, &alpha_rule, 1);
+
+    run_ok(&["delete", "--addr", &addrs, alpha.to_str().expect("alpha")]);
+    wait_for_search_candidates(&addrs, &alpha_rule, 0);
+
+    let _ = child_a.kill();
+    let _ = child_a.wait();
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+}
+
+#[test]
 fn serve_requires_explicit_init() {
     let tmp = tempdir().expect("tmp");
     let root = tmp.path().join("candidate_db");
