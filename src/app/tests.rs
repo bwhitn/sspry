@@ -361,6 +361,7 @@ rule rule_two {
 
     let executions = collect_streamed_search_executions_batch(
         &args,
+        None,
         planned_rules,
         None,
         &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
@@ -491,6 +492,7 @@ rule rule_two {
 
     stream_search_executions_batch(
         &args,
+        None,
         planned_rules,
         None,
         &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
@@ -601,6 +603,240 @@ rule rule_two {
 }
 
 #[test]
+fn search_execution_accumulator_reports_external_id_backfills() {
+    let args = SearchCommandArgs {
+        connection: default_connection(),
+        rule: "sample.yar".to_owned(),
+        verify_yara_files: true,
+        max_candidates: 100.0,
+        max_anchors_per_pattern: 16,
+        verbose: false,
+    };
+    let mut accumulator = SearchExecutionAccumulator::default();
+
+    let first = accumulator
+        .apply_frame(
+            &args,
+            rpc::CandidateQueryStreamFrame {
+                identities: vec!["hash-a".to_owned(), "hash-b".to_owned()],
+                external_ids: Some(vec![None, Some("/tmp/b".to_owned())]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "sample".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            },
+            Duration::from_millis(1),
+        )
+        .expect("first frame");
+    assert_eq!(
+        first.accepted_rows,
+        vec![(0, None), (1, Some("/tmp/b".to_owned())),]
+    );
+    assert!(first.backfilled_rows.is_empty());
+
+    let second = accumulator
+        .apply_frame(
+            &args,
+            rpc::CandidateQueryStreamFrame {
+                identities: vec!["hash-a".to_owned()],
+                external_ids: Some(vec![Some("/tmp/a".to_owned())]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "sample".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            },
+            Duration::from_millis(2),
+        )
+        .expect("second frame");
+    assert!(second.accepted_rows.is_empty());
+    assert_eq!(second.backfilled_rows, vec![(0, "/tmp/a".to_owned())]);
+    assert_eq!(
+        accumulator.external_ids,
+        vec![Some("/tmp/a".to_owned()), Some("/tmp/b".to_owned())]
+    );
+}
+
+#[test]
+fn verify_search_candidates_parallel_preserves_match_then_skip_order() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("sample.yar");
+    let rule_text = r#"
+rule sample {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+"#;
+    fs::write(&rule_path, rule_text).expect("rule file");
+    let match_path = tmp.path().join("match.bin");
+    let miss_path = tmp.path().join("miss.bin");
+    let missing_path = tmp.path().join("missing.bin");
+    fs::write(&match_path, b"before alpha after").expect("match file");
+    fs::write(&miss_path, b"no literal here").expect("miss file");
+    let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+        rule_text,
+        "sample",
+        GramSizes::new(3, 4).expect("gram sizes"),
+        None,
+        16,
+        false,
+        true,
+        100.0,
+    )
+    .expect("compile plan");
+
+    let result = verify_search_candidates(
+        &rule_path,
+        Some("sample"),
+        &plan,
+        vec![
+            "skip-no-path".to_owned(),
+            "miss".to_owned(),
+            "match".to_owned(),
+            "skip-missing".to_owned(),
+        ],
+        vec![
+            None,
+            Some(miss_path.display().to_string()),
+            Some(match_path.display().to_string()),
+            Some(missing_path.display().to_string()),
+        ],
+        true,
+    )
+    .expect("verify candidates");
+
+    assert_eq!(
+        result.rows,
+        vec![
+            "match".to_owned(),
+            "skip-no-path".to_owned(),
+            "skip-missing".to_owned()
+        ]
+    );
+    assert_eq!(result.verified_checked, 2);
+    assert_eq!(result.verified_matched, 1);
+    assert_eq!(result.verified_skipped, 2);
+}
+
+#[test]
+fn collect_streamed_search_execution_preverifies_backfilled_rows() {
+    let tmp = tempdir().expect("tmp");
+    let rule_path = tmp.path().join("sample.yar");
+    let rule_text = r#"
+rule sample {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+"#;
+    fs::write(&rule_path, rule_text).expect("rule file");
+    let match_path = tmp.path().join("match.bin");
+    let miss_path = tmp.path().join("miss.bin");
+    fs::write(&match_path, b"alpha in file").expect("match file");
+    fs::write(&miss_path, b"no hit").expect("miss file");
+    let args = SearchCommandArgs {
+        connection: default_connection(),
+        rule: rule_path.display().to_string(),
+        verify_yara_files: true,
+        max_candidates: 100.0,
+        max_anchors_per_pattern: 16,
+        verbose: false,
+    };
+    let started_plan = Instant::now();
+    let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+        rule_text,
+        "sample",
+        GramSizes::new(3, 4).expect("gram sizes"),
+        None,
+        args.max_anchors_per_pattern,
+        false,
+        true,
+        args.max_candidates,
+    )
+    .expect("compile plan");
+
+    let execution = collect_streamed_search_execution(
+        &args,
+        Some(&rule_path),
+        "sample",
+        plan,
+        started_plan.elapsed(),
+        None,
+        &mut |on_frame: &mut dyn FnMut(rpc::CandidateQueryStreamFrame) -> Result<()>| {
+            on_frame(rpc::CandidateQueryStreamFrame {
+                identities: vec!["match-id".to_owned()],
+                external_ids: Some(vec![None]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "sample".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                identities: vec!["miss-id".to_owned()],
+                external_ids: Some(vec![Some(miss_path.display().to_string())]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "sample".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                identities: vec!["match-id".to_owned()],
+                external_ids: Some(vec![Some(match_path.display().to_string())]),
+                candidate_limit: Some(100),
+                stream_complete: false,
+                rule_complete: false,
+                target_rule_name: "sample".to_owned(),
+                tier_used: String::new(),
+                query_profile: CandidateQueryProfile::default(),
+                query_eval_nanos: 0,
+            })?;
+            on_frame(rpc::CandidateQueryStreamFrame {
+                identities: Vec::new(),
+                external_ids: None,
+                candidate_limit: Some(100),
+                stream_complete: true,
+                rule_complete: false,
+                target_rule_name: "sample".to_owned(),
+                tier_used: "tier1".to_owned(),
+                query_profile: CandidateQueryProfile {
+                    docs_scanned: 2,
+                    ..CandidateQueryProfile::default()
+                },
+                query_eval_nanos: 0,
+            })?;
+            Ok(())
+        },
+    )
+    .expect("collect streamed execution");
+
+    assert_eq!(
+        execution.rows,
+        vec!["match-id".to_owned(), "miss-id".to_owned()]
+    );
+    assert_eq!(execution.query_profile.docs_scanned, 2);
+    assert!(execution.verify_time.is_some());
+    let verification = execution.verification.expect("preverified results");
+    assert_eq!(verification.rows, vec!["match-id".to_owned()]);
+    assert_eq!(verification.verified_checked, 2);
+    assert_eq!(verification.verified_matched, 1);
+    assert_eq!(verification.verified_skipped, 0);
+}
+
+#[test]
 fn parse_host_port_accepts_common_forms() {
     assert_eq!(
         parse_host_port("127.0.0.1:17653").expect("ipv4"),
@@ -701,6 +937,8 @@ rule sample {
                 server_rss_kb: None,
                 plan_time: Duration::from_millis(1),
                 query_time: Duration::from_millis(2),
+                verification: None,
+                verify_time: None,
             }
         };
 
@@ -920,15 +1158,16 @@ fn resolve_ingest_workers_respects_explicit_override() {
 }
 
 #[test]
-fn default_search_workers_is_quarter_cpu_floor() {
+fn default_search_workers_matches_ingest_formula() {
     assert_eq!(default_search_workers_for(1), 1);
     assert_eq!(default_search_workers_for(2), 1);
     assert_eq!(default_search_workers_for(3), 1);
-    assert_eq!(default_search_workers_for(4), 1);
-    assert_eq!(default_search_workers_for(7), 1);
-    assert_eq!(default_search_workers_for(8), 2);
-    assert_eq!(default_search_workers_for(16), 4);
-    assert_eq!(default_search_workers_for(20), 5);
+    assert_eq!(default_search_workers_for(4), 2);
+    assert_eq!(default_search_workers_for(7), 3);
+    assert_eq!(default_search_workers_for(8), 6);
+    assert_eq!(default_search_workers_for(9), 6);
+    assert_eq!(default_search_workers_for(16), 12);
+    assert_eq!(default_search_workers_for(20), 15);
 }
 
 #[test]

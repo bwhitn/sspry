@@ -395,7 +395,7 @@ struct ServeCommonArgs {
     #[arg(
         long = "search-workers",
         default_value_t = default_search_workers(),
-        help = "Server-side search workers per search. Direct/workspace mode fans out across shards; forest mode fans out across shard/tree work units. Default is max(1, cpus/4)."
+        help = "Server-side search workers per search. Direct/workspace mode fans out across shards; forest mode fans out across shard/tree work units. Default matches index workers: max(1, cpus/2) below 8 CPUs, otherwise max(1, 3*cpus/4)."
     )]
     search_workers: usize,
     #[arg(

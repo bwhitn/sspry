@@ -90,7 +90,7 @@ Options:
   - server-side search workers per search
   - one top-level search runs at a time; later searches queue
   - the active search fans out across at most this many shard/tree work units concurrently
-  - default is `max(1, cpus/4)`
+  - default matches `index`: `max(1, cpus/2)` below `8` CPUs, otherwise `max(1, 3*cpus/4)`
 - `--root <path>`
   - root path to open
   - auto-detected as one of:

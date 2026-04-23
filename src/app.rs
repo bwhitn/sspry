@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use md5::Md5;
 use serde::Serialize;
 use sha1::Sha1;
@@ -314,14 +314,29 @@ fn resolve_ingest_workers(
     }
 }
 
-/// Chooses a conservative default search worker count from the available CPUs.
+/// Chooses the default search worker count from the available CPUs.
 fn default_search_workers_for(cpus: usize) -> usize {
-    (cpus.max(1) / 4).max(1)
+    default_ingest_workers_for(cpus)
 }
 
 /// Chooses the process default search worker count from host parallelism.
 fn default_search_workers() -> usize {
     default_search_workers_for(
+        std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1),
+    )
+}
+
+/// Chooses a small client-side verification pool so verification can overlap
+/// search streaming without turning result checks into a thread explosion.
+fn default_verify_workers_for(cpus: usize) -> usize {
+    (cpus.max(1) / 2).clamp(1, 4)
+}
+
+/// Chooses the process default verification worker count from host parallelism.
+fn default_verify_workers() -> usize {
+    default_verify_workers_for(
         std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1),
@@ -1952,6 +1967,8 @@ struct SearchExecution {
     server_rss_kb: Option<(u64, u64)>,
     plan_time: Duration,
     query_time: Duration,
+    verification: Option<SearchVerificationResult>,
+    verify_time: Option<Duration>,
 }
 
 /// Collects streamed candidate rows and terminal profile data for one rule so
@@ -1967,6 +1984,13 @@ struct SearchExecutionAccumulator {
     truncated: bool,
     truncated_limit: Option<usize>,
     terminal_received: bool,
+    query_time: Option<Duration>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SearchStreamVerificationUpdates {
+    accepted_rows: Vec<(usize, Option<String>)>,
+    backfilled_rows: Vec<(usize, String)>,
 }
 
 impl SearchExecutionAccumulator {
@@ -1976,15 +2000,18 @@ impl SearchExecutionAccumulator {
         &mut self,
         args: &SearchCommandArgs,
         frame: rpc::CandidateQueryStreamFrame,
-    ) -> Result<()> {
+        query_time: Duration,
+    ) -> Result<SearchStreamVerificationUpdates> {
+        let mut updates = SearchStreamVerificationUpdates::default();
         if self.truncated_limit.is_none() {
             self.truncated_limit = frame.candidate_limit;
         }
         if frame.rule_complete || frame.stream_complete {
             self.terminal_received = true;
+            self.query_time.get_or_insert(query_time);
             self.tier_used = frame.tier_used;
             self.query_profile = frame.query_profile;
-            return Ok(());
+            return Ok(updates);
         }
 
         let mut frame_external_ids = frame.external_ids.unwrap_or_default();
@@ -2005,7 +2032,10 @@ impl SearchExecutionAccumulator {
                         .is_some_and(Option::is_none)
                     && external_id.is_some()
                 {
-                    self.external_ids[existing_idx] = external_id;
+                    self.external_ids[existing_idx] = external_id.clone();
+                    if let Some(external_id) = external_id {
+                        updates.backfilled_rows.push((existing_idx, external_id));
+                    }
                 }
                 continue;
             }
@@ -2016,15 +2046,17 @@ impl SearchExecutionAccumulator {
                 self.truncated = true;
                 continue;
             }
+            let accepted_index = self.rows.len();
             self.accepted_positions
-                .insert(identity.clone(), self.rows.len());
+                .insert(identity.clone(), accepted_index);
             self.total_candidates = self.total_candidates.saturating_add(1);
             self.rows.push(identity);
             if args.verify_yara_files {
-                self.external_ids.push(external_id);
+                self.external_ids.push(external_id.clone());
+                updates.accepted_rows.push((accepted_index, external_id));
             }
         }
-        Ok(())
+        Ok(updates)
     }
 
     /// Finalizes one rule's collected frames into the search summary rendered
@@ -2049,16 +2081,276 @@ impl SearchExecutionAccumulator {
             search_workers: None,
             server_rss_kb,
             plan_time,
-            query_time,
+            query_time: self.query_time.unwrap_or(query_time),
+            verification: None,
+            verify_time: None,
         }
     }
 }
 
+#[derive(Debug)]
 struct SearchVerificationResult {
     rows: Vec<String>,
     verified_checked: usize,
     verified_matched: usize,
     verified_skipped: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationRowState {
+    Pending,
+    Queued,
+    Matched,
+    NotMatched,
+    Skipped,
+}
+
+#[derive(Debug)]
+struct VerificationJob {
+    index: usize,
+    candidate_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct VerificationJobOutcome {
+    index: usize,
+    matched: bool,
+}
+
+/// Rechecks candidate files in a small worker pool so remote searches can
+/// overlap result verification with streamed server responses.
+struct SearchVerificationPipeline {
+    row_states: Vec<VerificationRowState>,
+    job_tx: Option<Sender<VerificationJob>>,
+    result_rx: Receiver<std::result::Result<VerificationJobOutcome, String>>,
+    handles: Vec<thread::JoinHandle<()>>,
+    worker_error: Option<String>,
+}
+
+impl SearchVerificationPipeline {
+    fn new(
+        rule_path: &Path,
+        target_rule_name: Option<&str>,
+        plan: &crate::candidate::CompiledQueryPlan,
+    ) -> Self {
+        let worker_count = default_verify_workers();
+        let queue_capacity = worker_count.saturating_mul(8).max(32);
+        let (job_tx, job_rx) = bounded::<VerificationJob>(queue_capacity);
+        let (result_tx, result_rx) =
+            unbounded::<std::result::Result<VerificationJobOutcome, String>>();
+        let literal_plan = fixed_literal_match_plan(plan);
+        let target_rule_name = target_rule_name.map(str::to_owned);
+        let rule_path = rule_path.to_path_buf();
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            let literal_plan = literal_plan.clone();
+            let rule_path = rule_path.clone();
+            let target_rule_name = target_rule_name.clone();
+            handles.push(thread::spawn(move || {
+                let mut yara_rules = None::<Arc<YaraRules>>;
+                while let Ok(job) = job_rx.recv() {
+                    let matched = (|| -> Result<bool> {
+                        if let Some(plan) = literal_plan.as_ref() {
+                            match verify_fixed_literal_plan_on_file(&job.candidate_path, plan) {
+                                Ok(matched) => Ok(matched),
+                                Err(_) => {
+                                    if yara_rules.is_none() {
+                                        yara_rules =
+                                            Some(compile_yara_verifier_cached(&rule_path)?);
+                                    }
+                                    scan_candidate_matches_rule(
+                                        yara_rules.as_ref().expect("cached YARA rules"),
+                                        &job.candidate_path,
+                                        target_rule_name.as_deref(),
+                                    )
+                                }
+                            }
+                        } else {
+                            if yara_rules.is_none() {
+                                yara_rules = Some(compile_yara_verifier_cached(&rule_path)?);
+                            }
+                            scan_candidate_matches_rule(
+                                yara_rules.as_ref().expect("cached YARA rules"),
+                                &job.candidate_path,
+                                target_rule_name.as_deref(),
+                            )
+                        }
+                    })();
+                    if result_tx
+                        .send(
+                            matched
+                                .map(|matched| VerificationJobOutcome {
+                                    index: job.index,
+                                    matched,
+                                })
+                                .map_err(|err| err.to_string()),
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(result_tx);
+        Self {
+            row_states: Vec::new(),
+            job_tx: Some(job_tx),
+            result_rx,
+            handles,
+            worker_error: None,
+        }
+    }
+
+    fn apply_updates(&mut self, updates: SearchStreamVerificationUpdates) -> Result<()> {
+        self.drain_ready_results()?;
+        for (index, external_id) in updates.accepted_rows {
+            self.accept_row(index, external_id)?;
+        }
+        for (index, external_id) in updates.backfilled_rows {
+            self.backfill_row(index, external_id)?;
+        }
+        self.drain_ready_results()
+    }
+
+    fn accept_row(&mut self, index: usize, external_id: Option<String>) -> Result<()> {
+        if index != self.row_states.len() {
+            return Err(SspryError::from(
+                "Search verification queue received out-of-order candidate rows.",
+            ));
+        }
+        self.row_states.push(VerificationRowState::Pending);
+        if let Some(external_id) = external_id {
+            self.queue_row(index, external_id)?;
+        }
+        Ok(())
+    }
+
+    fn backfill_row(&mut self, index: usize, external_id: String) -> Result<()> {
+        match self.row_states.get(index).copied() {
+            Some(VerificationRowState::Pending) => self.queue_row(index, external_id),
+            Some(_) => Ok(()),
+            None => Err(SspryError::from(
+                "Search verification queue received an unknown candidate index.",
+            )),
+        }
+    }
+
+    fn queue_row(&mut self, index: usize, external_id: String) -> Result<()> {
+        self.take_worker_error()?;
+        if !matches!(
+            self.row_states.get(index).copied(),
+            Some(VerificationRowState::Pending)
+        ) {
+            return Ok(());
+        }
+        let candidate_path = PathBuf::from(external_id);
+        if !candidate_path.is_file() {
+            self.row_states[index] = VerificationRowState::Skipped;
+            return Ok(());
+        }
+        self.job_tx
+            .as_ref()
+            .ok_or_else(|| {
+                SspryError::from("Search verification queue closed before candidates finished.")
+            })?
+            .send(VerificationJob {
+                index,
+                candidate_path,
+            })
+            .map_err(|_| SspryError::from("Search verification workers exited unexpectedly."))?;
+        self.row_states[index] = VerificationRowState::Queued;
+        Ok(())
+    }
+
+    fn drain_ready_results(&mut self) -> Result<()> {
+        while let Ok(outcome) = self.result_rx.try_recv() {
+            match outcome {
+                Ok(outcome) => {
+                    let Some(state) = self.row_states.get_mut(outcome.index) else {
+                        return Err(SspryError::from(
+                            "Search verification worker returned an unknown candidate index.",
+                        ));
+                    };
+                    *state = if outcome.matched {
+                        VerificationRowState::Matched
+                    } else {
+                        VerificationRowState::NotMatched
+                    };
+                }
+                Err(err) => {
+                    if self.worker_error.is_none() {
+                        self.worker_error = Some(err);
+                    }
+                }
+            }
+        }
+        self.take_worker_error()
+    }
+
+    fn finish(mut self, rows: &[String]) -> Result<SearchVerificationResult> {
+        self.drain_ready_results()?;
+        drop(self.job_tx.take());
+        for handle in self.handles.drain(..) {
+            handle
+                .join()
+                .map_err(|_| SspryError::from("Search verification worker panicked."))?;
+        }
+        self.drain_ready_results()?;
+        if self.row_states.len() < rows.len() {
+            return Err(SspryError::from(
+                "Search verification did not receive every candidate row.",
+            ));
+        }
+
+        let mut verified_rows = Vec::<String>::new();
+        let mut unverified_rows = Vec::<String>::new();
+        let mut verified_checked = 0usize;
+        let mut verified_matched = 0usize;
+        let mut verified_skipped = 0usize;
+        for (index, identity) in rows.iter().cloned().enumerate() {
+            match self.row_states.get(index).copied() {
+                Some(VerificationRowState::Matched) => {
+                    verified_checked += 1;
+                    verified_matched += 1;
+                    verified_rows.push(identity);
+                }
+                Some(VerificationRowState::NotMatched) => {
+                    verified_checked += 1;
+                }
+                Some(VerificationRowState::Pending | VerificationRowState::Skipped) => {
+                    verified_skipped += 1;
+                    unverified_rows.push(identity);
+                }
+                Some(VerificationRowState::Queued) => {
+                    return Err(SspryError::from(
+                        "Search verification workers exited before finishing queued candidates.",
+                    ));
+                }
+                None => {
+                    return Err(SspryError::from(
+                        "Search verification result missing candidate state.",
+                    ));
+                }
+            }
+        }
+        verified_rows.extend(unverified_rows);
+        Ok(SearchVerificationResult {
+            rows: verified_rows,
+            verified_checked,
+            verified_matched,
+            verified_skipped,
+        })
+    }
+
+    fn take_worker_error(&mut self) -> Result<()> {
+        if let Some(err) = self.worker_error.take() {
+            return Err(SspryError::from(err));
+        }
+        Ok(())
+    }
 }
 
 struct RemoteSearchContext {
@@ -2362,84 +2654,20 @@ fn verify_search_candidates(
     if external_ids.len() < rows.len() {
         external_ids.resize(rows.len(), None);
     }
-    let literal_plan = fixed_literal_match_plan(plan);
-    let mut yara_rules = None::<Arc<YaraRules>>;
-    let mut verified_rows = Vec::<String>::new();
-    let mut verified_checked = 0usize;
-    let mut verified_matched = 0usize;
-    let mut verified_skipped = 0usize;
-    let mut unverified_rows = Vec::<String>::new();
-    let mut page_results = vec![None::<bool>; rows.len()];
-    let mut skipped_results = vec![false; rows.len()];
-    let mut verify_jobs = Vec::<(usize, String, PathBuf)>::new();
-    for (index, (identity, external_id)) in rows
-        .iter()
-        .cloned()
-        .zip(external_ids.into_iter())
-        .enumerate()
-    {
-        let Some(path_text) = external_id else {
-            verified_skipped += 1;
-            skipped_results[index] = true;
-            continue;
-        };
-        let candidate_path = PathBuf::from(path_text);
-        if !candidate_path.is_file() {
-            verified_skipped += 1;
-            skipped_results[index] = true;
-            continue;
-        }
-        verify_jobs.push((index, identity, candidate_path));
+    if rows.is_empty() {
+        return Ok(SearchVerificationResult {
+            rows,
+            verified_checked: 0,
+            verified_matched: 0,
+            verified_skipped: 0,
+        });
     }
-    for (index, _identity, candidate_path) in verify_jobs {
-        verified_checked += 1;
-        let matched = if let Some(plan) = &literal_plan {
-            match verify_fixed_literal_plan_on_file(&candidate_path, plan) {
-                Ok(matched) => matched,
-                Err(_) => {
-                    if yara_rules.is_none() {
-                        yara_rules = Some(compile_yara_verifier_cached(rule_path)?);
-                    }
-                    scan_candidate_matches_rule(
-                        yara_rules.as_ref().expect("cached YARA rules"),
-                        &candidate_path,
-                        target_rule_name,
-                    )?
-                }
-            }
-        } else {
-            if yara_rules.is_none() {
-                yara_rules = Some(compile_yara_verifier_cached(rule_path)?);
-            }
-            scan_candidate_matches_rule(
-                yara_rules.as_ref().expect("cached YARA rules"),
-                &candidate_path,
-                target_rule_name,
-            )?
-        };
-        page_results[index] = Some(matched);
-    }
-    for (index, identity) in rows.iter().cloned().enumerate() {
-        match page_results.get(index).copied().flatten() {
-            Some(true) => {
-                verified_matched += 1;
-                verified_rows.push(identity);
-            }
-            Some(false) => {}
-            None => {
-                if skipped_results[index] {
-                    unverified_rows.push(identity);
-                }
-            }
-        }
-    }
-    verified_rows.extend(unverified_rows);
-    Ok(SearchVerificationResult {
-        rows: verified_rows,
-        verified_checked,
-        verified_matched,
-        verified_skipped,
-    })
+    let mut verifier = SearchVerificationPipeline::new(rule_path, target_rule_name, plan);
+    verifier.apply_updates(SearchStreamVerificationUpdates {
+        accepted_rows: external_ids.into_iter().enumerate().collect(),
+        backfilled_rows: Vec::new(),
+    })?;
+    verifier.finish(&rows)
 }
 
 #[derive(Debug)]
@@ -5063,6 +5291,8 @@ fn cmd_rule_check(args: &RuleCheckArgs) -> i32 {
 /// summary, optionally preserving external ids for verification.
 fn collect_streamed_search_execution<F>(
     args: &SearchCommandArgs,
+    verification_rule_path: Option<&Path>,
+    rule_name: &str,
     plan: CompiledQueryPlan,
     plan_time: Duration,
     server_rss_kb: Option<(u64, u64)>,
@@ -5073,8 +5303,24 @@ where
 {
     let started_query = Instant::now();
     let mut accumulator = SearchExecutionAccumulator::default();
-    pump(&mut |frame| accumulator.apply_frame(args, frame))?;
-    Ok(accumulator.into_execution(plan, server_rss_kb, plan_time, started_query.elapsed()))
+    let mut verifier = verification_rule_path
+        .filter(|_| args.verify_yara_files)
+        .map(|rule_path| SearchVerificationPipeline::new(rule_path, Some(rule_name), &plan));
+    pump(&mut |frame| {
+        let updates = accumulator.apply_frame(args, frame, started_query.elapsed())?;
+        if let Some(verifier) = verifier.as_mut() {
+            verifier.apply_updates(updates)?;
+        }
+        Ok(())
+    })?;
+    let mut execution =
+        accumulator.into_execution(plan, server_rss_kb, plan_time, started_query.elapsed());
+    if let Some(verifier) = verifier {
+        let started_verify = Instant::now();
+        execution.verification = Some(verifier.finish(&execution.rows)?);
+        execution.verify_time = Some(started_verify.elapsed());
+    }
+    Ok(execution)
 }
 
 /// Flushes any consecutively completed bundled-rule accumulators in source
@@ -5083,6 +5329,7 @@ where
 fn flush_streamed_search_executions_batch<G>(
     pending_rules: &mut [Option<(String, CompiledQueryPlan, Duration)>],
     accumulators: &mut [SearchExecutionAccumulator],
+    verifiers: &mut [Option<SearchVerificationPipeline>],
     next_rule_index: &mut usize,
     server_rss_kb: Option<(u64, u64)>,
     query_time: Duration,
@@ -5097,12 +5344,17 @@ where
         let (rule_name, plan, plan_time) = pending_rules[index]
             .take()
             .ok_or_else(|| SspryError::from("Bundled search rule state was already finalized."))?;
-        let execution = std::mem::take(&mut accumulators[index]).into_execution(
+        let mut execution = std::mem::take(&mut accumulators[index]).into_execution(
             plan,
             server_rss_kb,
             plan_time,
             query_time,
         );
+        if let Some(verifier) = verifiers[index].take() {
+            let started_verify = Instant::now();
+            execution.verification = Some(verifier.finish(&execution.rows)?);
+            execution.verify_time = Some(started_verify.elapsed());
+        }
         on_execution(rule_name, execution, index)?;
         *next_rule_index += 1;
     }
@@ -5113,6 +5365,7 @@ where
 /// caller as soon as its terminal frame arrives, preserving source order.
 fn stream_search_executions_batch<F, G>(
     args: &SearchCommandArgs,
+    verification_rule_path: Option<&Path>,
     planned_rules: Vec<(String, CompiledQueryPlan, Duration)>,
     server_rss_kb: Option<(u64, u64)>,
     mut pump: F,
@@ -5133,6 +5386,19 @@ where
         .iter()
         .map(|_| SearchExecutionAccumulator::default())
         .collect::<Vec<_>>();
+    let mut verifiers = pending_rules
+        .iter()
+        .map(|rule| {
+            verification_rule_path
+                .filter(|_| args.verify_yara_files)
+                .map(|rule_path| {
+                    let (rule_name, plan, _) = rule
+                        .as_ref()
+                        .expect("planned bundled rule remains available while initializing");
+                    SearchVerificationPipeline::new(rule_path, Some(rule_name), plan)
+                })
+        })
+        .collect::<Vec<_>>();
     let mut next_rule_index = 0usize;
     let mut stream_complete = false;
 
@@ -5147,10 +5413,14 @@ where
                 frame.target_rule_name
             )));
         };
-        accumulators[rule_index].apply_frame(args, frame)?;
+        let updates = accumulators[rule_index].apply_frame(args, frame, started_query.elapsed())?;
+        if let Some(verifier) = verifiers[rule_index].as_mut() {
+            verifier.apply_updates(updates)?;
+        }
         flush_streamed_search_executions_batch(
             &mut pending_rules,
             &mut accumulators,
+            &mut verifiers,
             &mut next_rule_index,
             server_rss_kb,
             started_query.elapsed(),
@@ -5161,6 +5431,7 @@ where
     flush_streamed_search_executions_batch(
         &mut pending_rules,
         &mut accumulators,
+        &mut verifiers,
         &mut next_rule_index,
         server_rss_kb,
         started_query.elapsed(),
@@ -5185,6 +5456,7 @@ where
 #[cfg(test)]
 fn collect_streamed_search_executions_batch<F>(
     args: &SearchCommandArgs,
+    verification_rule_path: Option<&Path>,
     planned_rules: Vec<(String, CompiledQueryPlan, Duration)>,
     server_rss_kb: Option<(u64, u64)>,
     mut pump: F,
@@ -5195,6 +5467,7 @@ where
     let mut results = Vec::with_capacity(planned_rules.len());
     stream_search_executions_batch(
         args,
+        verification_rule_path,
         planned_rules,
         server_rss_kb,
         &mut pump,
@@ -5276,10 +5549,11 @@ fn print_search_error(
 /// policy and draining the streamed result frames.
 fn execute_grpc_search_rule(
     args: &SearchCommandArgs,
-    _rule_path: &Path,
+    rule_path: &Path,
     rule_text: &str,
     rule_name: &str,
     context: &mut RemoteSearchContext,
+    preverify_streamed_results: bool,
 ) -> Result<SearchExecution> {
     let started_plan = Instant::now();
     let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
@@ -5293,21 +5567,29 @@ fn execute_grpc_search_rule(
         args.max_candidates,
     )?;
     let plan_time = started_plan.elapsed();
-    collect_streamed_search_execution(args, plan, plan_time, None, |on_frame| {
-        context.client.search_stream(
-            grpc::v1::SearchRequest {
-                yara_rule_source: rule_text.to_owned(),
-                target_rule_name: rule_name.to_owned(),
-                chunk_size: DEFAULT_SEARCH_RESULT_CHUNK_SIZE as u32,
-                include_external_ids: args.verify_yara_files,
-                max_candidates_percent: args.max_candidates,
-                max_anchors_per_pattern: args.max_anchors_per_pattern as u32,
-                force_tier1_only: false,
-                allow_tier2_fallback: true,
-            },
-            |frame| on_frame(grpc_search_frame_to_internal(frame)),
-        )
-    })
+    collect_streamed_search_execution(
+        args,
+        preverify_streamed_results.then_some(rule_path),
+        rule_name,
+        plan,
+        plan_time,
+        None,
+        |on_frame| {
+            context.client.search_stream(
+                grpc::v1::SearchRequest {
+                    yara_rule_source: rule_text.to_owned(),
+                    target_rule_name: rule_name.to_owned(),
+                    chunk_size: DEFAULT_SEARCH_RESULT_CHUNK_SIZE as u32,
+                    include_external_ids: args.verify_yara_files,
+                    max_candidates_percent: args.max_candidates,
+                    max_anchors_per_pattern: args.max_anchors_per_pattern as u32,
+                    force_tier1_only: false,
+                    allow_tier2_fallback: true,
+                },
+                |frame| on_frame(grpc_search_frame_to_internal(frame)),
+            )
+        },
+    )
 }
 
 /// Compiles one client-side rule plan using the server policy so output and
@@ -5336,6 +5618,7 @@ fn compile_grpc_search_plan(
 /// the caller as soon as it is available.
 fn execute_grpc_search_bundle_streaming<G>(
     args: &SearchCommandArgs,
+    verification_rule_path: Option<&Path>,
     rule_text: &str,
     rule_names: &[String],
     context: &mut RemoteSearchContext,
@@ -5353,6 +5636,7 @@ where
         .collect::<Result<Vec<_>>>()?;
     stream_search_executions_batch(
         args,
+        verification_rule_path,
         planned_rules,
         None,
         |on_frame| {
@@ -5427,6 +5711,8 @@ fn merge_distributed_search_executions(
         server_rss_kb,
         plan_time,
         query_time,
+        verification: _,
+        verify_time: _,
     } = first;
 
     let mut merged_rows = Vec::new();
@@ -5531,6 +5817,8 @@ fn merge_distributed_search_executions(
         server_rss_kb: merged_server_rss,
         plan_time: merged_plan_time,
         query_time: merged_query_time,
+        verification: None,
+        verify_time: None,
     })
 }
 
@@ -5577,6 +5865,8 @@ fn execute_local_search_rule(
         server_rss_kb: None,
         plan_time,
         query_time,
+        verification: None,
+        verify_time: None,
     })
 }
 
@@ -5590,20 +5880,27 @@ fn finish_search_execution(
     max_candidates: f64,
     max_anchors_per_pattern: usize,
     started_total: Instant,
-    execution: SearchExecution,
+    mut execution: SearchExecution,
     multi_rule: bool,
     first_rule: bool,
 ) -> Result<()> {
-    let started_verify = Instant::now();
-    let verification = verify_search_candidates(
-        rule_path,
-        Some(rule_name),
-        &execution.plan,
-        execution.rows,
-        execution.external_ids,
-        verify_yara_files,
-    )?;
-    let verify_time = started_verify.elapsed();
+    let (verification, verify_time) = if let Some(verification) = execution.verification.take() {
+        (
+            verification,
+            execution.verify_time.unwrap_or(Duration::ZERO),
+        )
+    } else {
+        let started_verify = Instant::now();
+        let verification = verify_search_candidates(
+            rule_path,
+            Some(rule_name),
+            &execution.plan,
+            execution.rows,
+            execution.external_ids,
+            verify_yara_files,
+        )?;
+        (verification, started_verify.elapsed())
+    };
     let SearchVerificationResult {
         rows,
         verified_checked,
@@ -5741,6 +6038,7 @@ fn cmd_grpc_search_single(args: &SearchCommandArgs) -> i32 {
             let mut exit_code = 0;
             execute_grpc_search_bundle_streaming(
                 args,
+                Some(rule_path),
                 &rule_text,
                 &rule_names,
                 &mut context,
@@ -5771,22 +6069,28 @@ fn cmd_grpc_search_single(args: &SearchCommandArgs) -> i32 {
         let mut exit_code = 0;
         for (index, rule_name) in rule_names.iter().enumerate() {
             let started_total = Instant::now();
-            let result =
-                execute_grpc_search_rule(args, rule_path, &rule_text, rule_name, &mut context)
-                    .and_then(|execution| {
-                        finish_search_execution(
-                            rule_path,
-                            rule_name,
-                            args.verify_yara_files,
-                            args.verbose,
-                            args.max_candidates,
-                            args.max_anchors_per_pattern,
-                            started_total,
-                            execution,
-                            multi_rule,
-                            index == 0,
-                        )
-                    });
+            let result = execute_grpc_search_rule(
+                args,
+                rule_path,
+                &rule_text,
+                rule_name,
+                &mut context,
+                true,
+            )
+            .and_then(|execution| {
+                finish_search_execution(
+                    rule_path,
+                    rule_name,
+                    args.verify_yara_files,
+                    args.verbose,
+                    args.max_candidates,
+                    args.max_anchors_per_pattern,
+                    started_total,
+                    execution,
+                    multi_rule,
+                    index == 0,
+                )
+            });
             if let Err(err) = result {
                 print_search_error(rule_path, rule_name, &err, multi_rule, index == 0);
                 exit_code = 1;
@@ -5839,6 +6143,7 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
                 let server_args = search_args_for_endpoint(args, endpoint, 0.0);
                 execute_grpc_search_bundle_streaming(
                     &server_args,
+                    None,
                     &rule_text,
                     &rule_names,
                     context,
@@ -5892,6 +6197,7 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
                     &rule_text,
                     rule_name,
                     context,
+                    false,
                 )?);
             }
             let result = merge_distributed_search_executions(

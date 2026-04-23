@@ -79,7 +79,7 @@ Key options:
   - one active top-level search per server
   - direct/workspace mode fans out over shard work units
   - forest mode fans out over `(tree, shard)` work units
-  - default is `max(1, cpus/4)`
+  - default matches `index`: `max(1, cpus/2)` below `8` CPUs, otherwise `max(1, 3*cpus/4)`
 - `--root <ROOT>`
   - workspace root, direct store root, or forest root
   - default `candidate_db`
