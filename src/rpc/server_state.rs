@@ -404,22 +404,54 @@ impl ServerState {
                     "Search request does not contain a searchable rule.",
                 ));
             }
-            let plans = rule_names
-                .iter()
-                .map(|rule_name| {
-                    compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
-                        &request.yara_rule_source,
-                        rule_name,
-                        gram_sizes,
-                        Some(id_source.as_str()),
-                        max_anchors_per_pattern,
-                        request.force_tier1_only,
-                        request.allow_tier2_fallback,
-                        request.max_candidates_percent,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(rule_names.into_iter().zip(plans.into_iter()).collect())
+            if rule_names.len() <= 1 {
+                let plans = rule_names
+                    .iter()
+                    .map(|rule_name| {
+                        compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                            &request.yara_rule_source,
+                            rule_name,
+                            gram_sizes,
+                            Some(id_source.as_str()),
+                            max_anchors_per_pattern,
+                            request.force_tier1_only,
+                            request.allow_tier2_fallback,
+                            request.max_candidates_percent,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(rule_names.into_iter().zip(plans.into_iter()).collect());
+            }
+            let source = request.yara_rule_source.as_str();
+            let id_source = id_source.as_str();
+            std::thread::scope(|scope| -> Result<Vec<(String, CompiledQueryPlan)>> {
+                let mut handles = Vec::with_capacity(rule_names.len());
+                for rule_name in &rule_names {
+                    handles.push(scope.spawn(move || {
+                        let plan =
+                            compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                                source,
+                                rule_name,
+                                gram_sizes,
+                                Some(id_source),
+                                max_anchors_per_pattern,
+                                request.force_tier1_only,
+                                request.allow_tier2_fallback,
+                                request.max_candidates_percent,
+                            )?;
+                        Ok::<_, SspryError>((rule_name.clone(), plan))
+                    }));
+                }
+                let mut planned = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    planned.push(
+                        handle
+                            .join()
+                            .map_err(|_| SspryError::from("Bundled search plan worker panicked."))??,
+                    );
+                }
+                Ok(planned)
+            })
         } else {
             Ok(vec![(
                 request.target_rule_name.clone(),

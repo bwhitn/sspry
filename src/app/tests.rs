@@ -1,7 +1,9 @@
 use super::*;
 use tempfile::tempdir;
 
-use crate::candidate::{CandidateConfig, QueryNode};
+use crate::candidate::{
+    CandidateConfig, DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE, QueryNode,
+};
 use crate::grpc::GrpcSearchFrame;
 
 fn default_connection() -> ClientConnectionArgs {
@@ -696,7 +698,7 @@ rule sample {
         &rule_path,
         Some("sample"),
         &plan,
-        vec![
+        &[
             "skip-no-path".to_owned(),
             "miss".to_owned(),
             "match".to_owned(),
@@ -712,14 +714,8 @@ rule sample {
     )
     .expect("verify candidates");
 
-    assert_eq!(
-        result.rows,
-        vec![
-            "match".to_owned(),
-            "skip-no-path".to_owned(),
-            "skip-missing".to_owned()
-        ]
-    );
+    let rendered_indexes: Vec<_> = result.display_row_indexes().collect();
+    assert_eq!(rendered_indexes, vec![2, 0, 3]);
     assert_eq!(result.verified_checked, 2);
     assert_eq!(result.verified_matched, 1);
     assert_eq!(result.verified_skipped, 2);
@@ -830,7 +826,8 @@ rule sample {
     assert_eq!(execution.query_profile.docs_scanned, 2);
     assert!(execution.verify_time.is_some());
     let verification = execution.verification.expect("preverified results");
-    assert_eq!(verification.rows, vec!["match-id".to_owned()]);
+    let rendered_indexes: Vec<_> = verification.display_row_indexes().collect();
+    assert_eq!(rendered_indexes, vec![0]);
     assert_eq!(verification.verified_checked, 2);
     assert_eq!(verification.verified_matched, 1);
     assert_eq!(verification.verified_skipped, 0);
@@ -1959,6 +1956,91 @@ fn public_ingest_and_delete_follow_server_identity_source() {
             values: vec![hex::encode(md5_file(&sample, 1024).expect("md5"))],
         }),
         0
+    );
+}
+
+#[test]
+fn query_store_group_all_candidates_counts_paginated_profiles_once_per_store() {
+    let tmp = tempdir().expect("tmp");
+    let root = tmp.path().join("candidate_db");
+    let sample = tmp.path().join("sample.bin");
+    fs::write(&sample, b"ABCDEF").expect("sample");
+    let mut store = CandidateStore::init(
+        CandidateConfig {
+            root,
+            filter_target_fp: None,
+            tier1_filter_target_fp: None,
+            tier2_filter_target_fp: None,
+            ..CandidateConfig::default()
+        },
+        true,
+    )
+    .expect("init");
+
+    let filter_bytes = 8;
+    let bloom_hashes = 3;
+    let tier2_filter_bytes = 8;
+    let tier2_bloom_hashes = 3;
+    let features = scan_file_features_bloom_only_with_gram_sizes(
+        &sample,
+        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
+            .expect("default gram sizes"),
+        filter_bytes,
+        bloom_hashes,
+        tier2_filter_bytes,
+        tier2_bloom_hashes,
+        4 * 1024,
+        None,
+    )
+    .expect("scan sample");
+    let doc_count = DEFAULT_SEARCH_RESULT_CHUNK_SIZE + 100;
+
+    for index in 0..doc_count {
+        let mut identity = [0u8; 32];
+        identity[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        store
+            .insert_document(
+                identity,
+                features.file_size,
+                None,
+                Some(bloom_hashes),
+                None,
+                Some(tier2_bloom_hashes),
+                filter_bytes,
+                &features.bloom_filter,
+                tier2_filter_bytes,
+                &features.tier2_bloom_filter,
+                Some(format!("doc-{index}")),
+            )
+            .expect("insert document");
+    }
+
+    let plan = crate::candidate::query_plan::compile_query_plan_with_gram_sizes(
+        r#"
+rule q {
+  strings:
+    $a = "ABC"
+  condition:
+    $a
+}
+"#,
+        GramSizes::new(DEFAULT_TIER1_GRAM_SIZE, DEFAULT_TIER2_GRAM_SIZE)
+            .expect("default gram sizes"),
+        8,
+        true,
+        true,
+        100_000,
+    )
+    .expect("plan");
+
+    let aggregate = query_store_group_all_candidates(std::slice::from_mut(&mut store), &plan, true)
+        .expect("aggregate");
+
+    assert_eq!(aggregate.identities.len(), doc_count);
+    assert_eq!(aggregate.query_profile.docs_scanned as usize, doc_count);
+    assert_eq!(
+        aggregate.query_profile.tier1_bloom_loads as usize,
+        doc_count
     );
 }
 

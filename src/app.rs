@@ -1942,17 +1942,6 @@ struct LocalTreeQueryAggregate {
 }
 
 #[derive(Debug)]
-struct LocalForestQueryAggregate {
-    identities: Vec<String>,
-    total_candidates: usize,
-    truncated: bool,
-    truncated_limit: Option<usize>,
-    tier_used: String,
-    query_profile: crate::candidate::CandidateQueryProfile,
-    external_ids: Option<Vec<Option<String>>>,
-}
-
-#[derive(Debug)]
 struct SearchExecution {
     plan: CompiledQueryPlan,
     total_candidates: usize,
@@ -1994,38 +1983,33 @@ struct SearchStreamVerificationUpdates {
 }
 
 impl SearchExecutionAccumulator {
-    /// Merges one streamed frame into the accumulator, deduplicating rows while
-    /// preserving the first-seen order used by CLI output.
-    fn apply_frame(
+    /// Merges one batch of candidate identities into the accumulator,
+    /// deduplicating rows while preserving the first-seen order used by CLI
+    /// output.
+    fn apply_rows(
         &mut self,
-        args: &SearchCommandArgs,
-        frame: rpc::CandidateQueryStreamFrame,
-        query_time: Duration,
+        include_external_ids: bool,
+        candidate_limit: Option<usize>,
+        identities: Vec<String>,
+        external_ids: Option<Vec<Option<String>>>,
     ) -> Result<SearchStreamVerificationUpdates> {
         let mut updates = SearchStreamVerificationUpdates::default();
         if self.truncated_limit.is_none() {
-            self.truncated_limit = frame.candidate_limit;
-        }
-        if frame.rule_complete || frame.stream_complete {
-            self.terminal_received = true;
-            self.query_time.get_or_insert(query_time);
-            self.tier_used = frame.tier_used;
-            self.query_profile = frame.query_profile;
-            return Ok(updates);
+            self.truncated_limit = candidate_limit;
         }
 
-        let mut frame_external_ids = frame.external_ids.unwrap_or_default();
-        if args.verify_yara_files && frame_external_ids.len() < frame.identities.len() {
-            frame_external_ids.resize(frame.identities.len(), None);
+        let mut row_external_ids = external_ids.unwrap_or_default();
+        if include_external_ids && row_external_ids.len() < identities.len() {
+            row_external_ids.resize(identities.len(), None);
         }
-        for (idx, identity) in frame.identities.into_iter().enumerate() {
-            let external_id = if args.verify_yara_files {
-                frame_external_ids.get(idx).cloned().flatten()
+        for (idx, identity) in identities.into_iter().enumerate() {
+            let external_id = if include_external_ids {
+                row_external_ids.get(idx).cloned().flatten()
             } else {
                 None
             };
             if let Some(existing_idx) = self.accepted_positions.get(&identity).copied() {
-                if args.verify_yara_files
+                if include_external_ids
                     && self
                         .external_ids
                         .get(existing_idx)
@@ -2051,12 +2035,35 @@ impl SearchExecutionAccumulator {
                 .insert(identity.clone(), accepted_index);
             self.total_candidates = self.total_candidates.saturating_add(1);
             self.rows.push(identity);
-            if args.verify_yara_files {
+            if include_external_ids {
                 self.external_ids.push(external_id.clone());
                 updates.accepted_rows.push((accepted_index, external_id));
             }
         }
         Ok(updates)
+    }
+
+    /// Merges one streamed frame into the accumulator, deduplicating rows while
+    /// preserving the first-seen order used by CLI output.
+    fn apply_frame(
+        &mut self,
+        args: &SearchCommandArgs,
+        frame: rpc::CandidateQueryStreamFrame,
+        query_time: Duration,
+    ) -> Result<SearchStreamVerificationUpdates> {
+        if frame.rule_complete || frame.stream_complete {
+            self.terminal_received = true;
+            self.query_time.get_or_insert(query_time);
+            self.tier_used = frame.tier_used;
+            self.query_profile = frame.query_profile;
+            return Ok(SearchStreamVerificationUpdates::default());
+        }
+        self.apply_rows(
+            args.verify_yara_files,
+            frame.candidate_limit,
+            frame.identities,
+            frame.external_ids,
+        )
     }
 
     /// Finalizes one rule's collected frames into the search summary rendered
@@ -2090,10 +2097,36 @@ impl SearchExecutionAccumulator {
 
 #[derive(Debug)]
 struct SearchVerificationResult {
-    rows: Vec<String>,
+    row_states: Vec<VerificationRowState>,
     verified_checked: usize,
     verified_matched: usize,
     verified_skipped: usize,
+}
+
+impl SearchVerificationResult {
+    /// Yields candidate row indexes in the same matched-first order used by
+    /// the CLI without rebuilding a second vector of row strings.
+    fn display_row_indexes(&self) -> impl Iterator<Item = usize> + '_ {
+        let matched = self
+            .row_states
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| {
+                matches!(state, VerificationRowState::Matched).then_some(index)
+            });
+        let skipped = self
+            .row_states
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| {
+                matches!(
+                    state,
+                    VerificationRowState::Pending | VerificationRowState::Skipped
+                )
+                .then_some(index)
+            });
+        matched.chain(skipped)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2290,7 +2323,7 @@ impl SearchVerificationPipeline {
         self.take_worker_error()
     }
 
-    fn finish(mut self, rows: &[String]) -> Result<SearchVerificationResult> {
+    fn finish(mut self, row_count: usize) -> Result<SearchVerificationResult> {
         self.drain_ready_results()?;
         drop(self.job_tx.take());
         for handle in self.handles.drain(..) {
@@ -2299,30 +2332,26 @@ impl SearchVerificationPipeline {
                 .map_err(|_| SspryError::from("Search verification worker panicked."))?;
         }
         self.drain_ready_results()?;
-        if self.row_states.len() < rows.len() {
+        if self.row_states.len() < row_count {
             return Err(SspryError::from(
                 "Search verification did not receive every candidate row.",
             ));
         }
 
-        let mut verified_rows = Vec::<String>::new();
-        let mut unverified_rows = Vec::<String>::new();
         let mut verified_checked = 0usize;
         let mut verified_matched = 0usize;
         let mut verified_skipped = 0usize;
-        for (index, identity) in rows.iter().cloned().enumerate() {
+        for index in 0..row_count {
             match self.row_states.get(index).copied() {
                 Some(VerificationRowState::Matched) => {
                     verified_checked += 1;
                     verified_matched += 1;
-                    verified_rows.push(identity);
                 }
                 Some(VerificationRowState::NotMatched) => {
                     verified_checked += 1;
                 }
                 Some(VerificationRowState::Pending | VerificationRowState::Skipped) => {
                     verified_skipped += 1;
-                    unverified_rows.push(identity);
                 }
                 Some(VerificationRowState::Queued) => {
                     return Err(SspryError::from(
@@ -2336,9 +2365,8 @@ impl SearchVerificationPipeline {
                 }
             }
         }
-        verified_rows.extend(unverified_rows);
         Ok(SearchVerificationResult {
-            rows: verified_rows,
+            row_states: self.row_states,
             verified_checked,
             verified_matched,
             verified_skipped,
@@ -2350,6 +2378,201 @@ impl SearchVerificationPipeline {
             return Err(SspryError::from(err));
         }
         Ok(())
+    }
+}
+
+/// Returns the concrete candidate limit used by accumulators, or `None` when
+/// the effective policy is unlimited.
+fn resolved_candidate_limit(resolved_limit: usize) -> Option<usize> {
+    (resolved_limit != usize::MAX).then_some(resolved_limit)
+}
+
+/// Merges per-server search executions for one rule while preserving
+/// first-seen Source ID order and allowing verification to overlap the merge.
+struct DistributedSearchAccumulator {
+    plan: CompiledQueryPlan,
+    rows: SearchExecutionAccumulator,
+    query_profile: CandidateQueryProfile,
+    tier_parts: Vec<String>,
+    server_rss_kb: Option<(u64, u64)>,
+    plan_time: Duration,
+    query_time: Duration,
+    received: usize,
+    expected: usize,
+    candidate_limit: Option<usize>,
+}
+
+impl DistributedSearchAccumulator {
+    fn new(plan: CompiledQueryPlan, expected: usize, candidate_limit: Option<usize>) -> Self {
+        Self {
+            plan,
+            rows: SearchExecutionAccumulator::default(),
+            query_profile: CandidateQueryProfile::default(),
+            tier_parts: Vec::new(),
+            server_rss_kb: None,
+            plan_time: Duration::ZERO,
+            query_time: Duration::ZERO,
+            received: 0,
+            expected: expected.max(1),
+            candidate_limit,
+        }
+    }
+
+    fn apply_execution(
+        &mut self,
+        execution: SearchExecution,
+    ) -> Result<SearchStreamVerificationUpdates> {
+        let SearchExecution {
+            plan: _,
+            total_candidates: _,
+            tier_used,
+            truncated: _,
+            truncated_limit: _,
+            rows,
+            query_profile,
+            external_ids,
+            tree_count: _,
+            search_workers: _,
+            server_rss_kb,
+            plan_time,
+            query_time,
+            verification: _,
+            verify_time: _,
+        } = execution;
+        if !tier_used.is_empty() && !self.tier_parts.iter().any(|value| value == &tier_used) {
+            self.tier_parts.push(tier_used);
+        }
+        self.query_profile.merge_from(&query_profile);
+        self.plan_time += plan_time;
+        self.query_time += query_time;
+        if let Some((current, peak)) = server_rss_kb {
+            self.server_rss_kb = Some(match self.server_rss_kb {
+                Some((existing_current, existing_peak)) => {
+                    (existing_current.max(current), existing_peak.max(peak))
+                }
+                None => (current, peak),
+            });
+        }
+        self.received = self.received.saturating_add(1);
+        self.rows
+            .apply_rows(true, self.candidate_limit, rows, Some(external_ids))
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received >= self.expected
+    }
+
+    fn into_execution(self) -> SearchExecution {
+        self.rows
+            .into_execution(
+                self.plan,
+                self.server_rss_kb,
+                self.plan_time,
+                self.query_time,
+            )
+            .with_query_profile(self.query_profile)
+            .with_tier_used(if self.tier_parts.is_empty() {
+                "none".to_owned()
+            } else {
+                self.tier_parts.join(",")
+            })
+    }
+}
+
+/// Builds one local search execution while allowing verification to overlap
+/// partial tree-group result delivery.
+struct LocalSearchAccumulator {
+    rows: SearchExecutionAccumulator,
+    query_profile: CandidateQueryProfile,
+    tier_parts: Vec<String>,
+    candidate_limit: Option<usize>,
+}
+
+impl LocalSearchAccumulator {
+    fn new(candidate_limit: Option<usize>) -> Self {
+        Self {
+            rows: SearchExecutionAccumulator::default(),
+            query_profile: CandidateQueryProfile::default(),
+            tier_parts: Vec::new(),
+            candidate_limit,
+        }
+    }
+
+    fn apply_partial(
+        &mut self,
+        partial: LocalTreeQueryAggregate,
+        include_external_ids: bool,
+    ) -> Result<SearchStreamVerificationUpdates> {
+        self.query_profile.merge_from(&partial.query_profile);
+        self.tier_parts.extend(partial.tier_used);
+        let LocalTreeQueryAggregate {
+            identities,
+            external_ids,
+            tier_used: _,
+            query_profile: _,
+        } = partial;
+        let identities = identities.into_iter().collect::<Vec<_>>();
+        let row_external_ids = if include_external_ids {
+            Some(
+                identities
+                    .iter()
+                    .map(|identity| external_ids.get(identity).cloned().flatten())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        self.rows.apply_rows(
+            include_external_ids,
+            self.candidate_limit,
+            identities,
+            row_external_ids,
+        )
+    }
+
+    fn into_execution(
+        self,
+        plan: CompiledQueryPlan,
+        tree_count: usize,
+        search_workers: usize,
+        plan_time: Duration,
+        query_time: Duration,
+    ) -> SearchExecution {
+        self.rows
+            .into_execution(plan, None, plan_time, query_time)
+            .with_query_profile(self.query_profile)
+            .with_tier_used(merge_tier_used(self.tier_parts))
+            .with_tree_count(tree_count)
+            .with_search_workers(search_workers)
+    }
+}
+
+trait SearchExecutionBuilderExt {
+    fn with_query_profile(self, query_profile: CandidateQueryProfile) -> Self;
+    fn with_tier_used(self, tier_used: String) -> Self;
+    fn with_tree_count(self, tree_count: usize) -> Self;
+    fn with_search_workers(self, search_workers: usize) -> Self;
+}
+
+impl SearchExecutionBuilderExt for SearchExecution {
+    fn with_query_profile(mut self, query_profile: CandidateQueryProfile) -> Self {
+        self.query_profile = query_profile;
+        self
+    }
+
+    fn with_tier_used(mut self, tier_used: String) -> Self {
+        self.tier_used = tier_used;
+        self
+    }
+
+    fn with_tree_count(mut self, tree_count: usize) -> Self {
+        self.tree_count = Some(tree_count);
+        self
+    }
+
+    fn with_search_workers(mut self, search_workers: usize) -> Self {
+        self.search_workers = Some(search_workers);
+        self
     }
 }
 
@@ -2501,10 +2724,14 @@ fn query_store_group_all_candidates(
     let collect_chunk = DEFAULT_SEARCH_RESULT_CHUNK_SIZE.max(1);
     for store in stores {
         let mut cursor = 0usize;
+        let mut saw_store_profile = false;
         loop {
             let local = store.query_candidates(&scan_plan, cursor, collect_chunk)?;
-            out.tier_used.push(local.tier_used.clone());
-            out.query_profile.merge_from(&local.query_profile);
+            if !saw_store_profile {
+                out.tier_used.push(local.tier_used.clone());
+                out.query_profile.merge_from(&local.query_profile);
+                saw_store_profile = true;
+            }
             if include_external_ids {
                 let external_ids = store.external_ids_for_identities(&local.identities);
                 for (identity, external_id) in
@@ -2526,36 +2753,38 @@ fn query_store_group_all_candidates(
     Ok(out)
 }
 
-/// Executes a candidate search across all trees in the forest and combines the
-/// results into one local aggregate.
-fn query_local_forest_all_candidates(
+/// Executes local forest queries chunk-by-chunk and forwards each completed
+/// partial aggregate as soon as it becomes available.
+fn stream_local_forest_query_partials<F>(
     tree_groups: &mut Vec<TreeStoreGroup>,
     plan: &crate::candidate::CompiledQueryPlan,
     include_external_ids: bool,
     search_workers: usize,
-) -> Result<LocalForestQueryAggregate> {
-    let searchable_doc_count = tree_groups
-        .iter()
-        .flat_map(|group| group.stores.iter())
-        .map(CandidateStore::live_doc_count)
-        .sum::<usize>();
-    let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
+    mut on_partial: F,
+) -> Result<()>
+where
+    F: FnMut(LocalTreeQueryAggregate) -> Result<()>,
+{
     let worker_count = search_workers.max(1).min(tree_groups.len().max(1));
-    let mut partials = Vec::<LocalTreeQueryAggregate>::new();
     if tree_groups.len() <= 1 || worker_count <= 1 {
         for group in tree_groups {
-            partials.push(query_store_group_all_candidates(
+            on_partial(query_store_group_all_candidates(
                 &mut group.stores,
                 plan,
                 include_external_ids,
-            )?);
+            )?)?;
         }
-    } else {
-        let chunk_size = tree_groups.len().div_ceil(worker_count);
-        let scoped = thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk in tree_groups.chunks_mut(chunk_size) {
-                handles.push(scope.spawn(move || -> Result<LocalTreeQueryAggregate> {
+        return Ok(());
+    }
+
+    let chunk_size = tree_groups.len().div_ceil(worker_count);
+    thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = unbounded::<Result<LocalTreeQueryAggregate>>();
+        let mut handles = Vec::new();
+        for chunk in tree_groups.chunks_mut(chunk_size) {
+            let tx = tx.clone();
+            handles.push(scope.spawn(move || {
+                let result = (|| -> Result<LocalTreeQueryAggregate> {
                     let mut merged = LocalTreeQueryAggregate::default();
                     for group in chunk {
                         let partial = query_store_group_all_candidates(
@@ -2571,56 +2800,39 @@ fn query_local_forest_all_candidates(
                         }
                     }
                     Ok(merged)
-                }));
-            }
-            let mut merged = Vec::with_capacity(handles.len());
-            for handle in handles {
-                merged.push(
-                    handle
-                        .join()
-                        .map_err(|_| SspryError::from("Forest search worker panicked."))??,
-                );
-            }
-            Ok::<Vec<LocalTreeQueryAggregate>, SspryError>(merged)
-        })?;
-        partials = scoped;
-    }
-
-    let mut identities = HashSet::<String>::new();
-    let mut external_id_map = HashMap::<String, Option<String>>::new();
-    let mut tier_used = Vec::<String>::new();
-    let mut query_profile = crate::candidate::CandidateQueryProfile::default();
-    for partial in partials {
-        identities.extend(partial.identities);
-        tier_used.extend(partial.tier_used);
-        query_profile.merge_from(&partial.query_profile);
-        for (identity, external_id) in partial.external_ids {
-            external_id_map.entry(identity).or_insert(external_id);
+                })();
+                let _ = tx.send(result);
+            }));
         }
-    }
-    let mut identities = identities.into_iter().collect::<Vec<_>>();
-    let truncated = resolved_limit != usize::MAX && identities.len() > resolved_limit;
-    if truncated {
-        identities.truncate(resolved_limit);
-    }
-    let external_ids = if include_external_ids {
-        Some(
-            identities
-                .iter()
-                .map(|identity| external_id_map.get(identity).cloned().flatten())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
-    Ok(LocalForestQueryAggregate {
-        total_candidates: identities.len(),
-        truncated,
-        truncated_limit: truncated.then_some(resolved_limit),
-        tier_used: merge_tier_used(tier_used),
-        query_profile,
-        external_ids,
-        identities,
+        drop(tx);
+
+        let mut first_error = None::<SspryError>;
+        for partial in rx {
+            let partial = match partial {
+                Ok(partial) => partial,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    continue;
+                }
+            };
+            if let Err(err) = on_partial(partial) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| SspryError::from("Forest search worker panicked."))?;
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(())
     })
 }
 
@@ -2639,13 +2851,13 @@ fn verify_search_candidates(
     rule_path: &Path,
     target_rule_name: Option<&str>,
     plan: &crate::candidate::CompiledQueryPlan,
-    rows: Vec<String>,
+    rows: &[String],
     mut external_ids: Vec<Option<String>>,
     verify_yara_files: bool,
 ) -> Result<SearchVerificationResult> {
     if !verify_yara_files {
         return Ok(SearchVerificationResult {
-            rows,
+            row_states: Vec::new(),
             verified_checked: 0,
             verified_matched: 0,
             verified_skipped: 0,
@@ -2656,7 +2868,7 @@ fn verify_search_candidates(
     }
     if rows.is_empty() {
         return Ok(SearchVerificationResult {
-            rows,
+            row_states: Vec::new(),
             verified_checked: 0,
             verified_matched: 0,
             verified_skipped: 0,
@@ -2667,7 +2879,7 @@ fn verify_search_candidates(
         accepted_rows: external_ids.into_iter().enumerate().collect(),
         backfilled_rows: Vec::new(),
     })?;
-    verifier.finish(&rows)
+    verifier.finish(rows.len())
 }
 
 #[derive(Debug)]
@@ -5317,7 +5529,7 @@ where
         accumulator.into_execution(plan, server_rss_kb, plan_time, started_query.elapsed());
     if let Some(verifier) = verifier {
         let started_verify = Instant::now();
-        execution.verification = Some(verifier.finish(&execution.rows)?);
+        execution.verification = Some(verifier.finish(execution.rows.len())?);
         execution.verify_time = Some(started_verify.elapsed());
     }
     Ok(execution)
@@ -5352,7 +5564,7 @@ where
         );
         if let Some(verifier) = verifiers[index].take() {
             let started_verify = Instant::now();
-            execution.verification = Some(verifier.finish(&execution.rows)?);
+            execution.verification = Some(verifier.finish(execution.rows.len())?);
             execution.verify_time = Some(started_verify.elapsed());
         }
         on_execution(rule_name, execution, index)?;
@@ -5547,26 +5759,16 @@ fn print_search_error(
 
 /// Executes a remote search by compiling the rule against the cached server
 /// policy and draining the streamed result frames.
-fn execute_grpc_search_rule(
+fn execute_grpc_search_rule_with_plan(
     args: &SearchCommandArgs,
     rule_path: &Path,
     rule_text: &str,
     rule_name: &str,
     context: &mut RemoteSearchContext,
     preverify_streamed_results: bool,
+    plan: CompiledQueryPlan,
+    plan_time: Duration,
 ) -> Result<SearchExecution> {
-    let started_plan = Instant::now();
-    let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
-        rule_text,
-        rule_name,
-        context.server_policy.gram_sizes,
-        Some(context.server_policy.id_source.as_str()),
-        args.max_anchors_per_pattern,
-        false,
-        true,
-        args.max_candidates,
-    )?;
-    let plan_time = started_plan.elapsed();
     collect_streamed_search_execution(
         args,
         preverify_streamed_results.then_some(rule_path),
@@ -5592,6 +5794,37 @@ fn execute_grpc_search_rule(
     )
 }
 
+fn execute_grpc_search_rule(
+    args: &SearchCommandArgs,
+    rule_path: &Path,
+    rule_text: &str,
+    rule_name: &str,
+    context: &mut RemoteSearchContext,
+    preverify_streamed_results: bool,
+) -> Result<SearchExecution> {
+    let started_plan = Instant::now();
+    let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+        rule_text,
+        rule_name,
+        context.server_policy.gram_sizes,
+        Some(context.server_policy.id_source.as_str()),
+        args.max_anchors_per_pattern,
+        false,
+        true,
+        args.max_candidates,
+    )?;
+    execute_grpc_search_rule_with_plan(
+        args,
+        rule_path,
+        rule_text,
+        rule_name,
+        context,
+        preverify_streamed_results,
+        plan,
+        started_plan.elapsed(),
+    )
+}
+
 /// Compiles one client-side rule plan using the server policy so output and
 /// verification stay aligned with the server's bundle execution.
 fn compile_grpc_search_plan(
@@ -5614,26 +5847,84 @@ fn compile_grpc_search_plan(
     Ok((plan, started_plan.elapsed()))
 }
 
-/// Executes one bundled remote search request and hands each completed rule to
-/// the caller as soon as it is available.
-fn execute_grpc_search_bundle_streaming<G>(
+/// Compiles bundled client-side rule plans in parallel so remote bundle setup
+/// does not serialize per-rule planning before the search stream starts.
+fn compile_grpc_search_bundle_plans(
+    args: &SearchCommandArgs,
+    rule_text: &str,
+    rule_names: &[String],
+    context: &RemoteSearchContext,
+) -> Result<Vec<(String, CompiledQueryPlan, Duration)>> {
+    let gram_sizes = context.server_policy.gram_sizes;
+    let id_source = context.server_policy.id_source.clone();
+    if rule_names.len() <= 1 {
+        return rule_names
+            .iter()
+            .map(|rule_name| {
+                let started_plan = Instant::now();
+                let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                    rule_text,
+                    rule_name,
+                    gram_sizes,
+                    Some(id_source.as_str()),
+                    args.max_anchors_per_pattern,
+                    false,
+                    true,
+                    args.max_candidates,
+                )?;
+                let plan_time = started_plan.elapsed();
+                Ok::<_, SspryError>((rule_name.clone(), plan, plan_time))
+            })
+            .collect::<Result<Vec<_>>>();
+    }
+    thread::scope(
+        |scope| -> Result<Vec<(String, CompiledQueryPlan, Duration)>> {
+            let mut handles = Vec::with_capacity(rule_names.len());
+            for rule_name in rule_names {
+                handles.push(scope.spawn(
+                    move || -> Result<(String, CompiledQueryPlan, Duration)> {
+                        let started_plan = Instant::now();
+                        let plan =
+                            compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                                rule_text,
+                                rule_name,
+                                gram_sizes,
+                                Some(id_source.as_str()),
+                                args.max_anchors_per_pattern,
+                                false,
+                                true,
+                                args.max_candidates,
+                            )?;
+                        Ok((rule_name.clone(), plan, started_plan.elapsed()))
+                    },
+                ));
+            }
+            let mut plans = Vec::with_capacity(handles.len());
+            for handle in handles {
+                plans.push(
+                    handle
+                        .join()
+                        .map_err(|_| SspryError::from("Remote bundle plan worker panicked."))??,
+                );
+            }
+            Ok(plans)
+        },
+    )
+}
+
+/// Streams one bundled remote search request using precompiled client-side
+/// verification plans.
+fn execute_grpc_search_bundle_streaming_with_plans<G>(
     args: &SearchCommandArgs,
     verification_rule_path: Option<&Path>,
     rule_text: &str,
-    rule_names: &[String],
+    planned_rules: Vec<(String, CompiledQueryPlan, Duration)>,
     context: &mut RemoteSearchContext,
     on_execution: G,
 ) -> Result<()>
 where
     G: FnMut(String, SearchExecution, usize) -> Result<()>,
 {
-    let planned_rules = rule_names
-        .iter()
-        .map(|rule_name| {
-            let (plan, plan_time) = compile_grpc_search_plan(args, rule_text, rule_name, context)?;
-            Ok::<_, SspryError>((rule_name.clone(), plan, plan_time))
-        })
-        .collect::<Result<Vec<_>>>()?;
     stream_search_executions_batch(
         args,
         verification_rule_path,
@@ -5654,6 +5945,30 @@ where
                 |frame| on_frame(grpc_search_frame_to_internal(frame)),
             )
         },
+        on_execution,
+    )
+}
+
+/// Executes one bundled remote search request and hands each completed rule to
+/// the caller as soon as it is available.
+fn execute_grpc_search_bundle_streaming<G>(
+    args: &SearchCommandArgs,
+    verification_rule_path: Option<&Path>,
+    rule_text: &str,
+    rule_names: &[String],
+    context: &mut RemoteSearchContext,
+    on_execution: G,
+) -> Result<()>
+where
+    G: FnMut(String, SearchExecution, usize) -> Result<()>,
+{
+    let planned_rules = compile_grpc_search_bundle_plans(args, rule_text, rule_names, context)?;
+    execute_grpc_search_bundle_streaming_with_plans(
+        args,
+        verification_rule_path,
+        rule_text,
+        planned_rules,
+        context,
         on_execution,
     )
 }
@@ -5688,6 +6003,7 @@ fn remote_search_context_for_endpoint(
 
 /// Merges per-server executions for one rule, deduplicating by Source ID and
 /// applying the original candidate cap across the full distributed corpus.
+#[cfg(test)]
 fn merge_distributed_search_executions(
     executions: Vec<SearchExecution>,
     searchable_doc_count: usize,
@@ -5826,7 +6142,7 @@ fn merge_distributed_search_executions(
 /// policy context.
 fn execute_local_search_rule(
     args: &LocalSearchArgs,
-    _rule_path: &Path,
+    rule_path: &Path,
     rule_text: &str,
     rule_name: &str,
     context: &mut LocalSearchContext,
@@ -5843,31 +6159,45 @@ fn execute_local_search_rule(
         args.max_candidates,
     )?;
     let plan_time = started_plan.elapsed();
+    let searchable_doc_count = context
+        .tree_groups
+        .iter()
+        .flat_map(|group| group.stores.iter())
+        .map(CandidateStore::live_doc_count)
+        .sum::<usize>();
+    let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
     let started_query = Instant::now();
-    let local = query_local_forest_all_candidates(
+    let mut accumulator = LocalSearchAccumulator::new(resolved_candidate_limit(resolved_limit));
+    let mut verifier = args
+        .verify_yara_files
+        .then(|| SearchVerificationPipeline::new(rule_path, Some(rule_name), &plan));
+    stream_local_forest_query_partials(
         &mut context.tree_groups,
         &plan,
         args.verify_yara_files,
         context.search_workers,
+        |partial| {
+            let updates = accumulator.apply_partial(partial, args.verify_yara_files)?;
+            if let Some(verifier) = verifier.as_mut() {
+                verifier.apply_updates(updates)?;
+            }
+            Ok(())
+        },
     )?;
     let query_time = started_query.elapsed();
-    Ok(SearchExecution {
+    let mut execution = accumulator.into_execution(
         plan,
-        total_candidates: local.total_candidates,
-        tier_used: local.tier_used,
-        truncated: local.truncated,
-        truncated_limit: local.truncated_limit,
-        rows: local.identities,
-        query_profile: local.query_profile,
-        external_ids: local.external_ids.unwrap_or_default(),
-        tree_count: Some(context.tree_count),
-        search_workers: Some(context.search_workers),
-        server_rss_kb: None,
+        context.tree_count,
+        context.search_workers,
         plan_time,
         query_time,
-        verification: None,
-        verify_time: None,
-    })
+    );
+    if let Some(verifier) = verifier {
+        let started_verify = Instant::now();
+        execution.verification = Some(verifier.finish(execution.rows.len())?);
+        execution.verify_time = Some(started_verify.elapsed());
+    }
+    Ok(execution)
 }
 
 /// Finalizes a search execution by optionally verifying candidates, printing
@@ -5895,19 +6225,12 @@ fn finish_search_execution(
             rule_path,
             Some(rule_name),
             &execution.plan,
-            execution.rows,
-            execution.external_ids,
+            &execution.rows,
+            std::mem::take(&mut execution.external_ids),
             verify_yara_files,
         )?;
         (verification, started_verify.elapsed())
     };
-    let SearchVerificationResult {
-        rows,
-        verified_checked,
-        verified_matched,
-        verified_skipped,
-    } = verification;
-
     print_search_block_prefix(rule_path, rule_name, 0, multi_rule, first_rule);
     println!("tier_used: {}", execution.tier_used);
     println!("candidates: {}", execution.total_candidates);
@@ -5916,12 +6239,16 @@ fn finish_search_execution(
         println!("truncated_limit: {limit}");
     }
     if verify_yara_files {
-        println!("verified_checked: {verified_checked}");
-        println!("verified_matched: {verified_matched}");
-        println!("verified_skipped: {verified_skipped}");
-    }
-    for row in rows {
-        println!("{row}");
+        println!("verified_checked: {}", verification.verified_checked);
+        println!("verified_matched: {}", verification.verified_matched);
+        println!("verified_skipped: {}", verification.verified_skipped);
+        for index in verification.display_row_indexes() {
+            println!("{}", execution.rows[index]);
+        }
+    } else {
+        for row in &execution.rows {
+            println!("{row}");
+        }
     }
     if verbose {
         if multi_rule {
@@ -6003,9 +6330,18 @@ fn finish_search_execution(
             eprintln!("verbose.search.search_workers: {search_workers}");
         }
         if verify_yara_files {
-            eprintln!("verbose.search.verified_checked: {verified_checked}");
-            eprintln!("verbose.search.verified_matched: {verified_matched}");
-            eprintln!("verbose.search.verified_skipped: {verified_skipped}");
+            eprintln!(
+                "verbose.search.verified_checked: {}",
+                verification.verified_checked
+            );
+            eprintln!(
+                "verbose.search.verified_matched: {}",
+                verification.verified_matched
+            );
+            eprintln!(
+                "verbose.search.verified_skipped: {}",
+                verification.verified_skipped
+            );
         }
     }
     Ok(())
@@ -6133,52 +6469,135 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
         let rule_path = Path::new(&args.rule);
         let (rule_text, rule_names) = load_search_rule_bundle(rule_path)?;
         let multi_rule = rule_names.len() > 1;
+        let server_count = search_targets.len().max(1);
+        let candidate_limit = resolved_candidate_limit(resolve_max_candidates(
+            searchable_doc_count,
+            args.max_candidates,
+        ));
+        let distributed_plan_args = search_args_for_endpoint(args, &search_targets[0].0, 0.0);
         let mut exit_code = 0;
 
         if multi_rule {
-            let mut executions_by_rule = (0..rule_names.len())
-                .map(|_| Vec::<SearchExecution>::new())
+            let planned_rules = compile_grpc_search_bundle_plans(
+                &distributed_plan_args,
+                &rule_text,
+                &rule_names,
+                &search_targets[0].1,
+            )?;
+            let mut accumulators = planned_rules
+                .iter()
+                .map(|(_, plan, _)| {
+                    Some(DistributedSearchAccumulator::new(
+                        plan.clone(),
+                        server_count,
+                        candidate_limit,
+                    ))
+                })
                 .collect::<Vec<_>>();
-            for (endpoint, context) in &mut search_targets {
-                let server_args = search_args_for_endpoint(args, endpoint, 0.0);
-                execute_grpc_search_bundle_streaming(
-                    &server_args,
-                    None,
-                    &rule_text,
-                    &rule_names,
-                    context,
-                    |_, execution, index| {
-                        executions_by_rule[index].push(execution);
-                        Ok(())
-                    },
-                )?;
-            }
+            let mut verifiers = planned_rules
+                .iter()
+                .map(|(rule_name, plan, _)| {
+                    args.verify_yara_files
+                        .then(|| SearchVerificationPipeline::new(rule_path, Some(rule_name), plan))
+                })
+                .collect::<Vec<_>>();
+            let started_total = Instant::now();
+            let rule_text_ref = rule_text.as_str();
+
+            thread::scope(|scope| -> Result<()> {
+                let (tx, rx) = unbounded::<Result<(usize, SearchExecution)>>();
+                let mut handles = Vec::new();
+                for (endpoint, mut context) in search_targets {
+                    let server_args = search_args_for_endpoint(args, &endpoint, 0.0);
+                    let planned_rules = planned_rules.clone();
+                    let tx = tx.clone();
+                    handles.push(scope.spawn(move || {
+                        let result = execute_grpc_search_bundle_streaming_with_plans(
+                            &server_args,
+                            None,
+                            rule_text_ref,
+                            planned_rules,
+                            &mut context,
+                            |_, execution, index| {
+                                tx.send(Ok((index, execution))).map_err(|_| {
+                                    SspryError::from(
+                                        "Distributed search receiver dropped before merge finished.",
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        );
+                        if let Err(err) = result {
+                            let _ = tx.send(Err(err));
+                        }
+                    }));
+                }
+                drop(tx);
+
+                let mut first_error = None::<SspryError>;
+                for item in rx {
+                    match item {
+                        Ok((index, execution)) => {
+                            let updates = accumulators[index]
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    SspryError::from(
+                                        "Distributed search accumulator finalized too early.",
+                                    )
+                                })?
+                                .apply_execution(execution)?;
+                            if let Some(verifier) = verifiers[index].as_mut() {
+                                verifier.apply_updates(updates)?;
+                            }
+                        }
+                        Err(err) => {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+
+                for handle in handles {
+                    handle
+                        .join()
+                        .map_err(|_| SspryError::from("Distributed search worker panicked."))?;
+                }
+                if let Some(err) = first_error {
+                    return Err(err);
+                }
+                Ok(())
+            })?;
 
             for (index, rule_name) in rule_names.iter().enumerate() {
-                let started_total = Instant::now();
-                let executions = std::mem::take(&mut executions_by_rule[index]);
-                let result = merge_distributed_search_executions(
-                    executions,
-                    searchable_doc_count,
+                let accumulator = accumulators[index].take().ok_or_else(|| {
+                    SspryError::from("Distributed search rule was already finalized.")
+                })?;
+                if !accumulator.is_complete() {
+                    return Err(SspryError::from(format!(
+                        "Distributed search did not receive all server results for rule `{rule_name}`."
+                    )));
+                }
+                let mut execution = accumulator.into_execution();
+                if let Some(verifier) = verifiers[index].take() {
+                    let started_verify = Instant::now();
+                    execution.verification = Some(verifier.finish(execution.rows.len())?);
+                    execution.verify_time = Some(started_verify.elapsed());
+                }
+                if let Err(err) = finish_search_execution(
+                    rule_path,
+                    rule_name,
+                    args.verify_yara_files,
+                    args.verbose,
                     args.max_candidates,
-                )
-                .and_then(|execution| {
-                    finish_search_execution(
-                        rule_path,
-                        rule_name,
-                        args.verify_yara_files,
-                        args.verbose,
-                        args.max_candidates,
-                        args.max_anchors_per_pattern,
-                        started_total
-                            .checked_sub(execution.plan_time + execution.query_time)
-                            .unwrap_or_else(Instant::now),
-                        execution,
-                        true,
-                        index == 0,
-                    )
-                });
-                if let Err(err) = result {
+                    args.max_anchors_per_pattern,
+                    started_total
+                        .checked_sub(execution.plan_time + execution.query_time)
+                        .unwrap_or_else(Instant::now),
+                    execution,
+                    true,
+                    index == 0,
+                ) {
                     print_search_error(rule_path, rule_name, &err, true, index == 0);
                     exit_code = 1;
                 }
@@ -6186,43 +6605,100 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
             return Ok(exit_code);
         }
 
-        for (index, rule_name) in rule_names.iter().enumerate() {
-            let started_total = Instant::now();
-            let mut executions = Vec::new();
-            for (endpoint, context) in &mut search_targets {
-                let server_args = search_args_for_endpoint(args, endpoint, 0.0);
-                executions.push(execute_grpc_search_rule(
-                    &server_args,
-                    rule_path,
-                    &rule_text,
-                    rule_name,
-                    context,
-                    false,
-                )?);
+        let rule_name = rule_names
+            .first()
+            .ok_or_else(|| SspryError::from("Search request does not contain a rule."))?;
+        let (plan, plan_time) = compile_grpc_search_plan(
+            &distributed_plan_args,
+            &rule_text,
+            rule_name,
+            &search_targets[0].1,
+        )?;
+        let mut accumulator =
+            DistributedSearchAccumulator::new(plan.clone(), server_count, candidate_limit);
+        let mut verifier = args
+            .verify_yara_files
+            .then(|| SearchVerificationPipeline::new(rule_path, Some(rule_name), &plan));
+        let started_total = Instant::now();
+        let rule_text_ref = rule_text.as_str();
+
+        thread::scope(|scope| -> Result<()> {
+            let (tx, rx) = unbounded::<Result<SearchExecution>>();
+            let mut handles = Vec::new();
+            for (endpoint, mut context) in search_targets {
+                let server_args = search_args_for_endpoint(args, &endpoint, 0.0);
+                let tx = tx.clone();
+                let plan = plan.clone();
+                handles.push(scope.spawn(move || {
+                    let result = execute_grpc_search_rule_with_plan(
+                        &server_args,
+                        rule_path,
+                        rule_text_ref,
+                        rule_name,
+                        &mut context,
+                        false,
+                        plan,
+                        plan_time,
+                    );
+                    let _ = tx.send(result);
+                }));
             }
-            let result = merge_distributed_search_executions(
-                executions,
-                searchable_doc_count,
-                args.max_candidates,
-            )
-            .and_then(|execution| {
-                finish_search_execution(
-                    rule_path,
-                    rule_name,
-                    args.verify_yara_files,
-                    args.verbose,
-                    args.max_candidates,
-                    args.max_anchors_per_pattern,
-                    started_total,
-                    execution,
-                    multi_rule,
-                    index == 0,
-                )
-            });
-            if let Err(err) = result {
-                print_search_error(rule_path, rule_name, &err, multi_rule, index == 0);
-                exit_code = 1;
+            drop(tx);
+
+            let mut first_error = None::<SspryError>;
+            for item in rx {
+                match item {
+                    Ok(execution) => {
+                        let updates = accumulator.apply_execution(execution)?;
+                        if let Some(verifier) = verifier.as_mut() {
+                            verifier.apply_updates(updates)?;
+                        }
+                    }
+                    Err(err) => {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                }
             }
+
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| SspryError::from("Distributed search worker panicked."))?;
+            }
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+            Ok(())
+        })?;
+
+        if !accumulator.is_complete() {
+            return Err(SspryError::from(
+                "Distributed search did not receive every server result.",
+            ));
+        }
+        let mut execution = accumulator.into_execution();
+        if let Some(verifier) = verifier {
+            let started_verify = Instant::now();
+            execution.verification = Some(verifier.finish(execution.rows.len())?);
+            execution.verify_time = Some(started_verify.elapsed());
+        }
+        let result = finish_search_execution(
+            rule_path,
+            rule_name,
+            args.verify_yara_files,
+            args.verbose,
+            args.max_candidates,
+            args.max_anchors_per_pattern,
+            started_total,
+            execution,
+            false,
+            true,
+        );
+        if let Err(err) = result {
+            print_search_error(rule_path, rule_name, &err, false, true);
+            exit_code = 1;
         }
         Ok(exit_code)
     })() {
