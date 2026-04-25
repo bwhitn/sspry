@@ -8,7 +8,7 @@
 
 At a high level:
 
-1. `serve` starts the TCP server and owns either a mutable store/workspace or a read-only forest root.
+1. `serve` starts the TCP server and owns either a mutable workspace/local root or direct tree root, or a read-only forest root.
 2. `index` scans files client-side and sends batched documents.
 3. The server stores:
    - per-document Tier1 bloom filters
@@ -25,7 +25,7 @@ Public interactive search now has two execution modes:
 
 RPC mode itself now has two useful server shapes:
 
-- mutable workspace/direct-store servers for remote ingest and query
+- mutable workspace/local-root or direct-tree-root servers for remote ingest and query
 - forest-root servers that open `tree_*/current` read-only and answer one RPC query across the whole forest
 
 Local forest mode opens each `tree_*/current` store, validates compatible forest policy, and can query trees concurrently with `--search-workers`.
@@ -62,15 +62,15 @@ When one top-level rule file expands to multiple searchable rules, `local search
 
 ![Storage Layout](images/storage-layout.svg)
 
-The current store is hash-sharded by document identity.
+Each tree store is hash-sharded by document identity.
 
 Shared policy metadata is written once as `meta.json`:
 
-- at the direct store root for standalone stores
-- at the workspace root for mutable RPC workspaces
+- at the direct tree root for standalone mutable tree roots
+- at the workspace/local root for mutable workspace or local roots
 - at the forest root for `tree_*/current` forests
 
-Each direct store or published tree root keeps its own `shards.json`.
+Each direct tree root or published tree root keeps its own `shards.json`.
 
 Per shard, the implementation persists sidecars such as:
 
@@ -111,7 +111,7 @@ For mutable workspaces, delete semantics are `current`-only:
 
 Compaction for delete reclaim also runs against `current/`, not `work_*`.
 
-This section applies to mutable workspace/direct-store roots. Forest-root servers are read-only views over published `tree_*/current` stores and do not expose ingest/delete/publish.
+This section applies to mutable workspace/local roots and direct tree roots. Forest-root servers are read-only views over published `tree_*/current` stores and do not expose ingest/delete/publish.
 
 Each shard now keeps a small compaction manifest with:
 

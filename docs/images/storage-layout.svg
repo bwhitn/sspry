@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520">
   <rect width="1280" height="520" fill="#fbfaf5"/>
-  <text x="32" y="42" font-family="Helvetica, Arial, sans-serif" font-size="28" font-weight="700" fill="#1f2937">Current Store Layout</text>
+  <text x="32" y="42" font-family="Helvetica, Arial, sans-serif" font-size="28" font-weight="700" fill="#1f2937">Tree Store Layout</text>
 
   <g font-family="Helvetica, Arial, sans-serif">
     <rect x="40" y="90" width="280" height="372" rx="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
@@ -11,9 +11,9 @@
     <text x="78" y="252" font-size="15" fill="#1e3a8a">shard_001</text>
     <text x="78" y="280" font-size="15" fill="#1e3a8a">...</text>
     <text x="78" y="308" font-size="15" fill="#1e3a8a">shard_NNN</text>
-    <text x="180" y="354" text-anchor="middle" font-size="14" fill="#1e3a8a">direct store, workspace,</text>
-    <text x="180" y="376" text-anchor="middle" font-size="14" fill="#1e3a8a">or forest root policy</text>
-    <text x="180" y="398" text-anchor="middle" font-size="14" fill="#1e3a8a">lives here</text>
+    <text x="180" y="354" text-anchor="middle" font-size="14" fill="#1e3a8a">tree-root policy</text>
+    <text x="180" y="376" text-anchor="middle" font-size="14" fill="#1e3a8a">and shard fanout</text>
+    <text x="180" y="398" text-anchor="middle" font-size="14" fill="#1e3a8a">live here</text>
 
     <rect x="370" y="90" width="360" height="372" rx="14" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
     <text x="550" y="126" text-anchor="middle" font-size="22" font-weight="700" fill="#14532d">Per-shard Metadata</text>

@@ -19,7 +19,7 @@
 
     <rect x="810" y="54" width="290" height="102" rx="14" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
     <text x="955" y="94" text-anchor="middle" font-size="21" font-weight="700" fill="#14532d">Published Store</text>
-    <text x="955" y="122" text-anchor="middle" font-size="14" fill="#14532d">current/ or tree_*/current</text>
+    <text x="955" y="122" text-anchor="middle" font-size="14" fill="#14532d">current/tree_* or tree_*/current</text>
 
     <rect x="810" y="176" width="290" height="114" rx="14" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
     <text x="955" y="216" text-anchor="middle" font-size="21" font-weight="700" fill="#14532d">Shard Metadata</text>
