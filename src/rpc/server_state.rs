@@ -39,6 +39,8 @@ struct BundledQueryPartial {
 
 type BundledStoreQueryResult = (SearchWorkUnit, Vec<BundledQueryPartial>);
 
+const WORKSPACE_TREE_DOC_LIMIT: usize = 5_000;
+
 impl ServerState {
     /// Initializes server state, opens or creates the underlying store layout,
     /// and seeds all runtime counters and caches.
@@ -294,8 +296,9 @@ impl ServerState {
         Ok(())
     }
 
-    /// Returns the currently published store set for modes that expose a single
-    /// queryable published view.
+    #[cfg(test)]
+    /// Returns the currently published store set for modes that still expose a
+    /// single queryable root.
     fn published_store_set(&self) -> Result<Arc<StoreSet>> {
         let mode = self
             .store_mode
@@ -308,12 +311,24 @@ impl ServerState {
                     "forest-root server has no single published store set; use candidate_query against the forest.",
                 ));
             }
-            StoreMode::Workspace { published, .. } => published.clone(),
+            StoreMode::Workspace { published, .. } => match published.as_slice() {
+                [stores] => stores.clone(),
+                [] => {
+                    return Err(SspryError::from(
+                        "workspace has no published tree yet; use the workspace root for aggregate queries.",
+                    ));
+                }
+                _ => {
+                    return Err(SspryError::from(
+                        "workspace publishes multiple trees; use aggregate workspace helpers instead of one published store set.",
+                    ));
+                }
+            },
         })
     }
 
-    /// Returns the writable store set, lazily creating the workspace work set
-    /// when needed.
+    /// Returns the writable store set for inserts, lazily opening or creating
+    /// the newest staged workspace tree when needed.
     fn work_store_set(&self) -> Result<Arc<StoreSet>> {
         let mut mode = self
             .store_mode
@@ -327,31 +342,23 @@ impl ServerState {
                 ));
             }
             StoreMode::Workspace {
-                root, work_active, ..
-            } => {
-                if let Some(work_active) = work_active.as_ref() {
-                    work_active.clone()
-                } else {
-                    let work_root = preferred_workspace_work_root(root);
-                    let (stores, _, _) = ensure_candidate_stores_at_root(&self.config, &work_root)?;
-                    let work_set = Arc::new(StoreSet::new(work_root, stores));
-                    *work_active = Some(work_set.clone());
-                    work_set
-                }
-            }
+                root,
+                published,
+                work_active,
+            } => self.ensure_workspace_insert_store_set(root, published, work_active)?,
         })
     }
 
-    /// Returns the writable store set when it already exists without forcing
+    /// Returns every writable store set that is already present without forcing
     /// workspace activation.
-    fn work_store_set_if_present(&self) -> Result<Option<Arc<StoreSet>>> {
+    fn work_store_sets_if_present(&self) -> Result<Vec<Arc<StoreSet>>> {
         let mode = self
             .store_mode
             .lock()
             .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
         Ok(match &*mode {
-            StoreMode::Direct { stores } => Some(stores.clone()),
-            StoreMode::Forest { .. } => None,
+            StoreMode::Direct { stores } => vec![stores.clone()],
+            StoreMode::Forest { .. } => Vec::new(),
             StoreMode::Workspace { work_active, .. } => work_active.clone(),
         })
     }
@@ -366,8 +373,285 @@ impl ServerState {
         Ok(match &*mode {
             StoreMode::Direct { stores } => vec![stores.clone()],
             StoreMode::Forest { trees, .. } => trees.clone(),
-            StoreMode::Workspace { published, .. } => vec![published.clone()],
+            StoreMode::Workspace { published, .. } => published.clone(),
         })
+    }
+
+    fn store_set_doc_count(store_set: &StoreSet) -> Result<usize> {
+        store_set
+            .stores
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |total, (shard_idx, store_lock)| {
+                let store = lock_candidate_store_with_timeout(
+                    store_lock,
+                    shard_idx,
+                    "workspace tree stats",
+                )?;
+                Ok::<usize, SspryError>(total.saturating_add(store.stats().doc_count))
+            })
+    }
+
+    fn workspace_tree_index(root: &Path) -> Result<usize> {
+        let name = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                SspryError::from(format!("invalid workspace tree root {}", root.display()))
+            })?;
+        let suffix = name
+            .strip_prefix("tree_")
+            .ok_or_else(|| SspryError::from(format!("invalid workspace tree name {name}")))?;
+        suffix
+            .parse::<usize>()
+            .map_err(|err| SspryError::from(format!("invalid workspace tree name {name}: {err}")))
+    }
+
+    fn next_workspace_tree_root(
+        workspace_root: &Path,
+        published: &[Arc<StoreSet>],
+        work_active: &[Arc<StoreSet>],
+        target_work_root: &Path,
+    ) -> Result<PathBuf> {
+        let mut next_idx = 0usize;
+        for store_set in published {
+            if Self::store_set_doc_count(store_set)? == 0 {
+                continue;
+            }
+            let root = store_set.root()?;
+            next_idx = next_idx.max(Self::workspace_tree_index(&root)?.saturating_add(1));
+        }
+        for store_set in work_active {
+            let root = store_set.root()?;
+            next_idx = next_idx.max(Self::workspace_tree_index(&root)?.saturating_add(1));
+        }
+        for work_root in [
+            workspace_work_root_a(workspace_root),
+            workspace_work_root_b(workspace_root),
+        ] {
+            for tree_root in direct_tree_roots(&work_root)? {
+                next_idx = next_idx.max(Self::workspace_tree_index(&tree_root)?.saturating_add(1));
+            }
+        }
+        fs::create_dir_all(target_work_root)?;
+        Ok(target_work_root.join(format!("tree_{next_idx:02}")))
+    }
+
+    fn ensure_workspace_insert_store_set(
+        &self,
+        workspace_root: &Path,
+        published: &Vec<Arc<StoreSet>>,
+        work_active: &mut Vec<Arc<StoreSet>>,
+    ) -> Result<Arc<StoreSet>> {
+        let mut newest = None::<(usize, Arc<StoreSet>)>;
+        for store_set in work_active.iter() {
+            let root = store_set.root()?;
+            let tree_idx = Self::workspace_tree_index(&root)?;
+            if newest
+                .as_ref()
+                .map(|(current_idx, _)| tree_idx > *current_idx)
+                .unwrap_or(true)
+            {
+                newest = Some((tree_idx, store_set.clone()));
+            }
+        }
+        if let Some((_, store_set)) = newest {
+            if Self::store_set_doc_count(&store_set)? < WORKSPACE_TREE_DOC_LIMIT {
+                return Ok(store_set);
+            }
+        }
+
+        let work_root = preferred_workspace_work_root(workspace_root);
+        let tree_root =
+            Self::next_workspace_tree_root(workspace_root, published, work_active, &work_root)?;
+        let (stores, _, _) = ensure_candidate_stores_at_root(&self.config, &tree_root)?;
+        let work_set = Arc::new(StoreSet::new(tree_root, stores));
+        work_active.push(work_set.clone());
+        work_active.sort_by_key(|stores: &Arc<StoreSet>| match stores.root() {
+            Ok(path) => Self::workspace_tree_index(&path).unwrap_or(usize::MAX),
+            Err(_) => usize::MAX,
+        });
+        Ok(work_set)
+    }
+
+    fn insert_store_set_capacity_limit(&self, store_set: &Arc<StoreSet>) -> Result<usize> {
+        let mode = self
+            .store_mode
+            .lock()
+            .map_err(|_| SspryError::from("Server store mode lock poisoned."))?;
+        Ok(match &*mode {
+            StoreMode::Workspace { .. } => {
+                WORKSPACE_TREE_DOC_LIMIT.saturating_sub(Self::store_set_doc_count(store_set)?)
+            }
+            StoreMode::Direct { .. } | StoreMode::Forest { .. } => usize::MAX,
+        })
+    }
+
+    fn accumulate_insert_batch_profile(
+        total: &mut CandidateInsertBatchProfile,
+        store_profile: &CandidateInsertBatchProfile,
+    ) {
+        total.resolve_doc_state_us = total
+            .resolve_doc_state_us
+            .saturating_add(store_profile.resolve_doc_state_us);
+        total.append_sidecars_us = total
+            .append_sidecars_us
+            .saturating_add(store_profile.append_sidecars_us);
+        total.append_sidecar_payloads_us = total
+            .append_sidecar_payloads_us
+            .saturating_add(store_profile.append_sidecar_payloads_us);
+        total.append_bloom_payload_assemble_us = total
+            .append_bloom_payload_assemble_us
+            .saturating_add(store_profile.append_bloom_payload_assemble_us);
+        total.append_bloom_payload_us = total
+            .append_bloom_payload_us
+            .saturating_add(store_profile.append_bloom_payload_us);
+        total.append_metadata_payload_us = total
+            .append_metadata_payload_us
+            .saturating_add(store_profile.append_metadata_payload_us);
+        total.append_external_id_payload_us = total
+            .append_external_id_payload_us
+            .saturating_add(store_profile.append_external_id_payload_us);
+        total.append_tier2_bloom_payload_us = total
+            .append_tier2_bloom_payload_us
+            .saturating_add(store_profile.append_tier2_bloom_payload_us);
+        total.append_doc_row_build_us = total
+            .append_doc_row_build_us
+            .saturating_add(store_profile.append_doc_row_build_us);
+        total.append_bloom_payload_bytes = total
+            .append_bloom_payload_bytes
+            .saturating_add(store_profile.append_bloom_payload_bytes);
+        total.append_metadata_payload_bytes = total
+            .append_metadata_payload_bytes
+            .saturating_add(store_profile.append_metadata_payload_bytes);
+        total.append_external_id_payload_bytes = total
+            .append_external_id_payload_bytes
+            .saturating_add(store_profile.append_external_id_payload_bytes);
+        total.append_tier2_bloom_payload_bytes = total
+            .append_tier2_bloom_payload_bytes
+            .saturating_add(store_profile.append_tier2_bloom_payload_bytes);
+        total.append_doc_records_us = total
+            .append_doc_records_us
+            .saturating_add(store_profile.append_doc_records_us);
+        total.write_existing_us = total
+            .write_existing_us
+            .saturating_add(store_profile.write_existing_us);
+        total.install_docs_us = total
+            .install_docs_us
+            .saturating_add(store_profile.install_docs_us);
+        total.tier2_update_us = total
+            .tier2_update_us
+            .saturating_add(store_profile.tier2_update_us);
+        total.persist_meta_us = total
+            .persist_meta_us
+            .saturating_add(store_profile.persist_meta_us);
+        total.rebalance_tier2_us = total
+            .rebalance_tier2_us
+            .saturating_add(store_profile.rebalance_tier2_us);
+    }
+
+    fn insert_parsed_documents_into_store_set(
+        &self,
+        work: &Arc<StoreSet>,
+        parsed_documents: &[ParsedCandidateInsertDocument],
+        result_offset: usize,
+        results: &mut [Option<CandidateInsertResponse>],
+        build_elapsed: &mut Duration,
+        group_elapsed: &mut Duration,
+        store_elapsed: &mut Duration,
+        store_profile_total: &mut CandidateInsertBatchProfile,
+    ) -> Result<usize> {
+        if self.candidate_shard_count() == 1 {
+            let mut store = lock_candidate_store_with_timeout(&work.stores[0], 0, "insert batch")?;
+            let started_build = Instant::now();
+            let batch = parsed_documents
+                .iter()
+                .map(|row| {
+                    (
+                        row.0.clone(),
+                        row.1,
+                        row.2,
+                        None,
+                        row.4,
+                        None,
+                        row.3.len(),
+                        row.3.clone(),
+                        row.5.len(),
+                        row.5.clone(),
+                        row.7.clone(),
+                        row.6,
+                        row.8.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            *build_elapsed += started_build.elapsed();
+            let started_store = Instant::now();
+            for (idx, result) in store
+                .insert_documents_batch(&batch)?
+                .into_iter()
+                .enumerate()
+            {
+                results[result_offset + idx] = Some(Self::candidate_insert_response(result));
+            }
+            Self::accumulate_insert_batch_profile(
+                store_profile_total,
+                &store.last_insert_batch_profile(),
+            );
+            *store_elapsed += started_store.elapsed();
+            return Ok(usize::from(!parsed_documents.is_empty()));
+        }
+
+        let started_group = Instant::now();
+        let mut grouped = HashMap::<usize, Vec<usize>>::new();
+        for (idx, row) in parsed_documents.iter().enumerate() {
+            let shard_idx = self.candidate_store_index_for_identity(&row.0);
+            grouped.entry(shard_idx).or_default().push(idx);
+        }
+        *group_elapsed += started_group.elapsed();
+        let shards_touched = grouped.len();
+        for (shard_idx, row_indexes) in grouped {
+            let mut store = lock_candidate_store_with_timeout(
+                &work.stores[shard_idx],
+                shard_idx,
+                "insert batch",
+            )?;
+            let started_build = Instant::now();
+            let batch = row_indexes
+                .iter()
+                .map(|local_idx| {
+                    let row = &parsed_documents[*local_idx];
+                    (
+                        row.0.clone(),
+                        row.1,
+                        row.2,
+                        None,
+                        row.4,
+                        None,
+                        row.3.len(),
+                        row.3.clone(),
+                        row.5.len(),
+                        row.5.clone(),
+                        row.7.clone(),
+                        row.6,
+                        row.8.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            *build_elapsed += started_build.elapsed();
+            let started_store = Instant::now();
+            for (local_idx, result) in row_indexes
+                .into_iter()
+                .zip(store.insert_documents_batch(&batch)?.into_iter())
+            {
+                results[result_offset + local_idx] = Some(Self::candidate_insert_response(result));
+            }
+            Self::accumulate_insert_batch_profile(
+                store_profile_total,
+                &store.last_insert_batch_profile(),
+            );
+            *store_elapsed += started_store.elapsed();
+        }
+        Ok(shards_touched)
     }
 
     /// Reads the active gram sizes and identity source from the published query
@@ -445,9 +729,9 @@ impl ServerState {
                 let mut planned = Vec::with_capacity(handles.len());
                 for handle in handles {
                     planned.push(
-                        handle
-                            .join()
-                            .map_err(|_| SspryError::from("Bundled search plan worker panicked."))??,
+                        handle.join().map_err(|_| {
+                            SspryError::from("Bundled search plan worker panicked.")
+                        })??,
                     );
                 }
                 Ok(planned)
@@ -514,16 +798,18 @@ impl ServerState {
                 work_active,
                 ..
             } => {
-                for (shard_idx, store_lock) in published.stores.iter().enumerate() {
-                    let mut store = lock_candidate_store_with_timeout(
-                        store_lock,
-                        shard_idx,
-                        "flush published meta",
-                    )?;
-                    let _ = store.persist_meta_if_dirty()?;
+                for stores in published {
+                    for (shard_idx, store_lock) in stores.stores.iter().enumerate() {
+                        let mut store = lock_candidate_store_with_timeout(
+                            store_lock,
+                            shard_idx,
+                            "flush published meta",
+                        )?;
+                        let _ = store.persist_meta_if_dirty()?;
+                    }
                 }
-                if let Some(work_active) = work_active {
-                    for (shard_idx, store_lock) in work_active.stores.iter().enumerate() {
+                for stores in work_active {
+                    for (shard_idx, store_lock) in stores.stores.iter().enumerate() {
                         let mut store = lock_candidate_store_with_timeout(
                             store_lock,
                             shard_idx,
@@ -547,16 +833,14 @@ impl ServerState {
             StoreMode::Direct { .. } => None,
             StoreMode::Forest { .. } => None,
             StoreMode::Workspace {
-                root,
-                published,
-                work_active,
-                ..
+                root, work_active, ..
             } => Some((
-                published.root()?,
+                workspace_current_root(root),
                 work_active
-                    .as_ref()
-                    .map(|work_active| work_active.root())
+                    .last()
+                    .map(|stores| stores.root())
                     .transpose()?
+                    .and_then(|tree_root| tree_root.parent().map(Path::to_path_buf))
                     .unwrap_or_else(|| preferred_workspace_work_root(root)),
             )),
         })
@@ -596,7 +880,7 @@ impl ServerState {
 
     /// Drops cached stats for the active work set if one exists.
     fn invalidate_work_stats_cache(&self) -> Result<()> {
-        if let Some(work) = self.work_store_set_if_present()? {
+        for work in self.work_store_sets_if_present()? {
             work.invalidate_stats_cache()?;
         }
         Ok(())
@@ -604,8 +888,10 @@ impl ServerState {
 
     /// Drops cached stats for the published store set.
     fn invalidate_published_stats_cache(&self) -> Result<()> {
-        let published = self.published_store_set()?;
-        published.invalidate_stats_cache()
+        for published in self.published_query_store_sets()? {
+            published.invalidate_stats_cache()?;
+        }
+        Ok(())
     }
 
     /// Computes the document-count threshold that triggers workspace
@@ -899,20 +1185,25 @@ impl ServerState {
             .store(true, Ordering::SeqCst);
         let started = Instant::now();
         let result = (|| -> Result<(u64, u64)> {
-            let published = self.published_store_set()?;
-            let Some(store_lock) = published.stores.get(shard_idx) else {
-                return Ok((0, 0));
-            };
-            match store_lock.try_lock() {
-                Ok(_store) => Ok((1, 0)),
-                Err(TryLockError::WouldBlock) => {
-                    self.enqueue_published_tier2_snapshot_shards([shard_idx])?;
-                    Ok((0, 0))
-                }
-                Err(TryLockError::Poisoned(_)) => {
-                    Err(SspryError::from("Candidate store lock poisoned."))
+            let mut persisted = 0u64;
+            for published in self.published_query_store_sets()? {
+                let Some(store_lock) = published.stores.get(shard_idx) else {
+                    continue;
+                };
+                match store_lock.try_lock() {
+                    Ok(_store) => {
+                        persisted = persisted.saturating_add(1);
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        self.enqueue_published_tier2_snapshot_shards([shard_idx])?;
+                        return Ok((0, 0));
+                    }
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err(SspryError::from("Candidate store lock poisoned."));
+                    }
                 }
             }
+            Ok((persisted, 0))
         })();
         self.published_tier2_snapshot_seal_in_progress
             .store(false, Ordering::SeqCst);
@@ -1643,20 +1934,32 @@ impl ServerState {
     }
 
     #[cfg(test)]
-    /// Aggregates stats JSON plus collection timing across all published query
-    /// roots for test-only diagnostics.
-    fn candidate_stats_json_for_query_store_sets_profiled(
+    /// Aggregates stats JSON plus collection timing across an arbitrary set of
+    /// store roots for test-only diagnostics.
+    fn candidate_stats_json_for_store_sets_profiled(
         &self,
+        store_sets: &[Arc<StoreSet>],
+        empty_root: &Path,
         operation: &str,
     ) -> Result<(Map<String, Value>, u64, CandidateStatsBuildProfile)> {
-        let store_sets = self.published_query_store_sets()?;
+        if store_sets.is_empty() {
+            return Ok((
+                empty_candidate_stats_json_for_config(
+                    &self.config,
+                    empty_root,
+                    self.candidate_shard_count(),
+                ),
+                0,
+                CandidateStatsBuildProfile::default(),
+            ));
+        }
         if store_sets.len() == 1 {
             return self.candidate_stats_json_for_store_set_profiled(&store_sets[0], operation);
         }
         let started_collect = Instant::now();
         let mut stats_rows = Vec::new();
         let mut deleted_storage_bytes = 0u64;
-        for store_set in &store_sets {
+        for store_set in store_sets {
             for (shard_idx, store_lock) in store_set.stores.iter().enumerate() {
                 let store = lock_candidate_store_with_timeout(store_lock, shard_idx, operation)?;
                 stats_rows.push(store.stats());
@@ -1671,7 +1974,7 @@ impl ServerState {
             .unwrap_or(u64::MAX);
         let started_disk_usage = Instant::now();
         let mut disk_usage_bytes = 0u64;
-        for store_set in &store_sets {
+        for store_set in store_sets {
             disk_usage_bytes =
                 disk_usage_bytes.saturating_add(disk_usage_under(&store_set.root()?));
         }
@@ -1703,6 +2006,22 @@ impl ServerState {
         ))
     }
 
+    #[cfg(test)]
+    /// Aggregates stats JSON plus collection timing across all published query
+    /// roots for test-only diagnostics.
+    fn candidate_stats_json_for_query_store_sets_profiled(
+        &self,
+        operation: &str,
+    ) -> Result<(Map<String, Value>, u64, CandidateStatsBuildProfile)> {
+        let store_sets = self.published_query_store_sets()?;
+        let empty_root = if let Some((published_root, _)) = self.workspace_roots()? {
+            published_root
+        } else {
+            self.config.candidate_config.root.clone()
+        };
+        self.candidate_stats_json_for_store_sets_profiled(&store_sets, &empty_root, operation)
+    }
+
     /// Builds a gRPC store summary for one store set by aggregating per-shard
     /// candidate stats.
     fn grpc_store_summary_for_store_set(
@@ -1728,17 +2047,27 @@ impl ServerState {
         ))
     }
 
-    /// Builds a gRPC store summary across every published query store set for
-    /// the active server mode.
-    fn grpc_store_summary_for_query_store_sets(&self, operation: &str) -> Result<StoreSummary> {
-        let store_sets = self.published_query_store_sets()?;
+    /// Builds a gRPC store summary across an arbitrary set of store sets.
+    fn grpc_store_summary_for_store_sets(
+        &self,
+        store_sets: &[Arc<StoreSet>],
+        operation: &str,
+        empty_root: &Path,
+    ) -> Result<StoreSummary> {
+        if store_sets.is_empty() {
+            return Ok(grpc_empty_store_summary_for_config(
+                &self.config,
+                empty_root,
+                self.candidate_shard_count(),
+            ));
+        }
         if store_sets.len() == 1 {
             let shard_count = store_sets[0].stores.len().max(1);
             return self.grpc_store_summary_for_store_set(&store_sets[0], operation, shard_count);
         }
         let mut stats_rows = Vec::new();
         let mut deleted_storage_bytes = 0u64;
-        for store_set in &store_sets {
+        for store_set in store_sets {
             for (shard_idx, store_lock) in store_set.stores.iter().enumerate() {
                 let store = lock_candidate_store_with_timeout(store_lock, shard_idx, operation)?;
                 stats_rows.push(store.stats());
@@ -1747,7 +2076,7 @@ impl ServerState {
             }
         }
         let mut disk_usage_bytes = 0u64;
-        for store_set in &store_sets {
+        for store_set in store_sets {
             disk_usage_bytes =
                 disk_usage_bytes.saturating_add(disk_usage_under(&store_set.root()?));
         }
@@ -1757,6 +2086,17 @@ impl ServerState {
             deleted_storage_bytes,
             self.candidate_shard_count(),
         ))
+    }
+
+    /// Builds a gRPC store summary across every published query store set for
+    /// the active server mode.
+    fn grpc_store_summary_for_query_store_sets(&self, operation: &str) -> Result<StoreSummary> {
+        let store_sets = self.published_query_store_sets()?;
+        self.grpc_store_summary_for_store_sets(
+            &store_sets,
+            operation,
+            &self.config.candidate_config.root,
+        )
     }
 
     /// Builds the lightweight `StatsResponse` used by CLI policy discovery and
@@ -1797,19 +2137,12 @@ impl ServerState {
         let workspace_mode = workspace_roots.is_some();
         let (published_root, work_root, has_work, work) =
             if let Some((published_root, work_root)) = workspace_roots {
-                let work = if let Some(store_set) = self.work_store_set_if_present()? {
-                    self.grpc_store_summary_for_store_set(
-                        &store_set,
-                        "grpc status work stats",
-                        self.candidate_shard_count(),
-                    )?
-                } else {
-                    grpc_empty_store_summary_for_config(
-                        &self.config,
-                        &work_root,
-                        self.candidate_shard_count(),
-                    )
-                };
+                let work_store_sets = self.work_store_sets_if_present()?;
+                let work = self.grpc_store_summary_for_store_sets(
+                    &work_store_sets,
+                    "grpc status work stats",
+                    &work_root,
+                )?;
                 (
                     published_root.display().to_string(),
                     work_root.display().to_string(),
@@ -2063,9 +2396,10 @@ impl ServerState {
         );
         index_session.insert(
             "last_update_unix_ms".to_owned(),
-            json!(self
-                .index_session_last_update_unix_ms
-                .load(Ordering::Acquire)),
+            json!(
+                self.index_session_last_update_unix_ms
+                    .load(Ordering::Acquire)
+            ),
         );
         index_session.insert(
             "server_insert_batch_profile".to_owned(),
@@ -2153,22 +2487,14 @@ impl ServerState {
             );
             stats.insert("forest_tree_count".to_owned(), json!(tree_count));
         } else if let Some((published_root, work_root)) = self.workspace_roots()? {
-            let (mut work_stats, work_deleted_storage_bytes) =
-                if let Some(work) = self.work_store_set_if_present()? {
-                    let (work_stats, work_deleted_storage_bytes, work_profile) =
-                        self.candidate_stats_json_for_store_set_profiled(&work, "work stats")?;
-                    work_stats_profile = work_profile;
-                    (work_stats, work_deleted_storage_bytes)
-                } else {
-                    (
-                        empty_candidate_stats_json_for_config(
-                            &self.config,
-                            &work_root,
-                            self.candidate_shard_count(),
-                        ),
-                        0,
-                    )
-                };
+            let work_store_sets = self.work_store_sets_if_present()?;
+            let (mut work_stats, work_deleted_storage_bytes, work_profile) =
+                self.candidate_stats_json_for_store_sets_profiled(
+                    &work_store_sets,
+                    &work_root,
+                    "work stats",
+                )?;
+            work_stats_profile = work_profile;
             let retired_root = workspace_retired_root(&self.config.candidate_config.root);
             let started_retired = Instant::now();
             let (retired_published_root_count, retired_published_disk_usage_bytes) =
@@ -2299,9 +2625,10 @@ impl ServerState {
             );
             publish.insert(
                 "index_backpressure_sleep_ms_total".to_owned(),
-                json!(self
-                    .index_backpressure_sleep_ms_total
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.index_backpressure_sleep_ms_total
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "adaptive_recent_publish_p95_ms".to_owned(),
@@ -2401,81 +2728,94 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_promote_work_export_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_export_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_export_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_resolve_doc_state_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_resolve_doc_state_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_resolve_doc_state_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_build_payloads_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_build_payloads_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_build_payloads_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_append_sidecars_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_append_sidecars_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_append_sidecars_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_install_docs_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_install_docs_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_install_docs_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_tier2_update_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_tier2_update_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_tier2_update_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_persist_meta_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_persist_meta_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_persist_meta_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_rebalance_tier2_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_rebalance_tier2_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_rebalance_tier2_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_remove_work_root_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_remove_work_root_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_remove_work_root_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_other_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_other_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_other_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_imported_docs".to_owned(),
-                json!(self
-                    .last_publish_promote_work_imported_docs
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_imported_docs
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_imported_shards".to_owned(),
-                json!(self
-                    .last_publish_promote_work_imported_shards
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_imported_shards
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_init_work_ms".to_owned(),
@@ -2483,15 +2823,17 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
-                json!(self
-                    .last_publish_tier2_snapshot_persist_failures
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_tier2_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_persisted_snapshot_shards".to_owned(),
-                json!(self
-                    .last_publish_persisted_snapshot_shards
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_persisted_snapshot_shards
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_reused_work_stores".to_owned(),
@@ -2711,30 +3053,13 @@ impl ServerState {
                 "work_root".to_owned(),
                 Value::String(work_root.display().to_string()),
             );
-            let (mut work_stats, work_deleted_storage_bytes) =
-                if let Some(work) = self.work_store_set_if_present()? {
-                    if let Some((work_stats, work_deleted_storage_bytes)) = work.cached_stats()? {
-                        (work_stats, work_deleted_storage_bytes)
-                    } else {
-                        (
-                            empty_candidate_stats_json_for_config(
-                                &self.config,
-                                &work_root,
-                                self.candidate_shard_count(),
-                            ),
-                            0,
-                        )
-                    }
-                } else {
-                    (
-                        empty_candidate_stats_json_for_config(
-                            &self.config,
-                            &work_root,
-                            self.candidate_shard_count(),
-                        ),
-                        0,
-                    )
-                };
+            let work_store_sets = self.work_store_sets_if_present()?;
+            let (mut work_stats, work_deleted_storage_bytes, _) =
+                self.candidate_stats_json_for_store_sets_profiled(
+                    &work_store_sets,
+                    &work_root,
+                    "status work stats",
+                )?;
             work_stats.insert(
                 "deleted_storage_bytes".to_owned(),
                 json!(work_deleted_storage_bytes),
@@ -2808,9 +3133,10 @@ impl ServerState {
             );
             publish.insert(
                 "index_backpressure_sleep_ms_total".to_owned(),
-                json!(self
-                    .index_backpressure_sleep_ms_total
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.index_backpressure_sleep_ms_total
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "retired_published_root_count".to_owned(),
@@ -2850,81 +3176,94 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_promote_work_export_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_export_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_export_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_resolve_doc_state_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_resolve_doc_state_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_resolve_doc_state_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_build_payloads_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_build_payloads_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_build_payloads_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_append_sidecars_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_append_sidecars_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_append_sidecars_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_install_docs_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_install_docs_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_install_docs_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_tier2_update_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_tier2_update_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_tier2_update_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_persist_meta_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_persist_meta_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_persist_meta_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_import_rebalance_tier2_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_import_rebalance_tier2_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_import_rebalance_tier2_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_remove_work_root_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_remove_work_root_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_remove_work_root_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_other_ms".to_owned(),
-                json!(self
-                    .last_publish_promote_work_other_ms
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_other_ms
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_imported_docs".to_owned(),
-                json!(self
-                    .last_publish_promote_work_imported_docs
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_imported_docs
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_promote_work_imported_shards".to_owned(),
-                json!(self
-                    .last_publish_promote_work_imported_shards
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_promote_work_imported_shards
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_init_work_ms".to_owned(),
@@ -2932,15 +3271,17 @@ impl ServerState {
             );
             publish.insert(
                 "last_publish_tier2_snapshot_persist_failures".to_owned(),
-                json!(self
-                    .last_publish_tier2_snapshot_persist_failures
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_tier2_snapshot_persist_failures
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_persisted_snapshot_shards".to_owned(),
-                json!(self
-                    .last_publish_persisted_snapshot_shards
-                    .load(Ordering::Acquire)),
+                json!(
+                    self.last_publish_persisted_snapshot_shards
+                        .load(Ordering::Acquire)
+                ),
             );
             publish.insert(
                 "last_publish_reused_work_stores".to_owned(),
@@ -3176,10 +3517,7 @@ impl ServerState {
                 runtime.last_reclaimed_docs = result.reclaimed_docs;
                 runtime.last_reclaimed_bytes = result.reclaimed_bytes;
                 runtime.last_completed_unix_ms = Some(current_unix_ms());
-                runtime.last_error = source_ref_result
-                    .as_ref()
-                    .err()
-                    .map(|err| err.to_string());
+                runtime.last_error = source_ref_result.as_ref().err().map(|err| err.to_string());
                 drop(runtime);
                 source_ref_result?;
                 Ok(CompactionCycleOutcome::Progress)
@@ -3573,7 +3911,8 @@ impl ServerState {
             let (hits, tier_used, query_profile) =
                 Self::collect_query_matches_single_store(&mut store, plan, &runtime)?;
             let mut ordered_identities = hits;
-            let truncated = resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
+            let truncated =
+                resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
             if truncated {
                 ordered_identities.truncate(resolved_limit);
             }
@@ -3608,7 +3947,8 @@ impl ServerState {
                 query_profile.merge_from(&local_profile);
             }
             let mut ordered_identities = hits.into_iter().collect::<Vec<_>>();
-            let truncated = resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
+            let truncated =
+                resolved_limit != usize::MAX && ordered_identities.len() > resolved_limit;
             if truncated {
                 ordered_identities.truncate(resolved_limit);
             }
@@ -3861,206 +4201,31 @@ impl ServerState {
         let mut build_elapsed = Duration::ZERO;
         let mut store_elapsed = Duration::ZERO;
         let mut store_profile_total = CandidateInsertBatchProfile::default();
-        let shards_touched;
+        let mut shards_touched = 0usize;
 
         let mut results = vec![None; parsed_documents.len()];
-        let work = self.work_store_set()?;
-        if self.candidate_shard_count() == 1 {
-            shards_touched = usize::from(!parsed_documents.is_empty());
-            let mut store = lock_candidate_store_with_timeout(&work.stores[0], 0, "insert batch")?;
-            let started_build = Instant::now();
-            let batch = parsed_documents
-                .iter()
-                .map(|row| {
-                    (
-                        row.0.clone(),
-                        row.1,
-                        row.2,
-                        None,
-                        row.4,
-                        None,
-                        row.3.len(),
-                        row.3.clone(),
-                        row.5.len(),
-                        row.5.clone(),
-                        row.7.clone(),
-                        row.6,
-                        row.8.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            build_elapsed += started_build.elapsed();
-            let started_store = Instant::now();
-            for (idx, result) in store
-                .insert_documents_batch(&batch)?
-                .into_iter()
-                .enumerate()
-            {
-                results[idx] = Some(Self::candidate_insert_response(result));
+        let mut offset = 0usize;
+        while offset < parsed_documents.len() {
+            let work = self.work_store_set()?;
+            let remaining_capacity = self.insert_store_set_capacity_limit(&work)?;
+            if remaining_capacity == 0 {
+                return Err(SspryError::from(
+                    "workspace insert selected a full work tree before slicing the batch",
+                ));
             }
-            let store_profile = store.last_insert_batch_profile();
-            store_profile_total.resolve_doc_state_us = store_profile_total
-                .resolve_doc_state_us
-                .saturating_add(store_profile.resolve_doc_state_us);
-            store_profile_total.append_sidecars_us = store_profile_total
-                .append_sidecars_us
-                .saturating_add(store_profile.append_sidecars_us);
-            store_profile_total.append_sidecar_payloads_us = store_profile_total
-                .append_sidecar_payloads_us
-                .saturating_add(store_profile.append_sidecar_payloads_us);
-            store_profile_total.append_bloom_payload_assemble_us = store_profile_total
-                .append_bloom_payload_assemble_us
-                .saturating_add(store_profile.append_bloom_payload_assemble_us);
-            store_profile_total.append_bloom_payload_us = store_profile_total
-                .append_bloom_payload_us
-                .saturating_add(store_profile.append_bloom_payload_us);
-            store_profile_total.append_metadata_payload_us = store_profile_total
-                .append_metadata_payload_us
-                .saturating_add(store_profile.append_metadata_payload_us);
-            store_profile_total.append_external_id_payload_us = store_profile_total
-                .append_external_id_payload_us
-                .saturating_add(store_profile.append_external_id_payload_us);
-            store_profile_total.append_tier2_bloom_payload_us = store_profile_total
-                .append_tier2_bloom_payload_us
-                .saturating_add(store_profile.append_tier2_bloom_payload_us);
-            store_profile_total.append_doc_row_build_us = store_profile_total
-                .append_doc_row_build_us
-                .saturating_add(store_profile.append_doc_row_build_us);
-            store_profile_total.append_bloom_payload_bytes = store_profile_total
-                .append_bloom_payload_bytes
-                .saturating_add(store_profile.append_bloom_payload_bytes);
-            store_profile_total.append_metadata_payload_bytes = store_profile_total
-                .append_metadata_payload_bytes
-                .saturating_add(store_profile.append_metadata_payload_bytes);
-            store_profile_total.append_external_id_payload_bytes = store_profile_total
-                .append_external_id_payload_bytes
-                .saturating_add(store_profile.append_external_id_payload_bytes);
-            store_profile_total.append_tier2_bloom_payload_bytes = store_profile_total
-                .append_tier2_bloom_payload_bytes
-                .saturating_add(store_profile.append_tier2_bloom_payload_bytes);
-            store_profile_total.append_doc_records_us = store_profile_total
-                .append_doc_records_us
-                .saturating_add(store_profile.append_doc_records_us);
-            store_profile_total.write_existing_us = store_profile_total
-                .write_existing_us
-                .saturating_add(store_profile.write_existing_us);
-            store_profile_total.install_docs_us = store_profile_total
-                .install_docs_us
-                .saturating_add(store_profile.install_docs_us);
-            store_profile_total.tier2_update_us = store_profile_total
-                .tier2_update_us
-                .saturating_add(store_profile.tier2_update_us);
-            store_profile_total.persist_meta_us = store_profile_total
-                .persist_meta_us
-                .saturating_add(store_profile.persist_meta_us);
-            store_profile_total.rebalance_tier2_us = store_profile_total
-                .rebalance_tier2_us
-                .saturating_add(store_profile.rebalance_tier2_us);
-            store_elapsed += started_store.elapsed();
-        } else {
-            let started_group = Instant::now();
-            let mut grouped = HashMap::<usize, Vec<(usize, ParsedCandidateInsertDocument)>>::new();
-            for (idx, row) in parsed_documents.into_iter().enumerate() {
-                let shard_idx = self.candidate_store_index_for_identity(&row.0);
-                grouped.entry(shard_idx).or_default().push((idx, row));
-            }
-            group_elapsed = started_group.elapsed();
-            shards_touched = grouped.len();
-            for (shard_idx, rows) in grouped {
-                let mut store = lock_candidate_store_with_timeout(
-                    &work.stores[shard_idx],
-                    shard_idx,
-                    "insert batch",
-                )?;
-                let started_build = Instant::now();
-                let batch = rows
-                    .iter()
-                    .map(|(_, row)| {
-                        (
-                            row.0.clone(),
-                            row.1,
-                            row.2,
-                            None,
-                            row.4,
-                            None,
-                            row.3.len(),
-                            row.3.clone(),
-                            row.5.len(),
-                            row.5.clone(),
-                            row.7.clone(),
-                            row.6,
-                            row.8.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                build_elapsed += started_build.elapsed();
-                let started_store = Instant::now();
-                for ((original_idx, _), result) in rows
-                    .into_iter()
-                    .zip(store.insert_documents_batch(&batch)?.into_iter())
-                {
-                    results[original_idx] = Some(Self::candidate_insert_response(result));
-                }
-                let store_profile = store.last_insert_batch_profile();
-                store_profile_total.resolve_doc_state_us = store_profile_total
-                    .resolve_doc_state_us
-                    .saturating_add(store_profile.resolve_doc_state_us);
-                store_profile_total.append_sidecars_us = store_profile_total
-                    .append_sidecars_us
-                    .saturating_add(store_profile.append_sidecars_us);
-                store_profile_total.append_sidecar_payloads_us = store_profile_total
-                    .append_sidecar_payloads_us
-                    .saturating_add(store_profile.append_sidecar_payloads_us);
-                store_profile_total.append_bloom_payload_assemble_us = store_profile_total
-                    .append_bloom_payload_assemble_us
-                    .saturating_add(store_profile.append_bloom_payload_assemble_us);
-                store_profile_total.append_bloom_payload_us = store_profile_total
-                    .append_bloom_payload_us
-                    .saturating_add(store_profile.append_bloom_payload_us);
-                store_profile_total.append_metadata_payload_us = store_profile_total
-                    .append_metadata_payload_us
-                    .saturating_add(store_profile.append_metadata_payload_us);
-                store_profile_total.append_external_id_payload_us = store_profile_total
-                    .append_external_id_payload_us
-                    .saturating_add(store_profile.append_external_id_payload_us);
-                store_profile_total.append_tier2_bloom_payload_us = store_profile_total
-                    .append_tier2_bloom_payload_us
-                    .saturating_add(store_profile.append_tier2_bloom_payload_us);
-                store_profile_total.append_doc_row_build_us = store_profile_total
-                    .append_doc_row_build_us
-                    .saturating_add(store_profile.append_doc_row_build_us);
-                store_profile_total.append_bloom_payload_bytes = store_profile_total
-                    .append_bloom_payload_bytes
-                    .saturating_add(store_profile.append_bloom_payload_bytes);
-                store_profile_total.append_metadata_payload_bytes = store_profile_total
-                    .append_metadata_payload_bytes
-                    .saturating_add(store_profile.append_metadata_payload_bytes);
-                store_profile_total.append_external_id_payload_bytes = store_profile_total
-                    .append_external_id_payload_bytes
-                    .saturating_add(store_profile.append_external_id_payload_bytes);
-                store_profile_total.append_tier2_bloom_payload_bytes = store_profile_total
-                    .append_tier2_bloom_payload_bytes
-                    .saturating_add(store_profile.append_tier2_bloom_payload_bytes);
-                store_profile_total.append_doc_records_us = store_profile_total
-                    .append_doc_records_us
-                    .saturating_add(store_profile.append_doc_records_us);
-                store_profile_total.write_existing_us = store_profile_total
-                    .write_existing_us
-                    .saturating_add(store_profile.write_existing_us);
-                store_profile_total.install_docs_us = store_profile_total
-                    .install_docs_us
-                    .saturating_add(store_profile.install_docs_us);
-                store_profile_total.tier2_update_us = store_profile_total
-                    .tier2_update_us
-                    .saturating_add(store_profile.tier2_update_us);
-                store_profile_total.persist_meta_us = store_profile_total
-                    .persist_meta_us
-                    .saturating_add(store_profile.persist_meta_us);
-                store_profile_total.rebalance_tier2_us = store_profile_total
-                    .rebalance_tier2_us
-                    .saturating_add(store_profile.rebalance_tier2_us);
-                store_elapsed += started_store.elapsed();
-            }
+            let slice_len = remaining_capacity.min(parsed_documents.len().saturating_sub(offset));
+            shards_touched =
+                shards_touched.saturating_add(self.insert_parsed_documents_into_store_set(
+                    &work,
+                    &parsed_documents[offset..offset + slice_len],
+                    offset,
+                    &mut results,
+                    &mut build_elapsed,
+                    &mut group_elapsed,
+                    &mut store_elapsed,
+                    &mut store_profile_total,
+                )?);
+            offset = offset.saturating_add(slice_len);
         }
         let started_finalize = Instant::now();
         let results = results.into_iter().flatten().collect::<Vec<_>>();
@@ -4127,23 +4292,30 @@ impl ServerState {
             .map_err(|_| SspryError::from("Server operation gate lock poisoned."))?;
         let decoded = decode_identity(identity, &self.config.candidate_config.id_source)?;
         let shard_idx = self.candidate_store_index_for_identity(&decoded);
-        let published = self.published_store_set()?;
-        let mut published_store = lock_candidate_store_with_timeout(
-            &published.stores[shard_idx],
-            shard_idx,
-            "delete published",
-        )?;
-        let published_result = published_store.delete_document(identity)?;
-        drop(published_store);
-        if published_result.status == "deleted" {
+        let mut deleted_result = None::<crate::candidate::CandidateDeleteResult>;
+        for published in self.published_query_store_sets()? {
+            let Some(store_lock) = published.stores.get(shard_idx) else {
+                continue;
+            };
+            let mut published_store =
+                lock_candidate_store_with_timeout(store_lock, shard_idx, "delete published")?;
+            let published_result = published_store.delete_document(identity)?;
+            drop(published_store);
+            if published_result.status == "deleted" && deleted_result.is_none() {
+                deleted_result = Some(published_result);
+            }
+        }
+        if deleted_result.is_some() {
             let _ = self.enqueue_published_tier2_snapshot_shards([shard_idx]);
             self.notify_maintenance_workers();
-        }
-
-        if published_result.status == "deleted" {
             let _ = self.invalidate_published_stats_cache();
         }
         self.invalidate_search_caches();
+        let published_result = deleted_result.unwrap_or(crate::candidate::CandidateDeleteResult {
+            status: "missing".to_owned(),
+            identity: identity.to_owned(),
+            doc_id: None,
+        });
         Ok(CandidateDeleteResponse {
             status: published_result.status,
             identity: published_result.identity,
@@ -4792,11 +4964,8 @@ impl ServerState {
                 workspace_root,
                 current_root,
                 retired_parent,
+                mut published_store_sets,
                 publish_work,
-                publish_work_root,
-                next_work_root,
-                published_store_set,
-                published_is_empty,
             ) = {
                 let mut store_mode = self
                     .store_mode
@@ -4817,40 +4986,12 @@ impl ServerState {
                 };
                 let current_root = workspace_current_root(&workspace_root);
                 let retired_parent = workspace_retired_root(&workspace_root);
-                let published_store_set = match &*store_mode {
-                    StoreMode::Workspace { published, .. } => published.clone(),
-                    StoreMode::Direct { .. } | StoreMode::Forest { .. } => {
-                        unreachable!("workspace already checked")
-                    }
-                };
-                let published_is_empty = published_store_set.stores.iter().all(|store_lock| {
-                    store_lock
-                        .lock()
-                        .map(|store| store.stats().doc_count == 0)
-                        .unwrap_or(false)
-                });
-                let (publish_work, publish_work_root, next_work_root) = match &mut *store_mode {
+                let (published_store_sets, publish_work) = match &mut *store_mode {
                     StoreMode::Workspace {
-                        root, work_active, ..
-                    } => {
-                        let publish_work = work_active.take();
-                        let publish_work_root = publish_work
-                            .as_ref()
-                            .map(|stores| stores.root())
-                            .transpose()?;
-                        let next_work_root =
-                            if self.active_index_sessions.load(Ordering::Acquire) > 0 {
-                                Some(match publish_work_root.as_deref() {
-                                    Some(active_root) => {
-                                        alternate_workspace_work_root(root, active_root)
-                                    }
-                                    None => preferred_workspace_work_root(root),
-                                })
-                            } else {
-                                None
-                            };
-                        (publish_work, publish_work_root, next_work_root)
-                    }
+                        published,
+                        work_active,
+                        ..
+                    } => (published.clone(), std::mem::take(work_active)),
                     StoreMode::Direct { .. } | StoreMode::Forest { .. } => {
                         unreachable!("workspace already checked")
                     }
@@ -4859,11 +5000,8 @@ impl ServerState {
                     workspace_root,
                     current_root,
                     retired_parent,
+                    published_store_sets,
                     publish_work,
-                    publish_work_root,
-                    next_work_root,
-                    published_store_set,
-                    published_is_empty,
                 )
             };
             self.work_dirty.store(false, Ordering::SeqCst);
@@ -4875,186 +5013,117 @@ impl ServerState {
             let mut removed_work = 0usize;
             let mut reuse_work_stores = false;
             let mut changed_shards = vec![false; publish_shard_count];
-            let published_store_set = if let Some(publish_work) = publish_work {
-                let publish_work_root = publish_work_root
-                    .ok_or_else(|| SspryError::from("active work root is unavailable"))?;
-                if published_is_empty {
-                    let swap_started = Instant::now();
-                    if current_root.exists() {
-                        fs::create_dir_all(&retired_parent)?;
-                        let retired_root = next_workspace_retired_root_path(&retired_parent);
-                        fs::rename(&current_root, &retired_root)?;
+            if !publish_work.is_empty() {
+                fs::create_dir_all(&current_root)?;
+                self.last_publish_swap_ms.store(0, Ordering::SeqCst);
+                let promote_started = Instant::now();
+                let mut imported_docs_total = 0u64;
+                let mut imported_shards_total = 0u64;
+                let mut work_parents = HashSet::new();
+                for work_set in publish_work {
+                    let work_tree_root = work_set.root()?;
+                    if let Some(parent) = work_tree_root.parent() {
+                        work_parents.insert(parent.to_path_buf());
                     }
-                    fs::rename(&publish_work_root, &current_root)?;
-                    self.last_publish_swap_ms.store(
-                        swap_started
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                        Ordering::SeqCst,
-                    );
-                    let promote_started = Instant::now();
-                    self.last_publish_promote_work_export_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_resolve_doc_state_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_build_payloads_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_append_sidecars_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_install_docs_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_tier2_update_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_persist_meta_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_rebalance_tier2_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_remove_work_root_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_other_ms
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_imported_docs
-                        .store(0, Ordering::SeqCst);
-                    self.last_publish_promote_work_imported_shards
-                        .store(0, Ordering::SeqCst);
-                    publish_work.retarget_root(&current_root, publish_shard_count)?;
-                    reuse_work_stores = true;
-                    let published_store_set = publish_work;
-                    self.last_publish_promote_work_ms.store(
-                        promote_started
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                        Ordering::SeqCst,
-                    );
-                    for (shard_idx, store_lock) in published_store_set.stores.iter().enumerate() {
+                    let tree_name = work_tree_root
+                        .file_name()
+                        .ok_or_else(|| {
+                            SspryError::from(format!(
+                                "invalid workspace tree root {}",
+                                work_tree_root.display()
+                            ))
+                        })?
+                        .to_os_string();
+                    let target_tree_root = current_root.join(tree_name);
+                    if target_tree_root.exists() {
+                        let mut remove_idx = None::<usize>;
+                        for (idx, published_set) in published_store_sets.iter().enumerate() {
+                            let published_root = published_set.root()?;
+                            if published_root != target_tree_root {
+                                continue;
+                            }
+                            if Self::store_set_doc_count(published_set)? == 0 {
+                                remove_idx = Some(idx);
+                            }
+                            break;
+                        }
+                        if let Some(idx) = remove_idx {
+                            published_store_sets.remove(idx);
+                            fs::remove_dir_all(&target_tree_root)?;
+                        } else {
+                            return Err(SspryError::from(format!(
+                                "workspace publish target already exists: {}",
+                                target_tree_root.display()
+                            )));
+                        }
+                    }
+                    for (shard_idx, store_lock) in work_set.stores.iter().enumerate() {
                         let store = store_lock
                             .lock()
                             .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
-                        if store.stats().doc_count > 0 {
+                        let doc_count = store.stats().doc_count as u64;
+                        if doc_count > 0 {
                             changed_shards[shard_idx] = true;
+                            imported_docs_total = imported_docs_total.saturating_add(doc_count);
+                            imported_shards_total = imported_shards_total.saturating_add(1);
                         }
                     }
-                    published_store_set
-                } else {
-                    self.last_publish_swap_ms.store(0, Ordering::SeqCst);
-                    let promote_started = Instant::now();
-                    let mut export_ms_total = 0u128;
-                    let mut import_ms_total = 0u128;
-                    let mut import_profile_total = CandidateImportBatchProfile::default();
-                    let mut imported_docs_total = 0u64;
-                    let mut imported_shards_total = 0u64;
-                    for (shard_idx, store_lock) in publish_work.stores.iter().enumerate() {
-                        let mut work_store = lock_candidate_store_with_timeout(
-                            store_lock,
-                            shard_idx,
-                            "publish export work",
-                        )?;
-                        let export_started = Instant::now();
-                        let imported = work_store.export_live_documents()?;
-                        export_ms_total =
-                            export_ms_total.saturating_add(export_started.elapsed().as_millis());
-                        if imported.is_empty() {
-                            continue;
-                        }
-                        changed_shards[shard_idx] = true;
-                        imported_docs_total =
-                            imported_docs_total.saturating_add(imported.len() as u64);
-                        imported_shards_total = imported_shards_total.saturating_add(1);
-                        let import_started = Instant::now();
-                        let mut published_store = published_store_set.stores[shard_idx]
-                            .lock()
-                            .map_err(|_| SspryError::from("Candidate store lock poisoned."))?;
-                        let all_known_new = imported.iter().all(|document| {
-                            !published_store.contains_live_document_identity(&document.identity)
-                        });
-                        if all_known_new {
-                            published_store.import_documents_batch_known_new_quiet(&imported)?
-                        } else {
-                            published_store.import_documents_batch_quiet(&imported)?
-                        }
-                        let import_profile = published_store.last_import_batch_profile();
-                        import_profile_total.resolve_doc_state_ms = import_profile_total
-                            .resolve_doc_state_ms
-                            .saturating_add(import_profile.resolve_doc_state_ms);
-                        import_profile_total.build_payloads_ms = import_profile_total
-                            .build_payloads_ms
-                            .saturating_add(import_profile.build_payloads_ms);
-                        import_profile_total.append_sidecars_ms = import_profile_total
-                            .append_sidecars_ms
-                            .saturating_add(import_profile.append_sidecars_ms);
-                        import_profile_total.install_docs_ms = import_profile_total
-                            .install_docs_ms
-                            .saturating_add(import_profile.install_docs_ms);
-                        import_profile_total.tier2_update_ms = import_profile_total
-                            .tier2_update_ms
-                            .saturating_add(import_profile.tier2_update_ms);
-                        import_profile_total.persist_meta_ms = import_profile_total
-                            .persist_meta_ms
-                            .saturating_add(import_profile.persist_meta_ms);
-                        import_profile_total.rebalance_tier2_ms = import_profile_total
-                            .rebalance_tier2_ms
-                            .saturating_add(import_profile.rebalance_tier2_ms);
-                        import_ms_total =
-                            import_ms_total.saturating_add(import_started.elapsed().as_millis());
-                    }
-                    let remove_started = Instant::now();
-                    if publish_work_root.exists() {
-                        fs::remove_dir_all(&publish_work_root)?;
-                    }
-                    let remove_ms = remove_started.elapsed().as_millis();
-                    let promote_ms = promote_started.elapsed().as_millis();
-                    self.last_publish_promote_work_ms
-                        .store(promote_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
-                    self.last_publish_promote_work_export_ms.store(
-                        export_ms_total.try_into().unwrap_or(u64::MAX),
-                        Ordering::SeqCst,
-                    );
-                    self.last_publish_promote_work_import_ms.store(
-                        import_ms_total.try_into().unwrap_or(u64::MAX),
-                        Ordering::SeqCst,
-                    );
-                    self.last_publish_promote_work_import_resolve_doc_state_ms
-                        .store(import_profile_total.resolve_doc_state_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_build_payloads_ms
-                        .store(import_profile_total.build_payloads_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_append_sidecars_ms
-                        .store(import_profile_total.append_sidecars_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_install_docs_ms
-                        .store(import_profile_total.install_docs_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_tier2_update_ms
-                        .store(import_profile_total.tier2_update_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_persist_meta_ms
-                        .store(import_profile_total.persist_meta_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_import_rebalance_tier2_ms
-                        .store(import_profile_total.rebalance_tier2_ms, Ordering::SeqCst);
-                    self.last_publish_promote_work_remove_work_root_ms
-                        .store(remove_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
-                    self.last_publish_promote_work_other_ms.store(
-                        promote_ms
-                            .saturating_sub(export_ms_total)
-                            .saturating_sub(import_ms_total)
-                            .saturating_sub(remove_ms)
-                            .try_into()
-                            .unwrap_or(0),
-                        Ordering::SeqCst,
-                    );
-                    self.last_publish_promote_work_imported_docs
-                        .store(imported_docs_total, Ordering::SeqCst);
-                    self.last_publish_promote_work_imported_shards
-                        .store(imported_shards_total, Ordering::SeqCst);
-                    published_store_set
+                    fs::rename(&work_tree_root, &target_tree_root)?;
+                    work_set.retarget_root(&target_tree_root, publish_shard_count)?;
+                    published_store_sets.push(work_set);
                 }
+                for work_root in work_parents {
+                    if direct_tree_roots(&work_root)?.is_empty() {
+                        match fs::remove_dir_all(&work_root) {
+                            Ok(()) => removed_work = removed_work.saturating_add(1),
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Err(err) => {
+                                return Err(SspryError::from(format!(
+                                    "failed to remove empty workspace work root {}: {err}",
+                                    work_root.display()
+                                )));
+                            }
+                        }
+                    }
+                }
+                published_store_sets.sort_by_key(|stores: &Arc<StoreSet>| match stores.root() {
+                    Ok(path) => Self::workspace_tree_index(&path).unwrap_or(usize::MAX),
+                    Err(_) => usize::MAX,
+                });
+                let promote_ms = promote_started.elapsed().as_millis();
+                self.last_publish_promote_work_ms
+                    .store(promote_ms.try_into().unwrap_or(u64::MAX), Ordering::SeqCst);
+                self.last_publish_promote_work_export_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_resolve_doc_state_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_build_payloads_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_append_sidecars_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_install_docs_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_tier2_update_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_persist_meta_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_import_rebalance_tier2_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_remove_work_root_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_other_ms
+                    .store(0, Ordering::SeqCst);
+                self.last_publish_promote_work_imported_docs
+                    .store(imported_docs_total, Ordering::SeqCst);
+                self.last_publish_promote_work_imported_shards
+                    .store(imported_shards_total, Ordering::SeqCst);
+                reuse_work_stores = true;
             } else {
                 self.last_publish_swap_ms.store(0, Ordering::SeqCst);
                 self.last_publish_promote_work_ms.store(0, Ordering::SeqCst);
-                published_store_set
-            };
+            }
             let persisted_snapshot_shards =
                 changed_shards.iter().filter(|changed| **changed).count();
             self.last_publish_persisted_snapshot_shards.store(
@@ -5079,25 +5148,7 @@ impl ServerState {
             )?;
             self.last_publish_reused_work_stores
                 .store(reuse_work_stores, Ordering::SeqCst);
-
-            let next_work_active = if let Some(next_work_root) = next_work_root {
-                let init_work_started = Instant::now();
-                let (next_work_stores, removed, _) =
-                    ensure_candidate_stores_at_root(&self.config, &next_work_root)?;
-                removed_work = removed;
-                self.last_publish_init_work_ms.store(
-                    init_work_started
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                    Ordering::SeqCst,
-                );
-                Some(Arc::new(StoreSet::new(next_work_root, next_work_stores)))
-            } else {
-                self.last_publish_init_work_ms.store(0, Ordering::SeqCst);
-                None
-            };
+            self.last_publish_init_work_ms.store(0, Ordering::SeqCst);
             {
                 let mut store_mode = self
                     .store_mode
@@ -5111,8 +5162,8 @@ impl ServerState {
                         ..
                     } => {
                         *root = workspace_root.clone();
-                        *published = published_store_set;
-                        *work_active = next_work_active;
+                        *published = published_store_sets;
+                        work_active.clear();
                     }
                     StoreMode::Direct { .. } | StoreMode::Forest { .. } => {
                         unreachable!("workspace already checked")

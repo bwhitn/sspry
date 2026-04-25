@@ -150,7 +150,7 @@ fn init_candidate_shard_count_uses_mode_defaults() {
         mode: InitMode::Local,
         ..workspace
     };
-    assert_eq!(init_candidate_shard_count(&local), 1);
+    assert_eq!(init_candidate_shard_count(&local), DEFAULT_CANDIDATE_SHARDS);
 }
 
 #[test]
@@ -177,6 +177,122 @@ fn resolve_serve_runtime_settings_prefers_existing_forest_tree_roots() {
     assert_eq!(resolved.candidate_shards, 2);
     assert!(!resolved.workspace_mode);
     assert_eq!(resolved.candidate_config.root, forest_root);
+}
+
+#[test]
+fn workspace_init_creates_first_tree_under_current() {
+    let tmp = tempdir().expect("tmp");
+    let workspace_root = tmp.path().join("workspace");
+    let mut args = default_internal_init_args(&workspace_root, 2, true);
+    args.mode = InitMode::Workspace;
+
+    let outcome = ensure_initialized_root(&args).expect("workspace init");
+    let tree_root = workspace_root.join("current").join("tree_00");
+
+    assert_eq!(outcome.store_root, tree_root);
+    assert!(store_root_has_markers(&tree_root));
+    assert!(!store_root_has_markers(&workspace_root.join("current")));
+    assert_eq!(
+        forest_tree_roots(&workspace_root).expect("workspace tree roots"),
+        vec![tree_root]
+    );
+}
+
+#[test]
+fn local_init_creates_first_tree_under_current() {
+    let tmp = tempdir().expect("tmp");
+    let local_root = tmp.path().join("local");
+    let mut args = default_internal_init_args(&local_root, 2, true);
+    args.mode = InitMode::Local;
+
+    let outcome = ensure_initialized_root(&args).expect("local init");
+    let tree_root = local_root.join("current").join("tree_00");
+
+    assert_eq!(outcome.store_root, tree_root);
+    assert!(store_root_has_markers(&tree_root));
+    assert!(!store_root_has_markers(&local_root.join("current")));
+    assert_eq!(
+        forest_tree_roots(&local_root).expect("local tree roots"),
+        vec![tree_root]
+    );
+}
+
+#[test]
+fn local_index_rolls_into_next_tree_when_current_tree_reaches_cap() {
+    let _guard = crate::perf::test_lock().lock().expect("perf lock");
+    crate::perf::configure(None, false);
+    let tmp = tempdir().expect("tmp");
+    let local_root = tmp.path().join("local");
+    let sample = tmp.path().join("sample.bin");
+    fs::write(&sample, b"ABCD").expect("sample");
+
+    assert_eq!(
+        cmd_init(&default_internal_init_args(
+            &local_root,
+            DEFAULT_CANDIDATE_SHARDS,
+            true
+        )),
+        0
+    );
+
+    let tree_root = local_root.join("current").join("tree_00");
+    let mut stores = open_stores(&tree_root).expect("open stores");
+    let filter_bytes = stores[0]
+        .resolve_filter_bytes_for_file_size(4, None)
+        .expect("filter bytes");
+    let bloom_bytes = vec![0u8; filter_bytes];
+    for idx in 0..LOCAL_TREE_DOC_LIMIT {
+        let mut identity = [0u8; 32];
+        identity[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+        let shard_idx = candidate_shard_index(&identity, stores.len());
+        stores[shard_idx]
+            .insert_document_with_metadata(
+                identity,
+                4,
+                None,
+                None,
+                None,
+                None,
+                filter_bytes,
+                &bloom_bytes,
+                0,
+                &[],
+                &[],
+                false,
+                None,
+            )
+            .expect("prefill doc");
+    }
+    persist_local_stores(&mut stores).expect("persist prefill");
+
+    assert_eq!(
+        cmd_local_index(&LocalIndexArgs {
+            root: local_root.display().to_string(),
+            paths: vec![sample.display().to_string()],
+            path_list: false,
+            batch_docs: 1,
+            workers: Some(1),
+            verbose: false,
+        }),
+        0
+    );
+
+    let tree_roots = forest_tree_roots(&local_root).expect("tree roots");
+    assert_eq!(
+        tree_roots,
+        vec![
+            local_root.join("current").join("tree_00"),
+            local_root.join("current").join("tree_01"),
+        ]
+    );
+
+    let tree_one_stores =
+        open_stores(&local_root.join("current").join("tree_01")).expect("open second tree stores");
+    let tree_one_docs = tree_one_stores
+        .iter()
+        .map(CandidateStore::live_doc_count)
+        .sum::<usize>();
+    assert_eq!(tree_one_docs, 1);
 }
 
 #[test]
@@ -1720,8 +1836,8 @@ rule remote_q {
     let policy = server_scan_policy(&connection).expect("scan policy from server");
     assert_eq!(policy.id_source, CandidateIdSource::Sha256);
     assert!(!policy.store_path);
-    assert_eq!(policy.tier1_filter_target_fp, Some(0.38));
-    assert_eq!(policy.tier2_filter_target_fp, Some(0.18));
+    assert_eq!(policy.tier1_filter_target_fp, Some(0.4));
+    assert_eq!(policy.tier2_filter_target_fp, Some(0.25));
     assert_eq!(policy.gram_sizes, GramSizes::new(3, 4).expect("gram sizes"));
 
     assert_eq!(
@@ -2236,6 +2352,13 @@ fn batch_search_helper_functions_cover_local_forest_paths() {
     assert_eq!(
         forest_tree_roots(&direct_root).expect("direct tree roots"),
         vec![direct_root.join("current")]
+    );
+
+    let workspace_root = base.join("workspace");
+    fs::create_dir_all(workspace_root.join("current").join("tree_00")).expect("workspace tree 00");
+    assert_eq!(
+        forest_tree_roots(&workspace_root).expect("workspace tree roots"),
+        vec![workspace_root.join("current").join("tree_00")]
     );
 
     let empty_root = base.join("empty");

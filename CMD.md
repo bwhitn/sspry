@@ -46,11 +46,10 @@ Key options:
 - `--root <ROOT>` default `candidate_db`
 - `--mode <workspace|local>` default `workspace`
 - `--shards <N>`
-  - defaults to `8` for `workspace`
-  - defaults to `1` for `local`
+  - defaults to `8` for both modes
 - `--force`
-- `--tier1-set-fp <P>` default `0.38`
-- `--tier2-set-fp <P>` default `0.18`
+- `--tier1-set-fp <P>` default `0.4`
+- `--tier2-set-fp <P>` default `0.25`
 - `--id-source <sha256|md5|sha1|sha512>` default `sha256`
 - `--store-path`
 - `--gram-sizes <tier1,tier2>` default `3,4`
@@ -61,8 +60,9 @@ Key options:
 
 Behavior:
 
-- `workspace` mode initializes `<root>/current` for remote `serve`
-- `local` mode initializes a direct store at `<root>` for `local index/search/info`
+- both modes initialize `<root>/current/tree_*`
+- `workspace` mode is intended for remote `serve`
+- `local` mode is intended for `local index/search/info/delete` without RPC
 - this is where DB-wide format/layout policy is chosen
 
 ## `serve`
@@ -81,14 +81,14 @@ Key options:
   - forest mode fans out over `(tree, shard)` work units
   - default matches `index`: `max(1, cpus/2)` below `8` CPUs, otherwise `max(1, 3*cpus/4)`
 - `--root <ROOT>`
-  - workspace root, direct store root, or forest root
+  - workspace/local root, direct tree root, or forest root
   - default `candidate_db`
 
 Behavior:
 
 - opens an existing initialized root
-- requires an explicitly initialized workspace root, direct local store root, or forest root
-- use `init` first before starting a new workspace or direct local store
+- requires an explicitly initialized workspace/local root, direct tree root, or forest root
+- use `init` first before starting a new workspace/local root
 
 ## `index`
 
@@ -199,7 +199,7 @@ Commands:
 
 Shared note:
 
-- these commands operate directly on a local store or forest root without RPC
+- these commands operate directly on a local/workspace root or forest root without RPC
 
 ### `local index`
 
@@ -216,7 +216,7 @@ Usage: sspry local index [OPTIONS] --root <ROOT> <PATHS>...
 Behavior:
 
 - writes directly without RPC
-- requires an explicitly initialized direct local store root
+- requires an explicitly initialized local/workspace root
 - use `init --mode local` first before local ingest
 
 ### `local delete`
@@ -243,7 +243,7 @@ Usage: sspry local search [OPTIONS] --root <ROOT> --rule <RULE>
 
 Behavior:
 
-- opens a direct local store or forest root in-process
+- opens a local/workspace root or forest root in-process
 - expands the top-level rule file once, including `include` directives
 - if the expanded source contains multiple searchable rules, the opened local root is reused across the rule bundle
 

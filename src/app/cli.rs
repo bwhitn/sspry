@@ -143,7 +143,7 @@ struct LocalIndexArgs {
     #[arg(
         long = "root",
         required = true,
-        help = "Direct local store root directory."
+        help = "Local/workspace root directory that contains <root>/current/tree_*."
     )]
     root: String,
     #[arg(required = true, help = "File or directory paths.")]
@@ -189,7 +189,7 @@ struct LocalDeleteArgs {
     #[arg(
         long = "root",
         required = true,
-        help = "Direct local store root directory."
+        help = "Local/workspace root directory or readable forest root."
     )]
     root: String,
     #[arg(
@@ -277,7 +277,7 @@ struct LocalSearchArgs {
     #[arg(
         long = "root",
         required = true,
-        help = "Direct local store or forest root for in-process search."
+        help = "Local/workspace root directory or readable forest root for in-process search."
     )]
     root: String,
     #[arg(long = "rule", required = true, help = "Path to YARA rule file.")]
@@ -352,7 +352,7 @@ struct LocalInfoArgs {
     #[arg(
         long = "root",
         required = true,
-        help = "Direct local store or forest root directory."
+        help = "Local/workspace root directory or readable forest root directory."
     )]
     root: String,
 }
@@ -401,7 +401,7 @@ struct ServeCommonArgs {
     #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
-        help = "Workspace root, direct local store root, or forest root directory."
+        help = "Workspace/local root directory or readable forest root directory."
     )]
     root: String,
 }
@@ -429,31 +429,31 @@ struct InitArgs {
     #[arg(
         long = "root",
         default_value = DEFAULT_CANDIDATE_ROOT,
-        help = "Workspace root or direct local store root to initialize."
+        help = "Root to initialize using the shared <root>/current/tree_* on-disk layout."
     )]
     root: String,
     #[arg(
         long = "mode",
         value_enum,
         default_value_t = InitMode::Workspace,
-        help = "Initialization target. `workspace` creates/uses <root>/current for serve. `local` creates a direct store at <root> for local index/search/info."
+        help = "Initialization target. Both modes create/use <root>/current/tree_* on disk. `workspace` is intended for serve/RPC management, while `local` is intended for direct local CLI management without serve."
     )]
     mode: InitMode,
     #[arg(
         long = "shards",
-        help = "Number of independent candidate shards (lock stripes) to initialize. Defaults to 8 for workspace mode and 1 for local mode."
+        help = "Number of independent candidate shards (lock stripes) per tree. Defaults to 8 for both modes."
     )]
     shards: Option<usize>,
     #[arg(long = "force", action = ArgAction::SetTrue, help = "Overwrite an existing candidate store.")]
     force: bool,
     #[arg(
         long = "tier1-set-fp",
-        help = "Tier1 Bloom false-positive rate. Defaults to 0.38 when omitted."
+        help = "Tier1 Bloom false-positive rate. Defaults to 0.4 when omitted."
     )]
     tier1_filter_target_fp: Option<f64>,
     #[arg(
         long = "tier2-set-fp",
-        help = "Tier2 Bloom false-positive rate. Defaults to 0.18 when omitted."
+        help = "Tier2 Bloom false-positive rate. Defaults to 0.25 when omitted."
     )]
     tier2_filter_target_fp: Option<f64>,
     #[arg(

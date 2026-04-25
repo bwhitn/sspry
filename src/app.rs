@@ -347,7 +347,7 @@ fn default_verify_workers() -> usize {
 fn default_candidate_shards_for_mode(mode: InitMode) -> usize {
     match mode {
         InitMode::Workspace => DEFAULT_CANDIDATE_SHARDS,
-        InitMode::Local => 1,
+        InitMode::Local => DEFAULT_CANDIDATE_SHARDS,
     }
 }
 
@@ -1589,10 +1589,22 @@ fn push_serialized_remote_batch_row(
     Ok(pending.rows.len() >= batch_docs)
 }
 
-/// Flushes a local pending batch into the correct shard stores and updates
-/// progress accounting.
+/// Persists any dirty local store metadata before the store set is dropped or
+/// reused under a different tree root.
+fn persist_local_stores(stores: &mut [CandidateStore]) -> Result<()> {
+    for store in stores {
+        let _ = store.persist_meta_if_dirty()?;
+    }
+    Ok(())
+}
+
+/// Flushes a local pending batch into the correct shard stores, rotating to
+/// the next `tree_*` root when one local/workspace tree reaches the per-tree
+/// document cap.
 fn flush_local_pending_rows(
-    stores: &mut [CandidateStore],
+    root: &Path,
+    target_root: &mut PathBuf,
+    stores: &mut Vec<CandidateStore>,
     pending: &mut Vec<IndexBatchRow>,
     processed: &mut usize,
     submit_time: &mut Duration,
@@ -1601,34 +1613,71 @@ fn flush_local_pending_rows(
     last_progress_reported: &mut usize,
     last_progress_at: &mut Instant,
 ) -> Result<()> {
-    for row in pending.drain(..) {
-        let started_submit = Instant::now();
-        let shard_idx = candidate_shard_index(&row.identity, stores.len());
-        let _ = stores[shard_idx].insert_document_with_metadata(
-            row.identity,
-            row.file_size,
-            row.bloom_item_estimate,
-            None,
-            row.tier2_bloom_item_estimate,
-            None,
-            row.filter_bytes,
-            &row.bloom_filter,
-            row.tier2_filter_bytes,
-            &row.tier2_bloom_filter,
-            &row.metadata,
-            row.special_population,
-            row.external_id,
-        )?;
-        *submit_time += started_submit.elapsed();
-        *processed += 1;
-        maybe_report_index_progress(
-            show_progress,
-            *processed,
-            total_files,
-            last_progress_reported,
-            last_progress_at,
-            false,
-        );
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let tree_managed_root = local_tree_container_root(root)?.is_some();
+    while !pending.is_empty() {
+        if tree_managed_root {
+            let active_doc_count = stores
+                .iter()
+                .map(CandidateStore::live_doc_count)
+                .sum::<usize>();
+            if active_doc_count >= LOCAL_TREE_DOC_LIMIT {
+                persist_local_stores(stores)?;
+                *target_root = resolve_local_index_store_root(root)?;
+                *stores = open_stores(target_root)?;
+                continue;
+            }
+        }
+
+        let batch_capacity = if tree_managed_root {
+            LOCAL_TREE_DOC_LIMIT.saturating_sub(
+                stores
+                    .iter()
+                    .map(CandidateStore::live_doc_count)
+                    .sum::<usize>(),
+            )
+        } else {
+            usize::MAX
+        };
+        let rows = if pending.len() <= batch_capacity {
+            std::mem::take(pending)
+        } else {
+            let tail = pending.split_off(batch_capacity);
+            std::mem::replace(pending, tail)
+        };
+
+        for row in rows {
+            let started_submit = Instant::now();
+            let shard_idx = candidate_shard_index(&row.identity, stores.len());
+            let _ = stores[shard_idx].insert_document_with_metadata(
+                row.identity,
+                row.file_size,
+                row.bloom_item_estimate,
+                None,
+                row.tier2_bloom_item_estimate,
+                None,
+                row.filter_bytes,
+                &row.bloom_filter,
+                row.tier2_filter_bytes,
+                &row.tier2_bloom_filter,
+                &row.metadata,
+                row.special_population,
+                row.external_id,
+            )?;
+            *submit_time += started_submit.elapsed();
+            *processed += 1;
+            maybe_report_index_progress(
+                show_progress,
+                *processed,
+                total_files,
+                last_progress_reported,
+                last_progress_at,
+                false,
+            );
+        }
     }
     Ok(())
 }
@@ -1807,9 +1856,26 @@ struct LocalInitOutcome {
 /// Returns the concrete store root that an init request should materialize.
 fn init_store_root(args: &InitArgs) -> PathBuf {
     let root = PathBuf::from(&args.root);
+    if root
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        .map(|name| name.starts_with("tree_"))
+        .unwrap_or(false)
+        && root.file_name().and_then(|value| value.to_str()) == Some("current")
+    {
+        return root;
+    }
+    if root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| name.starts_with("tree_"))
+        .unwrap_or(false)
+    {
+        return root;
+    }
     match args.mode {
-        InitMode::Workspace => root.join("current"),
-        InitMode::Local => root,
+        InitMode::Workspace | InitMode::Local => root.join("current").join("tree_00"),
     }
 }
 
@@ -1884,15 +1950,28 @@ fn ensure_initialized_root(args: &InitArgs) -> Result<LocalInitOutcome> {
     let logical_root = PathBuf::from(&args.root);
     let store_root = init_store_root(args);
     let shard_count = init_candidate_shard_count(args);
-    if args.mode == InitMode::Workspace {
-        if !logical_root.join("current").is_dir()
-            && !logical_root.join("work_a").is_dir()
-            && !logical_root.join("work_b").is_dir()
-            && store_root_has_markers(&logical_root)
+    if !logical_root.join("current").is_dir()
+        && !logical_root.join("work_a").is_dir()
+        && !logical_root.join("work_b").is_dir()
+        && store_root_has_markers(&logical_root)
+    {
+        return Err(SspryError::from(format!(
+            "{} contains a direct store; initialize a fresh root before using the tree-based layout.",
+            logical_root.display()
+        )));
+    }
+    for workspace_root in [
+        logical_root.join("current"),
+        logical_root.join("work_a"),
+        logical_root.join("work_b"),
+    ] {
+        if workspace_root.is_dir()
+            && store_root_has_markers(&workspace_root)
+            && !has_named_tree_dirs(&workspace_root)?
         {
             return Err(SspryError::from(format!(
-                "{} contains a direct store; initialize a fresh workspace root or use --mode local.",
-                logical_root.display()
+                "{} contains the flattened workspace layout. Use a fresh root before restoring tree-based layout.",
+                workspace_root.display()
             )));
         }
     }
@@ -2627,31 +2706,70 @@ impl LocalSearchContext {
     }
 }
 
-/// Returns the searchable tree roots within a forest or falls back to the
-/// provided root for single-tree layouts.
-fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
-    let direct_current = root.join("current");
-    if direct_current.is_dir() {
-        return Ok(vec![direct_current]);
+/// Returns whether one directory contains direct `tree_*` child directories.
+fn has_named_tree_dirs(root: &Path) -> Result<bool> {
+    if !root.is_dir() {
+        return Ok(false);
+    }
+    Ok(fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with("tree_"))
+                    .unwrap_or(false)
+        }))
+}
+
+/// Discovers direct tree roots beneath one forest-style directory.
+///
+/// How it works:
+/// - Walks one directory level.
+/// - Treats direct `tree_*` directories as live tree roots.
+/// - Accepts legacy `tree_*/current` layouts when present.
+/// - Falls back to the provided root itself when it already contains a direct
+///   store.
+fn direct_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
     }
     let mut tree_roots = fs::read_dir(root)?
         .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with("tree_"))
+                    .unwrap_or(false)
+        })
         .map(|entry| {
             let path = entry.path();
             let current = path.join("current");
             if current.is_dir() { current } else { path }
         })
-        .filter(|path| {
-            path.is_dir()
-                && path
-                    .parent()
-                    .and_then(|value| value.file_name().or_else(|| path.file_name()))
-                    .and_then(|value| value.to_str())
-                    .map(|name| name.starts_with("tree_"))
-                    .unwrap_or(false)
-        })
         .collect::<Vec<_>>();
     tree_roots.sort();
+    if tree_roots.is_empty() && store_root_has_markers(root) {
+        tree_roots.push(root.to_path_buf());
+    }
+    Ok(tree_roots)
+}
+
+/// Returns the searchable tree roots within a forest or falls back to the
+/// provided root for single-tree layouts.
+fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    let direct_current = root.join("current");
+    if direct_current.is_dir() {
+        let current_tree_roots = direct_tree_roots(&direct_current)?;
+        if !current_tree_roots.is_empty() {
+            return Ok(current_tree_roots);
+        }
+        return Ok(vec![direct_current]);
+    }
+    let tree_roots = direct_tree_roots(root)?;
     if tree_roots.is_empty() {
         Ok(vec![root.to_path_buf()])
     } else {
@@ -2670,6 +2788,91 @@ fn open_forest_tree_groups(root: &Path) -> Result<Vec<TreeStoreGroup>> {
             })
         })
         .collect()
+}
+
+const LOCAL_TREE_DOC_LIMIT: usize = 5_000;
+
+/// Parses one `tree_XX` root name into its numeric tree index.
+fn tree_root_index(root: &Path) -> Result<usize> {
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| SspryError::from(format!("invalid tree root {}", root.display())))?;
+    let suffix = name
+        .strip_prefix("tree_")
+        .ok_or_else(|| SspryError::from(format!("invalid tree root name {name}")))?;
+    suffix
+        .parse::<usize>()
+        .map_err(|err| SspryError::from(format!("invalid tree root name {name}: {err}")))
+}
+
+/// Returns the directory that should contain live tree roots for a local
+/// workspace-style root.
+fn local_tree_container_root(root: &Path) -> Result<Option<PathBuf>> {
+    let current_root = root.join("current");
+    if current_root.is_dir() {
+        return Ok(Some(current_root));
+    }
+    if root.file_name().and_then(|value| value.to_str()) == Some("current")
+        && has_named_tree_dirs(root)?
+    {
+        return Ok(Some(root.to_path_buf()));
+    }
+    Ok(None)
+}
+
+/// Resolves the tree root local indexing should append into, creating the next
+/// tree under `current/` when the newest tree reaches the per-tree document
+/// cap.
+fn resolve_local_index_store_root(root: &Path) -> Result<PathBuf> {
+    let Some(container_root) = local_tree_container_root(root)? else {
+        return Ok(root.to_path_buf());
+    };
+    if !has_named_tree_dirs(&container_root)? {
+        return Err(SspryError::from(format!(
+            "{} is not initialized with tree roots under {}.",
+            root.display(),
+            container_root.display()
+        )));
+    }
+    let mut tree_roots = direct_tree_roots(&container_root)?;
+    tree_roots.sort_by_key(|tree_root| tree_root_index(tree_root).unwrap_or(usize::MAX));
+    let latest_tree_root = tree_roots.last().cloned().ok_or_else(|| {
+        SspryError::from(format!(
+            "{} has no live tree roots under {}.",
+            root.display(),
+            container_root.display()
+        ))
+    })?;
+    let latest_stores = open_stores(&latest_tree_root)?;
+    let latest_doc_count = latest_stores
+        .iter()
+        .map(CandidateStore::live_doc_count)
+        .sum::<usize>();
+    if latest_doc_count < LOCAL_TREE_DOC_LIMIT {
+        return Ok(latest_tree_root);
+    }
+    let shard_count = latest_stores.len().max(1);
+    let template_config = latest_stores
+        .first()
+        .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
+        .config();
+    let next_tree_idx = tree_roots
+        .iter()
+        .map(|tree_root| tree_root_index(tree_root))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let next_tree_root = container_root.join(format!("tree_{next_tree_idx:02}"));
+    for shard_idx in 0..shard_count {
+        let mut shard_config = template_config.clone();
+        shard_config.root = candidate_shard_root(&next_tree_root, shard_count, shard_idx);
+        let _ = ensure_store(shard_config, false)?;
+    }
+    write_candidate_shard_count(&next_tree_root, shard_count)?;
+    Ok(next_tree_root)
 }
 
 /// Verifies that every tree in the forest agrees on gram sizes and identity
@@ -3393,21 +3596,7 @@ fn serve_uses_workspace_mode(root: &Path) -> bool {
     if store_root_has_markers(root) {
         return false;
     }
-    fs::read_dir(root)
-        .ok()
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-                    && entry
-                        .file_name()
-                        .to_str()
-                        .map(|name| name.starts_with("tree_"))
-                        .unwrap_or(false)
-                    && entry.path().join("current").is_dir()
-            })
-        })
-        .map(|has_forest_trees| !has_forest_trees)
-        .unwrap_or(true)
+    !has_named_tree_dirs(root).unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -3421,30 +3610,30 @@ struct ResolvedServeRuntimeSettings {
 /// already initialized.
 fn existing_serve_store_root(root: &Path, workspace_mode: bool) -> Result<Option<PathBuf>> {
     if workspace_mode {
-        let current_root = root.join("current");
-        if store_root_has_markers(&current_root) {
-            return Ok(Some(current_root));
+        for workspace_root in [
+            root.join("current"),
+            root.join("work_a"),
+            root.join("work_b"),
+        ] {
+            if let Some(tree_root) = direct_tree_roots(&workspace_root)?
+                .into_iter()
+                .find(|tree_root| store_root_has_markers(tree_root))
+            {
+                return Ok(Some(tree_root));
+            }
         }
         return Ok(None);
     }
-    let tree_roots = forest_tree_roots(root)?;
-    if let Some(tree_root) = tree_roots
-        .iter()
-        .find(|tree_root| *tree_root != root && store_root_has_markers(tree_root))
-    {
-        return Ok(Some(tree_root.clone()));
-    }
-    if store_root_has_markers(root) {
-        return Ok(Some(root.to_path_buf()));
-    }
-    Ok(None)
+    Ok(direct_tree_roots(root)?
+        .into_iter()
+        .find(|tree_root| store_root_has_markers(tree_root)))
 }
 
 /// Returns a stable user-facing error when a serve target does not point at an
-/// initialized workspace, direct local store, or forest root.
+/// initialized workspace/local root, direct tree root, or forest root.
 fn missing_serve_root_error(root: &Path) -> SspryError {
     SspryError::from(format!(
-        "{} is not initialized. Run `sspry init --root {}` first, or point `serve --root` at an existing direct local store or forest root.",
+        "{} is not initialized. Run `sspry init --root {}` first, or point `serve --root` at an existing workspace/local root, direct tree root, or forest root.",
         root.display(),
         root.display(),
     ))
@@ -3547,7 +3736,8 @@ fn cmd_init(args: &InitArgs) -> i32 {
 fn cmd_internal_index(args: &InternalIndexArgs) -> i32 {
     match (|| -> Result<i32> {
         let result = if let Some(root) = &args.root {
-            let mut stores = open_stores(Path::new(root))?;
+            let target_root = resolve_local_index_store_root(Path::new(root))?;
+            let mut stores = open_stores(&target_root)?;
             let config = stores
                 .first()
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
@@ -3640,9 +3830,11 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
         let mut any_failed = false;
         let mut results = Vec::with_capacity(args.values.len());
         if let Some(root) = &args.root {
-            let mut stores = open_stores(Path::new(root))?;
-            let id_source = stores
-                .first()
+            let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
+            let id_source = tree_groups
+                .iter()
+                .flat_map(|group| group.stores.iter())
+                .next()
                 .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
                 .config()
                 .id_source;
@@ -3651,8 +3843,19 @@ fn cmd_internal_delete(args: &InternalDeleteArgs) -> i32 {
                 let identity_hex =
                     resolve_delete_value(value, id_source, DEFAULT_FILE_READ_CHUNK_SIZE)?;
                 let identity = identity_from_hex(&identity_hex, id_source)?;
-                let shard_idx = candidate_shard_index(&identity, stores.len());
-                results.push(stores[shard_idx].delete_document(&identity_hex)?);
+                let mut deleted = None;
+                for group in &mut tree_groups {
+                    let shard_idx = candidate_shard_index(&identity, group.stores.len());
+                    let result = group.stores[shard_idx].delete_document(&identity_hex)?;
+                    if result.status == "deleted" && deleted.is_none() {
+                        deleted = Some(result);
+                    }
+                }
+                results.push(deleted.unwrap_or(crate::candidate::CandidateDeleteResult {
+                    status: "missing".to_owned(),
+                    doc_id: None,
+                    identity: identity_hex,
+                }));
             }
         } else {
             let server_id_source = server_identity_source(&args.connection)?;
@@ -3701,18 +3904,8 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 "internal remote query was removed; use `search`",
             ));
         };
-        let mut stores = open_stores(Path::new(root))?;
-        let (gram_sizes, active_identity_source) = stores
-            .first()
-            .map(|store| {
-                let config = store.config();
-                Ok::<_, SspryError>((
-                    GramSizes::new(config.tier1_gram_size, config.tier2_gram_size)?,
-                    Some(config.id_source),
-                ))
-            })
-            .transpose()?
-            .unwrap_or((GramSizes::new(3, 4)?, None));
+        let mut tree_groups = open_forest_tree_groups(Path::new(root))?;
+        let (gram_sizes, active_identity_source, _) = validate_forest_search_policy(&tree_groups)?;
         let plan =
             crate::candidate::compile_query_plan_from_file_with_gram_sizes_and_identity_source(
                 &args.rule,
@@ -3723,12 +3916,17 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
                 !args.no_tier2_fallback,
                 args.max_candidates,
             )?;
-        let result = if stores.len() == 1 {
+        let result = if tree_groups.len() == 1 && tree_groups[0].stores.len() == 1 {
             let mut resolved_plan = plan.clone();
-            resolved_plan.max_candidates =
-                resolve_max_candidates(stores[0].live_doc_count(), plan.max_candidates) as f64;
-            let result =
-                stores[0].query_candidates(&resolved_plan, args.cursor, args.chunk_size)?;
+            resolved_plan.max_candidates = resolve_max_candidates(
+                tree_groups[0].stores[0].live_doc_count(),
+                plan.max_candidates,
+            ) as f64;
+            let result = tree_groups[0].stores[0].query_candidates(
+                &resolved_plan,
+                args.cursor,
+                args.chunk_size,
+            )?;
             rpc::CandidateQueryResponse {
                 identities: result.identities,
                 total_candidates: result.total_candidates,
@@ -3747,22 +3945,17 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
             let mut query_profile = crate::candidate::CandidateQueryProfile::default();
             let mut scan_plan = plan.clone();
             scan_plan.max_candidates = 0.0;
-            let collect_chunk = DEFAULT_SEARCH_RESULT_CHUNK_SIZE.max(1);
-            let searchable_doc_count = stores.iter().map(CandidateStore::live_doc_count).sum();
+            let searchable_doc_count = tree_groups
+                .iter()
+                .flat_map(|group| group.stores.iter())
+                .map(CandidateStore::live_doc_count)
+                .sum();
             let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
-            for store in &mut stores {
-                let mut cursor = 0usize;
-                loop {
-                    let local = store.query_candidates(&scan_plan, cursor, collect_chunk)?;
-                    tier_used.push(local.tier_used.clone());
-                    query_profile.merge_from(&local.query_profile);
-                    identities.extend(local.identities);
-                    if let Some(next) = local.next_cursor {
-                        cursor = next;
-                    } else {
-                        break;
-                    }
-                }
+            for group in &mut tree_groups {
+                let local = query_store_group_all_candidates(&mut group.stores, &scan_plan, false)?;
+                tier_used.extend(local.tier_used);
+                query_profile.merge_from(&local.query_profile);
+                identities.extend(local.identities);
             }
             let mut identities = identities.into_iter().collect::<Vec<_>>();
             let truncated = resolved_limit != usize::MAX && identities.len() > resolved_limit;
@@ -3820,7 +4013,10 @@ fn cmd_internal_query(args: &InternalQueryArgs) -> i32 {
 fn cmd_internal_stats(args: &InternalStatsArgs) -> i32 {
     match (|| -> Result<i32> {
         let stats = if let Some(root) = &args.root {
-            let stores = open_stores(Path::new(root))?;
+            let stores = open_forest_tree_groups(Path::new(root))?
+                .into_iter()
+                .flat_map(|group| group.stores)
+                .collect::<Vec<_>>();
             serde_json::Value::Object(rpc::candidate_stats_json_for_stores(
                 Path::new(root),
                 &stores,
@@ -3908,7 +4104,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             Some(Path::new(root)),
         );
         let workers = resolved_workers.workers;
-        let mut stores = open_stores(Path::new(root))?;
+        let mut target_root = resolve_local_index_store_root(Path::new(root))?;
+        let mut stores = open_stores(&target_root)?;
         let config = stores
             .first()
             .ok_or_else(|| SspryError::from("Candidate store is not initialized."))?
@@ -3944,6 +4141,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                 );
                 if pending.len() >= batch_docs {
                     flush_local_pending_rows(
+                        Path::new(root),
+                        &mut target_root,
                         &mut stores,
                         &mut pending,
                         &mut processed,
@@ -4019,6 +4218,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
                     );
                     if pending.len() >= batch_docs {
                         flush_local_pending_rows(
+                            Path::new(root),
+                            &mut target_root,
                             &mut stores,
                             &mut pending,
                             &mut processed,
@@ -4040,6 +4241,8 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
         }
 
         flush_local_pending_rows(
+            Path::new(root),
+            &mut target_root,
             &mut stores,
             &mut pending,
             &mut processed,
@@ -4049,9 +4252,7 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
             &mut last_progress_reported,
             &mut last_progress_at,
         )?;
-        for store in &mut stores {
-            let _ = store.persist_meta_if_dirty()?;
-        }
+        persist_local_stores(&mut stores)?;
 
         maybe_report_index_progress(
             show_progress,
@@ -4107,20 +4308,36 @@ fn cmd_internal_index_batch(args: &InternalIndexBatchArgs) -> i32 {
 /// Validates that `local index` targets an explicitly initialized direct local
 /// store root rather than relying on implicit creation.
 fn ensure_local_index_root_initialized(root: &Path) -> Result<()> {
+    if let Some(container_root) = local_tree_container_root(root)? {
+        if has_named_tree_dirs(&container_root)? {
+            return Ok(());
+        }
+        if store_root_has_markers(&container_root) {
+            return Err(SspryError::from(format!(
+                "{} contains the flattened workspace layout. Use a tree-based local/workspace root instead.",
+                container_root.display()
+            )));
+        }
+    }
     if read_candidate_shard_count(root)?.is_some() || store_root_has_markers(root) {
         return Ok(());
+    }
+    if has_named_tree_dirs(root)? {
+        return Err(SspryError::from(format!(
+            "{} looks like a forest root. Point `local index --root` at the root that owns `current/`, not a read-only forest root.",
+            root.display()
+        )));
     }
     if root.join("current").is_dir() || root.join("work_a").is_dir() || root.join("work_b").is_dir()
     {
         return Err(SspryError::from(format!(
-            "{} is a workspace root. Use `sspry serve --root {}` with remote `index`, or initialize a direct local store with `sspry init --root {} --mode local`.",
-            root.display(),
+            "{} is not initialized for local tree-based indexing. Run `sspry init --root {} --mode local` first.",
             root.display(),
             root.display(),
         )));
     }
     Err(SspryError::from(format!(
-        "{} is not initialized as a direct local store. Run `sspry init --root {} --mode local` first.",
+        "{} is not initialized. Run `sspry init --root {} --mode local` first.",
         root.display(),
         root.display(),
     )))
@@ -5293,7 +5510,7 @@ fn cmd_grpc_index_multi(args: &IndexArgs) -> i32 {
 }
 
 /// Implements the high-level local indexing command by requiring an existing
-/// initialized direct local store and delegating to batch indexing.
+/// initialized local root and delegating to batch indexing.
 fn cmd_local_index(args: &LocalIndexArgs) -> i32 {
     match ensure_local_index_root_initialized(Path::new(&args.root)) {
         Ok(_) => cmd_internal_index_batch(&InternalIndexBatchArgs {
@@ -6847,22 +7064,10 @@ fn cmd_grpc_info_multi(args: &InfoCommandArgs) -> i32 {
 fn cmd_local_info(args: &LocalInfoArgs) -> i32 {
     match (|| -> Result<i32> {
         let root = Path::new(&args.root);
-        let stats = if root.is_dir()
-            && fs::read_dir(root)
-                .ok()
-                .map(|entries| {
-                    entries.flatten().any(|entry| {
-                        entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-                            && entry
-                                .file_name()
-                                .to_str()
-                                .map(|name| name.starts_with("tree_"))
-                                .unwrap_or(false)
-                            && entry.path().join("current").is_dir()
-                    })
-                })
-                .unwrap_or(false)
-        {
+        let tree_roots = forest_tree_roots(root)?;
+        let use_forest_groups =
+            tree_roots.len() > 1 || tree_roots.first().is_some_and(|path| path != root);
+        let stats = if use_forest_groups {
             let tree_groups = open_forest_tree_groups(root)?;
             let stores = tree_groups
                 .into_iter()

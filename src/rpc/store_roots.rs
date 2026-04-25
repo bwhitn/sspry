@@ -64,6 +64,22 @@ fn ensure_candidate_store_profiled(
     Ok((store, false, profile))
 }
 
+/// Returns whether a root already contains files that identify it as one
+/// direct store or one sharded tree root.
+fn store_root_has_markers(root: &Path) -> bool {
+    root.join("store_meta.json").exists()
+        || root.join("meta.json").exists()
+        || root.join("source_id_by_docid.dat").exists()
+        || root.join("doc_meta.bin").exists()
+        || root.join("shard_000").join("store_meta.json").exists()
+        || root.join("shard_000").join("meta.json").exists()
+        || root
+            .join("shard_000")
+            .join("source_id_by_docid.dat")
+            .exists()
+        || root.join("shard_000").join("doc_meta.bin").exists()
+}
+
 /// Returns the canonical workspace path that serves published data.
 fn workspace_current_root(root: &Path) -> PathBuf {
     root.join("current")
@@ -96,22 +112,6 @@ fn preferred_workspace_work_root(root: &Path) -> PathBuf {
         work_root_b
     } else {
         work_root_a
-    }
-}
-
-/// Returns the staging root opposite the currently active one.
-///
-/// Inputs:
-/// - `root`: Top-level workspace root.
-/// - `active_root`: The work root currently in use.
-///
-/// Returns:
-/// - The alternate work root that can be prepared next.
-fn alternate_workspace_work_root(root: &Path, active_root: &Path) -> PathBuf {
-    if active_root == workspace_work_root_a(root) {
-        workspace_work_root_b(root)
-    } else {
-        workspace_work_root_a(root)
     }
 }
 
@@ -164,12 +164,55 @@ fn workspace_retired_stats(root: &Path) -> (u64, u64) {
     (retired.len() as u64, bytes)
 }
 
+/// Discovers direct tree roots beneath one forest-style directory.
+///
+/// How it works:
+/// - Walks one directory level.
+/// - Treats `tree_*` directories as live tree roots.
+/// - Accepts legacy `tree_*/current` layouts when present so callers can still
+///   open older forests during transition.
+///
+/// Inputs:
+/// - `root`: Directory that should contain tree directories.
+///
+/// Returns:
+/// - Sorted live tree roots that should participate in search/open.
+fn direct_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut tree_roots = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+                && entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with("tree_"))
+                    .unwrap_or(false)
+        })
+        .map(|entry| {
+            let path = entry.path();
+            let current = path.join("current");
+            if current.is_dir() { current } else { path }
+        })
+        .collect::<Vec<_>>();
+    tree_roots.sort();
+    if tree_roots.is_empty() && store_root_has_markers(root) {
+        tree_roots.push(root.to_path_buf());
+    }
+    Ok(tree_roots)
+}
+
 /// Discovers forest tree roots beneath a top-level root.
 ///
 /// How it works:
 /// - Walks one directory level.
-/// - Treats `tree_*/current` as the live tree root when present.
-/// - Filters out anything that does not match the expected tree layout.
+/// - Treats `tree_*` directories as the live tree roots.
+/// - Falls back to `tree_*/current` roots for older forests.
 ///
 /// Inputs:
 /// - `root`: Top-level forest directory.
@@ -177,28 +220,27 @@ fn workspace_retired_stats(root: &Path) -> (u64, u64) {
 /// Returns:
 /// - Sorted live tree roots that should participate in search/open.
 fn forest_tree_roots(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.is_dir() {
-        return Ok(Vec::new());
+    direct_tree_roots(root)
+}
+
+/// Opens every tree store set beneath one forest-style root and aggregates the
+/// resulting startup profile.
+fn ensure_candidate_tree_sets_at_root(
+    config: &ServerConfig,
+    root: &Path,
+) -> Result<(Vec<Arc<StoreSet>>, usize, StoreRootStartupProfile)> {
+    let tree_roots = direct_tree_roots(root)?;
+    let mut trees = Vec::with_capacity(tree_roots.len());
+    let mut removed_roots = 0usize;
+    let mut profile = StoreRootStartupProfile::default();
+    for tree_root in tree_roots {
+        let (stores, tree_removed_roots, tree_profile) =
+            ensure_candidate_stores_at_root(config, &tree_root)?;
+        removed_roots = removed_roots.saturating_add(tree_removed_roots);
+        merge_store_root_startup_profile(&mut profile, &tree_profile);
+        trees.push(Arc::new(StoreSet::new(tree_root, stores)));
     }
-    let mut tree_roots = fs::read_dir(root)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| {
-            let path = entry.path();
-            let current = path.join("current");
-            if current.is_dir() { current } else { path }
-        })
-        .filter(|path| {
-            path.is_dir()
-                && path
-                    .parent()
-                    .and_then(|value| value.file_name().or_else(|| path.file_name()))
-                    .and_then(|value| value.to_str())
-                    .map(|name| name.starts_with("tree_"))
-                    .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    tree_roots.sort();
-    Ok(tree_roots)
+    Ok((trees, removed_roots, profile))
 }
 
 /// Merges one root's startup profile into a larger startup aggregate.
@@ -242,24 +284,6 @@ fn merge_store_root_startup_profile(
     dst.store_open_rebuild_identity_index_ms = dst
         .store_open_rebuild_identity_index_ms
         .saturating_add(src.store_open_rebuild_identity_index_ms);
-}
-
-/// Produces a unique path for the next retired published root.
-///
-/// Inputs:
-/// - `root`: The retired-root directory that will contain published generations.
-///
-/// Returns:
-/// - A path using the current timestamp, with a PID fallback if needed.
-fn next_workspace_retired_root_path(root: &Path) -> PathBuf {
-    let base = current_unix_ms();
-    for offset in 0..1024u64 {
-        let candidate = root.join(format!("published_{}", base.saturating_add(offset)));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    root.join(format!("published_{}_{}", base, std::process::id()))
 }
 
 /// Deletes the oldest retired workspace roots beyond the configured retention
@@ -387,16 +411,8 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     if !config.workspace_mode {
         let forest_roots = forest_tree_roots(root)?;
         if !forest_roots.is_empty() && !root.join("current").is_dir() {
-            let mut trees = Vec::with_capacity(forest_roots.len());
-            let mut removed_roots = 0usize;
-            let mut current_profile = StoreRootStartupProfile::default();
-            for tree_root in forest_roots {
-                let (stores, tree_removed_roots, tree_profile) =
-                    ensure_candidate_stores_at_root(config, &tree_root)?;
-                removed_roots = removed_roots.saturating_add(tree_removed_roots);
-                merge_store_root_startup_profile(&mut current_profile, &tree_profile);
-                trees.push(Arc::new(StoreSet::new(tree_root, stores)));
-            }
+            let (trees, removed_roots, current_profile) =
+                ensure_candidate_tree_sets_at_root(config, root)?;
             return Ok((
                 StoreMode::Forest {
                     _root: root.clone(),
@@ -440,17 +456,40 @@ fn ensure_candidate_stores(config: &ServerConfig) -> Result<(StoreMode, usize, S
     let retired_root = workspace_retired_root(root);
     let removed_retired =
         prune_workspace_retired_roots(&retired_root, DEFAULT_WORKSPACE_RETIRED_ROOTS_TO_KEEP)?;
-    let (published, removed_current, current_profile) =
-        ensure_candidate_stores_at_root(config, &current_root)?;
+    fs::create_dir_all(&current_root)?;
+    let (mut published, mut removed_current, mut current_profile) =
+        ensure_candidate_tree_sets_at_root(config, &current_root)?;
+    let (mut work_active, mut removed_work, mut work_profile) =
+        (Vec::new(), 0usize, StoreRootStartupProfile::default());
+    for work_root in [workspace_work_root_a(root), workspace_work_root_b(root)] {
+        let (mut trees, removed_roots, profile) = ensure_candidate_tree_sets_at_root(config, &work_root)?;
+        if trees.is_empty() {
+            continue;
+        }
+        removed_work = removed_work.saturating_add(removed_roots);
+        merge_store_root_startup_profile(&mut work_profile, &profile);
+        work_active.append(&mut trees);
+    }
+    if published.is_empty() && work_active.is_empty() {
+        let first_tree_root = current_root.join("tree_00");
+        let (stores, removed_roots, profile) =
+            ensure_candidate_stores_at_root(config, &first_tree_root)?;
+        removed_current = removed_current.saturating_add(removed_roots);
+        merge_store_root_startup_profile(&mut current_profile, &profile);
+        published.push(Arc::new(StoreSet::new(first_tree_root, stores)));
+    }
     Ok((
         StoreMode::Workspace {
             root: root.clone(),
-            published: Arc::new(StoreSet::new(current_root, published)),
-            work_active: None,
+            published,
+            work_active,
         },
-        removed_current.saturating_add(removed_retired),
+        removed_current
+            .saturating_add(removed_work)
+            .saturating_add(removed_retired),
         StartupProfile {
             current: current_profile,
+            work: work_profile,
             ..StartupProfile::default()
         },
     ))

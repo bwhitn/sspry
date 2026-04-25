@@ -10,11 +10,11 @@
    - `index`, `delete`, `search`, `info`, and `shutdown` talk to that server over gRPC.
    - `rule-check` can pull the active scan policy from a live server with `--addr`.
 2. Local/direct mode:
-   - `init --mode local` creates a direct local store and persists DB-wide format/layout policy.
-   - `local index` writes directly to an already initialized local store root.
-   - `local delete` operates directly on a local store.
-   - `local info` reports direct local store stats and can also aggregate a forest root.
-   - `local search` opens a direct local store or forest locally in-process.
+   - `init --mode local` creates the same `<root>/current/tree_*` on-disk layout as workspace mode and persists DB-wide format/layout policy.
+   - `local index` writes directly to an already initialized local/workspace root without RPC.
+   - `local delete` operates directly on a local/workspace root.
+   - `local info` reports local/workspace-root stats and can also aggregate a forest root.
+   - `local search` opens a local/workspace root or forest locally in-process.
 3. Direct YARA scan mode:
    - `sspry --rule <rule.yar> <file>` scans one file directly with `yara-x` and does not use the database.
    - `rule-check` can also validate a rule offline with explicit `--id-source` / `--gram-sizes` or against a local root with `--root`.
@@ -39,18 +39,21 @@ Options:
   - target root to initialize
   - defaults to `candidate_db`
 - `--mode <workspace|local>`
-  - `workspace` creates/uses `<root>/current` for remote `serve`
-  - `local` creates a direct local store at `<root>`
+  - both modes create/use `<root>/current/tree_*`
+  - `workspace` is intended for remote `serve`
+  - `local` is intended for direct local CLI management without `serve`
   - default is `workspace`
 - `--shards <n>`
-  - shard count to initialize
-  - default is `8` for `workspace` and `1` for `local`
+  - shard count to initialize per tree
+  - default is `8` for both modes
 - `--force`
   - replace an existing initialized root
 - `--tier1-set-fp <p>`
   - Tier1 false-positive rate
+  - default is `0.4`
 - `--tier2-set-fp <p>`
   - Tier2 false-positive rate
+  - default is `0.25`
 - `--id-source <sha256|md5|sha1|sha512>`
   - DB-wide identity mode
 - `--store-path`
@@ -68,7 +71,7 @@ Behavior:
 
 - `init` is the single place to choose DB-wide format/layout policy
 - `serve` and `local index` require an explicitly initialized root
-- use `init` first for all workspace and direct-local-store creation
+- use `init` first for all workspace/local-root creation
 - workspace mode keeps shared policy in root-level `meta.json`
 - shard-local state stays in each shard's `store_meta.json`
 
@@ -95,19 +98,21 @@ Options:
   - root path to open
   - auto-detected as one of:
     - mutable workspace root
-    - direct published store root
+    - mutable local root with the same on-disk layout
+    - direct published tree root
     - forest root containing `tree_*/current`
   - forest-root servers are read-only and intended for search/info
 
 Behavior:
 
-- mutable workspace/direct-store roots support ingest, delete, publish, and search
+- mutable workspace/local roots support ingest, delete, publish, and search
 - forest-root servers open all published `tree_*/current` stores once and answer search/info requests across the forest
 - forest-root servers are read-only; use them for persistent remote search over a finished forest, not for remote ingest
-- `serve` requires an explicitly initialized workspace root, direct local store root, or forest root
+- `serve` requires an explicitly initialized workspace/local root, direct tree root, or forest root
 - workspace mode keeps shared policy in root-level `meta.json`
 - shard-local state stays in each shard's `store_meta.json`
-- `current/` is always present in a workspace; `work_a/` and `work_b/` are created lazily when publish/indexing needs them
+- `current/` is always present in workspace/local roots
+- workspace roots create `work_a/` and `work_b/` lazily when publish/indexing needs them
 
 Example:
 
@@ -171,7 +176,7 @@ Notes:
 Options:
 
 - `--root <path>`
-  - direct local store root
+  - local/workspace root containing `current/tree_*`
 - `--path-list`
 - `--batch-docs <n>`
 - `--workers <n>`
@@ -180,7 +185,7 @@ Options:
 Behavior:
 
 - `local index` writes directly without RPC
-- `local index` requires an explicitly initialized direct local store root
+- `local index` requires an explicitly initialized local/workspace root
 - use `init --mode local` first before local ingest
 
 ## delete
@@ -239,7 +244,7 @@ Options:
 - `--addr <host:port>`
   - use a live server's active scan policy
 - `--root <path>`
-  - use a local store or forest root's active scan policy
+  - use a local/workspace root or forest root's active scan policy
 - `--id-source <sha256|md5|sha1|sha512>`
   - assumed identity source when neither `--addr` nor `--root` is used
 - `--gram-sizes <tier1,tier2>`
@@ -307,7 +312,7 @@ Behavior:
 Options:
 
 - `--root <path>`
-  - in-process forest search root
+  - in-process local/workspace root or readable forest root
 - `--rule <path>`
   - path to one top-level YARA file
   - normal YARA `include "..."` directives are expanded before search
@@ -322,7 +327,7 @@ Options:
 
 Behavior:
 
-- `local search` opens a direct local store or `tree_*/current` forest in-process
+- `local search` opens a local/workspace root or `tree_*/current` forest in-process
 - `--search-workers` is the local in-process search concurrency knob
 - if the expanded source contains multiple searchable rules, `local search` still executes them one rule at a time while reusing the opened local root
 - if the expanded source contains multiple searchable rules, stdout is grouped into one labeled block per rule identifier in source order
@@ -443,7 +448,7 @@ Returns JSON describing one server. With multiple addresses, returns a JSON arra
 ./target/release/sspry local info --root <path>
 ```
 
-Returns JSON describing a direct local store or aggregated stats for a local forest root.
+Returns JSON describing a local/workspace root or aggregated stats for a readable forest root.
 
 ## shutdown
 

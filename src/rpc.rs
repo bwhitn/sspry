@@ -22,10 +22,10 @@ use crate::candidate::query_plan::compiled_query_plan_memory_bytes;
 #[cfg(test)]
 use crate::candidate::store::read_forest_source_dedup_manifest;
 use crate::candidate::store::{
-    CandidateCompactionSnapshot, CandidateImportBatchProfile, CandidateInsertBatchProfile,
-    CandidateStoreOpenProfile, ForestSourceDedupResult, RuntimeQueryArtifacts,
-    build_runtime_query_artifacts, build_tree_source_ref, cleanup_abandoned_compaction_roots,
-    compaction_work_root, for_each_forest_source_ref_duplicate_victim, forest_source_dedup_due,
+    CandidateCompactionSnapshot, CandidateInsertBatchProfile, CandidateStoreOpenProfile,
+    ForestSourceDedupResult, RuntimeQueryArtifacts, build_runtime_query_artifacts,
+    build_tree_source_ref, cleanup_abandoned_compaction_roots, compaction_work_root,
+    for_each_forest_source_ref_duplicate_victim, forest_source_dedup_due,
     record_forest_source_dedup_pass, runtime_query_artifacts_memory_bytes,
     tree_source_ref_build_due, write_compacted_snapshot,
 };
@@ -443,8 +443,8 @@ enum StoreMode {
     },
     Workspace {
         root: PathBuf,
-        published: Arc<StoreSet>,
-        work_active: Option<Arc<StoreSet>>,
+        published: Vec<Arc<StoreSet>>,
+        work_active: Vec<Arc<StoreSet>>,
     },
 }
 

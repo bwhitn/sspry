@@ -449,6 +449,20 @@ fn candidate_document_wire_from_bytes(path: &Path, bytes: &[u8]) -> CandidateDoc
     }
 }
 
+fn synthetic_candidate_document_wire(index: usize) -> CandidateDocumentWire {
+    CandidateDocumentWire {
+        identity: format!("{index:064x}"),
+        file_size: 1,
+        bloom_filter_b64: base64::engine::general_purpose::STANDARD.encode(vec![0u8; 1024]),
+        bloom_item_estimate: None,
+        tier2_bloom_filter_b64: None,
+        tier2_bloom_item_estimate: None,
+        special_population: false,
+        metadata_b64: None,
+        external_id: Some(format!("synthetic-{index}")),
+    }
+}
+
 fn scan_features_default_grams(
     path: impl AsRef<Path>,
 ) -> Result<crate::candidate::DocumentFeatures> {
@@ -861,7 +875,12 @@ fn published_query_waits_for_locked_shard() {
         .expect("insert");
     state.handle_publish().expect("publish");
 
-    let published = state.published_store_set().expect("published stores");
+    let published = state
+        .published_query_store_sets()
+        .expect("published stores")
+        .into_iter()
+        .last()
+        .expect("newest published tree");
     let waited = thread::scope(|scope| {
         let store_lock = &published.stores[0];
         let holder = scope.spawn(move || {
@@ -2201,6 +2220,103 @@ fn workspace_publish_merges_incremental_work_into_published_root() {
 }
 
 #[test]
+fn workspace_batch_insert_rotates_trees_and_publishes_tree_zero_first() {
+    let tmp = tempdir().expect("tmp");
+    let state = sample_workspace_server_state(tmp.path(), 1);
+
+    let docs = (0..5_001)
+        .map(synthetic_candidate_document_wire)
+        .collect::<Vec<_>>();
+    let response = state
+        .handle_candidate_insert_batch(&docs)
+        .expect("insert synthetic batch");
+    assert_eq!(response.inserted_count, 5_001);
+
+    let stats_before = state.current_stats_json().expect("stats before publish");
+    assert_eq!(
+        stats_before.get("doc_count").and_then(Value::as_u64),
+        Some(0)
+    );
+    let staged = state
+        .work_store_sets_if_present()
+        .expect("staged trees before publish");
+    let staged_names = staged
+        .iter()
+        .map(|store_set| {
+            store_set
+                .root()
+                .expect("staged tree root")
+                .file_name()
+                .and_then(|value| value.to_str())
+                .expect("staged tree name")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staged_names,
+        vec!["tree_00".to_owned(), "tree_01".to_owned()]
+    );
+    let staged_counts = staged
+        .iter()
+        .map(|store_set| ServerState::store_set_doc_count(store_set).expect("staged tree count"))
+        .collect::<Vec<_>>();
+    assert_eq!(staged_counts, vec![5_000, 1]);
+    assert_eq!(
+        stats_before
+            .get("work")
+            .and_then(Value::as_object)
+            .and_then(|work| work.get("doc_count"))
+            .and_then(Value::as_u64),
+        Some(5_001)
+    );
+    let status_before = state
+        .grpc_status_response()
+        .expect("grpc status before publish");
+    let work_before = status_before.work.as_ref().expect("grpc work summary");
+    assert_eq!(work_before.doc_count, 5_001);
+    assert_eq!(work_before.active_doc_count, 5_001);
+
+    state.handle_publish().expect("publish synthetic batch");
+
+    let published = state.published_query_store_sets().expect("published trees");
+    let tree_names = published
+        .iter()
+        .map(|store_set| {
+            store_set
+                .root()
+                .expect("tree root")
+                .file_name()
+                .and_then(|value| value.to_str())
+                .expect("tree name")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tree_names, vec!["tree_00".to_owned(), "tree_01".to_owned()]);
+
+    let tree_counts = published
+        .iter()
+        .map(|store_set| {
+            store_set
+                .stores
+                .iter()
+                .map(|store_lock| store_lock.lock().expect("lock shard").stats().doc_count)
+                .sum::<usize>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tree_counts, vec![5_000, 1]);
+
+    let stats_after = state.current_stats_json().expect("stats after publish");
+    assert_eq!(
+        stats_after.get("doc_count").and_then(Value::as_u64),
+        Some(5_001)
+    );
+    assert_eq!(
+        stats_after.get("active_doc_count").and_then(Value::as_u64),
+        Some(5_001)
+    );
+}
+
+#[test]
 fn candidate_stats_json_contains_current_scan_policy_fields() {
     let tmp = tempdir().expect("tmp");
     let config = CandidateConfig {
@@ -2220,11 +2336,11 @@ fn candidate_stats_json_contains_current_scan_policy_fields() {
     );
     assert_eq!(
         stats.get("tier1_filter_target_fp").and_then(Value::as_f64),
-        Some(0.38)
+        Some(0.4)
     );
     assert_eq!(
         stats.get("tier2_filter_target_fp").and_then(Value::as_f64),
-        Some(0.18)
+        Some(0.25)
     );
     assert_eq!(
         stats
@@ -2343,6 +2459,14 @@ fn workspace_and_forest_root_helpers_filter_expected_directories() {
     assert_eq!(trees.len(), 2);
     assert!(trees[0].ends_with("tree_00/current"));
     assert!(trees[1].ends_with("tree_01/current"));
+
+    let direct_tree_root = workspace_root.join("current");
+    fs::create_dir_all(direct_tree_root.join("tree_00")).expect("direct tree 00");
+    fs::create_dir_all(direct_tree_root.join("tree_01")).expect("direct tree 01");
+    let trees = forest_tree_roots(&direct_tree_root).expect("direct tree roots");
+    assert_eq!(trees.len(), 2);
+    assert!(trees[0].ends_with("current/tree_00"));
+    assert!(trees[1].ends_with("current/tree_01"));
 }
 
 #[test]

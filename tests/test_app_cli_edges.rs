@@ -197,10 +197,8 @@ fn local_index_requires_explicit_init() {
         root.to_str().expect("root"),
         sample.to_str().expect("sample"),
     ]);
-    assert!(
-        err.contains("is not initialized as a direct local store"),
-        "{err}"
-    );
+    assert!(err.contains("is not initialized"), "{err}");
+    assert!(err.contains("--mode local"), "{err}");
     assert!(err.contains("sspry init --root"), "{err}");
 }
 
@@ -998,15 +996,17 @@ fn serve_persists_candidate_shards() {
         parsed.get("workspace_mode").and_then(Value::as_bool),
         Some(true)
     );
-    assert!(root.join("meta.json").exists());
+    assert!(root.join("current").join("tree_00").join("meta.json").exists());
     assert!(
         root.join("current")
+            .join("tree_00")
             .join("shard_000")
             .join("store_meta.json")
             .exists()
     );
     assert!(
         root.join("current")
+            .join("tree_00")
             .join("shard_001")
             .join("store_meta.json")
             .exists()
