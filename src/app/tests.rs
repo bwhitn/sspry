@@ -2024,6 +2024,105 @@ fn local_command_error_paths_report_failures() {
     );
 }
 
+#[test]
+fn execute_local_search_bundle_matches_individual_rule_execution() {
+    let _guard = crate::perf::test_lock().lock().expect("perf lock");
+    crate::perf::configure(None, false);
+    let tmp = tempdir().expect("tmp");
+    let local_root = tmp.path().join("local");
+    let sample_a = tmp.path().join("sample_a.bin");
+    let sample_b = tmp.path().join("sample_b.bin");
+    let sample_c = tmp.path().join("sample_c.bin");
+    fs::write(&sample_a, b"alpha and beta").expect("sample a");
+    fs::write(&sample_b, b"alpha only").expect("sample b");
+    fs::write(&sample_c, b"beta only").expect("sample c");
+
+    assert_eq!(
+        cmd_init(&default_internal_init_args(&local_root, 2, true)),
+        0
+    );
+    assert_eq!(
+        cmd_local_index(&LocalIndexArgs {
+            root: local_root.display().to_string(),
+            paths: vec![
+                sample_a.display().to_string(),
+                sample_b.display().to_string(),
+                sample_c.display().to_string(),
+            ],
+            path_list: false,
+            batch_docs: 2,
+            workers: Some(2),
+            verbose: false,
+        }),
+        0
+    );
+
+    let rule_path = tmp.path().join("bundle_rules.yar");
+    let rule_text = r#"
+rule rule_alpha {
+  strings:
+    $a = "alpha"
+  condition:
+    $a
+}
+
+rule rule_beta {
+  strings:
+    $b = "beta"
+  condition:
+    $b
+}
+"#;
+    fs::write(&rule_path, rule_text).expect("rule bundle");
+    let args = LocalSearchArgs {
+        root: local_root.display().to_string(),
+        rule: rule_path.display().to_string(),
+        search_workers: 2,
+        max_anchors_per_pattern: 16,
+        max_candidates: 100.0,
+        verify_yara_files: false,
+        verbose: false,
+    };
+    let (rule_text, rule_names) = load_search_rule_bundle(&rule_path).expect("load rule bundle");
+    let mut bundled_context = LocalSearchContext::open(&args).expect("open local context");
+    let bundled = execute_local_search_bundle(
+        &args,
+        &rule_path,
+        &rule_text,
+        &rule_names,
+        &mut bundled_context,
+    )
+    .expect("execute local bundle");
+    bundled_context.clear_search_caches();
+
+    let mut serial_context = LocalSearchContext::open(&args).expect("open serial context");
+    let serial = rule_names
+        .iter()
+        .map(|rule_name| {
+            execute_local_search_rule(&args, &rule_path, &rule_text, rule_name, &mut serial_context)
+                .map(|execution| (rule_name.clone(), execution))
+        })
+        .collect::<Result<Vec<_>>>()
+        .expect("execute local rules serially");
+
+    assert_eq!(bundled.len(), serial.len());
+    for ((bundled_name, bundled_execution), (serial_name, serial_execution)) in
+        bundled.into_iter().zip(serial.into_iter())
+    {
+        assert_eq!(bundled_name, serial_name);
+        assert_eq!(
+            bundled_execution.rows.iter().cloned().collect::<std::collections::HashSet<_>>(),
+            serial_execution.rows.iter().cloned().collect::<std::collections::HashSet<_>>()
+        );
+        assert_eq!(bundled_execution.total_candidates, serial_execution.total_candidates);
+        assert_eq!(bundled_execution.tier_used, serial_execution.tier_used);
+        assert_eq!(
+            bundled_execution.query_profile.docs_scanned,
+            serial_execution.query_profile.docs_scanned
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn public_ingest_and_delete_follow_server_identity_source() {

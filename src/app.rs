@@ -3016,6 +3016,42 @@ fn query_store_group_all_candidates(
     Ok(out)
 }
 
+/// Executes multiple full candidate scans across one tree group's stores and
+/// returns one aggregate per rule in the original bundle order.
+fn query_store_group_all_candidates_batch(
+    stores: &mut [CandidateStore],
+    plans: &[crate::candidate::CompiledQueryPlan],
+    include_external_ids: bool,
+) -> Result<Vec<LocalTreeQueryAggregate>> {
+    let mut out = (0..plans.len())
+        .map(|_| LocalTreeQueryAggregate::default())
+        .collect::<Vec<_>>();
+    for store in stores {
+        let local = store.collect_query_hits_batch(plans)?;
+        for (index, (identities, tier_used, query_profile, _eval_nanos)) in local.into_iter().enumerate()
+        {
+            let Some(aggregate) = out.get_mut(index) else {
+                return Err(SspryError::from(
+                    "Local batch search returned a rule index outside the planned bundle.",
+                ));
+            };
+            aggregate.tier_used.push(tier_used);
+            aggregate.query_profile.merge_from(&query_profile);
+            if include_external_ids {
+                let external_ids = store.external_ids_for_identities(&identities);
+                for (identity, external_id) in identities.into_iter().zip(external_ids.into_iter())
+                {
+                    aggregate.identities.insert(identity.clone());
+                    aggregate.external_ids.entry(identity).or_insert(external_id);
+                }
+            } else {
+                aggregate.identities.extend(identities);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Executes local forest queries chunk-by-chunk and forwards each completed
 /// partial aggregate as soon as it becomes available.
 fn stream_local_forest_query_partials<F>(
@@ -5155,6 +5191,98 @@ fn flush_multi_server_pending_batch(
     Ok(())
 }
 
+/// Executes bundled local forest queries chunk-by-chunk and forwards one
+/// per-rule partial aggregate batch for each completed worker chunk.
+fn stream_local_forest_query_partials_batch<F>(
+    tree_groups: &mut Vec<TreeStoreGroup>,
+    plans: &[crate::candidate::CompiledQueryPlan],
+    include_external_ids: bool,
+    search_workers: usize,
+    mut on_partial: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<LocalTreeQueryAggregate>) -> Result<()>,
+{
+    let worker_count = search_workers.max(1).min(tree_groups.len().max(1));
+    if tree_groups.len() <= 1 || worker_count <= 1 {
+        for group in tree_groups {
+            on_partial(query_store_group_all_candidates_batch(
+                &mut group.stores,
+                plans,
+                include_external_ids,
+            )?)?;
+        }
+        return Ok(());
+    }
+
+    let chunk_size = tree_groups.len().div_ceil(worker_count);
+    thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = unbounded::<Result<Vec<LocalTreeQueryAggregate>>>();
+        let mut handles = Vec::new();
+        for chunk in tree_groups.chunks_mut(chunk_size) {
+            let tx = tx.clone();
+            handles.push(scope.spawn(move || {
+                let result = (|| -> Result<Vec<LocalTreeQueryAggregate>> {
+                    let mut merged = (0..plans.len())
+                        .map(|_| LocalTreeQueryAggregate::default())
+                        .collect::<Vec<_>>();
+                    for group in chunk {
+                        let partials = query_store_group_all_candidates_batch(
+                            &mut group.stores,
+                            plans,
+                            include_external_ids,
+                        )?;
+                        if partials.len() != merged.len() {
+                            return Err(SspryError::from(
+                                "Local batch search returned a different number of rule partials than planned.",
+                            ));
+                        }
+                        for (aggregate, partial) in merged.iter_mut().zip(partials.into_iter()) {
+                            aggregate.identities.extend(partial.identities);
+                            aggregate.tier_used.extend(partial.tier_used);
+                            aggregate.query_profile.merge_from(&partial.query_profile);
+                            for (identity, external_id) in partial.external_ids {
+                                aggregate.external_ids.entry(identity).or_insert(external_id);
+                            }
+                        }
+                    }
+                    Ok(merged)
+                })();
+                let _ = tx.send(result);
+            }));
+        }
+        drop(tx);
+
+        let mut first_error = None::<SspryError>;
+        for partials in rx {
+            let partials = match partials {
+                Ok(partials) => partials,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    continue;
+                }
+            };
+            if let Err(err) = on_partial(partials) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| SspryError::from("Forest bundled search worker panicked."))?;
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(())
+    })
+}
+
 fn push_serialized_multi_server_upload_row(
     targets: &mut [MultiServerIndexTarget],
     pending: &mut RemotePendingBatch,
@@ -6531,6 +6659,150 @@ fn execute_local_search_rule(
     Ok(execution)
 }
 
+/// Executes one bundled local forest search so all rules share the same store
+/// scan passes instead of running one-by-one through the CLI loop.
+fn execute_local_search_bundle(
+    args: &LocalSearchArgs,
+    rule_path: &Path,
+    rule_text: &str,
+    rule_names: &[String],
+    context: &mut LocalSearchContext,
+) -> Result<Vec<(String, SearchExecution)>> {
+    let searchable_doc_count = context
+        .tree_groups
+        .iter()
+        .flat_map(|group| group.stores.iter())
+        .map(CandidateStore::live_doc_count)
+        .sum::<usize>();
+    let gram_sizes = context.gram_sizes;
+    let active_identity_source = context.active_identity_source.clone();
+    let planned_rules = if rule_names.len() <= 1 {
+        rule_names
+            .iter()
+            .map(|rule_name| {
+                let started_plan = Instant::now();
+                let plan = compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                    rule_text,
+                    rule_name,
+                    gram_sizes,
+                    active_identity_source.as_deref(),
+                    args.max_anchors_per_pattern,
+                    false,
+                    true,
+                    args.max_candidates,
+                )?;
+                Ok::<_, SspryError>((rule_name.clone(), plan, started_plan.elapsed()))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        thread::scope(
+            |scope| -> Result<Vec<(String, CompiledQueryPlan, Duration)>> {
+                let mut handles = Vec::with_capacity(rule_names.len());
+                for rule_name in rule_names {
+                    let active_identity_source = active_identity_source.clone();
+                    handles.push(scope.spawn(
+                        move || -> Result<(String, CompiledQueryPlan, Duration)> {
+                            let started_plan = Instant::now();
+                            let plan =
+                                compile_query_plan_for_rule_name_with_gram_sizes_and_identity_source(
+                                    rule_text,
+                                    rule_name,
+                                    gram_sizes,
+                                    active_identity_source.as_deref(),
+                                    args.max_anchors_per_pattern,
+                                    false,
+                                    true,
+                                    args.max_candidates,
+                                )?;
+                            Ok((rule_name.clone(), plan, started_plan.elapsed()))
+                        },
+                    ));
+                }
+                let mut plans = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    plans.push(
+                        handle
+                            .join()
+                            .map_err(|_| SspryError::from("Local bundle plan worker panicked."))??,
+                    );
+                }
+                Ok(plans)
+            },
+        )?
+    };
+
+    let plans = planned_rules
+        .iter()
+        .map(|(_, plan, _)| plan.clone())
+        .collect::<Vec<_>>();
+    let mut accumulators = planned_rules
+        .iter()
+        .map(|(_, plan, _)| {
+            let resolved_limit = resolve_max_candidates(searchable_doc_count, plan.max_candidates);
+            LocalSearchAccumulator::new(resolved_candidate_limit(resolved_limit))
+        })
+        .collect::<Vec<_>>();
+    let mut verifiers = planned_rules
+        .iter()
+        .map(|(rule_name, plan, _)| {
+            args.verify_yara_files
+                .then(|| SearchVerificationPipeline::new(rule_path, Some(rule_name), plan))
+        })
+        .collect::<Vec<_>>();
+    let mut verify_overlap_times = vec![Duration::ZERO; planned_rules.len()];
+    let started_query = Instant::now();
+
+    stream_local_forest_query_partials_batch(
+        &mut context.tree_groups,
+        &plans,
+        args.verify_yara_files,
+        context.search_workers,
+        |partials| {
+            if partials.len() != accumulators.len() {
+                return Err(SspryError::from(
+                    "Local bundled search returned a different number of rule partials than planned.",
+                ));
+            }
+            for (index, partial) in partials.into_iter().enumerate() {
+                let updates = accumulators[index].apply_partial(partial, args.verify_yara_files)?;
+                if let Some(verifier) = verifiers[index].as_mut() {
+                    let started_overlap = Instant::now();
+                    verifier.apply_updates(updates)?;
+                    verify_overlap_times[index] += started_overlap.elapsed();
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    let query_elapsed = started_query.elapsed();
+    let mut executions = Vec::with_capacity(planned_rules.len());
+    for ((((rule_name, plan, plan_time), accumulator), verifier), verify_overlap_time) in planned_rules
+        .into_iter()
+        .zip(accumulators.into_iter())
+        .zip(verifiers.into_iter())
+        .zip(verify_overlap_times.into_iter())
+    {
+        let mut execution = accumulator.into_execution(
+            plan,
+            context.tree_count,
+            context.search_workers,
+            plan_time,
+            query_elapsed.saturating_sub(verify_overlap_time),
+        );
+        execution.verify_overlap_time = verify_overlap_time;
+        if let Some(verifier) = verifier {
+            let started_verify = Instant::now();
+            let (verification, stats) = verifier.finish(execution.rows.len())?;
+            execution.verification = Some(verification);
+            execution.verification_stats = stats;
+            execution.verify_time = Some(started_verify.elapsed());
+        }
+        executions.push((rule_name, execution));
+    }
+    Ok(executions)
+}
+
 /// Finalizes a search execution by optionally verifying candidates, printing
 /// the result rows, and emitting verbose timing and memory diagnostics.
 fn finish_search_execution(
@@ -7101,6 +7373,33 @@ fn cmd_local_search(args: &LocalSearchArgs) -> i32 {
         let (rule_text, rule_names) = load_search_rule_bundle(rule_path)?;
         let multi_rule = rule_names.len() > 1;
         let mut context = LocalSearchContext::open(args)?;
+        if multi_rule {
+            let mut exit_code = 0;
+            let executions =
+                execute_local_search_bundle(args, rule_path, &rule_text, &rule_names, &mut context);
+            context.clear_search_caches();
+            for (index, result) in executions?.into_iter().enumerate() {
+                let (rule_name, execution) = result;
+                if let Err(err) = finish_search_execution(
+                    rule_path,
+                    &rule_name,
+                    args.verify_yara_files,
+                    args.verbose,
+                    args.max_candidates,
+                    args.max_anchors_per_pattern,
+                    Instant::now()
+                        .checked_sub(execution.plan_time + execution.query_time)
+                        .unwrap_or_else(Instant::now),
+                    execution,
+                    true,
+                    index == 0,
+                ) {
+                    print_search_error(rule_path, &rule_name, &err, true, index == 0);
+                    exit_code = 1;
+                }
+            }
+            return Ok(exit_code);
+        }
         let mut exit_code = 0;
         for (index, rule_name) in rule_names.iter().enumerate() {
             let started_total = Instant::now();

@@ -4043,6 +4043,19 @@ impl CandidateStore {
         Ok((matched_hits, used_tiers.as_label(), query_profile))
     }
 
+    /// Collects full hit lists for multiple runtime-hash queries while
+    /// sharing per-store runtime artifact caches and scan passes.
+    pub(crate) fn collect_query_hits_batch(
+        &mut self,
+        plans: &[CompiledQueryPlan],
+    ) -> Result<Vec<(Vec<String>, String, CandidateQueryProfile, u128)>> {
+        let runtime = plans
+            .iter()
+            .map(|plan| self.runtime_query_artifacts(plan))
+            .collect::<Result<Vec<_>>>()?;
+        self.collect_query_hits_with_runtime_hash_batch(plans, &runtime)
+    }
+
     /// Collects hit lists for multiple runtime-hash queries while scanning
     /// each document at most once per lane.
     pub(crate) fn collect_query_hits_with_runtime_hash_batch(
@@ -4296,7 +4309,6 @@ impl CandidateStore {
             let Some(result) = results.get_mut(result_idx) else {
                 continue;
             };
-            result.profile.docs_scanned = result.profile.docs_scanned.saturating_add(1);
             let profile_before = doc_inputs.profile.clone();
             let started = Instant::now();
             let outcome = evaluate_node_runtime(
