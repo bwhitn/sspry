@@ -2035,7 +2035,9 @@ struct SearchExecution {
     server_rss_kb: Option<(u64, u64)>,
     plan_time: Duration,
     query_time: Duration,
+    verify_overlap_time: Duration,
     verification: Option<SearchVerificationResult>,
+    verification_stats: SearchVerificationStats,
     verify_time: Option<Duration>,
 }
 
@@ -2168,7 +2170,9 @@ impl SearchExecutionAccumulator {
             server_rss_kb,
             plan_time,
             query_time: self.query_time.unwrap_or(query_time),
+            verify_overlap_time: Duration::ZERO,
             verification: None,
+            verification_stats: SearchVerificationStats::default(),
             verify_time: None,
         }
     }
@@ -2229,6 +2233,14 @@ struct VerificationJobOutcome {
     matched: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct SearchVerificationStats {
+    apply_updates_time: Duration,
+    queue_send_time: Duration,
+    queued_jobs: usize,
+    skipped_jobs: usize,
+}
+
 /// Rechecks candidate files in a small worker pool so remote searches can
 /// overlap result verification with streamed server responses.
 struct SearchVerificationPipeline {
@@ -2237,6 +2249,7 @@ struct SearchVerificationPipeline {
     result_rx: Receiver<std::result::Result<VerificationJobOutcome, String>>,
     handles: Vec<thread::JoinHandle<()>>,
     worker_error: Option<String>,
+    stats: SearchVerificationStats,
 }
 
 impl SearchVerificationPipeline {
@@ -2246,8 +2259,7 @@ impl SearchVerificationPipeline {
         plan: &crate::candidate::CompiledQueryPlan,
     ) -> Self {
         let worker_count = default_verify_workers();
-        let queue_capacity = worker_count.saturating_mul(8).max(32);
-        let (job_tx, job_rx) = bounded::<VerificationJob>(queue_capacity);
+        let (job_tx, job_rx) = unbounded::<VerificationJob>();
         let (result_tx, result_rx) =
             unbounded::<std::result::Result<VerificationJobOutcome, String>>();
         let literal_plan = fixed_literal_match_plan(plan);
@@ -2313,18 +2325,24 @@ impl SearchVerificationPipeline {
             result_rx,
             handles,
             worker_error: None,
+            stats: SearchVerificationStats::default(),
         }
     }
 
     fn apply_updates(&mut self, updates: SearchStreamVerificationUpdates) -> Result<()> {
-        self.drain_ready_results()?;
-        for (index, external_id) in updates.accepted_rows {
-            self.accept_row(index, external_id)?;
-        }
-        for (index, external_id) in updates.backfilled_rows {
-            self.backfill_row(index, external_id)?;
-        }
-        self.drain_ready_results()
+        let started = Instant::now();
+        let result = (|| {
+            self.drain_ready_results()?;
+            for (index, external_id) in updates.accepted_rows {
+                self.accept_row(index, external_id)?;
+            }
+            for (index, external_id) in updates.backfilled_rows {
+                self.backfill_row(index, external_id)?;
+            }
+            self.drain_ready_results()
+        })();
+        self.stats.apply_updates_time += started.elapsed();
+        result
     }
 
     fn accept_row(&mut self, index: usize, external_id: Option<String>) -> Result<()> {
@@ -2361,8 +2379,10 @@ impl SearchVerificationPipeline {
         let candidate_path = PathBuf::from(external_id);
         if !candidate_path.is_file() {
             self.row_states[index] = VerificationRowState::Skipped;
+            self.stats.skipped_jobs = self.stats.skipped_jobs.saturating_add(1);
             return Ok(());
         }
+        let started_send = Instant::now();
         self.job_tx
             .as_ref()
             .ok_or_else(|| {
@@ -2373,8 +2393,14 @@ impl SearchVerificationPipeline {
                 candidate_path,
             })
             .map_err(|_| SspryError::from("Search verification workers exited unexpectedly."))?;
+        self.stats.queue_send_time += started_send.elapsed();
+        self.stats.queued_jobs = self.stats.queued_jobs.saturating_add(1);
         self.row_states[index] = VerificationRowState::Queued;
         Ok(())
+    }
+
+    fn stats(&self) -> SearchVerificationStats {
+        self.stats
     }
 
     fn drain_ready_results(&mut self) -> Result<()> {
@@ -2402,7 +2428,7 @@ impl SearchVerificationPipeline {
         self.take_worker_error()
     }
 
-    fn finish(mut self, row_count: usize) -> Result<SearchVerificationResult> {
+    fn finish(mut self, row_count: usize) -> Result<(SearchVerificationResult, SearchVerificationStats)> {
         self.drain_ready_results()?;
         drop(self.job_tx.take());
         for handle in self.handles.drain(..) {
@@ -2444,12 +2470,15 @@ impl SearchVerificationPipeline {
                 }
             }
         }
-        Ok(SearchVerificationResult {
-            row_states: self.row_states,
-            verified_checked,
-            verified_matched,
-            verified_skipped,
-        })
+        Ok((
+            SearchVerificationResult {
+                row_states: self.row_states,
+                verified_checked,
+                verified_matched,
+                verified_skipped,
+            },
+            self.stats,
+        ))
     }
 
     fn take_worker_error(&mut self) -> Result<()> {
@@ -2476,6 +2505,8 @@ struct DistributedSearchAccumulator {
     server_rss_kb: Option<(u64, u64)>,
     plan_time: Duration,
     query_time: Duration,
+    verify_overlap_time: Duration,
+    verification_stats: SearchVerificationStats,
     received: usize,
     expected: usize,
     candidate_limit: Option<usize>,
@@ -2491,6 +2522,8 @@ impl DistributedSearchAccumulator {
             server_rss_kb: None,
             plan_time: Duration::ZERO,
             query_time: Duration::ZERO,
+            verify_overlap_time: Duration::ZERO,
+            verification_stats: SearchVerificationStats::default(),
             received: 0,
             expected: expected.max(1),
             candidate_limit,
@@ -2515,7 +2548,9 @@ impl DistributedSearchAccumulator {
             server_rss_kb,
             plan_time,
             query_time,
+            verify_overlap_time,
             verification: _,
+            verification_stats,
             verify_time: _,
         } = execution;
         if !tier_used.is_empty() && !self.tier_parts.iter().any(|value| value == &tier_used) {
@@ -2524,6 +2559,17 @@ impl DistributedSearchAccumulator {
         self.query_profile.merge_from(&query_profile);
         self.plan_time += plan_time;
         self.query_time += query_time;
+        self.verify_overlap_time += verify_overlap_time;
+        self.verification_stats.apply_updates_time += verification_stats.apply_updates_time;
+        self.verification_stats.queue_send_time += verification_stats.queue_send_time;
+        self.verification_stats.queued_jobs = self
+            .verification_stats
+            .queued_jobs
+            .saturating_add(verification_stats.queued_jobs);
+        self.verification_stats.skipped_jobs = self
+            .verification_stats
+            .skipped_jobs
+            .saturating_add(verification_stats.skipped_jobs);
         if let Some((current, peak)) = server_rss_kb {
             self.server_rss_kb = Some(match self.server_rss_kb {
                 Some((existing_current, existing_peak)) => {
@@ -2549,6 +2595,8 @@ impl DistributedSearchAccumulator {
                 self.plan_time,
                 self.query_time,
             )
+            .with_verify_overlap_time(self.verify_overlap_time)
+            .with_verification_stats(self.verification_stats)
             .with_query_profile(self.query_profile)
             .with_tier_used(if self.tier_parts.is_empty() {
                 "none".to_owned()
@@ -2627,6 +2675,8 @@ impl LocalSearchAccumulator {
 }
 
 trait SearchExecutionBuilderExt {
+    fn with_verify_overlap_time(self, verify_overlap_time: Duration) -> Self;
+    fn with_verification_stats(self, verification_stats: SearchVerificationStats) -> Self;
     fn with_query_profile(self, query_profile: CandidateQueryProfile) -> Self;
     fn with_tier_used(self, tier_used: String) -> Self;
     fn with_tree_count(self, tree_count: usize) -> Self;
@@ -2634,6 +2684,16 @@ trait SearchExecutionBuilderExt {
 }
 
 impl SearchExecutionBuilderExt for SearchExecution {
+    fn with_verify_overlap_time(mut self, verify_overlap_time: Duration) -> Self {
+        self.verify_overlap_time = verify_overlap_time;
+        self
+    }
+
+    fn with_verification_stats(mut self, verification_stats: SearchVerificationStats) -> Self {
+        self.verification_stats = verification_stats;
+        self
+    }
+
     fn with_query_profile(mut self, query_profile: CandidateQueryProfile) -> Self {
         self.query_profile = query_profile;
         self
@@ -3057,25 +3117,31 @@ fn verify_search_candidates(
     rows: &[String],
     mut external_ids: Vec<Option<String>>,
     verify_yara_files: bool,
-) -> Result<SearchVerificationResult> {
+) -> Result<(SearchVerificationResult, SearchVerificationStats)> {
     if !verify_yara_files {
-        return Ok(SearchVerificationResult {
-            row_states: Vec::new(),
-            verified_checked: 0,
-            verified_matched: 0,
-            verified_skipped: 0,
-        });
+        return Ok((
+            SearchVerificationResult {
+                row_states: Vec::new(),
+                verified_checked: 0,
+                verified_matched: 0,
+                verified_skipped: 0,
+            },
+            SearchVerificationStats::default(),
+        ));
     }
     if external_ids.len() < rows.len() {
         external_ids.resize(rows.len(), None);
     }
     if rows.is_empty() {
-        return Ok(SearchVerificationResult {
-            row_states: Vec::new(),
-            verified_checked: 0,
-            verified_matched: 0,
-            verified_skipped: 0,
-        });
+        return Ok((
+            SearchVerificationResult {
+                row_states: Vec::new(),
+                verified_checked: 0,
+                verified_matched: 0,
+                verified_skipped: 0,
+            },
+            SearchVerificationStats::default(),
+        ));
     }
     let mut verifier = SearchVerificationPipeline::new(rule_path, target_rule_name, plan);
     verifier.apply_updates(SearchStreamVerificationUpdates {
@@ -5742,11 +5808,22 @@ where
         }
         Ok(())
     })?;
-    let mut execution =
-        accumulator.into_execution(plan, server_rss_kb, plan_time, started_query.elapsed());
+    let verify_overlap_time = verifier
+        .as_ref()
+        .map(|pipeline| pipeline.stats().apply_updates_time)
+        .unwrap_or(Duration::ZERO);
+    let mut execution = accumulator.into_execution(
+        plan,
+        server_rss_kb,
+        plan_time,
+        started_query.elapsed().saturating_sub(verify_overlap_time),
+    );
+    execution.verify_overlap_time = verify_overlap_time;
     if let Some(verifier) = verifier {
         let started_verify = Instant::now();
-        execution.verification = Some(verifier.finish(execution.rows.len())?);
+        let (verification, stats) = verifier.finish(execution.rows.len())?;
+        execution.verification = Some(verification);
+        execution.verification_stats = stats;
         execution.verify_time = Some(started_verify.elapsed());
     }
     Ok(execution)
@@ -5759,6 +5836,7 @@ fn flush_streamed_search_executions_batch<G>(
     pending_rules: &mut [Option<(String, CompiledQueryPlan, Duration)>],
     accumulators: &mut [SearchExecutionAccumulator],
     verifiers: &mut [Option<SearchVerificationPipeline>],
+    verify_overlap_times: &[Duration],
     next_rule_index: &mut usize,
     server_rss_kb: Option<(u64, u64)>,
     query_time: Duration,
@@ -5777,11 +5855,14 @@ where
             plan,
             server_rss_kb,
             plan_time,
-            query_time,
+            query_time.saturating_sub(verify_overlap_times[index]),
         );
+        execution.verify_overlap_time = verify_overlap_times[index];
         if let Some(verifier) = verifiers[index].take() {
             let started_verify = Instant::now();
-            execution.verification = Some(verifier.finish(execution.rows.len())?);
+            let (verification, stats) = verifier.finish(execution.rows.len())?;
+            execution.verification = Some(verification);
+            execution.verification_stats = stats;
             execution.verify_time = Some(started_verify.elapsed());
         }
         on_execution(rule_name, execution, index)?;
@@ -5828,6 +5909,7 @@ where
                 })
         })
         .collect::<Vec<_>>();
+    let mut verify_overlap_times = vec![Duration::ZERO; pending_rules.len()];
     let mut next_rule_index = 0usize;
     let mut stream_complete = false;
 
@@ -5844,12 +5926,15 @@ where
         };
         let updates = accumulators[rule_index].apply_frame(args, frame, started_query.elapsed())?;
         if let Some(verifier) = verifiers[rule_index].as_mut() {
+            let started_overlap = Instant::now();
             verifier.apply_updates(updates)?;
+            verify_overlap_times[rule_index] += started_overlap.elapsed();
         }
         flush_streamed_search_executions_batch(
             &mut pending_rules,
             &mut accumulators,
             &mut verifiers,
+            &verify_overlap_times,
             &mut next_rule_index,
             server_rss_kb,
             started_query.elapsed(),
@@ -5861,6 +5946,7 @@ where
         &mut pending_rules,
         &mut accumulators,
         &mut verifiers,
+        &verify_overlap_times,
         &mut next_rule_index,
         server_rss_kb,
         started_query.elapsed(),
@@ -6244,7 +6330,9 @@ fn merge_distributed_search_executions(
         server_rss_kb,
         plan_time,
         query_time,
+        verify_overlap_time,
         verification: _,
+        verification_stats,
         verify_time: _,
     } = first;
 
@@ -6256,6 +6344,8 @@ fn merge_distributed_search_executions(
     let mut merged_server_rss = server_rss_kb;
     let mut merged_plan_time = Duration::ZERO;
     let mut merged_query_time = Duration::ZERO;
+    let mut merged_verify_overlap_time = Duration::ZERO;
+    let mut merged_verification_stats = SearchVerificationStats::default();
 
     let mut merge_one = |tier_used: String,
                          rows: Vec<String>,
@@ -6263,13 +6353,24 @@ fn merge_distributed_search_executions(
                          query_profile: CandidateQueryProfile,
                          server_rss_kb: Option<(u64, u64)>,
                          plan_time: Duration,
-                         query_time: Duration| {
+                         query_time: Duration,
+                         verify_overlap_time: Duration,
+                         verification_stats: SearchVerificationStats| {
         if !tier_used.is_empty() && !tier_parts.iter().any(|value| value == &tier_used) {
             tier_parts.push(tier_used);
         }
         merged_profile.merge_from(&query_profile);
         merged_plan_time += plan_time;
         merged_query_time += query_time;
+        merged_verify_overlap_time += verify_overlap_time;
+        merged_verification_stats.apply_updates_time += verification_stats.apply_updates_time;
+        merged_verification_stats.queue_send_time += verification_stats.queue_send_time;
+        merged_verification_stats.queued_jobs = merged_verification_stats
+            .queued_jobs
+            .saturating_add(verification_stats.queued_jobs);
+        merged_verification_stats.skipped_jobs = merged_verification_stats
+            .skipped_jobs
+            .saturating_add(verification_stats.skipped_jobs);
         if let Some((current, peak)) = server_rss_kb {
             merged_server_rss = Some(match merged_server_rss {
                 Some((existing_current, existing_peak)) => {
@@ -6309,6 +6410,8 @@ fn merge_distributed_search_executions(
         server_rss_kb,
         plan_time,
         query_time,
+        verify_overlap_time,
+        verification_stats,
     );
     for execution in executions {
         merge_one(
@@ -6319,6 +6422,8 @@ fn merge_distributed_search_executions(
             execution.server_rss_kb,
             execution.plan_time,
             execution.query_time,
+            execution.verify_overlap_time,
+            execution.verification_stats,
         );
     }
 
@@ -6350,7 +6455,9 @@ fn merge_distributed_search_executions(
         server_rss_kb: merged_server_rss,
         plan_time: merged_plan_time,
         query_time: merged_query_time,
+        verify_overlap_time: merged_verify_overlap_time,
         verification: None,
+        verification_stats: merged_verification_stats,
         verify_time: None,
     })
 }
@@ -6401,7 +6508,11 @@ fn execute_local_search_rule(
             Ok(())
         },
     )?;
-    let query_time = started_query.elapsed();
+    let verify_overlap_time = verifier
+        .as_ref()
+        .map(|pipeline| pipeline.stats().apply_updates_time)
+        .unwrap_or(Duration::ZERO);
+    let query_time = started_query.elapsed().saturating_sub(verify_overlap_time);
     let mut execution = accumulator.into_execution(
         plan,
         context.tree_count,
@@ -6409,9 +6520,12 @@ fn execute_local_search_rule(
         plan_time,
         query_time,
     );
+    execution.verify_overlap_time = verify_overlap_time;
     if let Some(verifier) = verifier {
         let started_verify = Instant::now();
-        execution.verification = Some(verifier.finish(execution.rows.len())?);
+        let (verification, stats) = verifier.finish(execution.rows.len())?;
+        execution.verification = Some(verification);
+        execution.verification_stats = stats;
         execution.verify_time = Some(started_verify.elapsed());
     }
     Ok(execution)
@@ -6431,14 +6545,17 @@ fn finish_search_execution(
     multi_rule: bool,
     first_rule: bool,
 ) -> Result<()> {
-    let (verification, verify_time) = if let Some(verification) = execution.verification.take() {
+    let (verification, verify_time, verification_stats) = if let Some(verification) =
+        execution.verification.take()
+    {
         (
             verification,
             execution.verify_time.unwrap_or(Duration::ZERO),
+            execution.verification_stats,
         )
     } else {
         let started_verify = Instant::now();
-        let verification = verify_search_candidates(
+        let (verification, verification_stats) = verify_search_candidates(
             rule_path,
             Some(rule_name),
             &execution.plan,
@@ -6446,7 +6563,7 @@ fn finish_search_execution(
             std::mem::take(&mut execution.external_ids),
             verify_yara_files,
         )?;
-        (verification, started_verify.elapsed())
+        (verification, started_verify.elapsed(), verification_stats)
     };
     print_search_block_prefix(rule_path, rule_name, 0, multi_rule, first_rule);
     println!("tier_used: {}", execution.tier_used);
@@ -6475,11 +6592,25 @@ fn finish_search_execution(
         let total_ms = started_total.elapsed().as_secs_f64() * 1000.0;
         let plan_ms = execution.plan_time.as_secs_f64() * 1000.0;
         let query_ms = execution.query_time.as_secs_f64() * 1000.0;
+        let verify_overlap_ms = execution.verify_overlap_time.as_secs_f64() * 1000.0;
         let verify_ms = verify_time.as_secs_f64() * 1000.0;
         eprintln!("verbose.search.total_ms: {total_ms:.3}");
         eprintln!("verbose.search.plan_ms: {plan_ms:.3}");
         eprintln!("verbose.search.query_ms: {query_ms:.3}");
+        eprintln!("verbose.search.verify_overlap_ms: {verify_overlap_ms:.3}");
         eprintln!("verbose.search.verify_ms: {verify_ms:.3}");
+        eprintln!(
+            "verbose.search.verify_queue_send_ms: {:.3}",
+            verification_stats.queue_send_time.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "verbose.search.verify_queued_jobs: {}",
+            verification_stats.queued_jobs
+        );
+        eprintln!(
+            "verbose.search.verify_skipped_jobs: {}",
+            verification_stats.skipped_jobs
+        );
         eprintln!(
             "verbose.search.docs_scanned: {}",
             execution.query_profile.docs_scanned
@@ -6507,6 +6638,30 @@ fn finish_search_execution(
         eprintln!(
             "verbose.search.tier2_bloom_bytes: {}",
             execution.query_profile.tier2_bloom_bytes
+        );
+        eprintln!(
+            "verbose.search.tier1_prefetch_docs: {}",
+            execution.query_profile.tier1_prefetch_docs
+        );
+        eprintln!(
+            "verbose.search.tier1_prefetch_bytes: {}",
+            execution.query_profile.tier1_prefetch_bytes
+        );
+        eprintln!(
+            "verbose.search.tier1_prefetch_requests: {}",
+            execution.query_profile.tier1_prefetch_requests
+        );
+        eprintln!(
+            "verbose.search.tier2_prefetch_docs: {}",
+            execution.query_profile.tier2_prefetch_docs
+        );
+        eprintln!(
+            "verbose.search.tier2_prefetch_bytes: {}",
+            execution.query_profile.tier2_prefetch_bytes
+        );
+        eprintln!(
+            "verbose.search.tier2_prefetch_requests: {}",
+            execution.query_profile.tier2_prefetch_requests
         );
         eprintln!("verbose.search.max_candidates: {max_candidates}");
         eprintln!("verbose.search.max_anchors_per_pattern: {max_anchors_per_pattern}");
@@ -6718,6 +6873,7 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
                         .then(|| SearchVerificationPipeline::new(rule_path, Some(rule_name), plan))
                 })
                 .collect::<Vec<_>>();
+            let mut verify_overlap_times = vec![Duration::ZERO; planned_rules.len()];
             let started_total = Instant::now();
             let rule_text_ref = rule_text.as_str();
 
@@ -6764,7 +6920,9 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
                                 })?
                                 .apply_execution(execution)?;
                             if let Some(verifier) = verifiers[index].as_mut() {
+                                let started_overlap = Instant::now();
                                 verifier.apply_updates(updates)?;
+                                verify_overlap_times[index] += started_overlap.elapsed();
                             }
                         }
                         Err(err) => {
@@ -6796,9 +6954,12 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
                     )));
                 }
                 let mut execution = accumulator.into_execution();
+                execution.verify_overlap_time = verify_overlap_times[index];
                 if let Some(verifier) = verifiers[index].take() {
                     let started_verify = Instant::now();
-                    execution.verification = Some(verifier.finish(execution.rows.len())?);
+                    let (verification, stats) = verifier.finish(execution.rows.len())?;
+                    execution.verification = Some(verification);
+                    execution.verification_stats = stats;
                     execution.verify_time = Some(started_verify.elapsed());
                 }
                 if let Err(err) = finish_search_execution(
@@ -6836,6 +6997,7 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
         let mut verifier = args
             .verify_yara_files
             .then(|| SearchVerificationPipeline::new(rule_path, Some(rule_name), &plan));
+        let mut verify_overlap_time = Duration::ZERO;
         let started_total = Instant::now();
         let rule_text_ref = rule_text.as_str();
 
@@ -6868,7 +7030,9 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
                     Ok(execution) => {
                         let updates = accumulator.apply_execution(execution)?;
                         if let Some(verifier) = verifier.as_mut() {
+                            let started_overlap = Instant::now();
                             verifier.apply_updates(updates)?;
+                            verify_overlap_time += started_overlap.elapsed();
                         }
                     }
                     Err(err) => {
@@ -6896,9 +7060,12 @@ fn cmd_grpc_search_multi(args: &SearchCommandArgs) -> i32 {
             ));
         }
         let mut execution = accumulator.into_execution();
+        execution.verify_overlap_time = verify_overlap_time;
         if let Some(verifier) = verifier {
             let started_verify = Instant::now();
-            execution.verification = Some(verifier.finish(execution.rows.len())?);
+            let (verification, stats) = verifier.finish(execution.rows.len())?;
+            execution.verification = Some(verification);
+            execution.verification_stats = stats;
             execution.verify_time = Some(started_verify.elapsed());
         }
         let result = finish_search_execution(

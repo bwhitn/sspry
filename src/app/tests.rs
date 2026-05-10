@@ -830,6 +830,7 @@ rule sample {
     )
     .expect("verify candidates");
 
+    let (result, _stats) = result;
     let rendered_indexes: Vec<_> = result.display_row_indexes().collect();
     assert_eq!(rendered_indexes, vec![2, 0, 3]);
     assert_eq!(result.verified_checked, 2);
@@ -1050,7 +1051,9 @@ rule sample {
                 server_rss_kb: None,
                 plan_time: Duration::from_millis(1),
                 query_time: Duration::from_millis(2),
+                verify_overlap_time: Duration::ZERO,
                 verification: None,
+                verification_stats: SearchVerificationStats::default(),
                 verify_time: None,
             }
         };
