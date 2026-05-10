@@ -386,6 +386,12 @@ fn query_profile_from_proto(summary: Option<&v1::QueryProfileSummary>) -> Candid
         tier1_bloom_bytes: summary.tier1_bloom_bytes,
         tier2_bloom_loads: summary.tier2_bloom_loads,
         tier2_bloom_bytes: summary.tier2_bloom_bytes,
+        tier1_prefetch_docs: 0,
+        tier1_prefetch_bytes: 0,
+        tier1_prefetch_requests: 0,
+        tier2_prefetch_docs: 0,
+        tier2_prefetch_bytes: 0,
+        tier2_prefetch_requests: 0,
     }
 }
 

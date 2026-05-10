@@ -2549,6 +2549,7 @@ dependencies = [
  "ctrlc",
  "hex",
  "hyperloglockless",
+ "libc",
  "md-5",
  "memmap2",
  "prost",

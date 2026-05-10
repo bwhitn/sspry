@@ -5,6 +5,8 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +18,8 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::bloom::{
-    DEFAULT_BLOOM_POSITION_LANES, bloom_word_masks_in_lane, raw_filter_matches_word_masks,
+    DEFAULT_BLOOM_POSITION_LANES, bloom_block_ranges_for_word_masks, bloom_word_masks_in_lane,
+    raw_filter_matches_word_masks,
 };
 use crate::candidate::cache::BoundedCache;
 use crate::candidate::filter_policy::{
@@ -209,6 +212,12 @@ pub struct CandidateQueryProfile {
     pub tier1_bloom_bytes: u64,
     pub tier2_bloom_loads: u64,
     pub tier2_bloom_bytes: u64,
+    pub tier1_prefetch_docs: u64,
+    pub tier1_prefetch_bytes: u64,
+    pub tier1_prefetch_requests: u64,
+    pub tier2_prefetch_docs: u64,
+    pub tier2_prefetch_bytes: u64,
+    pub tier2_prefetch_requests: u64,
 }
 
 impl CandidateQueryProfile {
@@ -229,6 +238,24 @@ impl CandidateQueryProfile {
         self.tier2_bloom_bytes = self
             .tier2_bloom_bytes
             .saturating_add(other.tier2_bloom_bytes);
+        self.tier1_prefetch_docs = self
+            .tier1_prefetch_docs
+            .saturating_add(other.tier1_prefetch_docs);
+        self.tier1_prefetch_bytes = self
+            .tier1_prefetch_bytes
+            .saturating_add(other.tier1_prefetch_bytes);
+        self.tier1_prefetch_requests = self
+            .tier1_prefetch_requests
+            .saturating_add(other.tier1_prefetch_requests);
+        self.tier2_prefetch_docs = self
+            .tier2_prefetch_docs
+            .saturating_add(other.tier2_prefetch_docs);
+        self.tier2_prefetch_bytes = self
+            .tier2_prefetch_bytes
+            .saturating_add(other.tier2_prefetch_bytes);
+        self.tier2_prefetch_requests = self
+            .tier2_prefetch_requests
+            .saturating_add(other.tier2_prefetch_requests);
     }
 
     /// Returns the saturating counter delta between two profile snapshots.
@@ -249,6 +276,24 @@ impl CandidateQueryProfile {
             tier2_bloom_bytes: self
                 .tier2_bloom_bytes
                 .saturating_sub(earlier.tier2_bloom_bytes),
+            tier1_prefetch_docs: self
+                .tier1_prefetch_docs
+                .saturating_sub(earlier.tier1_prefetch_docs),
+            tier1_prefetch_bytes: self
+                .tier1_prefetch_bytes
+                .saturating_sub(earlier.tier1_prefetch_bytes),
+            tier1_prefetch_requests: self
+                .tier1_prefetch_requests
+                .saturating_sub(earlier.tier1_prefetch_requests),
+            tier2_prefetch_docs: self
+                .tier2_prefetch_docs
+                .saturating_sub(earlier.tier2_prefetch_docs),
+            tier2_prefetch_bytes: self
+                .tier2_prefetch_bytes
+                .saturating_sub(earlier.tier2_prefetch_bytes),
+            tier2_prefetch_requests: self
+                .tier2_prefetch_requests
+                .saturating_sub(earlier.tier2_prefetch_requests),
         }
     }
 }
@@ -405,12 +450,14 @@ fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-const DOC_META_ROW_BYTES: usize = 56;
-const TIER2_DOC_META_ROW_BYTES: usize = 24;
+const DOC_META_ROW_BYTES: usize = 40;
+const TIER2_DOC_META_ROW_BYTES: usize = 8;
+const BLOOM_LOC_ROW_BYTES: usize = 16;
 const APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const TREE_SOURCE_REF_MANIFEST_VERSION: u32 = 1;
 const FOREST_SOURCE_DEDUP_MANIFEST_VERSION: u32 = 1;
 const TREE_SOURCE_REF_RUN_MAX_ENTRIES: usize = 16_384;
+const QUERY_BLOOM_IO_PREFETCH_DOCS: usize = 256;
 const DOC_FLAG_DELETED: u8 = 0x02;
 const DOC_FLAG_SPECIAL_POPULATION: u8 = 0x04;
 
@@ -481,14 +528,39 @@ struct Tier2DocMetaRow {
     bloom_len: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BloomLocRow {
+    bloom_offset: u64,
+    bloom_len: u32,
+}
+
+impl BloomLocRow {
+    /// Encodes one bloom-location row into the fixed-width on-disk format.
+    fn encode(self) -> [u8; BLOOM_LOC_ROW_BYTES] {
+        let mut out = [0u8; BLOOM_LOC_ROW_BYTES];
+        out[0..8].copy_from_slice(&self.bloom_offset.to_le_bytes());
+        out[8..12].copy_from_slice(&self.bloom_len.to_le_bytes());
+        out
+    }
+
+    /// Decodes one fixed-width bloom-location row from disk.
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != BLOOM_LOC_ROW_BYTES {
+            return Err(SspryError::from("Invalid candidate bloom loc row size"));
+        }
+        Ok(Self {
+            bloom_offset: u64::from_le_bytes(bytes[0..8].try_into().expect("bloom_offset")),
+            bloom_len: u32::from_le_bytes(bytes[8..12].try_into().expect("bloom_len")),
+        })
+    }
+}
+
 impl Tier2DocMetaRow {
     /// Encodes one tier-2 metadata row into the fixed-width on-disk format.
     fn encode(self) -> [u8; TIER2_DOC_META_ROW_BYTES] {
         let mut out = [0u8; TIER2_DOC_META_ROW_BYTES];
         out[0..4].copy_from_slice(&self.filter_bytes.to_le_bytes());
         out[4] = self.bloom_hashes;
-        out[8..16].copy_from_slice(&self.bloom_offset.to_le_bytes());
-        out[16..20].copy_from_slice(&self.bloom_len.to_le_bytes());
         out
     }
 
@@ -502,8 +574,8 @@ impl Tier2DocMetaRow {
         Ok(Self {
             filter_bytes: u32::from_le_bytes(bytes[0..4].try_into().expect("tier2_filter_bytes")),
             bloom_hashes: bytes[4],
-            bloom_offset: u64::from_le_bytes(bytes[8..16].try_into().expect("tier2_bloom_offset")),
-            bloom_len: u32::from_le_bytes(bytes[16..20].try_into().expect("tier2_bloom_len")),
+            bloom_offset: 0,
+            bloom_len: 0,
         })
     }
 }
@@ -517,12 +589,10 @@ impl DocMetaRow {
         out[8..12].copy_from_slice(&self.filter_bytes.to_le_bytes());
         out[12] = self.flags;
         out[13] = self.bloom_hashes;
-        out[16..24].copy_from_slice(&self.bloom_offset.to_le_bytes());
-        out[24..28].copy_from_slice(&self.bloom_len.to_le_bytes());
-        out[28..36].copy_from_slice(&self.external_id_offset.to_le_bytes());
-        out[36..40].copy_from_slice(&self.external_id_len.to_le_bytes());
-        out[40..48].copy_from_slice(&self.metadata_offset.to_le_bytes());
-        out[48..52].copy_from_slice(&self.metadata_len.to_le_bytes());
+        out[16..24].copy_from_slice(&self.external_id_offset.to_le_bytes());
+        out[24..28].copy_from_slice(&self.external_id_len.to_le_bytes());
+        out[28..36].copy_from_slice(&self.metadata_offset.to_le_bytes());
+        out[36..40].copy_from_slice(&self.metadata_len.to_le_bytes());
         out
     }
 
@@ -536,14 +606,14 @@ impl DocMetaRow {
             filter_bytes: u32::from_le_bytes(bytes[8..12].try_into().expect("filter_bytes")),
             flags: bytes[12],
             bloom_hashes: bytes[13],
-            bloom_offset: u64::from_le_bytes(bytes[16..24].try_into().expect("bloom_offset")),
-            bloom_len: u32::from_le_bytes(bytes[24..28].try_into().expect("bloom_len")),
+            bloom_offset: 0,
+            bloom_len: 0,
             external_id_offset: u64::from_le_bytes(
-                bytes[28..36].try_into().expect("external_id_offset"),
+                bytes[16..24].try_into().expect("external_id_offset"),
             ),
-            external_id_len: u32::from_le_bytes(bytes[36..40].try_into().expect("external_id_len")),
-            metadata_offset: u64::from_le_bytes(bytes[40..48].try_into().expect("metadata_offset")),
-            metadata_len: u32::from_le_bytes(bytes[48..52].try_into().expect("metadata_len")),
+            external_id_len: u32::from_le_bytes(bytes[24..28].try_into().expect("external_id_len")),
+            metadata_offset: u64::from_le_bytes(bytes[28..36].try_into().expect("metadata_offset")),
+            metadata_len: u32::from_le_bytes(bytes[36..40].try_into().expect("metadata_len")),
         })
     }
 }
@@ -559,6 +629,57 @@ struct Tier2Telemetry {
 enum BlobSidecarAccessMode {
     MmapWholeFile,
     PositionedRead,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlobReadRequest {
+    offset: u64,
+    len: usize,
+    doc_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BlobReadStats {
+    requests: u64,
+    bytes: u64,
+}
+
+#[derive(Debug)]
+struct BlobReadBatch {
+    buffers: Vec<Vec<u8>>,
+    stats: BlobReadStats,
+}
+
+#[cfg(target_os = "linux")]
+fn best_effort_posix_fadvise(file: &fs::File, offset: u64, len: u64, advice: i32) {
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), offset as _, len as _, advice) };
+}
+
+#[cfg(target_os = "linux")]
+fn best_effort_madvise_random(mmap: &Mmap) {
+    if mmap.is_empty() {
+        return;
+    }
+    let _ = unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_RANDOM,
+        )
+    };
+}
+
+fn request_span(requests: &[BlobReadRequest]) -> Option<(u64, u64)> {
+    let mut start = u64::MAX;
+    let mut end = 0u64;
+    for request in requests {
+        if request.len == 0 {
+            continue;
+        }
+        start = start.min(request.offset);
+        end = end.max(request.offset.saturating_add(request.len as u64));
+    }
+    (start != u64::MAX && end > start).then_some((start, end - start))
 }
 
 #[derive(Debug)]
@@ -632,6 +753,8 @@ impl BlobSidecar {
                 }
                 let mmap = unsafe { MmapOptions::new().map(&file) }
                     .map_err(|err| format!("Failed to mmap {}: {err}", self.path.display()))?;
+                #[cfg(target_os = "linux")]
+                best_effort_madvise_random(&mmap);
                 Ok(Some(mmap))
             })
             .as_ref()
@@ -643,8 +766,13 @@ impl BlobSidecar {
     fn file_handle(&self) -> Result<&fs::File> {
         self.file
             .get_or_init(|| {
-                fs::File::open(&self.path)
-                    .map_err(|err| format!("Failed to open {}: {err}", self.path.display()))
+                let file = fs::File::open(&self.path)
+                    .map_err(|err| format!("Failed to open {}: {err}", self.path.display()))?;
+                #[cfg(target_os = "linux")]
+                if self.access_mode == BlobSidecarAccessMode::PositionedRead {
+                    best_effort_posix_fadvise(&file, 0, 0, libc::POSIX_FADV_RANDOM);
+                }
+                Ok(file)
             })
             .as_ref()
             .map_err(|err: &String| SspryError::from(err.clone()))
@@ -694,6 +822,52 @@ impl BlobSidecar {
             ))
         })?;
         Ok(Cow::Owned(bytes))
+    }
+
+    /// Reads multiple sidecar payload ranges and returns physical I/O stats
+    /// for the submitted batch work.
+    fn read_many_bytes_with_stats(
+        &self,
+        requests: &[BlobReadRequest],
+        label: &str,
+    ) -> Result<BlobReadBatch> {
+        if requests.is_empty() {
+            return Ok(BlobReadBatch {
+                buffers: Vec::new(),
+                stats: BlobReadStats::default(),
+            });
+        }
+        if requests.iter().all(|request| request.len == 0) {
+            return Ok(BlobReadBatch {
+                buffers: (0..requests.len()).map(|_| Vec::new()).collect(),
+                stats: BlobReadStats::default(),
+            });
+        }
+        if let Some(mmap) = self.mmap_if_exists()? {
+            let mut out = Vec::with_capacity(requests.len());
+            for request in requests {
+                let start = request.offset as usize;
+                let end = start.saturating_add(request.len);
+                if end > mmap.len() {
+                    return Err(SspryError::from(format!(
+                        "Invalid {label} payload stored for doc_id {}",
+                        request.doc_id
+                    )));
+                }
+                out.push(mmap[start..end].to_vec());
+            }
+            return Ok(BlobReadBatch {
+                buffers: out,
+                stats: BlobReadStats {
+                    requests: requests.iter().filter(|request| request.len > 0).count() as u64,
+                    bytes: requests.iter().map(|request| request.len as u64).sum(),
+                    ..BlobReadStats::default()
+                },
+            });
+        }
+
+        let file = self.file_handle()?;
+        read_many_exact_at(file, requests, label)
     }
 
     #[cfg(test)]
@@ -749,15 +923,15 @@ impl StoreSidecars {
             ),
             tier2_blooms: BlobSidecar::with_access_mode(
                 tier2_blooms_path(root),
-                BlobSidecarAccessMode::PositionedRead,
+                BlobSidecarAccessMode::MmapWholeFile,
             ),
             metadata: BlobSidecar::with_access_mode(
                 doc_metadata_path(root),
-                BlobSidecarAccessMode::PositionedRead,
+                BlobSidecarAccessMode::MmapWholeFile,
             ),
             external_ids: BlobSidecar::with_access_mode(
                 external_ids_path(root),
-                BlobSidecarAccessMode::PositionedRead,
+                BlobSidecarAccessMode::MmapWholeFile,
             ),
         }
     }
@@ -818,6 +992,39 @@ fn read_exact_at(file: &fs::File, offset: u64, buf: &mut [u8]) -> std::io::Resul
         read_total += read_now;
     }
     Ok(())
+}
+
+fn read_many_exact_at(
+    file: &fs::File,
+    requests: &[BlobReadRequest],
+    label: &str,
+) -> Result<BlobReadBatch> {
+    let mut out = Vec::with_capacity(requests.len());
+    let mut stats = BlobReadStats::default();
+    #[cfg(target_os = "linux")]
+    if let Some((offset, len)) = request_span(requests) {
+        best_effort_posix_fadvise(file, offset, len, libc::POSIX_FADV_WILLNEED);
+    }
+    stats.requests = requests.iter().filter(|request| request.len > 0).count() as u64;
+    stats.bytes = requests.iter().map(|request| request.len as u64).sum();
+    for request in requests {
+        let mut bytes = vec![0u8; request.len];
+        read_exact_at(file, request.offset, &mut bytes).map_err(|err| {
+            SspryError::from(format!(
+                "Invalid {label} payload stored for doc_id {}: {err}",
+                request.doc_id
+            ))
+        })?;
+        out.push(bytes);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some((offset, len)) = request_span(requests) {
+        best_effort_posix_fadvise(file, offset, len, libc::POSIX_FADV_DONTNEED);
+    }
+    Ok(BlobReadBatch {
+        buffers: out,
+        stats,
+    })
 }
 
 #[derive(Debug)]
@@ -898,6 +1105,8 @@ impl AppendFile {
 struct StoreAppendWriters {
     blooms: AppendFile,
     tier2_blooms: AppendFile,
+    bloom_locs: AppendFile,
+    tier2_bloom_locs: AppendFile,
     metadata: AppendFile,
     external_ids: AppendFile,
     source_id_by_docid: AppendFile,
@@ -917,6 +1126,8 @@ impl StoreAppendWriters {
                 tier2_blooms_path(root),
                 APPEND_PAYLOAD_SYNC_THRESHOLD_BYTES,
             )?,
+            bloom_locs: AppendFile::new(bloom_loc_path(root))?,
+            tier2_bloom_locs: AppendFile::new(tier2_bloom_loc_path(root))?,
             metadata: AppendFile::new(doc_metadata_path(root))?,
             external_ids: AppendFile::new(external_ids_path(root))?,
             source_id_by_docid: AppendFile::new(source_id_by_docid_path(root))?,
@@ -929,6 +1140,8 @@ impl StoreAppendWriters {
     fn retarget_root(&mut self, root: &Path) {
         self.blooms.retarget(blooms_path(root));
         self.tier2_blooms.retarget(tier2_blooms_path(root));
+        self.bloom_locs.retarget(bloom_loc_path(root));
+        self.tier2_bloom_locs.retarget(tier2_bloom_loc_path(root));
         self.metadata.retarget(doc_metadata_path(root));
         self.external_ids.retarget(external_ids_path(root));
         self.source_id_by_docid
@@ -1153,6 +1366,8 @@ struct LazyDocQueryInputs<'a> {
     metadata_bytes: Option<Cow<'a, [u8]>>,
     tier1_bloom_bytes: Option<Cow<'a, [u8]>>,
     tier2_bloom_bytes: Option<Cow<'a, [u8]>>,
+    prefetched_tier1_charge_bytes: Option<u64>,
+    prefetched_tier2_charge_bytes: Option<u64>,
     profile: CandidateQueryProfile,
 }
 
@@ -1165,6 +1380,8 @@ impl<'a> LazyDocQueryInputs<'a> {
             metadata_bytes: None,
             tier1_bloom_bytes: None,
             tier2_bloom_bytes: None,
+            prefetched_tier1_charge_bytes: None,
+            prefetched_tier2_charge_bytes: None,
             profile: CandidateQueryProfile::default(),
         }
     }
@@ -1182,6 +1399,8 @@ impl<'a> LazyDocQueryInputs<'a> {
             metadata_bytes: Some(Cow::Borrowed(metadata_bytes)),
             tier1_bloom_bytes: Some(Cow::Borrowed(tier1_bloom_bytes)),
             tier2_bloom_bytes: Some(Cow::Borrowed(tier2_bloom_bytes)),
+            prefetched_tier1_charge_bytes: Some(tier1_bloom_bytes.len() as u64),
+            prefetched_tier2_charge_bytes: Some(tier2_bloom_bytes.len() as u64),
             profile: CandidateQueryProfile::default(),
         }
     }
@@ -1189,6 +1408,20 @@ impl<'a> LazyDocQueryInputs<'a> {
     /// Consumes the lazy wrapper and returns the accumulated query profile.
     fn into_profile(self) -> CandidateQueryProfile {
         self.profile
+    }
+
+    /// Seeds tier-1 bloom bytes while charging a caller-supplied physical byte
+    /// count instead of the in-memory buffer length.
+    fn seed_tier1_bloom_bytes_with_charge(&mut self, bytes: Vec<u8>, charge_bytes: Option<u64>) {
+        self.prefetched_tier1_charge_bytes = Some(charge_bytes.unwrap_or(bytes.len() as u64));
+        self.tier1_bloom_bytes = Some(Cow::Owned(bytes));
+    }
+
+    /// Seeds tier-2 bloom bytes while charging a caller-supplied physical byte
+    /// count instead of the in-memory buffer length.
+    fn seed_tier2_bloom_bytes_with_charge(&mut self, bytes: Vec<u8>, charge_bytes: Option<u64>) {
+        self.prefetched_tier2_charge_bytes = Some(charge_bytes.unwrap_or(bytes.len() as u64));
+        self.tier2_bloom_bytes = Some(Cow::Owned(bytes));
     }
 
     /// Loads and caches compact metadata bytes for the current document.
@@ -1221,6 +1454,12 @@ impl<'a> LazyDocQueryInputs<'a> {
                 .tier1_bloom_bytes
                 .saturating_add(bytes.len() as u64);
             self.tier1_bloom_bytes = Some(bytes);
+        } else if let Some(prefetched_bytes) = self.prefetched_tier1_charge_bytes.take() {
+            self.profile.tier1_bloom_loads = self.profile.tier1_bloom_loads.saturating_add(1);
+            self.profile.tier1_bloom_bytes = self
+                .profile
+                .tier1_bloom_bytes
+                .saturating_add(prefetched_bytes);
         }
         Ok(self.tier1_bloom_bytes.as_deref().unwrap_or(&[]))
     }
@@ -1238,9 +1477,56 @@ impl<'a> LazyDocQueryInputs<'a> {
                 .tier2_bloom_bytes
                 .saturating_add(bytes.len() as u64);
             self.tier2_bloom_bytes = Some(bytes);
+        } else if let Some(prefetched_bytes) = self.prefetched_tier2_charge_bytes.take() {
+            self.profile.tier2_bloom_loads = self.profile.tier2_bloom_loads.saturating_add(1);
+            self.profile.tier2_bloom_bytes = self
+                .profile
+                .tier2_bloom_bytes
+                .saturating_add(prefetched_bytes);
         }
         Ok(self.tier2_bloom_bytes.as_deref().unwrap_or(&[]))
     }
+}
+
+fn plan_needs_tier1_bloom(plan: &CompiledQueryPlan) -> bool {
+    if experiment_tier2_only_enabled() || experiment_tier2_and_metadata_only_enabled() {
+        return false;
+    }
+    plan.patterns
+        .iter()
+        .any(|pattern| pattern.alternatives.iter().any(|alt| !alt.is_empty()))
+}
+
+fn plan_needs_tier2_bloom(plan: &CompiledQueryPlan) -> bool {
+    let has_tier2_terms = plan
+        .patterns
+        .iter()
+        .any(|pattern| pattern.tier2_alternatives.iter().any(|alt| !alt.is_empty()));
+    if !has_tier2_terms {
+        return false;
+    }
+    experiment_tier2_only_enabled()
+        || experiment_tier2_and_metadata_only_enabled()
+        || (!plan.force_tier1_only && plan.allow_tier2_fallback)
+}
+
+fn plans_need_bloom_tiers(
+    plans: &[CompiledQueryPlan],
+    scan_rule_indices: &[usize],
+) -> (bool, bool) {
+    let mut need_tier1 = false;
+    let mut need_tier2 = false;
+    for index in scan_rule_indices {
+        let Some(plan) = plans.get(*index) else {
+            continue;
+        };
+        need_tier1 |= plan_needs_tier1_bloom(plan);
+        need_tier2 |= plan_needs_tier2_bloom(plan);
+        if need_tier1 && need_tier2 {
+            break;
+        }
+    }
+    (need_tier1, need_tier2)
 }
 
 impl TierFlags {
@@ -2205,6 +2491,8 @@ impl CandidateStore {
                 .saturating_add(32)
                 .saturating_add(DOC_META_ROW_BYTES as u64)
                 .saturating_add(TIER2_DOC_META_ROW_BYTES as u64)
+                .saturating_add(BLOOM_LOC_ROW_BYTES as u64)
+                .saturating_add(BLOOM_LOC_ROW_BYTES as u64)
                 .saturating_add(row.bloom_len as u64)
                 .saturating_add(tier2_row.bloom_len as u64)
                 .saturating_add(row.metadata_len as u64)
@@ -2898,6 +3186,10 @@ impl CandidateStore {
                 Vec::<u8>::with_capacity(pending_new_inserts.len() * DOC_META_ROW_BYTES);
             let mut tier2_doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_new_inserts.len() * TIER2_DOC_META_ROW_BYTES);
+            let mut bloom_loc_payload =
+                Vec::<u8>::with_capacity(pending_new_inserts.len() * BLOOM_LOC_ROW_BYTES);
+            let mut tier2_bloom_loc_payload =
+                Vec::<u8>::with_capacity(pending_new_inserts.len() * BLOOM_LOC_ROW_BYTES);
             let mut bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
             let mut tier2_bloom_offsets = Vec::<u64>::with_capacity(pending_new_inserts.len());
             let assemble_bloom_payloads_started = Instant::now();
@@ -2980,6 +3272,20 @@ impl CandidateStore {
                     .append_external_id_payload_bytes
                     .saturating_add(row_profile.external_id_bytes);
                 source_id_by_docid_payload.extend_from_slice(pending.identity);
+                bloom_loc_payload.extend_from_slice(
+                    &BloomLocRow {
+                        bloom_offset: row.bloom_offset,
+                        bloom_len: row.bloom_len,
+                    }
+                    .encode(),
+                );
+                tier2_bloom_loc_payload.extend_from_slice(
+                    &BloomLocRow {
+                        bloom_offset: tier2_row.bloom_offset,
+                        bloom_len: tier2_row.bloom_len,
+                    }
+                    .encode(),
+                );
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared_rows.push((pending, row, tier2_row));
@@ -2989,6 +3295,10 @@ impl CandidateStore {
             self.append_writers
                 .source_id_by_docid
                 .append(&source_id_by_docid_payload)?;
+            self.append_writers.bloom_locs.append(&bloom_loc_payload)?;
+            self.append_writers
+                .tier2_bloom_locs
+                .append(&tier2_bloom_loc_payload)?;
             self.append_writers.doc_meta.append(&doc_meta_payload)?;
             self.append_writers
                 .tier2_doc_meta
@@ -3359,6 +3669,10 @@ impl CandidateStore {
                 Vec::<u8>::with_capacity(pending_inserts.len() * DOC_META_ROW_BYTES);
             let mut tier2_doc_meta_payload =
                 Vec::<u8>::with_capacity(pending_inserts.len() * TIER2_DOC_META_ROW_BYTES);
+            let mut bloom_loc_payload =
+                Vec::<u8>::with_capacity(pending_inserts.len() * BLOOM_LOC_ROW_BYTES);
+            let mut tier2_bloom_loc_payload =
+                Vec::<u8>::with_capacity(pending_inserts.len() * BLOOM_LOC_ROW_BYTES);
             let mut prepared = Vec::<(
                 CandidateDoc,
                 DocMetaRow,
@@ -3434,6 +3748,20 @@ impl CandidateStore {
                 };
 
                 source_id_by_docid_payload.extend_from_slice(&document.identity);
+                bloom_loc_payload.extend_from_slice(
+                    &BloomLocRow {
+                        bloom_offset: row.bloom_offset,
+                        bloom_len: row.bloom_len,
+                    }
+                    .encode(),
+                );
+                tier2_bloom_loc_payload.extend_from_slice(
+                    &BloomLocRow {
+                        bloom_offset: tier2_row.bloom_offset,
+                        bloom_len: tier2_row.bloom_len,
+                    }
+                    .encode(),
+                );
                 doc_meta_payload.extend_from_slice(&row.encode());
                 tier2_doc_meta_payload.extend_from_slice(&tier2_row.encode());
                 prepared.push((
@@ -3467,6 +3795,10 @@ impl CandidateStore {
             self.append_writers
                 .source_id_by_docid
                 .append(&source_id_by_docid_payload)?;
+            self.append_writers.bloom_locs.append(&bloom_loc_payload)?;
+            self.append_writers
+                .tier2_bloom_locs
+                .append(&tier2_bloom_loc_payload)?;
             self.append_writers.doc_meta.append(&doc_meta_payload)?;
             self.append_writers
                 .tier2_doc_meta
@@ -3942,12 +4274,10 @@ impl CandidateStore {
         Ok((matched_hits, used_tiers, query_profile))
     }
 
-    /// Evaluates one document against every runtime-hash bundled rule while
-    /// sharing doc-side payload loads and query gram masks across rules.
-    fn evaluate_query_batch_doc_runtime(
-        &self,
+    fn evaluate_query_batch_doc_runtime_with_inputs<'a>(
+        &'a self,
         pos: usize,
-        doc: &CandidateDoc,
+        doc_inputs: &mut LazyDocQueryInputs<'a>,
         plans: &[CompiledQueryPlan],
         runtime: &[Arc<RuntimeQueryArtifacts>],
         scan_rule_indices: &[usize],
@@ -3955,7 +4285,6 @@ impl CandidateStore {
         gram_cache: &mut RuntimeGramMaskCache,
         results: &mut [BatchedQueryResult],
     ) -> Result<()> {
-        let mut doc_inputs = LazyDocQueryInputs::new(doc);
         let mut load_metadata = || self.doc_metadata_bytes(pos);
         let mut load_tier1 = || self.doc_bloom_bytes(pos);
         let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
@@ -3972,7 +4301,7 @@ impl CandidateStore {
             let started = Instant::now();
             let outcome = evaluate_node_runtime(
                 &plans[result_idx].root,
-                &mut doc_inputs,
+                doc_inputs,
                 &mut load_metadata,
                 &mut load_tier1,
                 &mut load_tier2,
@@ -3988,11 +4317,60 @@ impl CandidateStore {
             let profile_delta = doc_inputs.profile.delta_since(&profile_before);
             result.profile.merge_from(&profile_delta);
             if outcome.matched {
-                result.hits.push(doc.identity.clone());
+                result.hits.push(doc_inputs.doc.identity.clone());
                 result.tiers.merge(outcome.tiers);
             }
         }
         Ok(())
+    }
+
+    fn prefilter_query_batch_doc_tier1<'a>(
+        &'a self,
+        pos: usize,
+        doc_inputs: &mut LazyDocQueryInputs<'a>,
+        plans: &[CompiledQueryPlan],
+        runtime: &[Arc<RuntimeQueryArtifacts>],
+        scan_rule_indices: &[usize],
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+        results: &mut [BatchedQueryResult],
+    ) -> Result<Vec<usize>> {
+        let mut load_metadata = || self.doc_metadata_bytes(pos);
+        let mut load_tier1 = || self.doc_bloom_bytes(pos);
+        let mut pending = Vec::new();
+        for result_idx in scan_rule_indices.iter().copied() {
+            let Some(result) = results.get_mut(result_idx) else {
+                continue;
+            };
+            result.profile.docs_scanned = result.profile.docs_scanned.saturating_add(1);
+            let profile_before = doc_inputs.profile.clone();
+            let started = Instant::now();
+            let mut pattern_cache = HashMap::new();
+            match evaluate_node_tier1_prefilter(
+                &plans[result_idx].root,
+                doc_inputs,
+                &mut load_metadata,
+                &mut load_tier1,
+                runtime[result_idx].as_ref(),
+                &plans[result_idx],
+                query_now_unix,
+                &mut pattern_cache,
+                gram_cache,
+            )? {
+                Tier1PrefilterOutcome::Match(tiers) => {
+                    result.hits.push(doc_inputs.doc.identity.clone());
+                    result.tiers.merge(tiers);
+                }
+                Tier1PrefilterOutcome::Miss => {}
+                Tier1PrefilterOutcome::NeedsTier2 => pending.push(result_idx),
+            }
+            result.eval_nanos = result
+                .eval_nanos
+                .saturating_add(started.elapsed().as_nanos());
+            let profile_delta = doc_inputs.profile.delta_since(&profile_before);
+            result.profile.merge_from(&profile_delta);
+        }
+        Ok(pending)
     }
 
     /// Evaluates bundled runtime-hash queries against every live regular doc
@@ -4006,20 +4384,138 @@ impl CandidateStore {
         gram_cache: &mut RuntimeGramMaskCache,
         results: &mut [BatchedQueryResult],
     ) -> Result<()> {
-        for (pos, doc) in self.docs.iter().enumerate() {
-            if doc.deleted || doc.special_population {
-                continue;
+        let (need_tier1, need_tier2) = plans_need_bloom_tiers(plans, scan_rule_indices);
+        let mut tier1_masks_by_geometry = HashMap::<(usize, usize), Vec<(usize, u64)>>::new();
+        let mut tier2_masks_by_geometry = HashMap::<(usize, usize), Vec<(usize, u64)>>::new();
+        let positions = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, doc)| (!doc.deleted && !doc.special_population).then_some(pos))
+            .collect::<Vec<_>>();
+        for chunk in positions.chunks(QUERY_BLOOM_IO_PREFETCH_DOCS) {
+            let (tier1_prefetched, tier1_prefetch_charges, _) = if need_tier1 {
+                self.prefetch_doc_bloom_payload_blocks(chunk, false, |pos| {
+                    let doc = &self.docs[pos];
+                    let key = (doc.filter_bytes, doc.bloom_hashes);
+                    let required = if let Some(masks) = tier1_masks_by_geometry.get(&key) {
+                        masks.clone()
+                    } else {
+                        let masks = runtime_plans_required_word_masks(
+                            plans,
+                            runtime,
+                            scan_rule_indices,
+                            doc.filter_bytes,
+                            doc.bloom_hashes,
+                            false,
+                            gram_cache,
+                        )?;
+                        tier1_masks_by_geometry.insert(key, masks.clone());
+                        masks
+                    };
+                    bloom_block_ranges_for_word_masks(
+                        &required,
+                        doc.filter_bytes,
+                        DEFAULT_BLOOM_POSITION_LANES,
+                    )
+                })?
+            } else {
+                (Vec::new(), Vec::new(), BlobReadStats::default())
+            };
+            let mut tier1_iter = tier1_prefetched.into_iter();
+            let mut tier1_charge_iter = tier1_prefetch_charges.into_iter();
+            let mut doc_inputs_batch = Vec::with_capacity(chunk.len());
+            let mut pending_rules_by_doc = vec![Vec::<usize>::new(); chunk.len()];
+            let mut pending_doc_indexes = Vec::<usize>::new();
+            for (chunk_index, pos) in chunk.iter().copied().enumerate() {
+                let doc = &self.docs[pos];
+                let mut doc_inputs = LazyDocQueryInputs::new(doc);
+                if need_tier1 {
+                    doc_inputs.seed_tier1_bloom_bytes_with_charge(
+                        tier1_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier1 bloom payload")
+                        })?,
+                        Some(tier1_charge_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier1 bloom charge bytes")
+                        })?),
+                    );
+                }
+                let pending = self.prefilter_query_batch_doc_tier1(
+                    pos,
+                    &mut doc_inputs,
+                    plans,
+                    runtime,
+                    scan_rule_indices,
+                    query_now_unix,
+                    gram_cache,
+                    results,
+                )?;
+                if !pending.is_empty() {
+                    pending_rules_by_doc[chunk_index] = pending;
+                    pending_doc_indexes.push(chunk_index);
+                }
+                doc_inputs_batch.push(doc_inputs);
             }
-            self.evaluate_query_batch_doc_runtime(
-                pos,
-                doc,
-                plans,
-                runtime,
-                scan_rule_indices,
-                query_now_unix,
-                gram_cache,
-                results,
-            )?;
+
+            if need_tier2 && !pending_doc_indexes.is_empty() {
+                let pending_positions = pending_doc_indexes
+                    .iter()
+                    .filter_map(|chunk_index| chunk.get(*chunk_index).copied())
+                    .collect::<Vec<_>>();
+                let (tier2_prefetched, tier2_prefetch_charges, _) =
+                    self.prefetch_doc_bloom_payload_blocks(&pending_positions, true, |pos| {
+                        let doc = &self.docs[pos];
+                        let key = (doc.tier2_filter_bytes, doc.tier2_bloom_hashes);
+                        let required = if let Some(masks) = tier2_masks_by_geometry.get(&key) {
+                            masks.clone()
+                        } else {
+                            let masks = runtime_plans_required_word_masks(
+                                plans,
+                                runtime,
+                                scan_rule_indices,
+                                doc.tier2_filter_bytes,
+                                doc.tier2_bloom_hashes,
+                                true,
+                                gram_cache,
+                            )?;
+                            tier2_masks_by_geometry.insert(key, masks.clone());
+                            masks
+                        };
+                        bloom_block_ranges_for_word_masks(
+                            &required,
+                            doc.tier2_filter_bytes,
+                            DEFAULT_BLOOM_POSITION_LANES,
+                        )
+                    })?;
+                let mut tier2_iter = tier2_prefetched.into_iter();
+                let mut tier2_charge_iter = tier2_prefetch_charges.into_iter();
+                for chunk_index in pending_doc_indexes {
+                    let Some(pos) = chunk.get(chunk_index).copied() else {
+                        continue;
+                    };
+                    let Some(doc_inputs) = doc_inputs_batch.get_mut(chunk_index) else {
+                        continue;
+                    };
+                    doc_inputs.seed_tier2_bloom_bytes_with_charge(
+                        tier2_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier2 bloom payload")
+                        })?,
+                        Some(tier2_charge_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier2 bloom charge bytes")
+                        })?),
+                    );
+                    self.evaluate_query_batch_doc_runtime_with_inputs(
+                        pos,
+                        doc_inputs,
+                        plans,
+                        runtime,
+                        &pending_rules_by_doc[chunk_index],
+                        query_now_unix,
+                        gram_cache,
+                        results,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -4035,25 +4531,324 @@ impl CandidateStore {
         gram_cache: &mut RuntimeGramMaskCache,
         results: &mut [BatchedQueryResult],
     ) -> Result<()> {
-        for pos in &self.special_doc_positions {
-            let Some(doc) = self.docs.get(*pos) else {
-                continue;
+        let (need_tier1, need_tier2) = plans_need_bloom_tiers(plans, scan_rule_indices);
+        let mut tier1_masks_by_geometry = HashMap::<(usize, usize), Vec<(usize, u64)>>::new();
+        let mut tier2_masks_by_geometry = HashMap::<(usize, usize), Vec<(usize, u64)>>::new();
+        let positions = self
+            .special_doc_positions
+            .iter()
+            .copied()
+            .filter(|pos| {
+                self.docs
+                    .get(*pos)
+                    .map(|doc| !doc.deleted && doc.special_population)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        for chunk in positions.chunks(QUERY_BLOOM_IO_PREFETCH_DOCS) {
+            let (tier1_prefetched, tier1_prefetch_charges, _) = if need_tier1 {
+                self.prefetch_doc_bloom_payload_blocks(chunk, false, |pos| {
+                    let doc = &self.docs[pos];
+                    let key = (doc.filter_bytes, doc.bloom_hashes);
+                    let required = if let Some(masks) = tier1_masks_by_geometry.get(&key) {
+                        masks.clone()
+                    } else {
+                        let masks = runtime_plans_required_word_masks(
+                            plans,
+                            runtime,
+                            scan_rule_indices,
+                            doc.filter_bytes,
+                            doc.bloom_hashes,
+                            false,
+                            gram_cache,
+                        )?;
+                        tier1_masks_by_geometry.insert(key, masks.clone());
+                        masks
+                    };
+                    bloom_block_ranges_for_word_masks(
+                        &required,
+                        doc.filter_bytes,
+                        DEFAULT_BLOOM_POSITION_LANES,
+                    )
+                })?
+            } else {
+                (Vec::new(), Vec::new(), BlobReadStats::default())
             };
-            if doc.deleted || !doc.special_population {
-                continue;
+            let mut tier1_iter = tier1_prefetched.into_iter();
+            let mut tier1_charge_iter = tier1_prefetch_charges.into_iter();
+            let mut doc_inputs_batch = Vec::with_capacity(chunk.len());
+            let mut pending_rules_by_doc = vec![Vec::<usize>::new(); chunk.len()];
+            let mut pending_doc_indexes = Vec::<usize>::new();
+            for (chunk_index, pos) in chunk.iter().copied().enumerate() {
+                let Some(doc) = self.docs.get(pos) else {
+                    continue;
+                };
+                let mut doc_inputs = LazyDocQueryInputs::new(doc);
+                if need_tier1 {
+                    doc_inputs.seed_tier1_bloom_bytes_with_charge(
+                        tier1_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier1 bloom payload")
+                        })?,
+                        Some(tier1_charge_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier1 bloom charge bytes")
+                        })?),
+                    );
+                }
+                let pending = self.prefilter_query_batch_doc_tier1(
+                    pos,
+                    &mut doc_inputs,
+                    plans,
+                    runtime,
+                    scan_rule_indices,
+                    query_now_unix,
+                    gram_cache,
+                    results,
+                )?;
+                if !pending.is_empty() {
+                    pending_rules_by_doc[chunk_index] = pending;
+                    pending_doc_indexes.push(chunk_index);
+                }
+                doc_inputs_batch.push(doc_inputs);
             }
-            self.evaluate_query_batch_doc_runtime(
-                *pos,
-                doc,
-                plans,
-                runtime,
-                scan_rule_indices,
-                query_now_unix,
-                gram_cache,
-                results,
-            )?;
+
+            if need_tier2 && !pending_doc_indexes.is_empty() {
+                let pending_positions = pending_doc_indexes
+                    .iter()
+                    .filter_map(|chunk_index| chunk.get(*chunk_index).copied())
+                    .collect::<Vec<_>>();
+                let (tier2_prefetched, tier2_prefetch_charges, _) =
+                    self.prefetch_doc_bloom_payload_blocks(&pending_positions, true, |pos| {
+                        let doc = &self.docs[pos];
+                        let key = (doc.tier2_filter_bytes, doc.tier2_bloom_hashes);
+                        let required = if let Some(masks) = tier2_masks_by_geometry.get(&key) {
+                            masks.clone()
+                        } else {
+                            let masks = runtime_plans_required_word_masks(
+                                plans,
+                                runtime,
+                                scan_rule_indices,
+                                doc.tier2_filter_bytes,
+                                doc.tier2_bloom_hashes,
+                                true,
+                                gram_cache,
+                            )?;
+                            tier2_masks_by_geometry.insert(key, masks.clone());
+                            masks
+                        };
+                        bloom_block_ranges_for_word_masks(
+                            &required,
+                            doc.tier2_filter_bytes,
+                            DEFAULT_BLOOM_POSITION_LANES,
+                        )
+                    })?;
+                let mut tier2_iter = tier2_prefetched.into_iter();
+                let mut tier2_charge_iter = tier2_prefetch_charges.into_iter();
+                for chunk_index in pending_doc_indexes {
+                    let Some(pos) = chunk.get(chunk_index).copied() else {
+                        continue;
+                    };
+                    let Some(doc_inputs) = doc_inputs_batch.get_mut(chunk_index) else {
+                        continue;
+                    };
+                    doc_inputs.seed_tier2_bloom_bytes_with_charge(
+                        tier2_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier2 bloom payload")
+                        })?,
+                        Some(tier2_charge_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier2 bloom charge bytes")
+                        })?),
+                    );
+                    self.evaluate_query_batch_doc_runtime_with_inputs(
+                        pos,
+                        doc_inputs,
+                        plans,
+                        runtime,
+                        &pending_rules_by_doc[chunk_index],
+                        query_now_unix,
+                        gram_cache,
+                        results,
+                    )?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Evaluates a runtime-hash query across a fixed list of live documents
+    /// using tier-1 prefiltering before batching any needed tier-2 reads.
+    fn scan_query_hits_positions_runtime(
+        &self,
+        positions: &[usize],
+        plan: &CompiledQueryPlan,
+        runtime: &RuntimeQueryArtifacts,
+        query_now_unix: u64,
+        gram_cache: &mut RuntimeGramMaskCache,
+    ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
+        let mut matched_hits = Vec::<String>::new();
+        let mut used_tiers = TierFlags::default();
+        let mut query_profile = CandidateQueryProfile::default();
+        let need_tier1 = plan_needs_tier1_bloom(plan);
+        let need_tier2 = plan_needs_tier2_bloom(plan);
+        let mut tier1_masks_by_geometry = HashMap::<(usize, usize), Vec<(usize, u64)>>::new();
+        let mut tier2_masks_by_geometry = HashMap::<(usize, usize), Vec<(usize, u64)>>::new();
+        for chunk in positions.chunks(QUERY_BLOOM_IO_PREFETCH_DOCS) {
+            let (tier1_prefetched, tier1_prefetch_charges, tier1_stats) = if need_tier1 {
+                self.prefetch_doc_bloom_payload_blocks(chunk, false, |pos| {
+                    let doc = &self.docs[pos];
+                    let key = (doc.filter_bytes, doc.bloom_hashes);
+                    let required = if let Some(masks) = tier1_masks_by_geometry.get(&key) {
+                        masks.clone()
+                    } else {
+                        let masks = runtime_plan_required_word_masks(
+                            plan,
+                            runtime,
+                            doc.filter_bytes,
+                            doc.bloom_hashes,
+                            false,
+                            gram_cache,
+                        )?;
+                        tier1_masks_by_geometry.insert(key, masks.clone());
+                        masks
+                    };
+                    bloom_block_ranges_for_word_masks(
+                        &required,
+                        doc.filter_bytes,
+                        DEFAULT_BLOOM_POSITION_LANES,
+                    )
+                })?
+            } else {
+                (Vec::new(), Vec::new(), BlobReadStats::default())
+            };
+            if need_tier1 {
+                Self::apply_prefetch_stats(&mut query_profile, false, chunk.len(), tier1_stats);
+            }
+            let mut tier1_iter = tier1_prefetched.into_iter();
+            let mut tier1_charge_iter = tier1_prefetch_charges.into_iter();
+            let mut doc_inputs_batch = Vec::with_capacity(chunk.len());
+            let mut pending_doc_indexes = Vec::<usize>::new();
+
+            for (chunk_index, pos) in chunk.iter().copied().enumerate() {
+                let Some(doc) = self.docs.get(pos) else {
+                    continue;
+                };
+                let mut doc_inputs = LazyDocQueryInputs::new(doc);
+                if need_tier1 {
+                    doc_inputs.seed_tier1_bloom_bytes_with_charge(
+                        tier1_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier1 bloom payload")
+                        })?,
+                        Some(tier1_charge_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier1 bloom charge bytes")
+                        })?),
+                    );
+                }
+
+                query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
+                let mut load_metadata = || self.doc_metadata_bytes(pos);
+                let mut load_tier1 = || self.doc_bloom_bytes(pos);
+                let mut pattern_cache = HashMap::new();
+                match evaluate_node_tier1_prefilter(
+                    &plan.root,
+                    &mut doc_inputs,
+                    &mut load_metadata,
+                    &mut load_tier1,
+                    runtime,
+                    plan,
+                    query_now_unix,
+                    &mut pattern_cache,
+                    gram_cache,
+                )? {
+                    Tier1PrefilterOutcome::Match(tiers) => {
+                        matched_hits.push(doc.identity.clone());
+                        used_tiers.merge(tiers);
+                    }
+                    Tier1PrefilterOutcome::Miss => {}
+                    Tier1PrefilterOutcome::NeedsTier2 => pending_doc_indexes.push(chunk_index),
+                }
+                doc_inputs_batch.push(doc_inputs);
+            }
+
+            if need_tier2 && !pending_doc_indexes.is_empty() {
+                let pending_positions = pending_doc_indexes
+                    .iter()
+                    .filter_map(|chunk_index| chunk.get(*chunk_index).copied())
+                    .collect::<Vec<_>>();
+                let (tier2_prefetched, tier2_prefetch_charges, tier2_stats) =
+                    self.prefetch_doc_bloom_payload_blocks(&pending_positions, true, |pos| {
+                        let doc = &self.docs[pos];
+                        let key = (doc.tier2_filter_bytes, doc.tier2_bloom_hashes);
+                        let required = if let Some(masks) = tier2_masks_by_geometry.get(&key) {
+                            masks.clone()
+                        } else {
+                            let masks = runtime_plan_required_word_masks(
+                                plan,
+                                runtime,
+                                doc.tier2_filter_bytes,
+                                doc.tier2_bloom_hashes,
+                                true,
+                                gram_cache,
+                            )?;
+                            tier2_masks_by_geometry.insert(key, masks.clone());
+                            masks
+                        };
+                        bloom_block_ranges_for_word_masks(
+                            &required,
+                            doc.tier2_filter_bytes,
+                            DEFAULT_BLOOM_POSITION_LANES,
+                        )
+                    })?;
+                Self::apply_prefetch_stats(
+                    &mut query_profile,
+                    true,
+                    pending_positions.len(),
+                    tier2_stats,
+                );
+                let mut tier2_iter = tier2_prefetched.into_iter();
+                let mut tier2_charge_iter = tier2_prefetch_charges.into_iter();
+                for chunk_index in pending_doc_indexes {
+                    let Some(pos) = chunk.get(chunk_index).copied() else {
+                        continue;
+                    };
+                    let Some(doc_inputs) = doc_inputs_batch.get_mut(chunk_index) else {
+                        continue;
+                    };
+                    doc_inputs.seed_tier2_bloom_bytes_with_charge(
+                        tier2_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier2 bloom payload")
+                        })?,
+                        Some(tier2_charge_iter.next().ok_or_else(|| {
+                            SspryError::from("missing prefetched tier2 bloom charge bytes")
+                        })?),
+                    );
+                    let mut load_metadata = || self.doc_metadata_bytes(pos);
+                    let mut load_tier1 = || self.doc_bloom_bytes(pos);
+                    let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
+                    let mut eval_cache = QueryEvalCache::default();
+                    let outcome = evaluate_node_runtime(
+                        &plan.root,
+                        doc_inputs,
+                        &mut load_metadata,
+                        &mut load_tier1,
+                        &mut load_tier2,
+                        runtime,
+                        plan,
+                        query_now_unix,
+                        &mut eval_cache,
+                        gram_cache,
+                    )?;
+                    if outcome.matched {
+                        let doc = &self.docs[pos];
+                        matched_hits.push(doc.identity.clone());
+                        used_tiers.merge(outcome.tiers);
+                    }
+                }
+            }
+
+            for doc_inputs in doc_inputs_batch {
+                query_profile.merge_from(&doc_inputs.into_profile());
+            }
+        }
+        Ok((matched_hits, used_tiers, query_profile))
     }
 
     /// Evaluates a runtime-hash query only against the special-population
@@ -4065,41 +4860,24 @@ impl CandidateStore {
         query_now_unix: u64,
         gram_cache: &mut RuntimeGramMaskCache,
     ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
-        let mut matched_hits = Vec::<String>::new();
-        let mut used_tiers = TierFlags::default();
-        let mut query_profile = CandidateQueryProfile::default();
-        for pos in &self.special_doc_positions {
-            let Some(doc) = self.docs.get(*pos) else {
-                continue;
-            };
-            if doc.deleted || !doc.special_population {
-                continue;
-            }
-            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
-            let mut doc_inputs = LazyDocQueryInputs::new(doc);
-            let mut load_metadata = || self.doc_metadata_bytes(*pos);
-            let mut load_tier1 = || self.doc_bloom_bytes(*pos);
-            let mut load_tier2 = || self.doc_tier2_bloom_bytes(*pos);
-            let mut eval_cache = QueryEvalCache::default();
-            let outcome = evaluate_node_runtime(
-                &plan.root,
-                &mut doc_inputs,
-                &mut load_metadata,
-                &mut load_tier1,
-                &mut load_tier2,
-                runtime,
-                plan,
-                query_now_unix,
-                &mut eval_cache,
-                gram_cache,
-            )?;
-            if outcome.matched {
-                matched_hits.push(doc.identity.clone());
-                used_tiers.merge(outcome.tiers);
-            }
-            query_profile.merge_from(&doc_inputs.into_profile());
-        }
-        Ok((matched_hits, used_tiers, query_profile))
+        let positions = self
+            .special_doc_positions
+            .iter()
+            .copied()
+            .filter(|pos| {
+                self.docs
+                    .get(*pos)
+                    .map(|doc| !doc.deleted && doc.special_population)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        self.scan_query_hits_positions_runtime(
+            &positions,
+            plan,
+            runtime,
+            query_now_unix,
+            gram_cache,
+        )
     }
 
     /// Evaluates a runtime-hash query across every live regular document in
@@ -4111,38 +4889,13 @@ impl CandidateStore {
         query_now_unix: u64,
         gram_cache: &mut RuntimeGramMaskCache,
     ) -> Result<(Vec<String>, TierFlags, CandidateQueryProfile)> {
-        let mut matched_hits = Vec::<String>::new();
-        let mut used_tiers = TierFlags::default();
-        let mut query_profile = CandidateQueryProfile::default();
-        for (pos, doc) in self.docs.iter().enumerate() {
-            if doc.deleted || doc.special_population {
-                continue;
-            }
-            query_profile.docs_scanned = query_profile.docs_scanned.saturating_add(1);
-            let mut doc_inputs = LazyDocQueryInputs::new(doc);
-            let mut load_metadata = || self.doc_metadata_bytes(pos);
-            let mut load_tier1 = || self.doc_bloom_bytes(pos);
-            let mut load_tier2 = || self.doc_tier2_bloom_bytes(pos);
-            let mut eval_cache = QueryEvalCache::default();
-            let outcome = evaluate_node_runtime(
-                &plan.root,
-                &mut doc_inputs,
-                &mut load_metadata,
-                &mut load_tier1,
-                &mut load_tier2,
-                runtime,
-                plan,
-                query_now_unix,
-                &mut eval_cache,
-                gram_cache,
-            )?;
-            if outcome.matched {
-                matched_hits.push(doc.identity.clone());
-                used_tiers.merge(outcome.tiers);
-            }
-            query_profile.merge_from(&doc_inputs.into_profile());
-        }
-        Ok((matched_hits, used_tiers, query_profile))
+        let positions = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, doc)| (!doc.deleted && !doc.special_population).then_some(pos))
+            .collect::<Vec<_>>();
+        self.scan_query_hits_positions_runtime(&positions, plan, runtime, query_now_unix, gram_cache)
     }
 
     /// Estimates memory owned by the document vector, including heap
@@ -4302,6 +5055,106 @@ impl CandidateStore {
             "tier2_bloom",
             doc.doc_id,
         )
+    }
+
+    fn apply_prefetch_stats(
+        query_profile: &mut CandidateQueryProfile,
+        tier2: bool,
+        doc_count: usize,
+        stats: BlobReadStats,
+    ) {
+        if tier2 {
+            query_profile.tier2_prefetch_docs = query_profile
+                .tier2_prefetch_docs
+                .saturating_add(doc_count as u64);
+            query_profile.tier2_prefetch_bytes = query_profile
+                .tier2_prefetch_bytes
+                .saturating_add(stats.bytes);
+            query_profile.tier2_prefetch_requests = query_profile
+                .tier2_prefetch_requests
+                .saturating_add(stats.requests);
+        } else {
+            query_profile.tier1_prefetch_docs = query_profile
+                .tier1_prefetch_docs
+                .saturating_add(doc_count as u64);
+            query_profile.tier1_prefetch_bytes = query_profile
+                .tier1_prefetch_bytes
+                .saturating_add(stats.bytes);
+            query_profile.tier1_prefetch_requests = query_profile
+                .tier1_prefetch_requests
+                .saturating_add(stats.requests);
+        }
+    }
+
+    fn prefetch_doc_bloom_payload_blocks<F>(
+        &self,
+        positions: &[usize],
+        tier2: bool,
+        mut ranges_for_doc: F,
+    ) -> Result<(Vec<Vec<u8>>, Vec<u64>, BlobReadStats)>
+    where
+        F: FnMut(usize) -> Result<Vec<(usize, usize)>>,
+    {
+        let sidecar = if tier2 {
+            &self.sidecars.tier2_blooms
+        } else {
+            &self.sidecars.blooms
+        };
+        let mut requests = Vec::<BlobReadRequest>::new();
+        let mut per_doc_ranges = Vec::<Vec<(usize, usize)>>::with_capacity(positions.len());
+        let mut per_doc_charge_bytes = Vec::<u64>::with_capacity(positions.len());
+        let mut per_doc_sizes = Vec::<usize>::with_capacity(positions.len());
+
+        for pos in positions {
+            let doc = &self.docs[*pos];
+            let (row_offset, row_len) = if tier2 {
+                let row = self.tier2_doc_rows[*pos];
+                (row.bloom_offset, row.bloom_len as usize)
+            } else {
+                let row = self.doc_rows[*pos];
+                (row.bloom_offset, row.bloom_len as usize)
+            };
+            let ranges = ranges_for_doc(*pos)?;
+            for (relative_offset, len) in &ranges {
+                requests.push(BlobReadRequest {
+                    offset: row_offset.saturating_add(*relative_offset as u64),
+                    len: *len,
+                    doc_id: doc.doc_id,
+                });
+            }
+            per_doc_charge_bytes.push(ranges.iter().map(|(_, len)| *len as u64).sum());
+            per_doc_ranges.push(ranges);
+            per_doc_sizes.push(row_len);
+        }
+
+        let batch = sidecar.read_many_bytes_with_stats(
+            &requests,
+            if tier2 { "tier2_bloom" } else { "bloom" },
+        )?;
+        let mut iter = batch.buffers.into_iter();
+        let mut out = Vec::with_capacity(positions.len());
+        for (size, ranges) in per_doc_sizes.into_iter().zip(per_doc_ranges.into_iter()) {
+            let mut materialized = vec![0u8; size];
+            for (relative_offset, len) in ranges {
+                let bytes = iter.next().ok_or_else(|| {
+                    SspryError::from("missing prefetched blocked bloom payload range")
+                })?;
+                if bytes.len() != len {
+                    return Err(SspryError::from(
+                        "prefetched blocked bloom payload range length mismatch",
+                    ));
+                }
+                let end = relative_offset.saturating_add(len);
+                if end > materialized.len() {
+                    return Err(SspryError::from(
+                        "prefetched blocked bloom payload range exceeds document bloom length",
+                    ));
+                }
+                materialized[relative_offset..end].copy_from_slice(&bytes);
+            }
+            out.push(materialized);
+        }
+        Ok((out, per_doc_charge_bytes, batch.stats))
     }
 
     /// Loads and decodes the optional external id for one document.
@@ -4558,6 +5411,20 @@ impl CandidateStore {
         tier2_row: Tier2DocMetaRow,
     ) -> Result<()> {
         self.append_writers.source_id_by_docid.append(identity)?;
+        self.append_writers.bloom_locs.append(
+            &BloomLocRow {
+                bloom_offset: row.bloom_offset,
+                bloom_len: row.bloom_len,
+            }
+            .encode(),
+        )?;
+        self.append_writers.tier2_bloom_locs.append(
+            &BloomLocRow {
+                bloom_offset: tier2_row.bloom_offset,
+                bloom_len: tier2_row.bloom_len,
+            }
+            .encode(),
+        )?;
         self.append_writers.doc_meta.append(&row.encode())?;
         self.append_writers
             .tier2_doc_meta
@@ -4668,6 +5535,8 @@ pub(crate) fn write_compacted_snapshot(
         source_id_by_docid_path(compacted_root),
         doc_meta_path(compacted_root),
         tier2_doc_meta_path(compacted_root),
+        bloom_loc_path(compacted_root),
+        tier2_bloom_loc_path(compacted_root),
         doc_metadata_path(compacted_root),
         blooms_path(compacted_root),
         tier2_blooms_path(compacted_root),
@@ -4756,6 +5625,22 @@ pub(crate) fn write_compacted_snapshot(
             }
         };
         append_blob(source_id_by_docid_path(compacted_root), &doc.identity)?;
+        append_blob(
+            bloom_loc_path(compacted_root),
+            &BloomLocRow {
+                bloom_offset: row.bloom_offset,
+                bloom_len: row.bloom_len,
+            }
+            .encode(),
+        )?;
+        append_blob(
+            tier2_bloom_loc_path(compacted_root),
+            &BloomLocRow {
+                bloom_offset: tier2_row.bloom_offset,
+                bloom_len: tier2_row.bloom_len,
+            }
+            .encode(),
+        )?;
         append_blob(doc_meta_path(compacted_root), &row.encode())?;
         append_blob(tier2_doc_meta_path(compacted_root), &tier2_row.encode())?;
     }

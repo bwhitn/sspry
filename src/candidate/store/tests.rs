@@ -1609,10 +1609,11 @@ fn binary_sidecars_reject_corrupt_lengths_and_offsets() {
         Some("ok".to_owned()),
     )
     .expect("insert invalid bloom root");
-    let mut row = DocMetaRow::decode(&fs::read(doc_meta_path(&invalid_bloom_root)).expect("row"))
-        .expect("decode row");
+    let mut row =
+        BloomLocRow::decode(&fs::read(bloom_loc_path(&invalid_bloom_root)).expect("row"))
+            .expect("decode row");
     row.bloom_offset = 1_000_000;
-    fs::write(doc_meta_path(&invalid_bloom_root), row.encode()).expect("write bad row");
+    fs::write(bloom_loc_path(&invalid_bloom_root), row.encode()).expect("write bad row");
     let mut reopened_invalid_bloom =
         CandidateStore::open(&invalid_bloom_root).expect("open invalid bloom root");
     let invalid_bloom_plan = CompiledQueryPlan {
@@ -1702,8 +1703,8 @@ fn doc_meta_codec_and_binary_write_helpers_cover_remaining_paths() {
     assert_eq!(decoded.file_size, row.file_size);
     assert_eq!(decoded.filter_bytes, row.filter_bytes);
     assert_eq!(decoded.flags, row.flags);
-    assert_eq!(decoded.bloom_offset, row.bloom_offset);
-    assert_eq!(decoded.bloom_len, row.bloom_len);
+    assert_eq!(decoded.bloom_offset, 0);
+    assert_eq!(decoded.bloom_len, 0);
     assert_eq!(decoded.external_id_offset, row.external_id_offset);
     assert_eq!(decoded.external_id_len, row.external_id_len);
     assert!(
@@ -1831,7 +1832,7 @@ fn sidecar_and_append_helper_paths_work() {
             .as_ref(),
         b"meta"
     );
-    assert_eq!(sidecars.metadata.mapped_bytes(), 0);
+    assert_eq!(sidecars.metadata.mapped_bytes(), 4);
     sidecars.invalidate_all();
     sidecars.retarget_root(&other_root);
     sidecars.refresh_maps().expect("refresh retargeted maps");

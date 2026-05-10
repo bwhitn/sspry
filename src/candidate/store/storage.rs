@@ -76,6 +76,16 @@ fn tier2_doc_meta_path(root: &Path) -> PathBuf {
     root.join("tier2_doc_meta.bin")
 }
 
+/// Returns the path of the tier-1 bloom offset/length sidecar.
+fn bloom_loc_path(root: &Path) -> PathBuf {
+    root.join("bloom_loc.bin")
+}
+
+/// Returns the path of the tier-2 bloom offset/length sidecar.
+fn tier2_bloom_loc_path(root: &Path) -> PathBuf {
+    root.join("tier2_bloom_loc.bin")
+}
+
 /// Returns the path of the compact document metadata blob file.
 fn doc_metadata_path(root: &Path) -> PathBuf {
     root.join("doc_metadata.bin")
@@ -431,6 +441,8 @@ fn load_candidate_binary_store(
     let source_id_bytes = fs::read(source_id_by_docid_path(root))?;
     let row_bytes = fs::read(doc_meta_path(root))?;
     let tier2_row_bytes = fs::read(tier2_doc_meta_path(root)).unwrap_or_default();
+    let bloom_loc_bytes = fs::read(bloom_loc_path(root)).unwrap_or_default();
+    let tier2_bloom_loc_bytes = fs::read(tier2_bloom_loc_path(root)).unwrap_or_default();
     if source_id_bytes.len() % identity_bytes != 0 || row_bytes.len() % DOC_META_ROW_BYTES != 0 {
         return Err(SspryError::from(format!(
             "Invalid candidate binary document state at {}",
@@ -441,6 +453,20 @@ fn load_candidate_binary_store(
     if doc_count != row_bytes.len() / DOC_META_ROW_BYTES {
         return Err(SspryError::from(format!(
             "Mismatched candidate binary document state at {}",
+            root.display()
+        )));
+    }
+    if !bloom_loc_bytes.is_empty() && bloom_loc_bytes.len() != doc_count * BLOOM_LOC_ROW_BYTES {
+        return Err(SspryError::from(format!(
+            "Mismatched candidate bloom loc state at {}",
+            root.display()
+        )));
+    }
+    if !tier2_bloom_loc_bytes.is_empty()
+        && tier2_bloom_loc_bytes.len() != doc_count * BLOOM_LOC_ROW_BYTES
+    {
+        return Err(SspryError::from(format!(
+            "Mismatched candidate tier2 bloom loc state at {}",
             root.display()
         )));
     }
@@ -455,14 +481,33 @@ fn load_candidate_binary_store(
         let row = DocMetaRow::decode(
             &row_bytes[index * DOC_META_ROW_BYTES..(index + 1) * DOC_META_ROW_BYTES],
         )?;
+        let bloom_loc = if bloom_loc_bytes.len() >= (index + 1) * BLOOM_LOC_ROW_BYTES {
+            BloomLocRow::decode(
+                &bloom_loc_bytes[index * BLOOM_LOC_ROW_BYTES..(index + 1) * BLOOM_LOC_ROW_BYTES],
+            )?
+        } else {
+            BloomLocRow::default()
+        };
         let tier2_row = if tier2_row_bytes.len() >= (index + 1) * TIER2_DOC_META_ROW_BYTES {
-            Tier2DocMetaRow::decode(
+            let mut tier2_row = Tier2DocMetaRow::decode(
                 &tier2_row_bytes
                     [index * TIER2_DOC_META_ROW_BYTES..(index + 1) * TIER2_DOC_META_ROW_BYTES],
-            )?
+            )?;
+            if tier2_bloom_loc_bytes.len() >= (index + 1) * BLOOM_LOC_ROW_BYTES {
+                let tier2_bloom_loc = BloomLocRow::decode(
+                    &tier2_bloom_loc_bytes
+                        [index * BLOOM_LOC_ROW_BYTES..(index + 1) * BLOOM_LOC_ROW_BYTES],
+                )?;
+                tier2_row.bloom_offset = tier2_bloom_loc.bloom_offset;
+                tier2_row.bloom_len = tier2_bloom_loc.bloom_len;
+            }
+            tier2_row
         } else {
             Tier2DocMetaRow::default()
         };
+        let mut row = row;
+        row.bloom_offset = bloom_loc.bloom_offset;
+        row.bloom_len = bloom_loc.bloom_len;
         docs.push(CandidateDoc {
             doc_id,
             identity: identity_hex,

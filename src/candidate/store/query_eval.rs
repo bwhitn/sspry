@@ -859,6 +859,587 @@ fn runtime_shifted_matches(
     Ok(false)
 }
 
+fn merge_required_masks(
+    merged: &mut std::collections::BTreeMap<usize, u64>,
+    masks: &[(usize, u64)],
+) {
+    for (word_idx, mask) in masks {
+        *merged.entry(*word_idx).or_insert(0) |= *mask;
+    }
+}
+
+fn runtime_pattern_required_word_masks(
+    pattern: &PatternPlan,
+    runtime_pattern: &RuntimePatternArtifacts,
+    size_bytes: usize,
+    hash_count: usize,
+    tier2: bool,
+    cache: &mut RuntimeGramMaskCache,
+    merged: &mut std::collections::BTreeMap<usize, u64>,
+) -> Result<()> {
+    let (alternatives, runtime_alternatives) = if tier2 {
+        (&pattern.tier2_alternatives, &runtime_pattern.tier2)
+    } else {
+        (&pattern.alternatives, &runtime_pattern.tier1)
+    };
+    for (alt_index, alternative) in alternatives.iter().enumerate() {
+        if alternative.is_empty() {
+            continue;
+        }
+        let runtime_alternative = runtime_alternatives
+            .get(alt_index)
+            .ok_or_else(|| SspryError::from("Runtime alternative missing for mask planning"))?;
+        if runtime_alternative.use_any_lane {
+            for value in alternative {
+                for lane in 0..DEFAULT_BLOOM_POSITION_LANES {
+                    let masks = cached_bloom_word_masks_in_lane(
+                        *value,
+                        size_bytes,
+                        hash_count,
+                        lane,
+                        DEFAULT_BLOOM_POSITION_LANES,
+                        cache,
+                    )?;
+                    merge_required_masks(merged, &masks);
+                }
+            }
+        } else {
+            for lanes in &runtime_alternative.lane_variants {
+                let masks = merge_cached_lane_bloom_word_masks(
+                    alternative,
+                    size_bytes,
+                    hash_count,
+                    lanes,
+                    DEFAULT_BLOOM_POSITION_LANES,
+                    cache,
+                )?;
+                merge_required_masks(merged, &masks);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_plan_required_word_masks(
+    plan: &CompiledQueryPlan,
+    runtime: &RuntimeQueryArtifacts,
+    size_bytes: usize,
+    hash_count: usize,
+    tier2: bool,
+    cache: &mut RuntimeGramMaskCache,
+) -> Result<Vec<(usize, u64)>> {
+    let mut merged = std::collections::BTreeMap::<usize, u64>::new();
+    for pattern in &plan.patterns {
+        let Some(runtime_pattern) = runtime.runtime_patterns.get(&pattern.pattern_id) else {
+            continue;
+        };
+        runtime_pattern_required_word_masks(
+            pattern,
+            runtime_pattern,
+            size_bytes,
+            hash_count,
+            tier2,
+            cache,
+            &mut merged,
+        )?;
+    }
+    Ok(merged.into_iter().collect())
+}
+
+pub(crate) fn runtime_plans_required_word_masks(
+    plans: &[CompiledQueryPlan],
+    runtime: &[Arc<RuntimeQueryArtifacts>],
+    scan_rule_indices: &[usize],
+    size_bytes: usize,
+    hash_count: usize,
+    tier2: bool,
+    cache: &mut RuntimeGramMaskCache,
+) -> Result<Vec<(usize, u64)>> {
+    let mut merged = std::collections::BTreeMap::<usize, u64>::new();
+    for index in scan_rule_indices {
+        let Some(plan) = plans.get(*index) else {
+            continue;
+        };
+        let Some(runtime_query) = runtime.get(*index) else {
+            continue;
+        };
+        for pattern in &plan.patterns {
+            let Some(runtime_pattern) = runtime_query.runtime_patterns.get(&pattern.pattern_id) else {
+                continue;
+            };
+            runtime_pattern_required_word_masks(
+                pattern,
+                runtime_pattern,
+                size_bytes,
+                hash_count,
+                tier2,
+                cache,
+                &mut merged,
+            )?;
+        }
+    }
+    Ok(merged.into_iter().collect())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Tier1PrefilterOutcome {
+    Match(TierFlags),
+    Miss,
+    NeedsTier2,
+}
+
+fn evaluate_pattern_tier1_prefilter<'a, FT1>(
+    pattern: &PatternPlan,
+    runtime_pattern: &RuntimePatternArtifacts,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_tier1: &mut FT1,
+    plan: &CompiledQueryPlan,
+    gram_cache: &mut RuntimeGramMaskCache,
+) -> Result<Tier1PrefilterOutcome>
+where
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    let allow_tier2 = !plan.force_tier1_only && plan.allow_tier2_fallback;
+    let tier2_only =
+        experiment_tier2_only_enabled() || experiment_tier2_and_metadata_only_enabled();
+    for (alt_index, alternative) in pattern.alternatives.iter().enumerate() {
+        let tier2_alternative = pattern
+            .tier2_alternatives
+            .get(alt_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if alternative.is_empty() && tier2_alternative.is_empty() {
+            return Ok(Tier1PrefilterOutcome::Match(TierFlags {
+                used_tier1: !tier2_only,
+                used_tier2: false,
+            }));
+        }
+
+        let doc = doc_inputs.doc;
+        let mut used_tier1 = false;
+        if !tier2_only && !alternative.is_empty() {
+            let bloom_bytes = doc_inputs.tier1_bloom_bytes(load_tier1)?;
+            let runtime_alternative = runtime_pattern
+                .tier1
+                .get(alt_index)
+                .ok_or_else(|| SspryError::from("Runtime tier1 alternative missing"))?;
+            let primary_match = if runtime_alternative.use_any_lane {
+                runtime_any_lane_matches(
+                    alternative,
+                    doc.filter_bytes,
+                    doc.bloom_hashes,
+                    bloom_bytes,
+                    gram_cache,
+                )?
+            } else {
+                runtime_shifted_matches(
+                    alternative,
+                    &runtime_alternative.lane_variants,
+                    doc.filter_bytes,
+                    doc.bloom_hashes,
+                    bloom_bytes,
+                    gram_cache,
+                )?
+            };
+            if !primary_match {
+                continue;
+            }
+            used_tier1 = true;
+        }
+
+        if !tier2_alternative.is_empty() {
+            if tier2_only {
+                if doc.tier2_filter_bytes == 0 || doc.tier2_bloom_hashes == 0 {
+                    continue;
+                }
+                return Ok(Tier1PrefilterOutcome::NeedsTier2);
+            }
+            if allow_tier2 && doc.tier2_filter_bytes > 0 && doc.tier2_bloom_hashes > 0 {
+                return Ok(Tier1PrefilterOutcome::NeedsTier2);
+            }
+        }
+
+        return Ok(Tier1PrefilterOutcome::Match(TierFlags {
+            used_tier1,
+            used_tier2: false,
+        }));
+    }
+    Ok(Tier1PrefilterOutcome::Miss)
+}
+
+fn evaluate_node_tier1_prefilter<'a, FM, FT1>(
+    node: &QueryNode,
+    doc_inputs: &mut LazyDocQueryInputs<'a>,
+    load_metadata: &mut FM,
+    load_tier1: &mut FT1,
+    runtime: &RuntimeQueryArtifacts,
+    plan: &CompiledQueryPlan,
+    query_now_unix: u64,
+    pattern_cache: &mut HashMap<String, Tier1PrefilterOutcome>,
+    gram_cache: &mut RuntimeGramMaskCache,
+) -> Result<Tier1PrefilterOutcome>
+where
+    FM: FnMut() -> Result<Cow<'a, [u8]>>,
+    FT1: FnMut() -> Result<Cow<'a, [u8]>>,
+{
+    match node.kind.as_str() {
+        "pattern" => {
+            let pattern_id = node
+                .pattern_id
+                .as_ref()
+                .ok_or_else(|| SspryError::from("pattern node requires pattern_id"))?;
+            if let Some(outcome) = pattern_cache.get(pattern_id).copied() {
+                return Ok(outcome);
+            }
+            let pattern = runtime
+                .patterns
+                .get(pattern_id)
+                .ok_or_else(|| SspryError::from(format!("Unknown pattern id: {pattern_id}")))?;
+            let runtime_pattern = runtime
+                .runtime_patterns
+                .get(pattern_id)
+                .ok_or_else(|| SspryError::from(format!("Unknown runtime pattern id: {pattern_id}")))?;
+            let outcome = evaluate_pattern_tier1_prefilter(
+                pattern,
+                runtime_pattern,
+                doc_inputs,
+                load_tier1,
+                plan,
+                gram_cache,
+            )?;
+            pattern_cache.insert(pattern_id.clone(), outcome);
+            Ok(outcome)
+        }
+        "identity_eq" => {
+            let expected = node
+                .pattern_id
+                .as_ref()
+                .ok_or_else(|| SspryError::from("identity_eq node requires pattern_id"))?;
+            Ok(if doc_inputs.doc.identity == *expected {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "not" => {
+            let child = node
+                .children
+                .first()
+                .ok_or_else(|| SspryError::from("not node requires one child"))?;
+            if query_node_uses_pattern_blooms(child) || query_node_contains_verifier_only(child) {
+                return Ok(Tier1PrefilterOutcome::Match(TierFlags::default()));
+            }
+            let outcome = evaluate_node_tier1_prefilter(
+                child,
+                doc_inputs,
+                load_metadata,
+                load_tier1,
+                runtime,
+                plan,
+                query_now_unix,
+                pattern_cache,
+                gram_cache,
+            )?;
+            Ok(match outcome {
+                Tier1PrefilterOutcome::Match(_) => Tier1PrefilterOutcome::Miss,
+                Tier1PrefilterOutcome::Miss | Tier1PrefilterOutcome::NeedsTier2 => {
+                    Tier1PrefilterOutcome::Match(TierFlags::default())
+                }
+            })
+        }
+        "verifier_only_eq" => {
+            let matched = if let Some(expr) = node.pattern_id.as_deref() {
+                let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+                if let Some(file_prefix) = metadata_file_prefix_8(metadata_bytes)? {
+                    verifier_only_eq_matches_file_prefix(
+                        expr,
+                        &file_prefix,
+                        doc_inputs.doc.file_size,
+                    )?
+                    .unwrap_or(true)
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            Ok(if matched {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "verifier_only_at" => {
+            let matched = if let Some(expr) = node.pattern_id.as_deref() {
+                if let Some((pattern_id, offset_text)) = expr.split_once('@') {
+                    if offset_text == "0" {
+                        let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+                        if let Some(file_prefix) = metadata_file_prefix_8(metadata_bytes)? {
+                            if let Some(pattern) = runtime.patterns.get(pattern_id) {
+                                pattern_matches_file_prefix_at_zero(
+                                    pattern,
+                                    &file_prefix,
+                                    doc_inputs.doc.file_size,
+                                )
+                                .unwrap_or(true)
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else if let Some(offset) = entry_point_prefix_offset(offset_text) {
+                        let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+                        if let Some(entry_point_prefix) =
+                            metadata_pe_entry_point_prefix(metadata_bytes)?
+                        {
+                            if let Some(pattern) = runtime.patterns.get(pattern_id) {
+                                pattern_matches_prefix_window(
+                                    pattern,
+                                    &entry_point_prefix,
+                                    offset,
+                                    PE_ENTRY_POINT_PREFIX_BYTES,
+                                )
+                                .unwrap_or(true)
+                            } else {
+                                true
+                            }
+                        } else if let Some(pattern) = runtime.patterns.get(pattern_id) {
+                            pattern_matches_prefix_window(
+                                pattern,
+                                &[],
+                                offset,
+                                PE_ENTRY_POINT_PREFIX_BYTES,
+                            )
+                            .unwrap_or(true)
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            Ok(if matched {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "verifier_only_count" | "verifier_only_in_range" | "verifier_only_loop" => {
+            Ok(Tier1PrefilterOutcome::Match(TierFlags::default()))
+        }
+        "filesize_eq" | "filesize_ne" | "filesize_lt" | "filesize_le" | "filesize_gt"
+        | "filesize_ge" => {
+            let expected_size = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u64;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported filesize node: {}", node.kind))
+            })?;
+            Ok(if compare_u64(doc_inputs.doc.file_size, expected_size, op) {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "metadata_eq" | "metadata_ne" | "metadata_lt" | "metadata_le" | "metadata_gt"
+        | "metadata_ge" => {
+            let field = node.pattern_id.as_deref().ok_or_else(|| {
+                SspryError::from(format!("{} node requires pattern_id", node.kind))
+            })?;
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u64;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched = metadata_field_matches_compare(metadata_bytes, field, op, expected)?
+                .unwrap_or(true);
+            Ok(if matched {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "metadata_float_eq" | "metadata_float_ne" | "metadata_float_lt" | "metadata_float_le"
+        | "metadata_float_gt" | "metadata_float_ge" => {
+            let field = node.pattern_id.as_deref().ok_or_else(|| {
+                SspryError::from(format!("{} node requires pattern_id", node.kind))
+            })?;
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u32;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata-float node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched = metadata_field_matches_compare_f32(
+                metadata_bytes,
+                field,
+                op,
+                f32::from_bits(expected),
+            )?
+            .unwrap_or(true);
+            Ok(if matched {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "metadata_time_eq" | "metadata_time_ne" | "metadata_time_lt" | "metadata_time_le"
+        | "metadata_time_gt" | "metadata_time_ge" => {
+            let field = node.pattern_id.as_deref().ok_or_else(|| {
+                SspryError::from(format!("{} node requires pattern_id", node.kind))
+            })?;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata-time node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched =
+                metadata_field_matches_compare(metadata_bytes, field, op, query_now_unix)?
+                    .unwrap_or(true);
+            Ok(if matched {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "metadata_field_eq" | "metadata_field_ne" | "metadata_field_lt" | "metadata_field_le"
+        | "metadata_field_gt" | "metadata_field_ge" => {
+            let (lhs_field, rhs_field) = metadata_field_pair(node, &node.kind)?;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported metadata-field node: {}", node.kind))
+            })?;
+            let metadata_bytes = doc_inputs.metadata_bytes(load_metadata)?;
+            let matched = metadata_fields_compare(metadata_bytes, &lhs_field, op, &rhs_field)?
+                .unwrap_or(true);
+            Ok(if matched {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "time_now_eq" | "time_now_ne" | "time_now_lt" | "time_now_le" | "time_now_gt"
+        | "time_now_ge" => {
+            let expected = node
+                .threshold
+                .ok_or_else(|| SspryError::from(format!("{} node requires threshold", node.kind)))?
+                as u64;
+            let op = compare_op_for_node_kind(&node.kind).ok_or_else(|| {
+                SspryError::from(format!("Unsupported time.now node: {}", node.kind))
+            })?;
+            Ok(if compare_u64(query_now_unix, expected, op) {
+                Tier1PrefilterOutcome::Match(TierFlags::default())
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "and" => {
+            let mut merged = TierFlags::default();
+            let mut pending = false;
+            for child in &node.children {
+                match evaluate_node_tier1_prefilter(
+                    child,
+                    doc_inputs,
+                    load_metadata,
+                    load_tier1,
+                    runtime,
+                    plan,
+                    query_now_unix,
+                    pattern_cache,
+                    gram_cache,
+                )? {
+                    Tier1PrefilterOutcome::Match(tiers) => merged.merge(tiers),
+                    Tier1PrefilterOutcome::Miss => return Ok(Tier1PrefilterOutcome::Miss),
+                    Tier1PrefilterOutcome::NeedsTier2 => pending = true,
+                }
+            }
+            Ok(if pending {
+                Tier1PrefilterOutcome::NeedsTier2
+            } else {
+                Tier1PrefilterOutcome::Match(merged)
+            })
+        }
+        "or" => {
+            let mut pending = false;
+            for child in &node.children {
+                match evaluate_node_tier1_prefilter(
+                    child,
+                    doc_inputs,
+                    load_metadata,
+                    load_tier1,
+                    runtime,
+                    plan,
+                    query_now_unix,
+                    pattern_cache,
+                    gram_cache,
+                )? {
+                    Tier1PrefilterOutcome::Match(tiers) => {
+                        return Ok(Tier1PrefilterOutcome::Match(tiers))
+                    }
+                    Tier1PrefilterOutcome::Miss => {}
+                    Tier1PrefilterOutcome::NeedsTier2 => pending = true,
+                }
+            }
+            Ok(if pending {
+                Tier1PrefilterOutcome::NeedsTier2
+            } else {
+                Tier1PrefilterOutcome::Miss
+            })
+        }
+        "n_of" => {
+            let threshold = node
+                .threshold
+                .ok_or_else(|| SspryError::from("n_of node requires threshold"))?;
+            let mut matched_count = 0usize;
+            let mut pending_count = 0usize;
+            let mut merged = TierFlags::default();
+            for child in &node.children {
+                match evaluate_node_tier1_prefilter(
+                    child,
+                    doc_inputs,
+                    load_metadata,
+                    load_tier1,
+                    runtime,
+                    plan,
+                    query_now_unix,
+                    pattern_cache,
+                    gram_cache,
+                )? {
+                    Tier1PrefilterOutcome::Match(tiers) => {
+                        matched_count += 1;
+                        merged.merge(tiers);
+                        if matched_count >= threshold {
+                            return Ok(Tier1PrefilterOutcome::Match(merged));
+                        }
+                    }
+                    Tier1PrefilterOutcome::Miss => {}
+                    Tier1PrefilterOutcome::NeedsTier2 => pending_count += 1,
+                }
+            }
+            Ok(if matched_count >= threshold {
+                Tier1PrefilterOutcome::Match(merged)
+            } else if matched_count + pending_count < threshold {
+                Tier1PrefilterOutcome::Miss
+            } else {
+                Tier1PrefilterOutcome::NeedsTier2
+            })
+        }
+        other => Err(SspryError::from(format!(
+            "Unsupported ast node kind: {other}"
+        ))),
+    }
+}
+
 /// Evaluates one pattern alternative by hashing query grams on demand.
 fn evaluate_pattern_runtime<'a, FT1, FT2>(
     pattern: &PatternPlan,
